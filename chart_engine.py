@@ -138,108 +138,86 @@ def _signal_markers(df):
     """
     Build QUALIFIED buy/sell markers on price chart.
 
-    Qualified Buy requires ALL of:
-    1. Price came within 5% of 150d SMA OR 200 SMA at some point in prior 120 bars
-       (or was below it — indicating a real pullback/reset)
-    2. MACD crossed up from BELOW ZERO (not just below signal line)
-    3. AO also crossed above zero (confirmation)
+    BUY: MACD crosses from below zero to above zero + AO goes positive
+    SELL: MACD crosses from above zero to below zero + AO goes negative
 
-    Shows ALL qualified buys and sells (not just the most recent).
+    The "from below/above zero" IS the filter — it eliminates all the noisy
+    mid-wave MACD/Signal crosses that happen while MACD stays above zero.
     """
-    if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
+    if 'MACD' not in df.columns:
         return []
 
     macd_vals = df['MACD'].values
     ao = df['AO'].values if 'AO' in df.columns else [0] * len(df)
     close = df['Close'].values
-    low = df['Low'].values
 
-    sma150 = df['SMA_150'].values if 'SMA_150' in df.columns else [np.nan] * len(df)
-    sma200 = df['SMA_200'].values if 'SMA_200' in df.columns else [np.nan] * len(df)
-
-    # ── Find MACD zero-cross-up events ──
-    zero_cross_ups = []
-    for i in range(1, len(df)):
-        if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
-            continue
-        if macd_vals[i] > 0 and macd_vals[i-1] <= 0:
-            zero_cross_ups.append(i)
-
-    # ── Check qualifiers for each zero-cross-up ──
-    qualified_buys = []
-    for cross_i in zero_cross_ups:
-        # Price must have come within 5% of either SMA in prior 120 bars
-        lookback = min(cross_i, 120)
-        sma_touched = False
-        for j in range(cross_i - lookback, cross_i + 1):
-            if j < 0:
-                continue
-            if not pd.isna(sma150[j]) and low[j] <= sma150[j] * 1.05:
-                sma_touched = True
-                break
-            if not pd.isna(sma200[j]) and low[j] <= sma200[j] * 1.05:
-                sma_touched = True
-                break
-
-        if not sma_touched:
-            continue
-
-        # AO must be positive within a window around the MACD cross
-        ao_confirmed = False
-        ao_confirm_bar = cross_i
-        for j in range(max(0, cross_i - 5), min(len(df), cross_i + 20)):
-            if not pd.isna(ao[j]) and ao[j] > 0:
-                ao_confirmed = True
-                ao_confirm_bar = j
-                break
-
-        if not ao_confirmed:
-            continue
-
-        signal_bar = max(cross_i, ao_confirm_bar)
-        if signal_bar < len(df):
-            price = float(close[signal_bar])
-            qualified_buys.append({
-                "bar": signal_bar,
-                "price": price,
-                "time": df.index[signal_bar].strftime('%Y-%m-%d'),
-            })
-
-    # ── Find sell signals (MACD crosses below zero) ──
-    sells = []
-    for i in range(1, len(df)):
-        if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
-            continue
-        if macd_vals[i] < 0 and macd_vals[i-1] >= 0:
-            price = float(close[i])
-            sells.append({
-                "bar": i,
-                "price": price,
-                "time": df.index[i].strftime('%Y-%m-%d'),
-            })
-
-    # ── Build markers — show ALL qualified, latest gets price ──
     markers = []
 
-    for idx, qb in enumerate(qualified_buys):
-        is_latest = (idx == len(qualified_buys) - 1)
-        markers.append({
-            "time": qb['time'],
-            "position": "belowBar",
-            "color": "#26a69a",
-            "shape": "arrowUp",
-            "text": f"BUY ${qb['price']:.0f}" if is_latest else "BUY",
-        })
+    # ── Find MACD zero-cross events and check AO confirmation ──
+    for i in range(1, len(df)):
+        if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
+            continue
 
-    for idx, s in enumerate(sells):
-        is_latest = (idx == len(sells) - 1)
-        markers.append({
-            "time": s['time'],
-            "position": "aboveBar",
-            "color": "#ef5350",
-            "shape": "arrowDown",
-            "text": f"SELL ${s['price']:.0f}" if is_latest else "SELL",
-        })
+        date_str = df.index[i].strftime('%Y-%m-%d')
+        price = float(close[i])
+
+        # BUY: MACD crosses from negative to positive
+        if macd_vals[i] > 0 and macd_vals[i-1] <= 0:
+            # Check AO is positive (or becomes positive within 15 bars)
+            ao_ok = False
+            for j in range(max(0, i - 3), min(len(df), i + 15)):
+                if not pd.isna(ao[j]) and ao[j] > 0:
+                    ao_ok = True
+                    break
+            if ao_ok:
+                markers.append({
+                    "time": date_str,
+                    "position": "belowBar",
+                    "color": "#26a69a",
+                    "shape": "arrowUp",
+                    "text": "BUY",
+                })
+
+        # SELL: MACD crosses from positive to negative
+        elif macd_vals[i] < 0 and macd_vals[i-1] >= 0:
+            # Check AO is also negative (or becomes negative within 15 bars)
+            ao_ok = False
+            for j in range(max(0, i - 3), min(len(df), i + 15)):
+                if not pd.isna(ao[j]) and ao[j] < 0:
+                    ao_ok = True
+                    break
+            if ao_ok:
+                markers.append({
+                    "time": date_str,
+                    "position": "aboveBar",
+                    "color": "#ef5350",
+                    "shape": "arrowDown",
+                    "text": "SELL",
+                })
+
+    # Add price to the most recent buy and sell
+    last_buy_idx = None
+    last_sell_idx = None
+    for idx, m in enumerate(markers):
+        if m['text'] == 'BUY':
+            last_buy_idx = idx
+        elif m['text'] == 'SELL':
+            last_sell_idx = idx
+
+    if last_buy_idx is not None:
+        # Find the price at that date
+        date = markers[last_buy_idx]['time']
+        match = df.index.get_indexer([pd.Timestamp(date)], method='nearest')
+        if len(match) > 0 and match[0] >= 0:
+            p = float(df['Close'].iloc[match[0]])
+            markers[last_buy_idx]['text'] = f"BUY ${p:.0f}"
+
+    if last_sell_idx is not None:
+        date = markers[last_sell_idx]['time']
+        match = df.index.get_indexer([pd.Timestamp(date)], method='nearest')
+        if len(match) > 0 and match[0] >= 0:
+            p = float(df['Close'].iloc[match[0]])
+            markers[last_sell_idx]['text'] = f"SELL ${p:.0f}"
 
     return markers
 
