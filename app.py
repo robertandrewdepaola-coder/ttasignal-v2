@@ -355,18 +355,25 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 - 🔵 **50 SMA** (dashed) — Medium-term trend direction
 - 🟣 **200 SMA** (dashed) — Long-term trend. Price above = bull market
 - 🔴 **R $xxx** — Overhead resistance levels (★ = critical resistance)
-- 🔶 **Div ⚠** — Bearish divergence: price making higher highs while MACD makes lower highs
+
+**Chart Signals:**
+- 🟢 **Buy ↑** — MACD crosses above Signal while AO is positive (strong buy)
+- 🟢 **Buy? ↑** — MACD crosses above Signal while AO is negative (weak buy)
+- 🔴 **Sell ↓** — MACD crosses below Signal
+- 🔶 **Div ⚠ ↓** — Bearish divergence (see below)
 """)
         with c2:
             st.markdown("""
 **Indicator Panels:**
 - **Volume** — Green/red bars showing daily trading volume
-- **AO (Awesome Oscillator)** — Momentum: green bars = bullish momentum, red = bearish
+- **AO (Awesome Oscillator)** — Momentum: green bars = bullish, red = bearish
 - **MACD (12/26/9)** — Trend/momentum:
-  - 🔵 Blue line = MACD line (fast - slow EMA)
+  - 🔵 Blue line = MACD line (fast − slow EMA)
   - 🟠 Orange line = Signal line (9-period SMA of MACD)
   - Green/red histogram = difference between MACD and Signal
-  - **Buy signal**: MACD crosses above Signal + AO turns green
+
+**Bearish Divergence (AO Wave Method):**
+AO goes positive (Wave 3) → drops below zero (Wave 4) → returns positive (Wave 5) but with a **smaller peak** while price makes a **higher high**. This warns the uptrend is losing momentum. The ⚠ marker appears at the highest price of the weaker AO block.
 """)
 
     # MTF chart
