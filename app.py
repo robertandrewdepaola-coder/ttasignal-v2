@@ -329,7 +329,7 @@ def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
 
 
 def _render_chart_tab(ticker: str, signal: EntrySignal):
-    """Interactive chart."""
+    """Interactive chart with TradingView-style zoom."""
     data_cache = st.session_state.get('ticker_data_cache', {})
     ticker_data = data_cache.get(ticker, {})
     daily = ticker_data.get('daily')
@@ -338,8 +338,46 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
         st.warning("No chart data available")
         return
 
-    fig = create_analysis_chart(daily, ticker, signal=signal)
-    st.plotly_chart(fig, use_container_width=True)
+    # Timeframe buttons
+    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 6])
+    tf_key = f'chart_tf_{ticker}'
+    if tf_key not in st.session_state:
+        st.session_state[tf_key] = '3M'
+
+    with col1:
+        if st.button("1M", key=f'tf1m_{ticker}', use_container_width=True):
+            st.session_state[tf_key] = '1M'
+    with col2:
+        if st.button("3M", key=f'tf3m_{ticker}', use_container_width=True):
+            st.session_state[tf_key] = '3M'
+    with col3:
+        if st.button("6M", key=f'tf6m_{ticker}', use_container_width=True):
+            st.session_state[tf_key] = '6M'
+    with col4:
+        if st.button("1Y", key=f'tf1y_{ticker}', use_container_width=True):
+            st.session_state[tf_key] = '1Y'
+    with col5:
+        if st.button("All", key=f'tfall_{ticker}', use_container_width=True):
+            st.session_state[tf_key] = 'All'
+
+    # Map timeframe to number of bars
+    tf = st.session_state[tf_key]
+    from signal_engine import normalize_columns
+    chart_df = normalize_columns(daily).copy()
+    bar_map = {'1M': 22, '3M': 65, '6M': 130, '1Y': 252, 'All': len(chart_df)}
+    n_bars = min(bar_map.get(tf, 65), len(chart_df))
+    chart_df = chart_df.tail(n_bars)
+
+    fig = create_analysis_chart(chart_df, ticker, signal=signal)
+
+    # Render with scroll zoom enabled (key TradingView behavior)
+    st.plotly_chart(fig, use_container_width=True,
+                    config={
+                        'scrollZoom': True,
+                        'displayModeBar': True,
+                        'modeBarButtonsToAdd': ['drawline', 'drawopenpath'],
+                        'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
+                    })
 
     # MTF chart
     weekly = ticker_data.get('weekly')
