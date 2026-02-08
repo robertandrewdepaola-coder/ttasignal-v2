@@ -427,24 +427,32 @@ def create_mtf_chart(daily_df: pd.DataFrame,
     fig = make_subplots(
         rows=1, cols=3,
         shared_yaxes=False,
-        horizontal_spacing=0.03,
+        horizontal_spacing=0.05,
         subplot_titles=('Daily', 'Weekly', 'Monthly'),
     )
 
-    for idx, (label, df) in enumerate([(
-        'Daily', daily_df), ('Weekly', weekly_df), ('Monthly', monthly_df)
-    ], start=1):
+    panels = [
+        ('Daily', daily_df, 60),
+        ('Weekly', weekly_df, 26),
+        ('Monthly', monthly_df, 24),
+    ]
+
+    for idx, (label, df, n_bars) in enumerate(panels, start=1):
         if df is None or df.empty:
             continue
 
         df = normalize_columns(df).copy()
         df = calculate_macd(df)
-        recent = df.tail(60 if label == 'Daily' else (26 if label == 'Weekly' else 24))
+        recent = df.tail(n_bars).copy()
+
+        if recent.empty:
+            continue
 
         # Candlestick
         fig.add_trace(
             go.Candlestick(
-                x=recent.index, open=recent['Open'], high=recent['High'],
+                x=list(range(len(recent))),  # Use integer indices to avoid date scaling issues
+                open=recent['Open'], high=recent['High'],
                 low=recent['Low'], close=recent['Close'],
                 name=label,
                 increasing_line_color=COLORS['candle_up'],
@@ -454,7 +462,7 @@ def create_mtf_chart(daily_df: pd.DataFrame,
             row=1, col=idx
         )
 
-        # MACD status annotation
+        # MACD status as subtitle text
         if 'MACD' in recent.columns and 'MACD_Signal' in recent.columns:
             m = float(recent['MACD'].iloc[-1])
             s = float(recent['MACD_Signal'].iloc[-1])
@@ -462,10 +470,14 @@ def create_mtf_chart(daily_df: pd.DataFrame,
                 bullish = m > s
                 status = "MACD ✅" if bullish else "MACD ❌"
                 color = COLORS['candle_up'] if bullish else COLORS['candle_down']
+                # Place annotation at middle of x-range, below chart
+                mid_x = len(recent) // 2
+                y_min = float(recent['Low'].min())
                 fig.add_annotation(
-                    text=status, xref=f'x{idx}', yref=f'y{idx}',
-                    x=0.5, y=1.05, xanchor='center', yanchor='bottom',
-                    showarrow=False, font=dict(size=11, color=color),
+                    text=status, x=mid_x, y=y_min * 0.98,
+                    xref=f'x{idx}', yref=f'y{idx}',
+                    xanchor='center', yanchor='top',
+                    showarrow=False, font=dict(size=12, color=color),
                 )
 
     fig.update_layout(
@@ -478,7 +490,10 @@ def create_mtf_chart(daily_df: pd.DataFrame,
     )
 
     for i in range(1, 4):
-        fig.update_xaxes(rangeslider_visible=False, gridcolor=COLORS['grid'], row=1, col=i)
+        fig.update_xaxes(
+            rangeslider_visible=False, gridcolor=COLORS['grid'],
+            showticklabels=False, row=1, col=i,
+        )
         fig.update_yaxes(gridcolor=COLORS['grid'], row=1, col=i)
 
     return fig
