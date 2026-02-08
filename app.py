@@ -356,11 +356,12 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 - 🟣 **200 SMA** (dashed) — Long-term trend. Price above = bull market
 - 🔴 **R $xxx** — Overhead resistance levels (★ = critical resistance)
 
-**Chart Signals:**
-- 🟢 **Buy ↑** — MACD crosses above Signal while AO is positive (strong buy)
-- 🟢 **Buy? ↑** — MACD crosses above Signal while AO is negative (weak buy)
-- 🔴 **Sell ↓** — MACD crosses below Signal
-- 🔶 **Div ⚠ ↓** — Bearish divergence (see below)
+**Chart Signals (Qualified Entry):**
+- 🟢 **BUY $xxx ↑** — Qualified buy: price tested SMA + MACD crossed above zero + AO confirmed positive
+- 🔴 **SELL $xxx ↓** — MACD crossed below zero
+- 🔶 **W5(div) ↓** — Bearish divergence warning (reduce exposure or exit)
+- 🟢 **W3 ↓** — Wave 3 peak label (momentum high)
+- Green/red **dots on MACD** — All crossovers for reference (not all qualify as signals)
 """)
         with c2:
             st.markdown("""
