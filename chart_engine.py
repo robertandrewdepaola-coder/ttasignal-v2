@@ -1,16 +1,19 @@
 """
-TTA v2 Chart Engine — Plotly Chart Generation
-===============================================
+TTA v2 Chart Engine — Professional Plotly Financial Charts
+============================================================
 
-Generates interactive candlestick charts with indicator overlays.
-Uses signal_engine for all calculations. No Streamlit dependencies.
+Built with Graph Objects + make_subplots for granular control.
+TradingView-inspired design: clean, interactive, narrative.
 
-Charts:
-- Main panel: Candlestick + SMA overlays + resistance levels
-- Sub panel: AO histogram + MACD histogram + signal line
-- Optional: Volume bars, divergence markers, entry/exit markers
+Design principles:
+- Multi-pane vertical layout with proper row weighting
+- Spikelines (crosshairs) that snap to data points
+- Right-side price axis (TradingView convention)
+- Clean aesthetic: minimal gridlines, dark theme, data pops
+- Narrative annotations on resistance levels
+- All data loaded, visible window controlled by x-range
 
-Version: 2.0.0 (2026-02-08)
+Version: 2.1.0 (2026-02-08)
 """
 
 import pandas as pd
@@ -19,7 +22,6 @@ from typing import Dict, List, Optional, Any, Tuple
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import base64
-import io
 
 from signal_engine import (
     normalize_columns, calculate_macd, calculate_ao, calculate_atr,
@@ -29,426 +31,400 @@ from signal_engine import (
 
 
 # =============================================================================
-# COLOR SCHEME
+# COLOR PALETTE — TradingView-inspired dark theme
 # =============================================================================
 
-COLORS = {
-    'candle_up': '#26a69a',
-    'candle_down': '#ef5350',
-    'sma_30w': '#ff9800',     # Orange - 30-week / 150-day SMA
-    'sma_50': '#2196f3',      # Blue - 50 SMA
-    'sma_200': '#9c27b0',     # Purple - 200 SMA
-    'ao_positive': '#26a69a',
-    'ao_negative': '#ef5350',
+C = {
+    # Candles
+    'up': '#26a69a',
+    'down': '#ef5350',
+    'up_fill': 'rgba(38, 166, 154, 0.8)',
+    'down_fill': 'rgba(239, 83, 80, 0.8)',
+
+    # Moving averages
+    'sma150': '#ff9800',      # Orange — 30-week / 150-day
+    'sma50': '#42a5f5',       # Blue
+    'sma200': '#ab47bc',      # Purple
+
+    # Volume
+    'vol_up': 'rgba(38, 166, 154, 0.4)',
+    'vol_down': 'rgba(239, 83, 80, 0.4)',
+
+    # Oscillators
+    'ao_up': '#26a69a',
+    'ao_down': '#ef5350',
     'macd_line': '#2962ff',
     'macd_signal': '#ff6d00',
-    'macd_hist_pos': 'rgba(38, 166, 154, 0.5)',
-    'macd_hist_neg': 'rgba(239, 83, 80, 0.5)',
-    'volume_up': 'rgba(38, 166, 154, 0.3)',
-    'volume_down': 'rgba(239, 83, 80, 0.3)',
-    'resistance': 'rgba(239, 83, 80, 0.6)',
-    'support': 'rgba(38, 166, 154, 0.6)',
-    'entry_marker': '#00e676',
+    'macd_hist_up': 'rgba(38, 166, 154, 0.6)',
+    'macd_hist_dn': 'rgba(239, 83, 80, 0.6)',
+
+    # Overlays
+    'resistance': 'rgba(239, 83, 80, 0.5)',
+    'resistance_crit': '#ff1744',
+    'divergence': '#ffa726',
+    'entry': '#00e676',
     'exit_win': '#00e676',
     'exit_loss': '#ff1744',
-    'divergence': '#ff9800',
-    'bg_dark': '#131722',
-    'grid': '#1e222d',
+
+    # Theme
+    'bg': '#131722',
+    'panel_bg': '#131722',
+    'grid': 'rgba(42, 46, 57, 0.6)',
     'text': '#d1d4dc',
+    'text_dim': '#787b86',
+    'spike': '#9598a1',
+    'zeroline': 'rgba(120, 123, 134, 0.3)',
 }
 
 
 # =============================================================================
-# MAIN CHART BUILDER
+# MAIN CHART — Professional multi-pane financial chart
 # =============================================================================
 
-def create_analysis_chart(df: pd.DataFrame,
-                          ticker: str,
-                          weekly_sma: pd.Series = None,
-                          signal: EntrySignal = None,
-                          show_volume: bool = True,
-                          show_resistance: bool = True,
-                          show_divergence: bool = True,
-                          trade_markers: List[Dict] = None,
-                          visible_bars: int = 130,
-                          height: int = 1000) -> go.Figure:
+def create_analysis_chart(
+    df: pd.DataFrame,
+    ticker: str,
+    weekly_sma: pd.Series = None,
+    signal: EntrySignal = None,
+    show_volume: bool = True,
+    show_resistance: bool = True,
+    show_divergence: bool = True,
+    trade_markers: List[Dict] = None,
+    visible_bars: int = 130,
+    height: int = 1000,
+) -> go.Figure:
     """
-    Create the main analysis chart.
+    Professional 4-pane chart: Price | Volume | AO | MACD
 
-    Layout:
-    - Row 1 (60%): Candlestick + SMAs + resistance levels
-    - Row 2 (20%): AO histogram
-    - Row 3 (20%): MACD histogram + signal line
+    All data is loaded into the figure. The visible_bars parameter
+    controls the initial x-axis window. User can pan, scroll-zoom,
+    and use timeframe buttons to change the view.
 
-    If show_volume=True, volume bars are overlaid on row 1 with secondary y-axis.
-
-    Args:
-        df: Daily OHLCV DataFrame (should already have indicators from add_all_indicators)
-        ticker: Symbol for title
-        weekly_sma: 30-week SMA series (optional, for Weinstein overlay)
-        signal: EntrySignal with pre-computed analysis (optional, for annotations)
-        show_volume: Show volume bars
-        show_resistance: Show overhead resistance levels
-        show_divergence: Show bearish divergence markers
-        trade_markers: List of dicts with entry/exit markers
-        height: Chart height in pixels
+    The y-axis auto-fits to the initial visible window.
     """
     df = normalize_columns(df).copy()
 
     # Ensure indicators exist
     if 'MACD' not in df.columns:
         df = add_all_indicators(df)
-
-    # Detect divergence if requested
     if show_divergence:
         df = detect_bearish_divergence(df)
 
-    # ── Build subplots ────────────────────────────────────────────────
-    if show_volume and 'Volume' in df.columns:
-        row_heights = [0.52, 0.10, 0.18, 0.20]
-        fig = make_subplots(
-            rows=4, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.02,
-            row_heights=row_heights,
-            subplot_titles=('', 'Volume', 'Awesome Oscillator', 'MACD (12/26/9 SMA)'),
-        )
-        vol_row = 2
-        ao_row = 3
-        macd_row = 4
-        total_rows = 4
-    else:
-        row_heights = [0.60, 0.20, 0.20]
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.02,
-            row_heights=row_heights,
-            subplot_titles=('', 'Awesome Oscillator', 'MACD (12/26/9 SMA)'),
-        )
-        vol_row = None
-        ao_row = 2
-        macd_row = 3
-        total_rows = 3
+    # ─── SUBPLOT LAYOUT ──────────────────────────────────────────────
+    has_volume = show_volume and 'Volume' in df.columns
 
-    # ── Row 1: Candlestick ────────────────────────────────────────────
-    fig.add_trace(
-        go.Candlestick(
-            x=df.index, open=df['Open'], high=df['High'],
-            low=df['Low'], close=df['Close'],
-            name='Price',
-            increasing_line_color=COLORS['candle_up'],
-            decreasing_line_color=COLORS['candle_down'],
-        ),
-        row=1, col=1
+    if has_volume:
+        rows = 4
+        heights = [0.55, 0.08, 0.17, 0.20]
+        titles = ('', '', 'Awesome Oscillator', 'MACD (12/26/9)')
+    else:
+        rows = 3
+        heights = [0.55, 0.22, 0.23]
+        titles = ('', 'Awesome Oscillator', 'MACD (12/26/9)')
+
+    fig = make_subplots(
+        rows=rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.015,
+        row_heights=heights,
+        subplot_titles=titles,
     )
 
-    # ── Volume bars (own row) ─────────────────────────────────────────
-    if show_volume and 'Volume' in df.columns and vol_row:
-        vol_colors = [COLORS['volume_up'] if df['Close'].iloc[i] >= df['Open'].iloc[i]
-                      else COLORS['volume_down'] for i in range(len(df))]
-        fig.add_trace(
-            go.Bar(
-                x=df.index, y=df['Volume'],
-                name='Volume',
-                marker_color=vol_colors,
-                opacity=0.6,
-            ),
-            row=vol_row, col=1
-        )
+    # Row assignments
+    price_row = 1
+    vol_row = 2 if has_volume else None
+    ao_row = 3 if has_volume else 2
+    macd_row = 4 if has_volume else 3
 
-    # ── 30-Week SMA (Weinstein) ───────────────────────────────────────
+    # ─── ROW 1: CANDLESTICK ──────────────────────────────────────────
+    fig.add_trace(
+        go.Candlestick(
+            x=df.index,
+            open=df['Open'], high=df['High'],
+            low=df['Low'], close=df['Close'],
+            name='Price',
+            increasing=dict(line=dict(color=C['up'], width=1), fillcolor=C['up_fill']),
+            decreasing=dict(line=dict(color=C['down'], width=1), fillcolor=C['down_fill']),
+            whiskerwidth=0.5,
+        ),
+        row=price_row, col=1,
+    )
+
+    # ─── MOVING AVERAGES (on price panel) ────────────────────────────
     if weekly_sma is not None and len(weekly_sma) > 0:
-        chart_start = df.index.min()
-        chart_end = df.index.max()
-        filtered_sma = weekly_sma[(weekly_sma.index >= chart_start) &
-                                   (weekly_sma.index <= chart_end)]
-        if len(filtered_sma) > 0:
-            sma_val = filtered_sma.iloc[-1]
-            slope = "↗" if len(filtered_sma) >= 5 and filtered_sma.iloc[-1] > filtered_sma.iloc[-5] else "↘"
-            fig.add_trace(
-                go.Scatter(
-                    x=filtered_sma.index, y=filtered_sma,
-                    mode='lines',
-                    name=f'30W SMA ${sma_val:.2f} {slope}',
-                    line=dict(color=COLORS['sma_30w'], width=2.5),
-                ),
-                row=1, col=1
-            )
+        filtered = weekly_sma[
+            (weekly_sma.index >= df.index.min()) & (weekly_sma.index <= df.index.max())
+        ]
+        if len(filtered) > 0:
+            fig.add_trace(go.Scatter(
+                x=filtered.index, y=filtered,
+                mode='lines', name=f'30W SMA ${filtered.iloc[-1]:.2f}',
+                line=dict(color=C['sma150'], width=2),
+            ), row=price_row, col=1)
     elif 'SMA_150' in df.columns:
-        # Fallback: use 150-day SMA as proxy for 30-week
-        sma150 = df['SMA_150'].dropna()
-        if len(sma150) > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=sma150.index, y=sma150,
-                    mode='lines',
-                    name=f'150d SMA ${sma150.iloc[-1]:.2f}',
-                    line=dict(color=COLORS['sma_30w'], width=2, dash='dot'),
-                ),
-                row=1, col=1
-            )
+        sma = df['SMA_150'].dropna()
+        if len(sma) > 0:
+            fig.add_trace(go.Scatter(
+                x=sma.index, y=sma,
+                mode='lines', name=f'150d SMA ${sma.iloc[-1]:.2f}',
+                line=dict(color=C['sma150'], width=2, dash='dot'),
+            ), row=price_row, col=1)
 
-    # ── 50 & 200 SMA ─────────────────────────────────────────────────
     if 'SMA_50' in df.columns:
-        sma50 = df['SMA_50'].dropna()
-        if len(sma50) > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=sma50.index, y=sma50,
-                    mode='lines',
-                    name=f'50 SMA ${sma50.iloc[-1]:.2f}',
-                    line=dict(color=COLORS['sma_50'], width=1.5, dash='dash'),
-                ),
-                row=1, col=1
-            )
+        sma = df['SMA_50'].dropna()
+        if len(sma) > 0:
+            fig.add_trace(go.Scatter(
+                x=sma.index, y=sma,
+                mode='lines', name=f'50 SMA ${sma.iloc[-1]:.2f}',
+                line=dict(color=C['sma50'], width=1.5, dash='dash'),
+            ), row=price_row, col=1)
 
     if 'SMA_200' in df.columns:
-        sma200 = df['SMA_200'].dropna()
-        if len(sma200) > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=sma200.index, y=sma200,
-                    mode='lines',
-                    name=f'200 SMA ${sma200.iloc[-1]:.2f}',
-                    line=dict(color=COLORS['sma_200'], width=1.5, dash='dash'),
-                ),
-                row=1, col=1
-            )
+        sma = df['SMA_200'].dropna()
+        if len(sma) > 0:
+            fig.add_trace(go.Scatter(
+                x=sma.index, y=sma,
+                mode='lines', name=f'200 SMA ${sma.iloc[-1]:.2f}',
+                line=dict(color=C['sma200'], width=1.5, dash='dash'),
+            ), row=price_row, col=1)
 
-    # ── Overhead Resistance Levels ────────────────────────────────────
+    # ─── OVERHEAD RESISTANCE (shapes + annotations) ──────────────────
     if show_resistance and signal and signal.overhead_resistance:
         levels = signal.overhead_resistance.get('levels', [])
         critical = signal.overhead_resistance.get('critical_level', {})
 
         for lev in levels:
             price = lev['price']
-            is_critical = critical and abs(price - critical.get('price', 0)) < 0.01
-            color = '#ff1744' if is_critical else COLORS['resistance']
-            width = 2 if is_critical else 1
-            dash = 'solid' if is_critical else 'dot'
+            is_crit = critical and abs(price - critical.get('price', 0)) < 0.01
+            color = C['resistance_crit'] if is_crit else C['resistance']
+            width = 2.5 if is_crit else 1
+            dash = 'solid' if is_crit else 'dot'
 
-            fig.add_hline(
-                y=price, row=1, col=1,
-                line_dash=dash, line_color=color, line_width=width,
-                annotation_text=f"R ${price:.0f}" + (" ★" if is_critical else ""),
-                annotation_position="right",
-                annotation_font_size=9,
-                annotation_font_color=color,
+            # Shape instead of hline (doesn't expand y-axis)
+            fig.add_shape(
+                type='line',
+                x0=df.index[0], x1=df.index[-1],
+                y0=price, y1=price,
+                line=dict(color=color, width=width, dash=dash),
+                xref='x', yref='y',
+            )
+            fig.add_annotation(
+                x=df.index[-1], y=price,
+                text=f"R ${price:.0f}" + (" ★" if is_crit else ""),
+                font=dict(size=9, color=color),
+                showarrow=False,
+                xanchor='left', xshift=5,
             )
 
-    # ── Trade Markers (entry/exit) ────────────────────────────────────
-    if trade_markers:
-        for marker in trade_markers:
-            date = marker.get('date')
-            price = marker.get('price')
-            mtype = marker.get('type', 'entry')  # 'entry' or 'exit'
-            label = marker.get('label', '')
-            win = marker.get('win', True)
-
-            if mtype == 'entry':
-                color = COLORS['entry_marker']
-                symbol = 'triangle-up'
-            else:
-                color = COLORS['exit_win'] if win else COLORS['exit_loss']
-                symbol = 'triangle-down'
-
-            fig.add_trace(
-                go.Scatter(
-                    x=[date], y=[price],
-                    mode='markers+text',
-                    name=label,
-                    marker=dict(symbol=symbol, size=12, color=color),
-                    text=[label],
-                    textposition='top center' if mtype == 'entry' else 'bottom center',
-                    textfont=dict(size=9, color=color),
-                    showlegend=False,
-                ),
-                row=1, col=1
-            )
-
-    # ── Divergence Markers ────────────────────────────────────────────
+    # ─── DIVERGENCE MARKERS ──────────────────────────────────────────
     if show_divergence and 'bearish_div_detected' in df.columns:
-        div_bars = df[df['bearish_div_detected'] == True]
-        if len(div_bars) > 0:
-            fig.add_trace(
-                go.Scatter(
-                    x=div_bars.index,
-                    y=div_bars['High'] * 1.005,
-                    mode='markers',
-                    name='Bearish Divergence',
-                    marker=dict(symbol='diamond', size=10,
-                                color=COLORS['divergence'], line=dict(width=1, color='white')),
-                    showlegend=True,
-                ),
-                row=1, col=1
-            )
+        divs = df[df['bearish_div_detected'] == True]
+        if len(divs) > 0:
+            fig.add_trace(go.Scatter(
+                x=divs.index, y=divs['High'] * 1.005,
+                mode='markers', name='Bearish Divergence',
+                marker=dict(symbol='diamond', size=10, color=C['divergence'],
+                            line=dict(width=1, color='white')),
+            ), row=price_row, col=1)
 
-    # ── Awesome Oscillator ────────────────────────────────────────────
+    # ─── TRADE MARKERS ───────────────────────────────────────────────
+    if trade_markers:
+        for m in trade_markers:
+            color = C['entry'] if m.get('type') == 'entry' else (
+                C['exit_win'] if m.get('win', True) else C['exit_loss'])
+            symbol = 'triangle-up' if m.get('type') == 'entry' else 'triangle-down'
+            fig.add_trace(go.Scatter(
+                x=[m['date']], y=[m['price']],
+                mode='markers+text', name=m.get('label', ''),
+                marker=dict(symbol=symbol, size=12, color=color),
+                text=[m.get('label', '')],
+                textposition='top center' if m.get('type') == 'entry' else 'bottom center',
+                textfont=dict(size=9, color=color),
+                showlegend=False,
+            ), row=price_row, col=1)
+
+    # ─── ROW 2: VOLUME ───────────────────────────────────────────────
+    if has_volume and vol_row:
+        vol_colors = [
+            C['vol_up'] if df['Close'].iloc[i] >= df['Open'].iloc[i]
+            else C['vol_down']
+            for i in range(len(df))
+        ]
+        fig.add_trace(go.Bar(
+            x=df.index, y=df['Volume'],
+            name='Volume', marker_color=vol_colors, showlegend=False,
+        ), row=vol_row, col=1)
+
+    # ─── ROW 3: AWESOME OSCILLATOR ───────────────────────────────────
     if 'AO' in df.columns:
         ao = df['AO'].dropna()
-        ao_colors = [COLORS['ao_positive'] if v >= 0 else COLORS['ao_negative']
-                     for v in ao]
-        fig.add_trace(
-            go.Bar(
-                x=ao.index, y=ao,
-                name='AO',
-                marker_color=ao_colors,
-            ),
-            row=ao_row, col=1
-        )
-        # Zero line
-        fig.add_hline(y=0, row=ao_row, col=1, line_dash='solid',
-                      line_color='rgba(255,255,255,0.2)', line_width=0.5)
+        ao_colors = [C['ao_up'] if v >= 0 else C['ao_down'] for v in ao]
+        fig.add_trace(go.Bar(
+            x=ao.index, y=ao, name='AO',
+            marker_color=ao_colors, showlegend=False,
+        ), row=ao_row, col=1)
 
-    # ── MACD ──────────────────────────────────────────────────────────
+    # ─── ROW 4: MACD ─────────────────────────────────────────────────
     if 'MACD' in df.columns and 'MACD_Signal' in df.columns:
-        macd = df['MACD'].dropna()
-        signal_line = df['MACD_Signal'].dropna()
         hist = df['MACD_Hist'].dropna()
+        hist_colors = [C['macd_hist_up'] if v >= 0 else C['macd_hist_dn'] for v in hist]
 
-        # Histogram
-        hist_colors = [COLORS['macd_hist_pos'] if v >= 0 else COLORS['macd_hist_neg']
-                       for v in hist]
-        fig.add_trace(
-            go.Bar(x=hist.index, y=hist, name='MACD Hist', marker_color=hist_colors),
-            row=macd_row, col=1
-        )
+        fig.add_trace(go.Bar(
+            x=hist.index, y=hist, name='MACD Hist',
+            marker_color=hist_colors, showlegend=False,
+        ), row=macd_row, col=1)
 
-        # MACD line
-        fig.add_trace(
-            go.Scatter(
-                x=macd.index, y=macd, mode='lines',
-                name='MACD', line=dict(color=COLORS['macd_line'], width=1.5),
-            ),
-            row=macd_row, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['MACD'],
+            mode='lines', name='MACD',
+            line=dict(color=C['macd_line'], width=1.5),
+        ), row=macd_row, col=1)
 
-        # Signal line
-        fig.add_trace(
-            go.Scatter(
-                x=signal_line.index, y=signal_line, mode='lines',
-                name='Signal (SMA 9)', line=dict(color=COLORS['macd_signal'], width=1.5),
-            ),
-            row=macd_row, col=1
-        )
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['MACD_Signal'],
+            mode='lines', name='Signal',
+            line=dict(color=C['macd_signal'], width=1.5),
+        ), row=macd_row, col=1)
 
-        # Zero line
-        fig.add_hline(y=0, row=macd_row, col=1, line_dash='solid',
-                      line_color='rgba(255,255,255,0.2)', line_width=0.5)
+    # ═══════════════════════════════════════════════════════════════════
+    # VISIBLE WINDOW + AXIS CONFIGURATION
+    # ═══════════════════════════════════════════════════════════════════
 
-    # ── Layout ────────────────────────────────────────────────────────
-    current_price = float(df['Close'].iloc[-1])
+    n_vis = min(visible_bars, len(df))
+    vis = df.tail(n_vis)
 
-    # Visible window: last N bars (all data still in chart for pan/zoom)
-    n_visible = min(visible_bars, len(df))
-    visible_slice = df.tail(n_visible)
+    x_min = vis.index[0]
+    x_max = df.index[-1]
 
-    # X-axis range: show the visible window
-    x_start = visible_slice.index[0]
-    x_end = df.index[-1]
+    # Tight y-range from visible candles
+    y_lo = float(vis['Low'].min())
+    y_hi = float(vis['High'].max())
+    pad = (y_hi - y_lo) * 0.05 if (y_hi - y_lo) > 1 else y_hi * 0.05
+    y_min = y_lo - pad
+    y_max = y_hi + pad
 
-    # Y-axis range: tight to visible price data with 5% padding
-    price_low = float(visible_slice['Low'].min())
-    price_high = float(visible_slice['High'].max())
-    price_range = price_high - price_low
-    if price_range < 1:
-        price_range = price_high * 0.1  # fallback for very flat data
-    price_pad = price_range * 0.05
-    y_min = price_low - price_pad
-    y_max = price_high + price_pad
-
+    # ─── GLOBAL LAYOUT ───────────────────────────────────────────────
     fig.update_layout(
-        title=dict(
-            text=f"{ticker} — ${current_price:.2f}",
-            font=dict(size=16, color=COLORS['text']),
-        ),
         height=height,
         template='plotly_dark',
-        paper_bgcolor=COLORS['bg_dark'],
-        plot_bgcolor=COLORS['bg_dark'],
-        xaxis_rangeslider_visible=False,
+        paper_bgcolor=C['bg'],
+        plot_bgcolor=C['panel_bg'],
+        font=dict(family='Inter, sans-serif', color=C['text']),
+        title=dict(
+            text=f"<b>{ticker}</b> — ${float(df['Close'].iloc[-1]):.2f}",
+            font=dict(size=18, color=C['text']),
+            x=0.01, xanchor='left',
+        ),
         showlegend=True,
         legend=dict(
-            orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1,
-            font=dict(size=10, color=COLORS['text']),
+            orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1,
+            font=dict(size=10, color=C['text_dim']),
             bgcolor='rgba(0,0,0,0)',
+            itemsizing='constant',
         ),
-        margin=dict(l=60, r=60, t=60, b=20),
-        dragmode='pan',  # Pan by default (like TradingView), drag to scroll
+        margin=dict(l=10, r=70, t=60, b=30),
+        dragmode='pan',
+        hovermode='x unified',
+        xaxis=dict(rangeslider=dict(visible=False)),
     )
 
-    # Set x-range on ALL rows (shared x-axes need explicit range on each)
-    for i in range(1, total_rows + 1):
-        fig.update_xaxes(
-            range=[x_start, x_end],
-            gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-            showticklabels=(i == total_rows),
-        )
-        fig.update_yaxes(
-            gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-        )
+    # ─── PER-AXIS CONFIGURATION ──────────────────────────────────────
+    for i in range(1, rows + 1):
+        ax = '' if i == 1 else str(i)
 
-    # Price panel y-axis: explicit tight range (override autorange)
-    fig.update_yaxes(range=[y_min, y_max], autorange=False, row=1, col=1)
+        fig.update_layout(**{
+            f'xaxis{ax}': dict(
+                range=[x_min, x_max],
+                showgrid=False,
+                zeroline=False,
+                showticklabels=(i == rows),
+                tickformat='%b\'%y',
+                tickfont=dict(size=10, color=C['text_dim']),
+                showspikes=True,
+                spikemode='across',
+                spikesnap='cursor',
+                spikecolor=C['spike'],
+                spikethickness=0.5,
+                spikedash='solid',
+            ),
+            f'yaxis{ax}': dict(
+                side='right',
+                showgrid=True,
+                gridcolor=C['grid'],
+                gridwidth=0.5,
+                zeroline=False,
+                tickfont=dict(size=10, color=C['text_dim']),
+                showspikes=True,
+                spikemode='across',
+                spikesnap='cursor',
+                spikecolor=C['spike'],
+                spikethickness=0.5,
+                spikedash='solid',
+            ),
+        })
+
+    # ─── PRICE Y-AXIS: TIGHT (last to override everything) ──────────
+    fig.update_layout(yaxis=dict(
+        range=[y_min, y_max],
+        autorange=False,
+        fixedrange=False,
+    ))
+
+    # Oscillator zero lines
+    ao_ax = f'yaxis{ao_row}' if ao_row > 1 else 'yaxis'
+    macd_ax = f'yaxis{macd_row}' if macd_row > 1 else 'yaxis'
+    fig.update_layout(**{
+        ao_ax: dict(zeroline=True, zerolinecolor=C['zeroline'], zerolinewidth=1),
+        macd_ax: dict(zeroline=True, zerolinecolor=C['zeroline'], zerolinewidth=1),
+    })
+
+    # Volume: hide y labels
+    if has_volume:
+        fig.update_layout(yaxis2=dict(showticklabels=False))
 
     return fig
 
 
 # =============================================================================
-# MINI CHART — For scanner table (sparkline-style)
+# MINI CHART — Sparkline for scanner table
 # =============================================================================
 
 def create_mini_chart(df: pd.DataFrame, ticker: str,
                       width: int = 300, height: int = 150) -> go.Figure:
-    """
-    Create a small sparkline chart for scanner table display.
-    Shows last 60 days of price + 50 SMA.
-    """
     df = normalize_columns(df).copy()
     recent = df.tail(60)
+    up = recent['Close'].iloc[-1] >= recent['Close'].iloc[0]
+    color = C['up'] if up else C['down']
+    fill = 'rgba(38,166,154,0.1)' if up else 'rgba(239,83,80,0.1)'
 
     fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=recent.index, y=recent['Close'],
-            mode='lines', name='Price',
-            line=dict(color=COLORS['candle_up'] if recent['Close'].iloc[-1] >= recent['Close'].iloc[0]
-                      else COLORS['candle_down'], width=1.5),
-            fill='tozeroy',
-            fillcolor='rgba(38, 166, 154, 0.1)' if recent['Close'].iloc[-1] >= recent['Close'].iloc[0]
-            else 'rgba(239, 83, 80, 0.1)',
-        )
-    )
-
+    fig.add_trace(go.Scatter(
+        x=recent.index, y=recent['Close'],
+        mode='lines', line=dict(color=color, width=1.5),
+        fill='tozeroy', fillcolor=fill,
+    ))
     fig.update_layout(
         height=height, width=width,
         template='plotly_dark',
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
         margin=dict(l=0, r=0, t=0, b=0),
         showlegend=False,
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
     )
-
     return fig
 
 
 # =============================================================================
-# MULTI-TIMEFRAME CHART GRID
+# MULTI-TIMEFRAME CHART — Daily | Weekly | Monthly
 # =============================================================================
 
-def create_mtf_chart(daily_df: pd.DataFrame,
-                     weekly_df: pd.DataFrame,
-                     monthly_df: pd.DataFrame,
-                     ticker: str,
-                     height: int = 500) -> go.Figure:
-    """
-    Create a 3-panel multi-timeframe view: Daily | Weekly | Monthly.
-    Each panel shows candlestick + MACD status.
-    """
+def create_mtf_chart(
+    daily_df: pd.DataFrame,
+    weekly_df: pd.DataFrame,
+    monthly_df: pd.DataFrame,
+    ticker: str,
+    height: int = 400,
+) -> go.Figure:
     fig = make_subplots(
         rows=1, cols=3,
         shared_yaxes=False,
@@ -458,89 +434,81 @@ def create_mtf_chart(daily_df: pd.DataFrame,
 
     panels = [
         ('Daily', daily_df, 60),
-        ('Weekly', weekly_df, 26),
+        ('Weekly', weekly_df, 52),
         ('Monthly', monthly_df, 24),
     ]
 
-    for idx, (label, df, n_bars) in enumerate(panels, start=1):
-        if df is None or df.empty:
+    for idx, (label, raw_df, n_bars) in enumerate(panels, start=1):
+        if raw_df is None or raw_df.empty:
             continue
 
-        df = normalize_columns(df).copy()
-        df = calculate_macd(df)
-        recent = df.tail(n_bars).copy()
-
+        d = normalize_columns(raw_df).copy()
+        d = calculate_macd(d)
+        recent = d.tail(n_bars)
         if recent.empty:
             continue
 
-        # Candlestick
-        fig.add_trace(
-            go.Candlestick(
-                x=list(range(len(recent))),  # Use integer indices to avoid date scaling issues
-                open=recent['Open'], high=recent['High'],
-                low=recent['Low'], close=recent['Close'],
-                name=label,
-                increasing_line_color=COLORS['candle_up'],
-                decreasing_line_color=COLORS['candle_down'],
-                showlegend=False,
-            ),
-            row=1, col=idx
-        )
+        fig.add_trace(go.Candlestick(
+            x=recent.index,
+            open=recent['Open'], high=recent['High'],
+            low=recent['Low'], close=recent['Close'],
+            increasing=dict(line=dict(color=C['up']), fillcolor=C['up_fill']),
+            decreasing=dict(line=dict(color=C['down']), fillcolor=C['down_fill']),
+            name=label, showlegend=False,
+        ), row=1, col=idx)
 
-        # MACD status as subtitle text
+        # MACD status annotation
         if 'MACD' in recent.columns and 'MACD_Signal' in recent.columns:
             m = float(recent['MACD'].iloc[-1])
             s = float(recent['MACD_Signal'].iloc[-1])
             if not (pd.isna(m) or pd.isna(s)):
                 bullish = m > s
                 status = "MACD ✅" if bullish else "MACD ❌"
-                color = COLORS['candle_up'] if bullish else COLORS['candle_down']
-                # Place annotation at middle of x-range, below chart
-                mid_x = len(recent) // 2
-                y_min = float(recent['Low'].min())
+                color = C['up'] if bullish else C['down']
                 fig.add_annotation(
-                    text=status, x=mid_x, y=y_min * 0.98,
+                    text=status,
+                    x=recent.index[len(recent) // 2],
+                    y=float(recent['Low'].min()) * 0.97,
                     xref=f'x{idx}', yref=f'y{idx}',
-                    xanchor='center', yanchor='top',
-                    showarrow=False, font=dict(size=12, color=color),
+                    showarrow=False,
+                    font=dict(size=12, color=color),
                 )
 
     fig.update_layout(
         height=height,
         template='plotly_dark',
-        paper_bgcolor=COLORS['bg_dark'],
-        plot_bgcolor=COLORS['bg_dark'],
+        paper_bgcolor=C['bg'], plot_bgcolor=C['panel_bg'],
         showlegend=False,
-        margin=dict(l=40, r=20, t=50, b=20),
+        margin=dict(l=40, r=40, t=40, b=20),
     )
 
     for i in range(1, 4):
         fig.update_xaxes(
-            rangeslider_visible=False, gridcolor=COLORS['grid'],
-            showticklabels=False, row=1, col=i,
+            rangeslider_visible=False, showgrid=False,
+            tickformat='%b\'%y', tickfont=dict(size=9, color=C['text_dim']),
+            row=1, col=i,
         )
-        fig.update_yaxes(gridcolor=COLORS['grid'], row=1, col=i)
+        fig.update_yaxes(
+            showgrid=True, gridcolor=C['grid'], gridwidth=0.5,
+            side='right', tickfont=dict(size=9, color=C['text_dim']),
+            row=1, col=i,
+        )
 
     return fig
 
 
 # =============================================================================
-# CHART EXPORT
+# EXPORT HELPERS
 # =============================================================================
 
 def chart_to_base64(fig: go.Figure, width: int = 1200, height: int = 700) -> Optional[str]:
-    """
-    Export chart as base64 PNG string (for AI analysis or PDF reports).
-    Requires kaleido package.
-    """
     try:
         img_bytes = fig.to_image(format='png', width=width, height=height)
         return base64.b64encode(img_bytes).decode('utf-8')
     except Exception as e:
-        print(f"[chart_engine] Error exporting chart: {e}")
+        print(f"[chart_engine] Export error: {e}")
         return None
 
 
 def chart_to_html(fig: go.Figure) -> str:
-    """Export chart as standalone HTML string."""
     return fig.to_html(include_plotlyjs='cdn', full_html=False)
