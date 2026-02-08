@@ -138,11 +138,12 @@ def _signal_markers(df):
     """
     Build QUALIFIED buy/sell markers on price chart.
 
-    BUY: MACD crosses from below zero to above zero + AO goes positive
-    SELL: MACD crosses from above zero to below zero + AO goes negative
+    BUY: MACD crosses from below zero to above zero + AO confirms positive
+    SELL: MACD crosses from above zero to below zero + AO confirms negative
 
-    The "from below/above zero" IS the filter — it eliminates all the noisy
-    mid-wave MACD/Signal crosses that happen while MACD stays above zero.
+    Filters:
+    - MACD must have reached meaningful depth below/above zero (not just tickle it)
+    - Minimum 15 bars between signals to avoid chop clusters
     """
     if 'MACD' not in df.columns:
         return []
@@ -151,11 +152,25 @@ def _signal_markers(df):
     ao = df['AO'].values if 'AO' in df.columns else [0] * len(df)
     close = df['Close'].values
 
-    markers = []
+    # Compute a dynamic threshold: ignore MACD zero-crosses if MACD never
+    # went more than 10% of its recent range below/above zero
+    # This filters out the tiny oscillations around zero in choppy markets
+    valid_macd = [v for v in macd_vals if not pd.isna(v)]
+    if len(valid_macd) < 30:
+        return []
+    macd_range = max(abs(max(valid_macd)), abs(min(valid_macd)))
+    min_depth = macd_range * 0.08  # must reach at least 8% of range beyond zero
 
-    # ── Find MACD zero-cross events and check AO confirmation ──
+    markers = []
+    last_signal_bar = -30  # cooldown tracker
+
+    # ── Scan for zero-cross events ──
     for i in range(1, len(df)):
         if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
+            continue
+
+        # Cooldown: skip if too close to last signal
+        if i - last_signal_bar < 15:
             continue
 
         date_str = df.index[i].strftime('%Y-%m-%d')
@@ -163,7 +178,19 @@ def _signal_markers(df):
 
         # BUY: MACD crosses from negative to positive
         if macd_vals[i] > 0 and macd_vals[i-1] <= 0:
-            # Check AO is positive (or becomes positive within 15 bars)
+            # Check MACD reached meaningful depth below zero before this cross
+            min_macd_before = 0.0
+            for j in range(max(0, i - 60), i):
+                if not pd.isna(macd_vals[j]) and macd_vals[j] < min_macd_before:
+                    min_macd_before = macd_vals[j]
+                # Stop scanning once we hit the previous positive zone
+                if not pd.isna(macd_vals[j]) and macd_vals[j] > 0 and j < i - 3:
+                    min_macd_before = 0.0  # reset — only count depth from last negative stretch
+
+            if abs(min_macd_before) < min_depth:
+                continue  # Too shallow — skip
+
+            # Check AO confirmation
             ao_ok = False
             for j in range(max(0, i - 3), min(len(df), i + 15)):
                 if not pd.isna(ao[j]) and ao[j] > 0:
@@ -178,10 +205,22 @@ def _signal_markers(df):
                     "text": "BUY",
                     "_price": price,
                 })
+                last_signal_bar = i
 
         # SELL: MACD crosses from positive to negative
         elif macd_vals[i] < 0 and macd_vals[i-1] >= 0:
-            # Check AO is also negative (or becomes negative within 15 bars)
+            # Check MACD reached meaningful height above zero before this cross
+            max_macd_before = 0.0
+            for j in range(max(0, i - 60), i):
+                if not pd.isna(macd_vals[j]) and macd_vals[j] > max_macd_before:
+                    max_macd_before = macd_vals[j]
+                if not pd.isna(macd_vals[j]) and macd_vals[j] < 0 and j < i - 3:
+                    max_macd_before = 0.0
+
+            if abs(max_macd_before) < min_depth:
+                continue  # Too shallow
+
+            # Check AO confirmation
             ao_ok = False
             for j in range(max(0, i - 3), min(len(df), i + 15)):
                 if not pd.isna(ao[j]) and ao[j] < 0:
@@ -196,8 +235,9 @@ def _signal_markers(df):
                     "text": "SELL",
                     "_price": price,
                 })
+                last_signal_bar = i
 
-    # Add price to the most recent buy and sell
+    # Add price to the most recent buy and sell only
     for idx in range(len(markers) - 1, -1, -1):
         if markers[idx]['text'] == 'BUY':
             markers[idx]['text'] = f"BUY ${markers[idx].pop('_price', 0):.0f}"
