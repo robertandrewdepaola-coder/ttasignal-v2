@@ -70,6 +70,7 @@ def create_analysis_chart(df: pd.DataFrame,
                           show_resistance: bool = True,
                           show_divergence: bool = True,
                           trade_markers: List[Dict] = None,
+                          visible_bars: int = 130,
                           height: int = 900) -> go.Figure:
     """
     Create the main analysis chart.
@@ -339,10 +340,18 @@ def create_analysis_chart(df: pd.DataFrame,
     # ── Layout ────────────────────────────────────────────────────────
     current_price = float(df['Close'].iloc[-1])
 
-    # Compute tight y-axis range from visible data (with 5% padding)
-    price_low = float(df['Low'].min())
-    price_high = float(df['High'].max())
-    price_pad = (price_high - price_low) * 0.05
+    # Visible window: last N bars (all data still in chart for pan/zoom)
+    n_visible = min(visible_bars, len(df))
+    visible_slice = df.tail(n_visible)
+
+    # X-axis range: show the visible window
+    x_start = visible_slice.index[0]
+    x_end = df.index[-1]
+
+    # Y-axis range: tight to visible data with 3% padding
+    price_low = float(visible_slice['Low'].min())
+    price_high = float(visible_slice['High'].max())
+    price_pad = (price_high - price_low) * 0.03
     y_min = price_low - price_pad
     y_max = price_high + price_pad
 
@@ -363,15 +372,12 @@ def create_analysis_chart(df: pd.DataFrame,
             bgcolor='rgba(0,0,0,0)',
         ),
         margin=dict(l=60, r=60, t=60, b=20),
-        dragmode='zoom',
+        dragmode='pan',  # Pan by default (like TradingView), drag to scroll
     )
 
-    # Price panel y-axis: tight range to visible data
-    fig.update_yaxes(
-        range=[y_min, y_max],
-        gridcolor=COLORS['grid'], zeroline=False,
-        row=1, col=1,
-    )
+    # Price panel: set both x and y range for the visible window
+    fig.update_xaxes(range=[x_start, x_end], row=1, col=1)
+    fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
 
     # Grid styling for all rows
     for i in range(1, total_rows + 1):
@@ -379,10 +385,9 @@ def create_analysis_chart(df: pd.DataFrame,
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
             showticklabels=(i == total_rows),
         )
-        if i > 1:  # Non-price rows: let them autorange
-            fig.update_yaxes(
-                gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-            )
+        fig.update_yaxes(
+            gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
+        )
 
     return fig
 
