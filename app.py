@@ -338,11 +338,11 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
         st.warning("No chart data available")
         return
 
-    # Timeframe buttons
+    # Timeframe buttons — these set the VISIBLE WINDOW, not slice the data
     col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 6])
     tf_key = f'chart_tf_{ticker}'
     if tf_key not in st.session_state:
-        st.session_state[tf_key] = '3M'
+        st.session_state[tf_key] = '6M'
 
     with col1:
         if st.button("1M", key=f'tf1m_{ticker}', use_container_width=True):
@@ -360,22 +360,20 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
         if st.button("All", key=f'tfall_{ticker}', use_container_width=True):
             st.session_state[tf_key] = 'All'
 
-    # Map timeframe to number of bars
+    # Map timeframe to number of visible bars
     tf = st.session_state[tf_key]
-    from signal_engine import normalize_columns
-    chart_df = normalize_columns(daily).copy()
-    bar_map = {'1M': 22, '3M': 65, '6M': 130, '1Y': 252, 'All': len(chart_df)}
-    n_bars = min(bar_map.get(tf, 65), len(chart_df))
-    chart_df = chart_df.tail(n_bars)
+    bar_map = {'1M': 22, '3M': 65, '6M': 130, '1Y': 252, 'All': 9999}
+    visible_bars = bar_map.get(tf, 130)
 
-    fig = create_analysis_chart(chart_df, ticker, signal=signal)
+    # Send ALL data to chart — visible_bars controls the default view window
+    fig = create_analysis_chart(daily, ticker, signal=signal,
+                                visible_bars=visible_bars)
 
-    # Render with scroll zoom enabled (key TradingView behavior)
+    # Render with scroll zoom enabled (TradingView-style mouse wheel zoom)
     st.plotly_chart(fig, use_container_width=True,
                     config={
                         'scrollZoom': True,
                         'displayModeBar': True,
-                        'modeBarButtonsToAdd': ['drawline', 'drawopenpath'],
                         'modeBarButtonsToRemove': ['lasso2d', 'select2d'],
                     })
 
