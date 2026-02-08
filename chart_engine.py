@@ -176,6 +176,7 @@ def _signal_markers(df):
                     "color": "#26a69a",
                     "shape": "arrowUp",
                     "text": "BUY",
+                    "_price": price,
                 })
 
         # SELL: MACD crosses from positive to negative
@@ -193,31 +194,22 @@ def _signal_markers(df):
                     "color": "#ef5350",
                     "shape": "arrowDown",
                     "text": "SELL",
+                    "_price": price,
                 })
 
     # Add price to the most recent buy and sell
-    last_buy_idx = None
-    last_sell_idx = None
-    for idx, m in enumerate(markers):
-        if m['text'] == 'BUY':
-            last_buy_idx = idx
-        elif m['text'] == 'SELL':
-            last_sell_idx = idx
+    for idx in range(len(markers) - 1, -1, -1):
+        if markers[idx]['text'] == 'BUY':
+            markers[idx]['text'] = f"BUY ${markers[idx].pop('_price', 0):.0f}"
+            break
+    for idx in range(len(markers) - 1, -1, -1):
+        if markers[idx]['text'] == 'SELL':
+            markers[idx]['text'] = f"SELL ${markers[idx].pop('_price', 0):.0f}"
+            break
 
-    if last_buy_idx is not None:
-        # Find the price at that date
-        date = markers[last_buy_idx]['time']
-        match = df.index.get_indexer([pd.Timestamp(date)], method='nearest')
-        if len(match) > 0 and match[0] >= 0:
-            p = float(df['Close'].iloc[match[0]])
-            markers[last_buy_idx]['text'] = f"BUY ${p:.0f}"
-
-    if last_sell_idx is not None:
-        date = markers[last_sell_idx]['time']
-        match = df.index.get_indexer([pd.Timestamp(date)], method='nearest')
-        if len(match) > 0 and match[0] >= 0:
-            p = float(df['Close'].iloc[match[0]])
-            markers[last_sell_idx]['text'] = f"SELL ${p:.0f}"
+    # Clean up _price from all markers
+    for m in markers:
+        m.pop('_price', None)
 
     return markers
 
