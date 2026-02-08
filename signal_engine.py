@@ -401,14 +401,14 @@ def _empty_ao_result() -> Dict[str, Any]:
 
 def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     """
-    Detect bearish divergence: price makes higher high BUT AO makes lower high.
+    Detect bearish divergence: price swing high is higher than previous
+    swing high, BUT AO at that swing high is lower than at the previous one.
 
-    Sets active flag True when divergence detected.
-    Clears flag when price breaks 2% above the divergence high.
+    A swing high = bar whose High is >= the 3 bars before and after it.
 
     Adds columns: bearish_div_detected, bearish_div_active
     """
-    if df is None or len(df) < lookback + 5:
+    if df is None or len(df) < lookback + 10:
         df = df.copy() if df is not None else pd.DataFrame()
         df['bearish_div_detected'] = False
         df['bearish_div_active'] = False
@@ -422,44 +422,51 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
     df['bearish_div_detected'] = False
     df['bearish_div_active'] = False
 
+    # Step 1: Find swing highs (local peaks with 3-bar confirmation each side)
+    swing_margin = 3
+    swing_highs = []  # list of (index_position, price, ao_value)
+
+    for i in range(swing_margin, len(df) - swing_margin):
+        high_val = float(df['High'].iloc[i])
+        ao_val = float(df['AO'].iloc[i]) if not pd.isna(df['AO'].iloc[i]) else None
+
+        if ao_val is None:
+            continue
+
+        # Check if this bar's High >= all bars in the window around it
+        window = df['High'].iloc[i - swing_margin:i + swing_margin + 1]
+        if high_val >= window.max():
+            swing_highs.append((i, high_val, ao_val))
+
+    # Step 2: Compare consecutive swing highs for divergence
     last_div_high = None
     div_active = False
 
-    for i in range(lookback + 5, len(df)):
-        current_high = float(df['High'].iloc[i])
-        current_ao = float(df['AO'].iloc[i])
+    for sh_idx in range(1, len(swing_highs)):
+        curr_pos, curr_price, curr_ao = swing_highs[sh_idx]
+        prev_pos, prev_price, prev_ao = swing_highs[sh_idx - 1]
 
-        if pd.isna(current_ao):
-            df.iloc[i, df.columns.get_loc('bearish_div_active')] = div_active
+        # Must be within lookback window of each other
+        if curr_pos - prev_pos > lookback:
             continue
 
-        # Previous swing high in lookback window
-        lb_start = max(0, i - lookback)
-        price_lb = df['High'].iloc[lb_start:i]
-        ao_lb = df['AO'].iloc[lb_start:i]
-
-        if len(price_lb) == 0:
-            df.iloc[i, df.columns.get_loc('bearish_div_active')] = div_active
-            continue
-
-        prev_high_idx = price_lb.idxmax()
-        prev_high_price = price_lb.loc[prev_high_idx]
-
-        try:
-            prev_high_pos = df.index.get_loc(prev_high_idx)
-            prev_high_ao = float(df['AO'].iloc[prev_high_pos])
-        except Exception:
-            prev_high_ao = float(ao_lb.max())
-
-        # Bearish divergence: price HH, AO LH, AO still positive
-        if current_high > prev_high_price and current_ao < prev_high_ao and current_ao > 0:
-            df.iloc[i, df.columns.get_loc('bearish_div_detected')] = True
+        # Bearish divergence: price HH but AO LH, and AO still positive
+        if curr_price > prev_price and curr_ao < prev_ao and curr_ao > 0:
+            df.iloc[curr_pos, df.columns.get_loc('bearish_div_detected')] = True
             div_active = True
-            last_div_high = current_high
+            last_div_high = curr_price
 
-        # Clear if price breaks 2% above divergence high
+    # Step 3: Set active flag and clear when price breaks 2% above
+    last_div_high = None
+    div_active = False
+
+    for i in range(len(df)):
+        if df.iloc[i]['bearish_div_detected']:
+            div_active = True
+            last_div_high = float(df['High'].iloc[i])
+
         if div_active and last_div_high is not None:
-            if current_high > last_div_high * 1.02:
+            if float(df['High'].iloc[i]) > last_div_high * 1.02:
                 div_active = False
                 last_div_high = None
 
