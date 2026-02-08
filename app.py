@@ -341,17 +341,40 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
     from chart_engine import render_tv_chart, render_mtf_chart
 
     # Render TradingView chart — ALL data, LWC handles zoom natively
-    # zoom_level=200 shows ~200 bars initially, user scrolls to zoom
     render_tv_chart(daily, ticker, signal=signal, height=750,
                     zoom_level=200, key=f"tv_{ticker}")
+
+    # Chart legend
+    with st.expander("📊 Chart Legend", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("""
+**Price Panel:**
+- 🟢🔴 **Candles** — Green = bullish close, Red = bearish close
+- 🟠 **150d SMA** (dotted) — 30-week trend proxy. Price above = uptrend
+- 🔵 **50 SMA** (dashed) — Medium-term trend direction
+- 🟣 **200 SMA** (dashed) — Long-term trend. Price above = bull market
+- 🔴 **R $xxx** — Overhead resistance levels (★ = critical resistance)
+- 🔶 **Div ⚠** — Bearish divergence: price making higher highs while MACD makes lower highs
+""")
+        with c2:
+            st.markdown("""
+**Indicator Panels:**
+- **Volume** — Green/red bars showing daily trading volume
+- **AO (Awesome Oscillator)** — Momentum: green bars = bullish momentum, red = bearish
+- **MACD (12/26/9)** — Trend/momentum:
+  - 🔵 Blue line = MACD line (fast - slow EMA)
+  - 🟠 Orange line = Signal line (9-period SMA of MACD)
+  - Green/red histogram = difference between MACD and Signal
+  - **Buy signal**: MACD crosses above Signal + AO turns green
+""")
 
     # MTF chart
     weekly = ticker_data.get('weekly')
     monthly = ticker_data.get('monthly')
     if weekly is not None and monthly is not None:
         with st.expander("Multi-Timeframe View"):
-            render_mtf_chart(daily, weekly, monthly, ticker, height=400,
-                             key=f"mtf_{ticker}")
+            render_mtf_chart(daily, weekly, monthly, ticker, height=400)
 
 
 def _render_ai_tab(ticker: str, signal: EntrySignal,
