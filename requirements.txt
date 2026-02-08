@@ -4,3 +4,5 @@ numpy>=1.24.0
 yfinance>=0.2.31
 plotly>=5.18.0
 google-generativeai>=0.3.0
+streamlit-lightweight-charts-v5>=0.1.8
+
