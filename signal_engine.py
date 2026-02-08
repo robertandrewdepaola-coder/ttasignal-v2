@@ -58,9 +58,9 @@ MARKET_FILTER_SPY_SMA = 200
 MARKET_FILTER_VIX_MAX = 30
 
 # Data periods (standardized)
-DAILY_PERIOD = '1y'      # ~251 bars, enough for MACD EMA warmup
-WEEKLY_PERIOD = '2y'     # ~104 bars
-MONTHLY_PERIOD = '5y'    # ~60 bars
+DAILY_PERIOD = '5y'      # Full history for chart viewing + indicator warmup
+WEEKLY_PERIOD = '5y'     # ~260 bars
+MONTHLY_PERIOD = '10y'   # ~120 bars
 
 
 # =============================================================================
