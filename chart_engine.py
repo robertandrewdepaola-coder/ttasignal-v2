@@ -139,12 +139,12 @@ def _signal_markers(df):
     Build QUALIFIED buy/sell markers on price chart.
 
     Qualified Buy requires ALL of:
-    1. Price touched or broke below 150d SMA OR 200 SMA at some point before
+    1. Price came within 5% of 150d SMA OR 200 SMA at some point in prior 120 bars
+       (or was below it — indicating a real pullback/reset)
     2. MACD crossed up from BELOW ZERO (not just below signal line)
     3. AO also crossed above zero (confirmation)
 
-    This filters out all noisy crosses during corrective legs above zero.
-    Only the most recent qualified buy and sell are shown with price labels.
+    Shows ALL qualified buys and sells (not just the most recent).
     """
     if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
         return []
@@ -154,48 +154,40 @@ def _signal_markers(df):
     close = df['Close'].values
     low = df['Low'].values
 
-    # Get SMA values for touch detection
     sma150 = df['SMA_150'].values if 'SMA_150' in df.columns else [np.nan] * len(df)
     sma200 = df['SMA_200'].values if 'SMA_200' in df.columns else [np.nan] * len(df)
 
-    # ── Step 1: Find MACD zero-cross-up events (from below zero to above) ──
-    # These are the ONLY candidates for qualified buys
-    zero_cross_ups = []  # list of bar indices where MACD crosses above zero
-
+    # ── Find MACD zero-cross-up events ──
+    zero_cross_ups = []
     for i in range(1, len(df)):
         if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
             continue
-        # MACD crosses from negative to positive
         if macd_vals[i] > 0 and macd_vals[i-1] <= 0:
             zero_cross_ups.append(i)
 
-    # ── Step 2: For each zero-cross-up, check qualifiers ──
+    # ── Check qualifiers for each zero-cross-up ──
     qualified_buys = []
-
     for cross_i in zero_cross_ups:
-        # Check: price must have touched 150d SMA or 200 SMA at some point
-        # before this MACD zero cross (look back up to 60 bars)
-        lookback = min(cross_i, 60)
+        # Price must have come within 5% of either SMA in prior 120 bars
+        lookback = min(cross_i, 120)
         sma_touched = False
         for j in range(cross_i - lookback, cross_i + 1):
             if j < 0:
                 continue
-            # Price Low touched or went below either SMA
-            if not pd.isna(sma150[j]) and low[j] <= sma150[j] * 1.02:  # within 2%
+            if not pd.isna(sma150[j]) and low[j] <= sma150[j] * 1.05:
                 sma_touched = True
                 break
-            if not pd.isna(sma200[j]) and low[j] <= sma200[j] * 1.02:
+            if not pd.isna(sma200[j]) and low[j] <= sma200[j] * 1.05:
                 sma_touched = True
                 break
 
         if not sma_touched:
             continue
 
-        # Check: AO must also cross above zero (can be before, at, or shortly after)
-        # Look for AO > 0 within 10 bars after MACD zero cross
+        # AO must be positive within a window around the MACD cross
         ao_confirmed = False
         ao_confirm_bar = cross_i
-        for j in range(max(0, cross_i - 5), min(len(df), cross_i + 15)):
+        for j in range(max(0, cross_i - 5), min(len(df), cross_i + 20)):
             if not pd.isna(ao[j]) and ao[j] > 0:
                 ao_confirmed = True
                 ao_confirm_bar = j
@@ -204,8 +196,7 @@ def _signal_markers(df):
         if not ao_confirmed:
             continue
 
-        # All 3 conditions met — this is a qualified buy
-        signal_bar = max(cross_i, ao_confirm_bar)  # mark at whichever comes last
+        signal_bar = max(cross_i, ao_confirm_bar)
         if signal_bar < len(df):
             price = float(close[signal_bar])
             qualified_buys.append({
@@ -214,7 +205,7 @@ def _signal_markers(df):
                 "time": df.index[signal_bar].strftime('%Y-%m-%d'),
             })
 
-    # ── Step 3: Find sell signals (MACD crosses below zero) ──
+    # ── Find sell signals (MACD crosses below zero) ──
     sells = []
     for i in range(1, len(df)):
         if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
@@ -227,27 +218,27 @@ def _signal_markers(df):
                 "time": df.index[i].strftime('%Y-%m-%d'),
             })
 
-    # ── Step 4: Build markers — only show most recent of each ──
+    # ── Build markers — show ALL qualified, latest gets price ──
     markers = []
 
-    if qualified_buys:
-        latest = qualified_buys[-1]
+    for idx, qb in enumerate(qualified_buys):
+        is_latest = (idx == len(qualified_buys) - 1)
         markers.append({
-            "time": latest['time'],
+            "time": qb['time'],
             "position": "belowBar",
             "color": "#26a69a",
             "shape": "arrowUp",
-            "text": f"BUY ${latest['price']:.2f}",
+            "text": f"BUY ${qb['price']:.0f}" if is_latest else "BUY",
         })
 
-    if sells:
-        latest = sells[-1]
+    for idx, s in enumerate(sells):
+        is_latest = (idx == len(sells) - 1)
         markers.append({
-            "time": latest['time'],
+            "time": s['time'],
             "position": "aboveBar",
             "color": "#ef5350",
             "shape": "arrowDown",
-            "text": f"SELL ${latest['price']:.2f}",
+            "text": f"SELL ${s['price']:.0f}" if is_latest else "SELL",
         })
 
     return markers
