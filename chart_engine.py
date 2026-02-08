@@ -70,7 +70,7 @@ def create_analysis_chart(df: pd.DataFrame,
                           show_resistance: bool = True,
                           show_divergence: bool = True,
                           trade_markers: List[Dict] = None,
-                          height: int = 700) -> go.Figure:
+                          height: int = 900) -> go.Figure:
     """
     Create the main analysis chart.
 
@@ -354,8 +354,32 @@ def create_analysis_chart(df: pd.DataFrame,
             font=dict(size=10, color=COLORS['text']),
             bgcolor='rgba(0,0,0,0)',
         ),
-        margin=dict(l=60, r=20, t=60, b=20),
+        margin=dict(l=60, r=20, t=80, b=20),
+        dragmode='zoom',  # Enable drag-to-zoom by default
     )
+
+    # ── Range selector buttons (on the bottom x-axis) ─────────────────
+    fig.update_xaxes(
+        rangeselector=dict(
+            buttons=list([
+                dict(count=1, label="1M", step="month", stepmode="backward"),
+                dict(count=3, label="3M", step="month", stepmode="backward"),
+                dict(count=6, label="6M", step="month", stepmode="backward"),
+                dict(count=1, label="1Y", step="year", stepmode="backward"),
+                dict(step="all", label="All"),
+            ]),
+            bgcolor=COLORS['grid'],
+            activecolor='#26a69a',
+            font=dict(color=COLORS['text'], size=11),
+            x=0, y=1.06,
+        ),
+        row=1, col=1,
+    )
+
+    # Default to 6 months view
+    if len(df) > 130:
+        six_months_ago = df.index[-130]
+        fig.update_xaxes(range=[six_months_ago, df.index[-1]], row=1, col=1)
 
     # Grid styling
     for i in range(1, total_rows + 1):
