@@ -348,10 +348,13 @@ def create_analysis_chart(df: pd.DataFrame,
     x_start = visible_slice.index[0]
     x_end = df.index[-1]
 
-    # Y-axis range: tight to visible data with 3% padding
+    # Y-axis range: tight to visible price data with 5% padding
     price_low = float(visible_slice['Low'].min())
     price_high = float(visible_slice['High'].max())
-    price_pad = (price_high - price_low) * 0.03
+    price_range = price_high - price_low
+    if price_range < 1:
+        price_range = price_high * 0.1  # fallback for very flat data
+    price_pad = price_range * 0.05
     y_min = price_low - price_pad
     y_max = price_high + price_pad
 
@@ -375,19 +378,19 @@ def create_analysis_chart(df: pd.DataFrame,
         dragmode='pan',  # Pan by default (like TradingView), drag to scroll
     )
 
-    # Price panel: set both x and y range for the visible window
-    fig.update_xaxes(range=[x_start, x_end], row=1, col=1)
-    fig.update_yaxes(range=[y_min, y_max], row=1, col=1)
-
-    # Grid styling for all rows
+    # Set x-range on ALL rows (shared x-axes need explicit range on each)
     for i in range(1, total_rows + 1):
         fig.update_xaxes(
+            range=[x_start, x_end],
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
             showticklabels=(i == total_rows),
         )
         fig.update_yaxes(
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
         )
+
+    # Price panel y-axis: explicit tight range (override autorange)
+    fig.update_yaxes(range=[y_min, y_max], autorange=False, row=1, col=1)
 
     return fig
 
