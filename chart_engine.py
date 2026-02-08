@@ -97,11 +97,11 @@ def _vol(df):
 
 
 # =============================================================================
-# DIVERGENCE MARKERS — shown on candlestick series
+# DIVERGENCE + SIGNAL MARKERS — shown on candlestick series
 # =============================================================================
 
 def _divergence_markers(df):
-    """Build LWC marker objects for bearish divergence points."""
+    """Build LWC marker objects for bearish divergence points (W5 labels)."""
     if 'bearish_div_detected' not in df.columns:
         return []
     divs = df[df['bearish_div_detected'] == True]
@@ -110,16 +110,33 @@ def _divergence_markers(df):
         markers.append({
             "time": idx.strftime('%Y-%m-%d'),
             "position": "aboveBar",
-            "color": "#ffa726",
+            "color": "#f87171",
             "shape": "arrowDown",
-            "text": "Div ⚠",
+            "text": "W5(div)",
         })
+    return markers
+
+
+def _wave_markers(df):
+    """Build wave label markers (W3) from divergence line data."""
+    div_lines = df.attrs.get('divergence_lines', [])
+    markers = []
+    for dl in div_lines:
+        w3 = dl.get('w3_label', {})
+        if w3.get('date'):
+            markers.append({
+                "time": w3['date'],
+                "position": "aboveBar",
+                "color": "#4ade80",
+                "shape": "arrowDown",
+                "text": "W3",
+            })
     return markers
 
 
 def _signal_markers(df):
     """
-    Build LWC marker objects for MACD buy/sell crossover signals.
+    Build LWC marker objects for MACD buy/sell crossover signals on price chart.
     Buy = MACD crosses above Signal while AO > 0
     Sell = MACD crosses below Signal
     """
@@ -138,36 +155,171 @@ def _signal_markers(df):
         # Bullish cross: MACD crosses above Signal
         if macd[i] > sig[i] and macd[i-1] <= sig[i-1]:
             ao_val = ao[i] if not pd.isna(ao[i]) else 0
+            price = float(df['Close'].iloc[i])
             if ao_val > 0:
-                # Strong buy: AO positive
                 markers.append({
                     "time": df.index[i].strftime('%Y-%m-%d'),
                     "position": "belowBar",
                     "color": "#26a69a",
                     "shape": "arrowUp",
-                    "text": "Buy",
+                    "text": f"BUY ${price:.2f}",
                 })
             else:
-                # Weak buy: AO negative
                 markers.append({
                     "time": df.index[i].strftime('%Y-%m-%d'),
                     "position": "belowBar",
                     "color": "#66bb6a",
                     "shape": "arrowUp",
-                    "text": "Buy?",
+                    "text": f"Buy? ${price:.2f}",
                 })
 
         # Bearish cross: MACD crosses below Signal
         elif macd[i] < sig[i] and macd[i-1] >= sig[i-1]:
+            price = float(df['Close'].iloc[i])
             markers.append({
                 "time": df.index[i].strftime('%Y-%m-%d'),
                 "position": "aboveBar",
                 "color": "#ef5350",
                 "shape": "arrowDown",
-                "text": "Sell",
+                "text": f"SELL ${price:.2f}",
             })
 
     return markers
+
+
+def _crossover_dots(df):
+    """
+    Build green/red dot data for MACD crossover points on the MACD pane.
+    Returns two lists: bullish dots and bearish dots (as line series data).
+    """
+    if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
+        return [], []
+
+    bull_dots = []
+    bear_dots = []
+    macd = df['MACD'].values
+    sig = df['MACD_Signal'].values
+
+    for i in range(1, len(df)):
+        if pd.isna(macd[i]) or pd.isna(sig[i]) or pd.isna(macd[i-1]) or pd.isna(sig[i-1]):
+            continue
+
+        date_str = df.index[i].strftime('%Y-%m-%d')
+        val = round(float(macd[i]), 4)
+
+        if macd[i] > sig[i] and macd[i-1] <= sig[i-1]:
+            bull_dots.append({"time": date_str, "value": val})
+        elif macd[i] < sig[i] and macd[i-1] >= sig[i-1]:
+            bear_dots.append({"time": date_str, "value": val})
+
+    return bull_dots, bear_dots
+
+
+def _divergence_line_series(df):
+    """
+    Build LWC line series for divergence lines on price and AO panes.
+    Returns dict with 'price_lines' and 'ao_lines' lists of series configs.
+    """
+    div_lines = df.attrs.get('divergence_lines', [])
+    price_line_series = []
+    ao_line_series = []
+
+    for i, dl in enumerate(div_lines):
+        pl = dl.get('price_line', {})
+        al = dl.get('ao_line', {})
+
+        if pl.get('x0') and pl.get('x1'):
+            price_line_series.append({
+                "type": "Line",
+                "data": [
+                    {"time": pl['x0'], "value": pl['y0']},
+                    {"time": pl['x1'], "value": pl['y1']},
+                ],
+                "options": {
+                    "color": "#ef4444",
+                    "lineWidth": 3,
+                    "lineStyle": 0,
+                    "crosshairMarkerVisible": False,
+                    "lastValueVisible": False,
+                    "priceLineVisible": False,
+                    "pointMarkersVisible": False,
+                },
+                "label": f"Div (price)" if i == 0 else "",
+            })
+
+        if al.get('x0') and al.get('x1'):
+            ao_line_series.append({
+                "type": "Line",
+                "data": [
+                    {"time": al['x0'], "value": al['y0']},
+                    {"time": al['x1'], "value": al['y1']},
+                ],
+                "options": {
+                    "color": "#ef4444",
+                    "lineWidth": 3,
+                    "lineStyle": 0,
+                    "crosshairMarkerVisible": False,
+                    "lastValueVisible": False,
+                    "priceLineVisible": False,
+                    "pointMarkersVisible": False,
+                },
+                "label": f"Div (AO)" if i == 0 else "",
+            })
+
+    return {"price_lines": price_line_series, "ao_lines": ao_line_series}
+
+
+# =============================================================================
+# TRIGGER LEVELS (Buy/Sell price lines)
+# =============================================================================
+
+def _compute_trigger_levels(df, signal=None):
+    """
+    Compute Buy/Sell trigger levels from signal data or recent swing highs/lows.
+    Returns dict with 'buy_level', 'sell_level', 'status_text', 'status_color'.
+    """
+    current_price = float(df['Close'].iloc[-1])
+
+    # Try to get from signal's overhead resistance
+    buy_level = None
+    sell_level = None
+
+    if signal and signal.overhead_resistance:
+        levels = signal.overhead_resistance.get('levels', [])
+        if levels:
+            # First resistance above current price = buy level
+            above = [l['price'] for l in levels if l['price'] > current_price]
+            if above:
+                buy_level = min(above)
+            # Nearest below = sell level
+            below = [l['price'] for l in levels if l['price'] < current_price]
+            if below:
+                sell_level = max(below)
+
+    # Fallback: use recent 20-bar swing high/low
+    if buy_level is None:
+        buy_level = float(df['High'].tail(20).max())
+    if sell_level is None:
+        sell_level = float(df['Low'].tail(20).min())
+
+    # Status text
+    if current_price > buy_level:
+        status = f"▲ ${current_price:.2f} > ${buy_level:.2f} = BUY"
+        color = "#26a69a"
+    elif current_price < sell_level:
+        status = f"▼ ${current_price:.2f} < ${sell_level:.2f} = SELL"
+        color = "#ef5350"
+    else:
+        status = f"${current_price:.2f} in range — WAIT"
+        color = "#ffa726"
+
+    return {
+        "buy_level": buy_level,
+        "sell_level": sell_level,
+        "status_text": status,
+        "status_color": color,
+        "current_price": current_price,
+    }
 
 
 # =============================================================================
@@ -186,6 +338,8 @@ def build_lwc_charts(
     """
     Build `charts` list for LWC v5.
     Each pane = separate dict with {chart, series, height, title}.
+    Includes: divergence lines, MACD crossover dots, buy/sell markers,
+    wave labels, and price status.
     """
     df = normalize_columns(df).copy()
     if 'MACD' not in df.columns:
@@ -197,10 +351,16 @@ def build_lwc_charts(
     panes = []
     current_price = round(float(df['Close'].iloc[-1]), 2)
 
+    # Compute trigger levels and status
+    triggers = _compute_trigger_levels(df, signal)
+
+    # Get divergence line series for price and AO panes
+    div_series = _divergence_line_series(df) if show_divergence else {"price_lines": [], "ao_lines": []}
+
     # ── PANE 0: PRICE ────────────────────────────────────────────────
     price_series = []
 
-    # Candlestick with divergence markers
+    # Candlestick with ALL markers: divergence, wave labels, buy/sell signals
     candle_config = {
         "type": "Candlestick",
         "data": _candles(df),
@@ -217,21 +377,22 @@ def build_lwc_charts(
         },
     }
 
-    # Add divergence + buy/sell markers to candlestick
+    # Combine all markers on the candlestick
     all_markers = []
     if show_divergence:
         all_markers.extend(_divergence_markers(df))
+        all_markers.extend(_wave_markers(df))
     all_markers.extend(_signal_markers(df))
     if all_markers:
         candle_config["markers"] = all_markers
 
     price_series.append(candle_config)
 
-    # Moving averages — crosshairMarkerVisible=False so dots don't snap to them
+    # Moving averages
     sma_configs = [
-        ('SMA_150', '#ff9800', 2, 1, '150d SMA'),  # orange, dotted
-        ('SMA_50', '#42a5f5', 1, 2, '50 SMA'),      # blue, dashed
-        ('SMA_200', '#ab47bc', 1, 2, '200 SMA'),     # purple, dashed
+        ('SMA_150', '#ff9800', 2, 1, '150d SMA'),
+        ('SMA_50', '#42a5f5', 1, 2, '50 SMA'),
+        ('SMA_200', '#ab47bc', 1, 2, '200 SMA'),
     ]
 
     for col, color, width, style, name in sma_configs:
@@ -280,16 +441,59 @@ def build_lwc_charts(
                 "label": f"R ${price:.0f}" + (" ★" if is_crit else ""),
             })
 
-    # Price pane — tight scaleMargins to reduce dead space
+    # Buy/Sell trigger level lines
+    if triggers['buy_level']:
+        bl = triggers['buy_level']
+        price_series.append({
+            "type": "Line",
+            "data": [
+                {'time': df.index[0].strftime('%Y-%m-%d'), 'value': round(bl, 2)},
+                {'time': df.index[-1].strftime('%Y-%m-%d'), 'value': round(bl, 2)},
+            ],
+            "options": {
+                "color": "rgba(38, 166, 154, 0.5)",
+                "lineWidth": 1, "lineStyle": 2,
+                "crosshairMarkerVisible": False,
+                "lastValueVisible": True,
+                "priceLineVisible": False,
+            },
+            "label": f"▲ BUY ${bl:.2f}",
+        })
+
+    if triggers['sell_level']:
+        sl = triggers['sell_level']
+        price_series.append({
+            "type": "Line",
+            "data": [
+                {'time': df.index[0].strftime('%Y-%m-%d'), 'value': round(sl, 2)},
+                {'time': df.index[-1].strftime('%Y-%m-%d'), 'value': round(sl, 2)},
+            ],
+            "options": {
+                "color": "rgba(239, 83, 80, 0.5)",
+                "lineWidth": 1, "lineStyle": 2,
+                "crosshairMarkerVisible": False,
+                "lastValueVisible": True,
+                "priceLineVisible": False,
+            },
+            "label": f"▼ SELL ${sl:.2f}",
+        })
+
+    # Divergence lines on price pane
+    for dls in div_series['price_lines']:
+        price_series.append(dls)
+
+    # Price pane
     price_theme = _theme()
     price_theme["rightPriceScale"]["scaleMargins"] = {"top": 0.02, "bottom": 0.02}
 
+    # Title includes status
+    status = triggers['status_text']
     ph = int(total_height * 0.55) if has_vol else int(total_height * 0.50)
     panes.append({
         "chart": price_theme,
         "series": price_series,
         "height": ph,
-        "title": f"{ticker}  ${current_price}",
+        "title": f"{ticker}  ${current_price}   |   {status}",
     })
 
     # ── PANE 1: VOLUME ───────────────────────────────────────────────
@@ -309,13 +513,13 @@ def build_lwc_charts(
     if 'AO' in df.columns:
         ao_data = _hist(df, 'AO')
         if ao_data:
+            ao_series_list = [{"type": "Histogram", "data": ao_data, "options": {}}]
+            # Add divergence lines on AO pane
+            for als in div_series['ao_lines']:
+                ao_series_list.append(als)
             panes.append({
                 "chart": _theme(),
-                "series": [{
-                    "type": "Histogram",
-                    "data": ao_data,
-                    "options": {},
-                }],
+                "series": ao_series_list,
                 "height": int(total_height * 0.15),
                 "title": "Awesome Oscillator",
             })
@@ -359,6 +563,41 @@ def build_lwc_charts(
                 },
                 "label": "Signal",
             })
+
+    # Crossover dots on MACD pane
+    bull_dots, bear_dots = _crossover_dots(df)
+    if bull_dots:
+        macd_series.append({
+            "type": "Line",
+            "data": bull_dots,
+            "options": {
+                "color": "#00E676",
+                "lineWidth": 0,
+                "lineVisible": False,
+                "pointMarkersVisible": True,
+                "pointMarkersRadius": 5,
+                "crosshairMarkerVisible": False,
+                "lastValueVisible": False,
+                "priceLineVisible": False,
+            },
+            "label": "Bullish Cross",
+        })
+    if bear_dots:
+        macd_series.append({
+            "type": "Line",
+            "data": bear_dots,
+            "options": {
+                "color": "#FF1744",
+                "lineWidth": 0,
+                "lineVisible": False,
+                "pointMarkersVisible": True,
+                "pointMarkersRadius": 5,
+                "crosshairMarkerVisible": False,
+                "lastValueVisible": False,
+                "priceLineVisible": False,
+            },
+            "label": "Bearish Cross",
+        })
 
     if macd_series:
         panes.append({
