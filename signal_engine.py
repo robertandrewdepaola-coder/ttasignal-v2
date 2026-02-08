@@ -401,14 +401,20 @@ def _empty_ao_result() -> Dict[str, Any]:
 
 def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     """
-    Detect bearish divergence: price swing high is higher than previous
-    swing high, BUT AO at that swing high is lower than at the previous one.
+    Detect bearish divergence using AO wave structure.
 
-    A swing high = bar whose High is >= the 3 bars before and after it.
+    The pattern:
+    1. AO is positive (Wave 3 momentum building)
+    2. AO crosses below zero (Wave 3 correction / Wave 4)
+    3. AO returns positive again (Wave 5 begins)
+    4. This new positive AO peak is SMALLER than the previous positive peak
+       while price is HIGHER → bearish divergence
+    5. Mark divergence at the highest price during the smaller AO block
+    6. Divergence confirmed once AO drops below zero again (correction starts)
 
     Adds columns: bearish_div_detected, bearish_div_active
     """
-    if df is None or len(df) < lookback + 10:
+    if df is None or len(df) < 50:
         df = df.copy() if df is not None else pd.DataFrame()
         df['bearish_div_detected'] = False
         df['bearish_div_active'] = False
@@ -422,53 +428,81 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
     df['bearish_div_detected'] = False
     df['bearish_div_active'] = False
 
-    # Step 1: Find swing highs (local peaks with 3-bar confirmation each side)
-    swing_margin = 3
-    swing_highs = []  # list of (index_position, price, ao_value)
+    ao = df['AO'].values
+    highs = df['High'].values
 
-    for i in range(swing_margin, len(df) - swing_margin):
-        high_val = float(df['High'].iloc[i])
-        ao_val = float(df['AO'].iloc[i]) if not pd.isna(df['AO'].iloc[i]) else None
+    # Step 1: Identify AO positive blocks (continuous runs above zero)
+    # Each block = (start_idx, end_idx, peak_ao, highest_price, highest_price_idx)
+    positive_blocks = []
+    in_block = False
+    block_start = 0
+    block_peak_ao = 0.0
+    block_high_price = 0.0
+    block_high_idx = 0
 
-        if ao_val is None:
+    for i in range(len(df)):
+        if pd.isna(ao[i]):
+            if in_block:
+                if block_peak_ao > 0:
+                    positive_blocks.append((block_start, i - 1, block_peak_ao,
+                                            block_high_price, block_high_idx))
+                in_block = False
             continue
 
-        # Check if this bar's High >= all bars in the window around it
-        window = df['High'].iloc[i - swing_margin:i + swing_margin + 1]
-        if high_val >= window.max():
-            swing_highs.append((i, high_val, ao_val))
+        if ao[i] > 0:
+            if not in_block:
+                in_block = True
+                block_start = i
+                block_peak_ao = ao[i]
+                block_high_price = highs[i]
+                block_high_idx = i
+            else:
+                if ao[i] > block_peak_ao:
+                    block_peak_ao = ao[i]
+                if highs[i] > block_high_price:
+                    block_high_price = highs[i]
+                    block_high_idx = i
+        else:
+            if in_block:
+                if block_peak_ao > 0:
+                    positive_blocks.append((block_start, i - 1, block_peak_ao,
+                                            block_high_price, block_high_idx))
+                in_block = False
 
-    # Step 2: Compare consecutive swing highs for divergence
-    last_div_high = None
-    div_active = False
+    # Capture final block if still in one
+    if in_block and block_peak_ao > 0:
+        positive_blocks.append((block_start, len(df) - 1, block_peak_ao,
+                                block_high_price, block_high_idx))
 
-    for sh_idx in range(1, len(swing_highs)):
-        curr_pos, curr_price, curr_ao = swing_highs[sh_idx]
-        prev_pos, prev_price, prev_ao = swing_highs[sh_idx - 1]
+    # Step 2: Compare consecutive positive blocks separated by negative zone
+    # The negative zone between them is the Wave 4 correction
+    for b_idx in range(1, len(positive_blocks)):
+        prev_start, prev_end, prev_peak_ao, prev_high_price, prev_high_idx = positive_blocks[b_idx - 1]
+        curr_start, curr_end, curr_peak_ao, curr_high_price, curr_high_idx = positive_blocks[b_idx]
 
-        # Must be within lookback window of each other
-        if curr_pos - prev_pos > lookback:
+        # Verify there's a negative zone between them (Wave 4)
+        gap_has_negative = False
+        for j in range(prev_end + 1, curr_start):
+            if not pd.isna(ao[j]) and ao[j] < 0:
+                gap_has_negative = True
+                break
+
+        if not gap_has_negative:
             continue
 
-        # Bearish divergence: price HH but AO LH, and AO still positive
-        if curr_price > prev_price and curr_ao < prev_ao and curr_ao > 0:
-            df.iloc[curr_pos, df.columns.get_loc('bearish_div_detected')] = True
-            div_active = True
-            last_div_high = curr_price
+        # Bearish divergence: price higher high BUT AO smaller peak
+        if curr_high_price > prev_high_price and curr_peak_ao < prev_peak_ao:
+            # Mark at the highest price bar in the smaller AO block
+            df.iloc[curr_high_idx, df.columns.get_loc('bearish_div_detected')] = True
 
-    # Step 3: Set active flag and clear when price breaks 2% above
-    last_div_high = None
+    # Step 3: Set active flag — active from detection until AO goes negative again
     div_active = False
-
     for i in range(len(df)):
         if df.iloc[i]['bearish_div_detected']:
             div_active = True
-            last_div_high = float(df['High'].iloc[i])
 
-        if div_active and last_div_high is not None:
-            if float(df['High'].iloc[i]) > last_div_high * 1.02:
-                div_active = False
-                last_div_high = None
+        if div_active and not pd.isna(ao[i]) and ao[i] < 0:
+            div_active = False
 
         df.iloc[i, df.columns.get_loc('bearish_div_active')] = div_active
 
