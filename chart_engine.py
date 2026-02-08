@@ -351,8 +351,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
 # MTF CHART — Also TradingView LWC v5
 # =============================================================================
 
-def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350,
-                     key: str = None):
+def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
     """
     Multi-timeframe view: 3 separate LWC charts side by side
     using st.columns, each with candlestick + MACD + AO.
@@ -446,7 +445,7 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350,
                 charts=panes,
                 height=height,
                 zoom_level=n_bars,
-                key=key or f"mtf_{ticker}_{label}",
+                key=f"mtf_{ticker}_{label}",
             )
 
 
