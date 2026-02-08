@@ -117,6 +117,59 @@ def _divergence_markers(df):
     return markers
 
 
+def _signal_markers(df):
+    """
+    Build LWC marker objects for MACD buy/sell crossover signals.
+    Buy = MACD crosses above Signal while AO > 0
+    Sell = MACD crosses below Signal
+    """
+    if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
+        return []
+
+    markers = []
+    macd = df['MACD'].values
+    sig = df['MACD_Signal'].values
+    ao = df['AO'].values if 'AO' in df.columns else [0] * len(df)
+
+    for i in range(1, len(df)):
+        if pd.isna(macd[i]) or pd.isna(sig[i]) or pd.isna(macd[i-1]) or pd.isna(sig[i-1]):
+            continue
+
+        # Bullish cross: MACD crosses above Signal
+        if macd[i] > sig[i] and macd[i-1] <= sig[i-1]:
+            ao_val = ao[i] if not pd.isna(ao[i]) else 0
+            if ao_val > 0:
+                # Strong buy: AO positive
+                markers.append({
+                    "time": df.index[i].strftime('%Y-%m-%d'),
+                    "position": "belowBar",
+                    "color": "#26a69a",
+                    "shape": "arrowUp",
+                    "text": "Buy",
+                })
+            else:
+                # Weak buy: AO negative
+                markers.append({
+                    "time": df.index[i].strftime('%Y-%m-%d'),
+                    "position": "belowBar",
+                    "color": "#66bb6a",
+                    "shape": "arrowUp",
+                    "text": "Buy?",
+                })
+
+        # Bearish cross: MACD crosses below Signal
+        elif macd[i] < sig[i] and macd[i-1] >= sig[i-1]:
+            markers.append({
+                "time": df.index[i].strftime('%Y-%m-%d'),
+                "position": "aboveBar",
+                "color": "#ef5350",
+                "shape": "arrowDown",
+                "text": "Sell",
+            })
+
+    return markers
+
+
 # =============================================================================
 # BUILD MULTI-PANE CHART CONFIG
 # =============================================================================
@@ -164,10 +217,13 @@ def build_lwc_charts(
         },
     }
 
-    # Add divergence markers to candlestick
-    div_markers = _divergence_markers(df) if show_divergence else []
-    if div_markers:
-        candle_config["markers"] = div_markers
+    # Add divergence + buy/sell markers to candlestick
+    all_markers = []
+    if show_divergence:
+        all_markers.extend(_divergence_markers(df))
+    all_markers.extend(_signal_markers(df))
+    if all_markers:
+        candle_config["markers"] = all_markers
 
     price_series.append(candle_config)
 
@@ -360,21 +416,21 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
     from lightweight_charts_v5 import lightweight_charts_v5_component
 
     panels = [
-        ('Daily', daily_df, 60),
-        ('Weekly', weekly_df, 52),
-        ('Monthly', monthly_df, 24),
+        ('Daily', daily_df, 120),     # Show last 120 bars initially, but ALL data available
+        ('Weekly', weekly_df, 104),    # ~2 years of weeks
+        ('Monthly', monthly_df, 60),   # 5 years of months
     ]
 
     cols = st.columns(3)
 
-    for col_idx, (label, raw_df, n_bars) in enumerate(panels):
+    for col_idx, (label, raw_df, zoom) in enumerate(panels):
         if raw_df is None or raw_df.empty:
             continue
 
         d = normalize_columns(raw_df).copy()
         d = add_all_indicators(d)
-        recent = d.tail(n_bars)
-        if recent.empty:
+        # Pass ALL data — let LWC zoom_level handle initial view
+        if d.empty:
             continue
 
         # Build panes for this timeframe
@@ -385,7 +441,7 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
             "chart": _theme(),
             "series": [{
                 "type": "Candlestick",
-                "data": _candles(recent),
+                "data": _candles(d),
                 "options": {
                     "upColor": COLOR_BULL,
                     "downColor": COLOR_BEAR,
@@ -401,8 +457,8 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
         })
 
         # AO pane
-        if 'AO' in recent.columns:
-            ao_data = _hist(recent, 'AO')
+        if 'AO' in d.columns:
+            ao_data = _hist(d, 'AO')
             if ao_data:
                 panes.append({
                     "chart": _theme(),
@@ -413,19 +469,19 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
 
         # MACD pane
         macd_s = []
-        if 'MACD_Hist' in recent.columns:
-            h = _hist(recent, 'MACD_Hist')
+        if 'MACD_Hist' in d.columns:
+            h = _hist(d, 'MACD_Hist')
             if h:
                 macd_s.append({"type": "Histogram", "data": h, "options": {}})
-        if 'MACD' in recent.columns:
-            md = _line(recent, 'MACD')
+        if 'MACD' in d.columns:
+            md = _line(d, 'MACD')
             if md:
                 macd_s.append({"type": "Line", "data": md,
                                "options": {"color": "#2962ff", "lineWidth": 1,
                                            "crosshairMarkerVisible": False},
                                "label": "MACD"})
-        if 'MACD_Signal' in recent.columns:
-            sd = _line(recent, 'MACD_Signal')
+        if 'MACD_Signal' in d.columns:
+            sd = _line(d, 'MACD_Signal')
             if sd:
                 macd_s.append({"type": "Line", "data": sd,
                                "options": {"color": "#ff6d00", "lineWidth": 1,
@@ -444,7 +500,7 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350):
                 name=f"{ticker} {label}",
                 charts=panes,
                 height=height,
-                zoom_level=n_bars,
+                zoom_level=zoom,
                 key=f"mtf_{ticker}_{label}",
             )
 
