@@ -103,14 +103,32 @@ def create_analysis_chart(df: pd.DataFrame,
         df = detect_bearish_divergence(df)
 
     # ── Build subplots ────────────────────────────────────────────────
-    row_heights = [0.55, 0.22, 0.23]
-    fig = make_subplots(
-        rows=3, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.02,
-        row_heights=row_heights,
-        subplot_titles=('', 'Awesome Oscillator', 'MACD (12/26/9 SMA)'),
-    )
+    if show_volume and 'Volume' in df.columns:
+        row_heights = [0.45, 0.12, 0.20, 0.23]
+        fig = make_subplots(
+            rows=4, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.02,
+            row_heights=row_heights,
+            subplot_titles=('', 'Volume', 'Awesome Oscillator', 'MACD (12/26/9 SMA)'),
+        )
+        vol_row = 2
+        ao_row = 3
+        macd_row = 4
+        total_rows = 4
+    else:
+        row_heights = [0.55, 0.22, 0.23]
+        fig = make_subplots(
+            rows=3, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.02,
+            row_heights=row_heights,
+            subplot_titles=('', 'Awesome Oscillator', 'MACD (12/26/9 SMA)'),
+        )
+        vol_row = None
+        ao_row = 2
+        macd_row = 3
+        total_rows = 3
 
     # ── Row 1: Candlestick ────────────────────────────────────────────
     fig.add_trace(
@@ -124,8 +142,8 @@ def create_analysis_chart(df: pd.DataFrame,
         row=1, col=1
     )
 
-    # ── Volume bars (overlay on row 1) ────────────────────────────────
-    if show_volume and 'Volume' in df.columns:
+    # ── Volume bars (own row) ─────────────────────────────────────────
+    if show_volume and 'Volume' in df.columns and vol_row:
         vol_colors = [COLORS['volume_up'] if df['Close'].iloc[i] >= df['Open'].iloc[i]
                       else COLORS['volume_down'] for i in range(len(df))]
         fig.add_trace(
@@ -133,10 +151,9 @@ def create_analysis_chart(df: pd.DataFrame,
                 x=df.index, y=df['Volume'],
                 name='Volume',
                 marker_color=vol_colors,
-                opacity=0.3,
-                yaxis='y2',
+                opacity=0.6,
             ),
-            row=1, col=1
+            row=vol_row, col=1
         )
 
     # ── 30-Week SMA (Weinstein) ───────────────────────────────────────
@@ -266,7 +283,7 @@ def create_analysis_chart(df: pd.DataFrame,
                 row=1, col=1
             )
 
-    # ── Row 2: Awesome Oscillator ─────────────────────────────────────
+    # ── Awesome Oscillator ────────────────────────────────────────────
     if 'AO' in df.columns:
         ao = df['AO'].dropna()
         ao_colors = [COLORS['ao_positive'] if v >= 0 else COLORS['ao_negative']
@@ -277,13 +294,13 @@ def create_analysis_chart(df: pd.DataFrame,
                 name='AO',
                 marker_color=ao_colors,
             ),
-            row=2, col=1
+            row=ao_row, col=1
         )
         # Zero line
-        fig.add_hline(y=0, row=2, col=1, line_dash='solid',
+        fig.add_hline(y=0, row=ao_row, col=1, line_dash='solid',
                       line_color='rgba(255,255,255,0.2)', line_width=0.5)
 
-    # ── Row 3: MACD ───────────────────────────────────────────────────
+    # ── MACD ──────────────────────────────────────────────────────────
     if 'MACD' in df.columns and 'MACD_Signal' in df.columns:
         macd = df['MACD'].dropna()
         signal_line = df['MACD_Signal'].dropna()
@@ -294,7 +311,7 @@ def create_analysis_chart(df: pd.DataFrame,
                        for v in hist]
         fig.add_trace(
             go.Bar(x=hist.index, y=hist, name='MACD Hist', marker_color=hist_colors),
-            row=3, col=1
+            row=macd_row, col=1
         )
 
         # MACD line
@@ -303,7 +320,7 @@ def create_analysis_chart(df: pd.DataFrame,
                 x=macd.index, y=macd, mode='lines',
                 name='MACD', line=dict(color=COLORS['macd_line'], width=1.5),
             ),
-            row=3, col=1
+            row=macd_row, col=1
         )
 
         # Signal line
@@ -312,11 +329,11 @@ def create_analysis_chart(df: pd.DataFrame,
                 x=signal_line.index, y=signal_line, mode='lines',
                 name='Signal (SMA 9)', line=dict(color=COLORS['macd_signal'], width=1.5),
             ),
-            row=3, col=1
+            row=macd_row, col=1
         )
 
         # Zero line
-        fig.add_hline(y=0, row=3, col=1, line_dash='solid',
+        fig.add_hline(y=0, row=macd_row, col=1, line_dash='solid',
                       line_color='rgba(255,255,255,0.2)', line_width=0.5)
 
     # ── Layout ────────────────────────────────────────────────────────
@@ -341,23 +358,13 @@ def create_analysis_chart(df: pd.DataFrame,
     )
 
     # Grid styling
-    for i in range(1, 4):
+    for i in range(1, total_rows + 1):
         fig.update_xaxes(
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-            showticklabels=(i == 3),  # Only show x-axis labels on bottom
+            showticklabels=(i == total_rows),  # Only show x-axis labels on bottom
         )
         fig.update_yaxes(
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-        )
-
-    # Volume y-axis (secondary on row 1)
-    if show_volume:
-        fig.update_layout(
-            yaxis2=dict(
-                overlaying='y', side='right',
-                showgrid=False, showticklabels=False,
-                range=[0, df['Volume'].max() * 4] if 'Volume' in df.columns else [0, 1],
-            )
         )
 
     return fig
