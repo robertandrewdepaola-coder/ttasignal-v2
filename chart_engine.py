@@ -2,14 +2,12 @@
 TTA v2 Chart Engine — TradingView Lightweight Charts v5
 =========================================================
 
-Uses streamlit-lightweight-charts-v5 for native TradingView experience:
-- Mouse wheel zoom (bunch up / spread out candles)
-- Auto-scaling y-axis as you zoom
-- Crosshair cursor synced across panes
-- Multi-pane: Price + Volume + AO + MACD
-- Pan, zoom, scroll — all native TradingView behavior
+Uses streamlit-lightweight-charts-v5 for native TradingView experience.
 
-Version: 3.0.0 (2026-02-08)
+v5 multi-pane: each pane is a separate dict in the `charts` array,
+each with its own height and series list.
+
+Version: 3.1.0 (2026-02-08)
 """
 
 import pandas as pd
@@ -27,18 +25,47 @@ from signal_engine import (
 # COLORS
 # =============================================================================
 
-COLOR_BULL = 'rgba(38,166,154,0.9)'   # #26a69a
-COLOR_BEAR = 'rgba(239,83,80,0.9)'    # #ef5350
+COLOR_BULL = 'rgba(38,166,154,0.9)'
+COLOR_BEAR = 'rgba(239,83,80,0.9)'
 COLOR_BULL_LIGHT = 'rgba(38,166,154,0.3)'
 COLOR_BEAR_LIGHT = 'rgba(239,83,80,0.3)'
 
+# Dark theme config shared across all panes
+DARK_THEME = {
+    "layout": {
+        "background": {"color": "#131722"},
+        "textColor": "#d1d4dc",
+        "fontSize": 12,
+        "panes": {
+            "separatorColor": "rgba(42, 46, 57, 0.8)",
+            "separatorHoverColor": "rgba(100, 100, 100, 0.5)",
+            "enableResize": True,
+        },
+    },
+    "grid": {
+        "vertLines": {"color": "rgba(42, 46, 57, 0.3)"},
+        "horzLines": {"color": "rgba(42, 46, 57, 0.3)"},
+    },
+    "crosshair": {"mode": 0},
+    "rightPriceScale": {
+        "borderColor": "rgba(197, 203, 206, 0.3)",
+    },
+    "timeScale": {
+        "borderColor": "rgba(197, 203, 206, 0.3)",
+        "timeVisible": False,
+        "barSpacing": 6,
+        "minBarSpacing": 2,
+        "rightOffset": 5,
+    },
+}
+
 
 # =============================================================================
-# DATA FORMATTERS — Convert DataFrames to LWC JSON format
+# DATA FORMATTERS
 # =============================================================================
 
 def _df_to_candles(df: pd.DataFrame) -> list:
-    """Convert OHLCV DataFrame to LWC candlestick JSON."""
+    """OHLCV -> LWC candlestick records."""
     records = []
     for idx, row in df.iterrows():
         records.append({
@@ -51,17 +78,17 @@ def _df_to_candles(df: pd.DataFrame) -> list:
     return records
 
 
-def _series_to_line(df: pd.DataFrame, col: str, color: str = 'blue') -> list:
-    """Convert a single column to LWC line series JSON."""
+def _col_to_line(df: pd.DataFrame, col: str) -> list:
+    """Column -> LWC line records (no color per point)."""
     s = df[col].dropna()
-    return [{'time': idx.strftime('%Y-%m-%d'), 'value': round(float(v), 4), 'color': color}
+    return [{'time': idx.strftime('%Y-%m-%d'), 'value': round(float(v), 4)}
             for idx, v in s.items()]
 
 
-def _series_to_histogram(df: pd.DataFrame, col: str,
+def _col_to_colored_hist(df: pd.DataFrame, col: str,
                          pos_color: str = COLOR_BULL,
                          neg_color: str = COLOR_BEAR) -> list:
-    """Convert a column to LWC histogram JSON with pos/neg colors."""
+    """Column -> LWC histogram records with pos/neg colors."""
     s = df[col].dropna()
     return [{'time': idx.strftime('%Y-%m-%d'),
              'value': round(float(v), 4),
@@ -69,243 +96,225 @@ def _series_to_histogram(df: pd.DataFrame, col: str,
             for idx, v in s.items()]
 
 
-def _volume_to_histogram(df: pd.DataFrame) -> list:
-    """Convert volume to LWC histogram with bull/bear colors."""
+def _volume_hist(df: pd.DataFrame) -> list:
+    """Volume -> LWC histogram with bull/bear colors."""
     records = []
     for idx, row in df.iterrows():
-        color = COLOR_BULL_LIGHT if row['Close'] >= row['Open'] else COLOR_BEAR_LIGHT
+        c = COLOR_BULL_LIGHT if row['Close'] >= row['Open'] else COLOR_BEAR_LIGHT
         records.append({
             'time': idx.strftime('%Y-%m-%d'),
             'value': float(row['Volume']),
-            'color': color,
+            'color': c,
         })
     return records
 
 
 # =============================================================================
-# MAIN CHART — Multi-pane TradingView chart config
+# BUILD MULTI-PANE CHART CONFIG
 # =============================================================================
 
-def build_lwc_chart_config(
+def build_lwc_charts(
     df: pd.DataFrame,
     ticker: str,
     signal: EntrySignal = None,
     show_volume: bool = True,
     show_resistance: bool = True,
-    height: int = 800,
-) -> dict:
+    total_height: int = 800,
+) -> list:
     """
-    Build the charts config dict for lightweight_charts_v5_component.
+    Build the `charts` list for lightweight_charts_v5_component.
 
-    Returns a single chart config with multi-pane series using the
-    v5 component's chart/series format.
+    Each pane is a separate dict: {chart, series, height, title}
 
-    Panes:
-    - Pane 0: Candlestick + SMAs + resistance rectangles
-    - Pane 1: Volume histogram
-    - Pane 2: AO histogram
-    - Pane 3: MACD (histogram + signal + MACD lines)
+    Pane 0: Price (candlestick + SMAs + resistance) — 55% height
+    Pane 1: Volume histogram — 10% height
+    Pane 2: AO histogram — 15% height
+    Pane 3: MACD (histogram + lines) — 20% height
     """
     df = normalize_columns(df).copy()
-
-    # Ensure indicators
     if 'MACD' not in df.columns:
         df = add_all_indicators(df)
 
-    # ── Chart options (TradingView dark theme) ────────────────────────
-    chart_options = {
-        "height": height,
-        "layout": {
-            "background": {"type": "solid", "color": "#131722"},
-            "textColor": "#d1d4dc",
-            "fontSize": 12,
-        },
-        "grid": {
-            "vertLines": {"color": "rgba(42, 46, 57, 0.4)"},
-            "horzLines": {"color": "rgba(42, 46, 57, 0.4)"},
-        },
-        "crosshair": {
-            "mode": 0,  # Normal crosshair
-        },
-        "rightPriceScale": {
-            "borderColor": "rgba(197, 203, 206, 0.4)",
-            "scaleMargins": {"top": 0.05, "bottom": 0.05},
-        },
-        "timeScale": {
-            "borderColor": "rgba(197, 203, 206, 0.4)",
-            "timeVisible": False,
-            "barSpacing": 6,
-            "minBarSpacing": 2,
-            "rightOffset": 5,
-        },
-    }
+    has_vol = show_volume and 'Volume' in df.columns
+    panes = []
 
-    # ── Build series list ─────────────────────────────────────────────
-    series = []
+    # ── PANE 0: PRICE ────────────────────────────────────────────────
+    price_series = []
 
-    # --- Pane 0: Candlestick ---
-    candles = _df_to_candles(df)
-    series.append({
+    # Candlestick
+    price_series.append({
         "type": "Candlestick",
-        "data": candles,
+        "data": _df_to_candles(df),
         "options": {
             "upColor": COLOR_BULL,
             "downColor": COLOR_BEAR,
             "borderVisible": False,
             "wickUpColor": COLOR_BULL,
             "wickDownColor": COLOR_BEAR,
-            "title": ticker,
-            "pane": 0,
         },
     })
 
-    # --- Pane 0: Moving Averages ---
+    # 150d SMA
     if 'SMA_150' in df.columns:
-        sma = _series_to_line(df, 'SMA_150', '#ff9800')
-        if sma:
-            series.append({
+        data = _col_to_line(df, 'SMA_150')
+        if data:
+            price_series.append({
                 "type": "Line",
-                "data": sma,
+                "data": data,
                 "options": {
                     "color": "#ff9800",
                     "lineWidth": 2,
-                    "lineStyle": 1,  # Dotted
-                    "title": "150d SMA",
-                    "pane": 0,
+                    "lineStyle": 1,
                 },
+                "label": f"150 SMA ${float(df['SMA_150'].dropna().iloc[-1]):.2f}" if len(df['SMA_150'].dropna()) > 0 else "150 SMA",
             })
 
+    # 50d SMA
     if 'SMA_50' in df.columns:
-        sma = _series_to_line(df, 'SMA_50', '#42a5f5')
-        if sma:
-            series.append({
+        data = _col_to_line(df, 'SMA_50')
+        if data:
+            price_series.append({
                 "type": "Line",
-                "data": sma,
+                "data": data,
                 "options": {
                     "color": "#42a5f5",
                     "lineWidth": 1,
-                    "lineStyle": 2,  # Dashed
-                    "title": "50 SMA",
-                    "pane": 0,
+                    "lineStyle": 2,
                 },
+                "label": f"50 SMA ${float(df['SMA_50'].dropna().iloc[-1]):.2f}" if len(df['SMA_50'].dropna()) > 0 else "50 SMA",
             })
 
+    # 200d SMA
     if 'SMA_200' in df.columns:
-        sma = _series_to_line(df, 'SMA_200', '#ab47bc')
-        if sma:
-            series.append({
+        data = _col_to_line(df, 'SMA_200')
+        if data:
+            price_series.append({
                 "type": "Line",
-                "data": sma,
+                "data": data,
                 "options": {
                     "color": "#ab47bc",
                     "lineWidth": 1,
-                    "lineStyle": 2,  # Dashed
-                    "title": "200 SMA",
-                    "pane": 0,
+                    "lineStyle": 2,
                 },
+                "label": f"200 SMA ${float(df['SMA_200'].dropna().iloc[-1]):.2f}" if len(df['SMA_200'].dropna()) > 0 else "200 SMA",
             })
 
-    # --- Pane 0: Resistance levels as horizontal lines ---
+    # Resistance levels as flat line series
     if show_resistance and signal and signal.overhead_resistance:
         levels = signal.overhead_resistance.get('levels', [])
         critical = signal.overhead_resistance.get('critical_level', {})
-
         for lev in levels:
             price = lev['price']
             is_crit = critical and abs(price - critical.get('price', 0)) < 0.01
-
-            # Create a flat line series at the resistance price
+            color = '#ff1744' if is_crit else 'rgba(239, 83, 80, 0.4)'
             res_data = [
                 {'time': df.index[0].strftime('%Y-%m-%d'), 'value': round(price, 2)},
                 {'time': df.index[-1].strftime('%Y-%m-%d'), 'value': round(price, 2)},
             ]
-            color = '#ff1744' if is_crit else 'rgba(239, 83, 80, 0.5)'
-            series.append({
+            price_series.append({
                 "type": "Line",
                 "data": res_data,
                 "options": {
                     "color": color,
                     "lineWidth": 2 if is_crit else 1,
-                    "lineStyle": 0 if is_crit else 2,  # Solid if critical, dashed otherwise
-                    "title": f"R ${price:.0f}" + (" ★" if is_crit else ""),
+                    "lineStyle": 0 if is_crit else 2,
                     "crosshairMarkerVisible": False,
                     "lastValueVisible": True,
                     "priceLineVisible": False,
-                    "pane": 0,
                 },
+                "label": f"R ${price:.0f}" + (" ★" if is_crit else ""),
             })
 
-    # --- Pane 1: Volume ---
-    if show_volume and 'Volume' in df.columns:
-        vol_data = _volume_to_histogram(df)
-        series.append({
-            "type": "Histogram",
-            "data": vol_data,
-            "options": {
-                "priceFormat": {"type": "volume"},
-                "title": "Volume",
-                "pane": 1,
-            },
+    price_height = int(total_height * 0.55) if has_vol else int(total_height * 0.50)
+    panes.append({
+        "chart": DARK_THEME,
+        "series": price_series,
+        "height": price_height,
+        "title": ticker,
+    })
+
+    # ── PANE 1: VOLUME ───────────────────────────────────────────────
+    if has_vol:
+        vol_data = _volume_hist(df)
+        panes.append({
+            "chart": DARK_THEME,
+            "series": [{
+                "type": "Histogram",
+                "data": vol_data,
+                "options": {
+                    "priceFormat": {"type": "volume"},
+                },
+            }],
+            "height": int(total_height * 0.10),
+            "title": "Volume",
         })
 
-    # --- Pane 2: Awesome Oscillator ---
+    # ── PANE 2: AWESOME OSCILLATOR ───────────────────────────────────
     if 'AO' in df.columns:
-        ao_data = _series_to_histogram(df, 'AO')
-        series.append({
-            "type": "Histogram",
-            "data": ao_data,
-            "options": {
+        ao_data = _col_to_colored_hist(df, 'AO')
+        if ao_data:
+            panes.append({
+                "chart": DARK_THEME,
+                "series": [{
+                    "type": "Histogram",
+                    "data": ao_data,
+                    "options": {},
+                }],
+                "height": int(total_height * 0.15),
                 "title": "AO",
-                "pane": 2,
-            },
-        })
+            })
 
-    # --- Pane 3: MACD ---
+    # ── PANE 3: MACD ─────────────────────────────────────────────────
+    macd_series = []
+
     if 'MACD_Hist' in df.columns:
-        macd_hist = _series_to_histogram(df, 'MACD_Hist')
-        series.append({
-            "type": "Histogram",
-            "data": macd_hist,
-            "options": {
-                "title": "MACD Hist",
-                "pane": 3,
-            },
-        })
+        hist_data = _col_to_colored_hist(df, 'MACD_Hist')
+        if hist_data:
+            macd_series.append({
+                "type": "Histogram",
+                "data": hist_data,
+                "options": {},
+            })
 
     if 'MACD' in df.columns:
-        macd_line = _series_to_line(df, 'MACD', '#2962ff')
-        series.append({
-            "type": "Line",
-            "data": macd_line,
-            "options": {
-                "color": "#2962ff",
-                "lineWidth": 2,
-                "title": "MACD",
-                "pane": 3,
-            },
-        })
+        macd_data = _col_to_line(df, 'MACD')
+        if macd_data:
+            macd_series.append({
+                "type": "Line",
+                "data": macd_data,
+                "options": {
+                    "color": "#2962ff",
+                    "lineWidth": 2,
+                },
+                "label": "MACD",
+            })
 
     if 'MACD_Signal' in df.columns:
-        sig_line = _series_to_line(df, 'MACD_Signal', '#ff6d00')
-        series.append({
-            "type": "Line",
-            "data": sig_line,
-            "options": {
-                "color": "#ff6d00",
-                "lineWidth": 2,
-                "title": "Signal",
-                "pane": 3,
-            },
+        sig_data = _col_to_line(df, 'MACD_Signal')
+        if sig_data:
+            macd_series.append({
+                "type": "Line",
+                "data": sig_data,
+                "options": {
+                    "color": "#ff6d00",
+                    "lineWidth": 2,
+                },
+                "label": "Signal",
+            })
+
+    if macd_series:
+        panes.append({
+            "chart": DARK_THEME,
+            "series": macd_series,
+            "height": int(total_height * 0.20),
+            "title": "MACD",
         })
 
-    return {
-        "chart": chart_options,
-        "series": series,
-    }
+    return panes
 
 
 # =============================================================================
-# RENDER FUNCTION — Called from app.py
+# RENDER — Called from app.py
 # =============================================================================
 
 def render_tv_chart(df: pd.DataFrame, ticker: str,
@@ -314,35 +323,31 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
                     show_resistance: bool = True,
                     height: int = 800,
                     key: str = None):
-    """
-    Render TradingView-style chart in Streamlit using lightweight-charts-v5.
-
-    Call this from app.py instead of st.plotly_chart().
-    """
+    """Render TradingView chart in Streamlit."""
     from lightweight_charts_v5 import lightweight_charts_v5_component
 
-    config = build_lwc_chart_config(
+    charts = build_lwc_charts(
         df, ticker, signal=signal,
         show_volume=show_volume,
         show_resistance=show_resistance,
-        height=height,
+        total_height=height,
     )
 
     lightweight_charts_v5_component(
         name=f"{ticker} — ${float(df['Close'].iloc[-1]):.2f}",
-        charts=[config],
+        charts=charts,
         height=height,
-        zoom_level=200,  # Initial visible bars
+        zoom_level=200,
         key=key or f"tv_chart_{ticker}",
     )
 
 
 # =============================================================================
-# MULTI-TIMEFRAME (kept simple with Plotly for now)
+# MTF CHART (Plotly for side-by-side)
 # =============================================================================
 
 def create_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=400):
-    """MTF chart using Plotly (LWC v5 doesn't support side-by-side easily)."""
+    """Multi-timeframe chart using Plotly."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -397,7 +402,7 @@ def create_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=400):
 
 
 # =============================================================================
-# EXPORT (kept for AI analysis screenshots)
+# EXPORT
 # =============================================================================
 
 def chart_to_base64(fig, width=1200, height=700):
