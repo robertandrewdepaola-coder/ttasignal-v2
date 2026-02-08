@@ -136,53 +136,119 @@ def _wave_markers(df):
 
 def _signal_markers(df):
     """
-    Build LWC marker objects for MACD buy/sell crossover signals on price chart.
-    Buy = MACD crosses above Signal while AO > 0
-    Sell = MACD crosses below Signal
+    Build QUALIFIED buy/sell markers on price chart.
+
+    Qualified Buy requires ALL of:
+    1. Price touched or broke below 150d SMA OR 200 SMA at some point before
+    2. MACD crossed up from BELOW ZERO (not just below signal line)
+    3. AO also crossed above zero (confirmation)
+
+    This filters out all noisy crosses during corrective legs above zero.
+    Only the most recent qualified buy and sell are shown with price labels.
     """
     if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
         return []
 
-    markers = []
-    macd = df['MACD'].values
-    sig = df['MACD_Signal'].values
+    macd_vals = df['MACD'].values
     ao = df['AO'].values if 'AO' in df.columns else [0] * len(df)
+    close = df['Close'].values
+    low = df['Low'].values
+
+    # Get SMA values for touch detection
+    sma150 = df['SMA_150'].values if 'SMA_150' in df.columns else [np.nan] * len(df)
+    sma200 = df['SMA_200'].values if 'SMA_200' in df.columns else [np.nan] * len(df)
+
+    # ── Step 1: Find MACD zero-cross-up events (from below zero to above) ──
+    # These are the ONLY candidates for qualified buys
+    zero_cross_ups = []  # list of bar indices where MACD crosses above zero
 
     for i in range(1, len(df)):
-        if pd.isna(macd[i]) or pd.isna(sig[i]) or pd.isna(macd[i-1]) or pd.isna(sig[i-1]):
+        if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
+            continue
+        # MACD crosses from negative to positive
+        if macd_vals[i] > 0 and macd_vals[i-1] <= 0:
+            zero_cross_ups.append(i)
+
+    # ── Step 2: For each zero-cross-up, check qualifiers ──
+    qualified_buys = []
+
+    for cross_i in zero_cross_ups:
+        # Check: price must have touched 150d SMA or 200 SMA at some point
+        # before this MACD zero cross (look back up to 60 bars)
+        lookback = min(cross_i, 60)
+        sma_touched = False
+        for j in range(cross_i - lookback, cross_i + 1):
+            if j < 0:
+                continue
+            # Price Low touched or went below either SMA
+            if not pd.isna(sma150[j]) and low[j] <= sma150[j] * 1.02:  # within 2%
+                sma_touched = True
+                break
+            if not pd.isna(sma200[j]) and low[j] <= sma200[j] * 1.02:
+                sma_touched = True
+                break
+
+        if not sma_touched:
             continue
 
-        # Bullish cross: MACD crosses above Signal
-        if macd[i] > sig[i] and macd[i-1] <= sig[i-1]:
-            ao_val = ao[i] if not pd.isna(ao[i]) else 0
-            price = float(df['Close'].iloc[i])
-            if ao_val > 0:
-                markers.append({
-                    "time": df.index[i].strftime('%Y-%m-%d'),
-                    "position": "belowBar",
-                    "color": "#26a69a",
-                    "shape": "arrowUp",
-                    "text": f"BUY ${price:.2f}",
-                })
-            else:
-                markers.append({
-                    "time": df.index[i].strftime('%Y-%m-%d'),
-                    "position": "belowBar",
-                    "color": "#66bb6a",
-                    "shape": "arrowUp",
-                    "text": f"Buy? ${price:.2f}",
-                })
+        # Check: AO must also cross above zero (can be before, at, or shortly after)
+        # Look for AO > 0 within 10 bars after MACD zero cross
+        ao_confirmed = False
+        ao_confirm_bar = cross_i
+        for j in range(max(0, cross_i - 5), min(len(df), cross_i + 15)):
+            if not pd.isna(ao[j]) and ao[j] > 0:
+                ao_confirmed = True
+                ao_confirm_bar = j
+                break
 
-        # Bearish cross: MACD crosses below Signal
-        elif macd[i] < sig[i] and macd[i-1] >= sig[i-1]:
-            price = float(df['Close'].iloc[i])
-            markers.append({
-                "time": df.index[i].strftime('%Y-%m-%d'),
-                "position": "aboveBar",
-                "color": "#ef5350",
-                "shape": "arrowDown",
-                "text": f"SELL ${price:.2f}",
+        if not ao_confirmed:
+            continue
+
+        # All 3 conditions met — this is a qualified buy
+        signal_bar = max(cross_i, ao_confirm_bar)  # mark at whichever comes last
+        if signal_bar < len(df):
+            price = float(close[signal_bar])
+            qualified_buys.append({
+                "bar": signal_bar,
+                "price": price,
+                "time": df.index[signal_bar].strftime('%Y-%m-%d'),
             })
+
+    # ── Step 3: Find sell signals (MACD crosses below zero) ──
+    sells = []
+    for i in range(1, len(df)):
+        if pd.isna(macd_vals[i]) or pd.isna(macd_vals[i-1]):
+            continue
+        if macd_vals[i] < 0 and macd_vals[i-1] >= 0:
+            price = float(close[i])
+            sells.append({
+                "bar": i,
+                "price": price,
+                "time": df.index[i].strftime('%Y-%m-%d'),
+            })
+
+    # ── Step 4: Build markers — only show most recent of each ──
+    markers = []
+
+    if qualified_buys:
+        latest = qualified_buys[-1]
+        markers.append({
+            "time": latest['time'],
+            "position": "belowBar",
+            "color": "#26a69a",
+            "shape": "arrowUp",
+            "text": f"BUY ${latest['price']:.2f}",
+        })
+
+    if sells:
+        latest = sells[-1]
+        markers.append({
+            "time": latest['time'],
+            "position": "aboveBar",
+            "color": "#ef5350",
+            "shape": "arrowDown",
+            "text": f"SELL ${latest['price']:.2f}",
+        })
 
     return markers
 
