@@ -19,6 +19,7 @@ Version: 2.0.0 (2026-02-08)
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from typing import Dict
 
 # Backend imports
 from signal_engine import EntrySignal
