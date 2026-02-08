@@ -413,11 +413,13 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
     6. Divergence confirmed once AO drops below zero again (correction starts)
 
     Adds columns: bearish_div_detected, bearish_div_active
+    Also stores divergence line data in df.attrs['divergence_lines'] for chart drawing.
     """
     if df is None or len(df) < 50:
         df = df.copy() if df is not None else pd.DataFrame()
         df['bearish_div_detected'] = False
         df['bearish_div_active'] = False
+        df.attrs['divergence_lines'] = []
         return df
 
     df = df.copy()
@@ -432,11 +434,12 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
     highs = df['High'].values
 
     # Step 1: Identify AO positive blocks (continuous runs above zero)
-    # Each block = (start_idx, end_idx, peak_ao, highest_price, highest_price_idx)
+    # Each block = (start_idx, end_idx, peak_ao, peak_ao_idx, highest_price, highest_price_idx)
     positive_blocks = []
     in_block = False
     block_start = 0
     block_peak_ao = 0.0
+    block_peak_ao_idx = 0
     block_high_price = 0.0
     block_high_idx = 0
 
@@ -445,7 +448,7 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
             if in_block:
                 if block_peak_ao > 0:
                     positive_blocks.append((block_start, i - 1, block_peak_ao,
-                                            block_high_price, block_high_idx))
+                                            block_peak_ao_idx, block_high_price, block_high_idx))
                 in_block = False
             continue
 
@@ -454,11 +457,13 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
                 in_block = True
                 block_start = i
                 block_peak_ao = ao[i]
+                block_peak_ao_idx = i
                 block_high_price = highs[i]
                 block_high_idx = i
             else:
                 if ao[i] > block_peak_ao:
                     block_peak_ao = ao[i]
+                    block_peak_ao_idx = i
                 if highs[i] > block_high_price:
                     block_high_price = highs[i]
                     block_high_idx = i
@@ -466,19 +471,20 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
             if in_block:
                 if block_peak_ao > 0:
                     positive_blocks.append((block_start, i - 1, block_peak_ao,
-                                            block_high_price, block_high_idx))
+                                            block_peak_ao_idx, block_high_price, block_high_idx))
                 in_block = False
 
     # Capture final block if still in one
     if in_block and block_peak_ao > 0:
         positive_blocks.append((block_start, len(df) - 1, block_peak_ao,
-                                block_high_price, block_high_idx))
+                                block_peak_ao_idx, block_high_price, block_high_idx))
 
     # Step 2: Compare consecutive positive blocks separated by negative zone
-    # The negative zone between them is the Wave 4 correction
+    divergence_lines = []
+
     for b_idx in range(1, len(positive_blocks)):
-        prev_start, prev_end, prev_peak_ao, prev_high_price, prev_high_idx = positive_blocks[b_idx - 1]
-        curr_start, curr_end, curr_peak_ao, curr_high_price, curr_high_idx = positive_blocks[b_idx]
+        prev_start, prev_end, prev_peak_ao, prev_ao_idx, prev_high_price, prev_high_idx = positive_blocks[b_idx - 1]
+        curr_start, curr_end, curr_peak_ao, curr_ao_idx, curr_high_price, curr_high_idx = positive_blocks[b_idx]
 
         # Verify there's a negative zone between them (Wave 4)
         gap_has_negative = False
@@ -494,6 +500,34 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
         if curr_high_price > prev_high_price and curr_peak_ao < prev_peak_ao:
             # Mark at the highest price bar in the smaller AO block
             df.iloc[curr_high_idx, df.columns.get_loc('bearish_div_detected')] = True
+
+            # Store line coordinates for chart drawing
+            # Line 1: Price panel — connects W3 high to W5 high (rising)
+            # Line 2: AO panel — connects W3 AO peak to W5 AO peak (falling)
+            divergence_lines.append({
+                "price_line": {
+                    "x0": df.index[prev_high_idx].strftime('%Y-%m-%d'),
+                    "y0": round(float(prev_high_price), 2),
+                    "x1": df.index[curr_high_idx].strftime('%Y-%m-%d'),
+                    "y1": round(float(curr_high_price), 2),
+                },
+                "ao_line": {
+                    "x0": df.index[prev_ao_idx].strftime('%Y-%m-%d'),
+                    "y0": round(float(prev_peak_ao), 4),
+                    "x1": df.index[curr_ao_idx].strftime('%Y-%m-%d'),
+                    "y1": round(float(curr_peak_ao), 4),
+                },
+                "w3_label": {
+                    "date": df.index[prev_high_idx].strftime('%Y-%m-%d'),
+                    "price": round(float(prev_high_price), 2),
+                },
+                "w5_label": {
+                    "date": df.index[curr_high_idx].strftime('%Y-%m-%d'),
+                    "price": round(float(curr_high_price), 2),
+                },
+            })
+
+    df.attrs['divergence_lines'] = divergence_lines
 
     # Step 3: Set active flag — active from detection until AO goes negative again
     div_active = False
