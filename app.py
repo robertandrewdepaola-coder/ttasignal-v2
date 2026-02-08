@@ -329,7 +329,7 @@ def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
 
 
 def _render_chart_tab(ticker: str, signal: EntrySignal):
-    """Interactive TradingView-style chart with timeframe selection."""
+    """Interactive TradingView-style chart."""
     data_cache = st.session_state.get('ticker_data_cache', {})
     ticker_data = data_cache.get(ticker, {})
     daily = ticker_data.get('daily')
@@ -339,44 +339,11 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
         return
 
     from chart_engine import render_tv_chart, render_mtf_chart
-    from signal_engine import normalize_columns
 
-    # ── Timeframe buttons ────────────────────────────────────────────
-    col1, col2, col3, col4, col5, col6 = st.columns([1, 1, 1, 1, 1, 6])
-    tf_key = f'chart_tf_{ticker}'
-    if tf_key not in st.session_state:
-        st.session_state[tf_key] = '6M'
-
-    with col1:
-        if st.button("1M", key=f'tf1m_{ticker}', use_container_width=True):
-            st.session_state[tf_key] = '1M'
-    with col2:
-        if st.button("3M", key=f'tf3m_{ticker}', use_container_width=True):
-            st.session_state[tf_key] = '3M'
-    with col3:
-        if st.button("6M", key=f'tf6m_{ticker}', use_container_width=True):
-            st.session_state[tf_key] = '6M'
-    with col4:
-        if st.button("1Y", key=f'tf1y_{ticker}', use_container_width=True):
-            st.session_state[tf_key] = '1Y'
-    with col5:
-        if st.button("All", key=f'tfall_{ticker}', use_container_width=True):
-            st.session_state[tf_key] = 'All'
-
-    # Slice data to selected timeframe
-    tf = st.session_state[tf_key]
-    bar_map = {'1M': 22, '3M': 65, '6M': 130, '1Y': 252, 'All': 99999}
-    n_bars = bar_map.get(tf, 130)
-
-    chart_df = normalize_columns(daily).copy()
-    chart_df = chart_df.tail(min(n_bars, len(chart_df)))
-
-    # Zoom level = how many bars visible initially
-    zoom = min(n_bars, len(chart_df))
-
-    # Render TradingView chart
-    render_tv_chart(chart_df, ticker, signal=signal, height=750,
-                    zoom_level=zoom, key=f"tv_{ticker}_{tf}")
+    # Render TradingView chart — ALL data, LWC handles zoom natively
+    # zoom_level=200 shows ~200 bars initially, user scrolls to zoom
+    render_tv_chart(daily, ticker, signal=signal, height=750,
+                    zoom_level=200, key=f"tv_{ticker}")
 
     # MTF chart
     weekly = ticker_data.get('weekly')
