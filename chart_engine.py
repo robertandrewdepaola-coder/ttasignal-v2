@@ -2,17 +2,17 @@
 TTA v2 Chart Engine — TradingView Lightweight Charts v5
 =========================================================
 
-Uses streamlit-lightweight-charts-v5 for native TradingView experience.
+Multi-pane financial charts with native TradingView behavior:
+zoom, pan, crosshair, auto-scaling y-axis.
 
-v5 multi-pane: each pane is a separate dict in the `charts` array,
-each with its own height and series list.
+v3.2: Price marker, divergence markers, tight margins,
+      MTF with LWC, timeframe support, proper labels.
 
-Version: 3.1.0 (2026-02-08)
+Version: 3.2.0 (2026-02-08)
 """
 
 import pandas as pd
 import numpy as np
-import json
 from typing import Dict, List, Optional, Any
 
 from signal_engine import (
@@ -30,83 +30,91 @@ COLOR_BEAR = 'rgba(239,83,80,0.9)'
 COLOR_BULL_LIGHT = 'rgba(38,166,154,0.3)'
 COLOR_BEAR_LIGHT = 'rgba(239,83,80,0.3)'
 
-# Dark theme config shared across all panes
-DARK_THEME = {
-    "layout": {
-        "background": {"color": "#131722"},
-        "textColor": "#d1d4dc",
-        "fontSize": 12,
-        "panes": {
-            "separatorColor": "rgba(42, 46, 57, 0.8)",
-            "separatorHoverColor": "rgba(100, 100, 100, 0.5)",
-            "enableResize": True,
+# Dark theme shared across all panes
+def _theme():
+    return {
+        "layout": {
+            "background": {"color": "#131722"},
+            "textColor": "#d1d4dc",
+            "fontSize": 12,
+            "panes": {
+                "separatorColor": "rgba(42, 46, 57, 0.8)",
+                "separatorHoverColor": "rgba(100, 100, 100, 0.5)",
+                "enableResize": True,
+            },
         },
-    },
-    "grid": {
-        "vertLines": {"color": "rgba(42, 46, 57, 0.3)"},
-        "horzLines": {"color": "rgba(42, 46, 57, 0.3)"},
-    },
-    "crosshair": {"mode": 0},
-    "rightPriceScale": {
-        "borderColor": "rgba(197, 203, 206, 0.3)",
-    },
-    "timeScale": {
-        "borderColor": "rgba(197, 203, 206, 0.3)",
-        "timeVisible": False,
-        "barSpacing": 6,
-        "minBarSpacing": 2,
-        "rightOffset": 5,
-    },
-}
+        "grid": {
+            "vertLines": {"color": "rgba(42, 46, 57, 0.3)"},
+            "horzLines": {"color": "rgba(42, 46, 57, 0.3)"},
+        },
+        "crosshair": {"mode": 0},
+        "rightPriceScale": {
+            "borderColor": "rgba(197, 203, 206, 0.3)",
+            "scaleMargins": {"top": 0.02, "bottom": 0.02},
+        },
+        "timeScale": {
+            "borderColor": "rgba(197, 203, 206, 0.3)",
+            "timeVisible": False,
+            "barSpacing": 6,
+            "minBarSpacing": 2,
+            "rightOffset": 5,
+        },
+    }
 
 
 # =============================================================================
 # DATA FORMATTERS
 # =============================================================================
 
-def _df_to_candles(df: pd.DataFrame) -> list:
-    """OHLCV -> LWC candlestick records."""
-    records = []
-    for idx, row in df.iterrows():
-        records.append({
-            'time': idx.strftime('%Y-%m-%d'),
-            'open': round(float(row['Open']), 2),
-            'high': round(float(row['High']), 2),
-            'low': round(float(row['Low']), 2),
-            'close': round(float(row['Close']), 2),
-        })
-    return records
+def _candles(df):
+    return [{'time': idx.strftime('%Y-%m-%d'),
+             'open': round(float(r['Open']), 2),
+             'high': round(float(r['High']), 2),
+             'low': round(float(r['Low']), 2),
+             'close': round(float(r['Close']), 2)}
+            for idx, r in df.iterrows()]
 
 
-def _col_to_line(df: pd.DataFrame, col: str) -> list:
-    """Column -> LWC line records (no color per point)."""
+def _line(df, col):
     s = df[col].dropna()
     return [{'time': idx.strftime('%Y-%m-%d'), 'value': round(float(v), 4)}
             for idx, v in s.items()]
 
 
-def _col_to_colored_hist(df: pd.DataFrame, col: str,
-                         pos_color: str = COLOR_BULL,
-                         neg_color: str = COLOR_BEAR) -> list:
-    """Column -> LWC histogram records with pos/neg colors."""
+def _hist(df, col, pos=COLOR_BULL, neg=COLOR_BEAR):
     s = df[col].dropna()
     return [{'time': idx.strftime('%Y-%m-%d'),
              'value': round(float(v), 4),
-             'color': pos_color if v >= 0 else neg_color}
+             'color': pos if v >= 0 else neg}
             for idx, v in s.items()]
 
 
-def _volume_hist(df: pd.DataFrame) -> list:
-    """Volume -> LWC histogram with bull/bear colors."""
-    records = []
-    for idx, row in df.iterrows():
-        c = COLOR_BULL_LIGHT if row['Close'] >= row['Open'] else COLOR_BEAR_LIGHT
-        records.append({
-            'time': idx.strftime('%Y-%m-%d'),
-            'value': float(row['Volume']),
-            'color': c,
+def _vol(df):
+    return [{'time': idx.strftime('%Y-%m-%d'),
+             'value': float(r['Volume']),
+             'color': COLOR_BULL_LIGHT if r['Close'] >= r['Open'] else COLOR_BEAR_LIGHT}
+            for idx, r in df.iterrows()]
+
+
+# =============================================================================
+# DIVERGENCE MARKERS — shown on candlestick series
+# =============================================================================
+
+def _divergence_markers(df):
+    """Build LWC marker objects for bearish divergence points."""
+    if 'bearish_div_detected' not in df.columns:
+        return []
+    divs = df[df['bearish_div_detected'] == True]
+    markers = []
+    for idx, row in divs.iterrows():
+        markers.append({
+            "time": idx.strftime('%Y-%m-%d'),
+            "position": "aboveBar",
+            "color": "#ffa726",
+            "shape": "arrowDown",
+            "text": "Div ⚠",
         })
-    return records
+    return markers
 
 
 # =============================================================================
@@ -119,94 +127,85 @@ def build_lwc_charts(
     signal: EntrySignal = None,
     show_volume: bool = True,
     show_resistance: bool = True,
+    show_divergence: bool = True,
     total_height: int = 800,
 ) -> list:
     """
-    Build the `charts` list for lightweight_charts_v5_component.
-
-    Each pane is a separate dict: {chart, series, height, title}
-
-    Pane 0: Price (candlestick + SMAs + resistance) — 55% height
-    Pane 1: Volume histogram — 10% height
-    Pane 2: AO histogram — 15% height
-    Pane 3: MACD (histogram + lines) — 20% height
+    Build `charts` list for LWC v5.
+    Each pane = separate dict with {chart, series, height, title}.
     """
     df = normalize_columns(df).copy()
     if 'MACD' not in df.columns:
         df = add_all_indicators(df)
+    if show_divergence:
+        df = detect_bearish_divergence(df)
 
     has_vol = show_volume and 'Volume' in df.columns
     panes = []
+    current_price = round(float(df['Close'].iloc[-1]), 2)
 
     # ── PANE 0: PRICE ────────────────────────────────────────────────
     price_series = []
 
-    # Candlestick
-    price_series.append({
+    # Candlestick with divergence markers
+    candle_config = {
         "type": "Candlestick",
-        "data": _df_to_candles(df),
+        "data": _candles(df),
         "options": {
             "upColor": COLOR_BULL,
             "downColor": COLOR_BEAR,
             "borderVisible": False,
             "wickUpColor": COLOR_BULL,
             "wickDownColor": COLOR_BEAR,
+            "lastValueVisible": True,
+            "priceLineVisible": True,
+            "priceLineColor": "#787b86",
+            "priceLineStyle": 2,
         },
-    })
+    }
 
-    # 150d SMA
-    if 'SMA_150' in df.columns:
-        data = _col_to_line(df, 'SMA_150')
-        if data:
-            price_series.append({
-                "type": "Line",
-                "data": data,
-                "options": {
-                    "color": "#ff9800",
-                    "lineWidth": 2,
-                    "lineStyle": 1,
-                },
-                "label": f"150 SMA ${float(df['SMA_150'].dropna().iloc[-1]):.2f}" if len(df['SMA_150'].dropna()) > 0 else "150 SMA",
-            })
+    # Add divergence markers to candlestick
+    div_markers = _divergence_markers(df) if show_divergence else []
+    if div_markers:
+        candle_config["markers"] = div_markers
 
-    # 50d SMA
-    if 'SMA_50' in df.columns:
-        data = _col_to_line(df, 'SMA_50')
-        if data:
-            price_series.append({
-                "type": "Line",
-                "data": data,
-                "options": {
-                    "color": "#42a5f5",
-                    "lineWidth": 1,
-                    "lineStyle": 2,
-                },
-                "label": f"50 SMA ${float(df['SMA_50'].dropna().iloc[-1]):.2f}" if len(df['SMA_50'].dropna()) > 0 else "50 SMA",
-            })
+    price_series.append(candle_config)
 
-    # 200d SMA
-    if 'SMA_200' in df.columns:
-        data = _col_to_line(df, 'SMA_200')
-        if data:
-            price_series.append({
-                "type": "Line",
-                "data": data,
-                "options": {
-                    "color": "#ab47bc",
-                    "lineWidth": 1,
-                    "lineStyle": 2,
-                },
-                "label": f"200 SMA ${float(df['SMA_200'].dropna().iloc[-1]):.2f}" if len(df['SMA_200'].dropna()) > 0 else "200 SMA",
-            })
+    # Moving averages — crosshairMarkerVisible=False so dots don't snap to them
+    sma_configs = [
+        ('SMA_150', '#ff9800', 2, 1, '150d SMA'),  # orange, dotted
+        ('SMA_50', '#42a5f5', 1, 2, '50 SMA'),      # blue, dashed
+        ('SMA_200', '#ab47bc', 1, 2, '200 SMA'),     # purple, dashed
+    ]
 
-    # Resistance levels as flat line series
+    for col, color, width, style, name in sma_configs:
+        if col in df.columns:
+            data = _line(df, col)
+            if data:
+                val = df[col].dropna()
+                label_text = f"{name} ${float(val.iloc[-1]):.2f}" if len(val) > 0 else name
+                price_series.append({
+                    "type": "Line",
+                    "data": data,
+                    "options": {
+                        "color": color,
+                        "lineWidth": width,
+                        "lineStyle": style,
+                        "crosshairMarkerVisible": False,
+                        "lastValueVisible": False,
+                        "priceLineVisible": False,
+                    },
+                    "label": label_text,
+                })
+
+    # Resistance levels
     if show_resistance and signal and signal.overhead_resistance:
         levels = signal.overhead_resistance.get('levels', [])
         critical = signal.overhead_resistance.get('critical_level', {})
         for lev in levels:
             price = lev['price']
             is_crit = critical and abs(price - critical.get('price', 0)) < 0.01
-            color = '#ff1744' if is_crit else 'rgba(239, 83, 80, 0.4)'
+            color = '#ff1744' if is_crit else 'rgba(239, 83, 80, 0.35)'
             res_data = [
                 {'time': df.index[0].strftime('%Y-%m-%d'), 'value': round(price, 2)},
                 {'time': df.index[-1].strftime('%Y-%m-%d'), 'value': round(price, 2)},
@@ -225,89 +224,92 @@ def build_lwc_charts(
                 "label": f"R ${price:.0f}" + (" ★" if is_crit else ""),
             })
 
-    price_height = int(total_height * 0.55) if has_vol else int(total_height * 0.50)
+    # Price pane — tight scaleMargins to reduce dead space
+    price_theme = _theme()
+    price_theme["rightPriceScale"]["scaleMargins"] = {"top": 0.02, "bottom": 0.02}
+
+    ph = int(total_height * 0.55) if has_vol else int(total_height * 0.50)
     panes.append({
-        "chart": DARK_THEME,
+        "chart": price_theme,
         "series": price_series,
-        "height": price_height,
-        "title": ticker,
+        "height": ph,
+        "title": f"{ticker}  ${current_price}",
     })
 
     # ── PANE 1: VOLUME ───────────────────────────────────────────────
     if has_vol:
-        vol_data = _volume_hist(df)
         panes.append({
-            "chart": DARK_THEME,
+            "chart": _theme(),
             "series": [{
                 "type": "Histogram",
-                "data": vol_data,
-                "options": {
-                    "priceFormat": {"type": "volume"},
-                },
+                "data": _vol(df),
+                "options": {"priceFormat": {"type": "volume"}},
             }],
             "height": int(total_height * 0.10),
             "title": "Volume",
         })
 
-    # ── PANE 2: AWESOME OSCILLATOR ───────────────────────────────────
+    # ── PANE 2: AO ───────────────────────────────────────────────────
     if 'AO' in df.columns:
-        ao_data = _col_to_colored_hist(df, 'AO')
+        ao_data = _hist(df, 'AO')
         if ao_data:
             panes.append({
-                "chart": DARK_THEME,
+                "chart": _theme(),
                 "series": [{
                     "type": "Histogram",
                     "data": ao_data,
                     "options": {},
                 }],
                 "height": int(total_height * 0.15),
-                "title": "AO",
+                "title": "Awesome Oscillator",
             })
 
     # ── PANE 3: MACD ─────────────────────────────────────────────────
     macd_series = []
 
     if 'MACD_Hist' in df.columns:
-        hist_data = _col_to_colored_hist(df, 'MACD_Hist')
-        if hist_data:
+        h = _hist(df, 'MACD_Hist')
+        if h:
             macd_series.append({
                 "type": "Histogram",
-                "data": hist_data,
+                "data": h,
                 "options": {},
             })
 
     if 'MACD' in df.columns:
-        macd_data = _col_to_line(df, 'MACD')
-        if macd_data:
+        d = _line(df, 'MACD')
+        if d:
             macd_series.append({
                 "type": "Line",
-                "data": macd_data,
+                "data": d,
                 "options": {
                     "color": "#2962ff",
                     "lineWidth": 2,
+                    "crosshairMarkerVisible": False,
                 },
                 "label": "MACD",
             })
 
     if 'MACD_Signal' in df.columns:
-        sig_data = _col_to_line(df, 'MACD_Signal')
-        if sig_data:
+        d = _line(df, 'MACD_Signal')
+        if d:
             macd_series.append({
                 "type": "Line",
-                "data": sig_data,
+                "data": d,
                 "options": {
                     "color": "#ff6d00",
                     "lineWidth": 2,
+                    "crosshairMarkerVisible": False,
                 },
                 "label": "Signal",
             })
 
     if macd_series:
         panes.append({
-            "chart": DARK_THEME,
+            "chart": _theme(),
             "series": macd_series,
             "height": int(total_height * 0.20),
-            "title": "MACD",
+            "title": "MACD (12/26/9)",
         })
 
     return panes
@@ -321,7 +323,9 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
                     signal: EntrySignal = None,
                     show_volume: bool = True,
                     show_resistance: bool = True,
+                    show_divergence: bool = True,
                     height: int = 800,
+                    zoom_level: int = 200,
                     key: str = None):
     """Render TradingView chart in Streamlit."""
     from lightweight_charts_v5 import lightweight_charts_v5_component
@@ -330,6 +334,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
         df, ticker, signal=signal,
         show_volume=show_volume,
         show_resistance=show_resistance,
+        show_divergence=show_divergence,
         total_height=height,
     )
 
@@ -337,72 +342,116 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
         name=f"{ticker} — ${float(df['Close'].iloc[-1]):.2f}",
         charts=charts,
         height=height,
-        zoom_level=200,
-        key=key or f"tv_chart_{ticker}",
+        zoom_level=zoom_level,
+        key=key or f"tv_{ticker}",
     )
 
 
 # =============================================================================
-# MTF CHART (Plotly for side-by-side)
+# MTF CHART — Also TradingView LWC v5
 # =============================================================================
 
-def create_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=400):
-    """Multi-timeframe chart using Plotly."""
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
+def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350,
+                     key: str = None):
+    """
+    Multi-timeframe view: 3 separate LWC charts side by side
+    using st.columns, each with candlestick + MACD + AO.
+    """
+    import streamlit as st
+    from lightweight_charts_v5 import lightweight_charts_v5_component
 
-    fig = make_subplots(rows=1, cols=3, shared_yaxes=False,
-                        horizontal_spacing=0.05,
-                        subplot_titles=('Daily', 'Weekly', 'Monthly'))
+    panels = [
+        ('Daily', daily_df, 60),
+        ('Weekly', weekly_df, 52),
+        ('Monthly', monthly_df, 24),
+    ]
 
-    panels = [('Daily', daily_df, 60), ('Weekly', weekly_df, 52), ('Monthly', monthly_df, 24)]
+    cols = st.columns(3)
 
-    for idx, (label, raw_df, n) in enumerate(panels, start=1):
+    for col_idx, (label, raw_df, n_bars) in enumerate(panels):
         if raw_df is None or raw_df.empty:
             continue
+
         d = normalize_columns(raw_df).copy()
-        d = calculate_macd(d)
-        r = d.tail(n)
-        if r.empty:
+        d = add_all_indicators(d)
+        recent = d.tail(n_bars)
+        if recent.empty:
             continue
 
-        fig.add_trace(go.Candlestick(
-            x=r.index, open=r['Open'], high=r['High'],
-            low=r['Low'], close=r['Close'],
-            increasing=dict(line=dict(color='#26a69a'), fillcolor='rgba(38,166,154,0.8)'),
-            decreasing=dict(line=dict(color='#ef5350'), fillcolor='rgba(239,83,80,0.8)'),
-            name=label, showlegend=False,
-        ), row=1, col=idx)
+        # Build panes for this timeframe
+        panes = []
 
-        if 'MACD' in r.columns and 'MACD_Signal' in r.columns:
-            m, s = float(r['MACD'].iloc[-1]), float(r['MACD_Signal'].iloc[-1])
-            if not (pd.isna(m) or pd.isna(s)):
-                bullish = m > s
-                fig.add_annotation(
-                    text="MACD ✅" if bullish else "MACD ❌",
-                    x=r.index[len(r)//2], y=float(r['Low'].min()) * 0.97,
-                    xref=f'x{idx}', yref=f'y{idx}',
-                    showarrow=False,
-                    font=dict(size=12, color='#26a69a' if bullish else '#ef5350'),
-                )
+        # Price pane
+        panes.append({
+            "chart": _theme(),
+            "series": [{
+                "type": "Candlestick",
+                "data": _candles(recent),
+                "options": {
+                    "upColor": COLOR_BULL,
+                    "downColor": COLOR_BEAR,
+                    "borderVisible": False,
+                    "wickUpColor": COLOR_BULL,
+                    "wickDownColor": COLOR_BEAR,
+                    "lastValueVisible": True,
+                    "priceLineVisible": True,
+                },
+            }],
+            "height": int(height * 0.50),
+            "title": f"{ticker} {label}",
+        })
 
-    fig.update_layout(
-        height=height, template='plotly_dark',
-        paper_bgcolor='#131722', plot_bgcolor='#131722',
-        showlegend=False, margin=dict(l=40, r=40, t=40, b=20),
-    )
-    for i in range(1, 4):
-        fig.update_xaxes(rangeslider_visible=False, showgrid=False,
-                         tickformat='%b\'%y', tickfont=dict(size=9, color='#787b86'),
-                         row=1, col=i)
-        fig.update_yaxes(showgrid=True, gridcolor='rgba(42,46,57,0.6)',
-                         side='right', tickfont=dict(size=9, color='#787b86'),
-                         row=1, col=i)
-    return fig
+        # AO pane
+        if 'AO' in recent.columns:
+            ao_data = _hist(recent, 'AO')
+            if ao_data:
+                panes.append({
+                    "chart": _theme(),
+                    "series": [{"type": "Histogram", "data": ao_data, "options": {}}],
+                    "height": int(height * 0.25),
+                    "title": "AO",
+                })
+
+        # MACD pane
+        macd_s = []
+        if 'MACD_Hist' in recent.columns:
+            h = _hist(recent, 'MACD_Hist')
+            if h:
+                macd_s.append({"type": "Histogram", "data": h, "options": {}})
+        if 'MACD' in recent.columns:
+            md = _line(recent, 'MACD')
+            if md:
+                macd_s.append({"type": "Line", "data": md,
+                               "options": {"color": "#2962ff", "lineWidth": 1,
+                                           "crosshairMarkerVisible": False},
+                               "label": "MACD"})
+        if 'MACD_Signal' in recent.columns:
+            sd = _line(recent, 'MACD_Signal')
+            if sd:
+                macd_s.append({"type": "Line", "data": sd,
+                               "options": {"color": "#ff6d00", "lineWidth": 1,
+                                           "crosshairMarkerVisible": False},
+                               "label": "Signal"})
+        if macd_s:
+            panes.append({
+                "chart": _theme(),
+                "series": macd_s,
+                "height": int(height * 0.25),
+                "title": "MACD",
+            })
+
+        with cols[col_idx]:
+            lightweight_charts_v5_component(
+                name=f"{ticker} {label}",
+                charts=panes,
+                height=height,
+                zoom_level=n_bars,
+                key=key or f"mtf_{ticker}_{label}",
+            )
 
 
 # =============================================================================
-# EXPORT
+# EXPORT (for AI analysis)
 # =============================================================================
 
 def chart_to_base64(fig, width=1200, height=700):
