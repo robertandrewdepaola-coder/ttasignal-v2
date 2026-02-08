@@ -71,7 +71,7 @@ def create_analysis_chart(df: pd.DataFrame,
                           show_divergence: bool = True,
                           trade_markers: List[Dict] = None,
                           visible_bars: int = 130,
-                          height: int = 900) -> go.Figure:
+                          height: int = 1000) -> go.Figure:
     """
     Create the main analysis chart.
 
@@ -105,7 +105,7 @@ def create_analysis_chart(df: pd.DataFrame,
 
     # ── Build subplots ────────────────────────────────────────────────
     if show_volume and 'Volume' in df.columns:
-        row_heights = [0.45, 0.12, 0.20, 0.23]
+        row_heights = [0.52, 0.10, 0.18, 0.20]
         fig = make_subplots(
             rows=4, cols=1,
             shared_xaxes=True,
@@ -118,7 +118,7 @@ def create_analysis_chart(df: pd.DataFrame,
         macd_row = 4
         total_rows = 4
     else:
-        row_heights = [0.55, 0.22, 0.23]
+        row_heights = [0.60, 0.20, 0.20]
         fig = make_subplots(
             rows=3, cols=1,
             shared_xaxes=True,
