@@ -339,12 +339,12 @@ def create_analysis_chart(df: pd.DataFrame,
     # ── Layout ────────────────────────────────────────────────────────
     current_price = float(df['Close'].iloc[-1])
 
-    # Default to 3 months view (like TradingView default zoom)
-    if len(df) > 65:
-        default_start = df.index[-65]
-    else:
-        default_start = df.index[0]
-    default_end = df.index[-1]
+    # Compute tight y-axis range from visible data (with 5% padding)
+    price_low = float(df['Low'].min())
+    price_high = float(df['High'].max())
+    price_pad = (price_high - price_low) * 0.05
+    y_min = price_low - price_pad
+    y_max = price_high + price_pad
 
     fig.update_layout(
         title=dict(
@@ -366,25 +366,23 @@ def create_analysis_chart(df: pd.DataFrame,
         dragmode='zoom',
     )
 
-    # Grid styling + scroll zoom on all x-axes
+    # Price panel y-axis: tight range to visible data
+    fig.update_yaxes(
+        range=[y_min, y_max],
+        gridcolor=COLORS['grid'], zeroline=False,
+        row=1, col=1,
+    )
+
+    # Grid styling for all rows
     for i in range(1, total_rows + 1):
         fig.update_xaxes(
             gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
             showticklabels=(i == total_rows),
-            range=[default_start, default_end],
         )
-        fig.update_yaxes(
-            gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
-            fixedrange=False,  # Allow y-axis zoom too
-        )
-
-    # Enable scroll-to-zoom (TradingView-style mouse wheel zoom)
-    fig.update_layout(
-        xaxis=dict(fixedrange=False),
-    )
-
-    # Store the dataframe length for JS config
-    fig._tta_config = {'scroll_zoom': True}
+        if i > 1:  # Non-price rows: let them autorange
+            fig.update_yaxes(
+                gridcolor=COLORS['grid'], zeroline=False, row=i, col=1,
+            )
 
     return fig
 
