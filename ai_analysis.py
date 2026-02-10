@@ -264,6 +264,120 @@ def _format_fundamentals(fundamentals: Dict) -> str:
     return "\n".join(lines) if lines else "No fundamental data available."
 
 
+def _format_fundamental_profile(profile: Dict) -> str:
+    """Format banker-grade fundamental profile for AI prompt."""
+    if not profile or profile.get('error'):
+        return "No fundamental profile available."
+
+    lines = []
+
+    # Business identity
+    name = profile.get('name', '?')
+    sector = profile.get('sector', '?')
+    industry = profile.get('industry', '?')
+    mcap = profile.get('market_cap')
+    mcap_str = f"${mcap/1e9:.1f}B" if mcap and mcap >= 1e9 else (
+        f"${mcap/1e6:.0f}M" if mcap else "?"
+    )
+    lines.append(f"COMPANY: {name} | {sector} / {industry} | Mkt Cap: {mcap_str}")
+
+    if profile.get('business_summary'):
+        lines.append(f"BUSINESS: {profile['business_summary'][:300]}")
+
+    # Revenue & Growth
+    lines.append("\nGROWTH:")
+    rev = profile.get('total_revenue')
+    if rev:
+        rev_str = f"${rev/1e9:.2f}B" if rev >= 1e9 else f"${rev/1e6:.0f}M"
+        lines.append(f"  Revenue: {rev_str}")
+    if profile.get('revenue_growth_yoy') is not None:
+        lines.append(f"  Revenue Growth (YoY): {profile['revenue_growth_yoy']*100:.1f}%")
+    if profile.get('revenue_growth_quarterly') is not None:
+        lines.append(f"  Revenue Growth (QoQ): {profile['revenue_growth_quarterly']*100:.1f}%")
+    if profile.get('earnings_growth_yoy') is not None:
+        lines.append(f"  Earnings Growth (YoY): {profile['earnings_growth_yoy']*100:.1f}%")
+
+    # Profitability
+    lines.append("\nPROFITABILITY:")
+    for key, label in [
+        ('gross_margin', 'Gross Margin'),
+        ('operating_margin', 'Operating Margin'),
+        ('profit_margin', 'Net Margin'),
+        ('ebitda_margin', 'EBITDA Margin'),
+        ('return_on_equity', 'ROE'),
+        ('return_on_assets', 'ROA'),
+    ]:
+        val = profile.get(key)
+        if val is not None:
+            lines.append(f"  {label}: {val*100:.1f}%")
+
+    ebitda = profile.get('ebitda')
+    if ebitda:
+        ebitda_str = f"${ebitda/1e9:.2f}B" if abs(ebitda) >= 1e9 else f"${ebitda/1e6:.0f}M"
+        lines.append(f"  EBITDA: {ebitda_str}")
+
+    # Cash Flow
+    fcf = profile.get('free_cash_flow')
+    ocf = profile.get('operating_cash_flow')
+    if fcf or ocf:
+        lines.append("\nCASH FLOW:")
+        if ocf:
+            lines.append(f"  Operating CF: ${ocf/1e6:.0f}M")
+        if fcf:
+            lines.append(f"  Free CF: ${fcf/1e6:.0f}M")
+            if rev and rev > 0:
+                lines.append(f"  FCF Yield: {fcf/rev*100:.1f}% of revenue")
+
+    # Balance Sheet
+    lines.append("\nBALANCE SHEET:")
+    debt = profile.get('total_debt')
+    cash = profile.get('total_cash')
+    if debt:
+        lines.append(f"  Total Debt: ${debt/1e6:.0f}M")
+    if cash:
+        lines.append(f"  Cash: ${cash/1e6:.0f}M")
+    if debt and cash:
+        lines.append(f"  Net Debt: ${(debt-cash)/1e6:.0f}M")
+    if profile.get('debt_to_equity') is not None:
+        lines.append(f"  Debt/Equity: {profile['debt_to_equity']:.1f}")
+    if profile.get('current_ratio') is not None:
+        lines.append(f"  Current Ratio: {profile['current_ratio']:.2f}")
+
+    # Valuation
+    lines.append("\nVALUATION MULTIPLES:")
+    for key, label in [
+        ('trailing_pe', 'Trailing P/E'),
+        ('forward_pe', 'Forward P/E'),
+        ('peg_ratio', 'PEG Ratio'),
+        ('price_to_book', 'P/Book'),
+        ('price_to_sales', 'P/Sales'),
+        ('ev_to_ebitda', 'EV/EBITDA'),
+        ('ev_to_revenue', 'EV/Revenue'),
+    ]:
+        val = profile.get(key)
+        if val is not None:
+            lines.append(f"  {label}: {val:.2f}")
+
+    # Ownership & Short Interest
+    lines.append("\nOWNERSHIP:")
+    if profile.get('insider_pct') is not None:
+        lines.append(f"  Insider: {profile['insider_pct']*100:.1f}%")
+    if profile.get('institution_pct') is not None:
+        lines.append(f"  Institutional: {profile['institution_pct']*100:.1f}%")
+    if profile.get('short_pct_float') is not None:
+        lines.append(f"  Short % Float: {profile['short_pct_float']*100:.1f}%")
+    if profile.get('short_ratio') is not None:
+        lines.append(f"  Short Ratio (days to cover): {profile['short_ratio']:.1f}")
+
+    # Earnings
+    if profile.get('next_earnings'):
+        lines.append(f"\nNEXT EARNINGS: {profile['next_earnings']}")
+    if profile.get('last_earnings_surprise_pct') is not None:
+        lines.append(f"  Last Surprise: {profile['last_earnings_surprise_pct']:+.1f}%")
+
+    return "\n".join(lines)
+
+
 def _format_quality(quality: Dict) -> str:
     """Format quality score from mini-backtest."""
     if not quality or quality.get('error'):
@@ -289,19 +403,18 @@ def build_ai_prompt(ticker: str,
                     signal: EntrySignal,
                     recommendation: Dict,
                     quality: Dict,
-                    fundamentals: Dict = None) -> str:
+                    fundamentals: Dict = None,
+                    fundamental_profile: Dict = None) -> str:
     """
-    Build the enhanced AI analysis prompt.
-
-    This is the core of v2 AI — instead of echoing scanner data,
-    we provide pre-computed analysis modules and ask the AI to SYNTHESIZE.
+    Build enhanced AI analysis prompt with fundamental profile
+    and actionable breakout/resistance guidance.
     """
-    prompt = f"""You are a senior technical analyst reviewing {ticker} for a swing trade entry.
-Your job is to add INSIGHT the mechanical scanner cannot — synthesize the data below
-and tell the trader something they don't already know.
+    prompt = f"""You are a senior equity analyst at a top investment bank reviewing {ticker} for a swing/position trade.
+Your job is to synthesize technical signals with fundamental reality to give an actionable decision.
+The trader sees the technical scanner output — you must add the WHY behind the price action.
 
 ══════════════════════════════════════════════════
-SCANNER SIGNAL (mechanical — this is what the trader already sees)
+TECHNICAL SIGNAL (what the scanner says)
 ══════════════════════════════════════════════════
 {_format_signal_status(signal, recommendation)}
 
@@ -311,62 +424,70 @@ MULTI-TIMEFRAME ALIGNMENT
 {_format_timeframes(signal)}
 
 ══════════════════════════════════════════════════
-CHART STRUCTURE (Weinstein Stage Analysis)
+CHART STRUCTURE (Weinstein Stage)
 ══════════════════════════════════════════════════
 {_format_chart_structure(signal)}
 
 ══════════════════════════════════════════════════
-OVERHEAD RESISTANCE — What must break for a sustained trend
+OVERHEAD RESISTANCE
 ══════════════════════════════════════════════════
 {_format_overhead_resistance(signal)}
 
 ══════════════════════════════════════════════════
-VOLUME ANALYSIS
+VOLUME & RELATIVE STRENGTH
 ══════════════════════════════════════════════════
 {_format_volume(signal)}
-
-══════════════════════════════════════════════════
-KEY LEVELS
-══════════════════════════════════════════════════
-{_format_key_levels(signal)}
-
-══════════════════════════════════════════════════
-RELATIVE STRENGTH vs SPY
-══════════════════════════════════════════════════
 {_format_relative_strength(signal)}
 
 ══════════════════════════════════════════════════
-TRADE SETUP
+KEY LEVELS & TRADE SETUP
 ══════════════════════════════════════════════════
+{_format_key_levels(signal)}
 {_format_stops(signal)}
 
 ══════════════════════════════════════════════════
-QUALITY SCORE (Historical Backtest on this ticker)
+QUALITY SCORE (Historical Backtest)
 ══════════════════════════════════════════════════
 {_format_quality(quality)}
 
 ══════════════════════════════════════════════════
-FUNDAMENTAL & SENTIMENT DATA
+FUNDAMENTAL PROFILE
+══════════════════════════════════════════════════
+{_format_fundamental_profile(fundamental_profile) if fundamental_profile else 'No fundamental data.'}
+
+══════════════════════════════════════════════════
+MARKET SENTIMENT DATA
 ══════════════════════════════════════════════════
 {_format_fundamentals(fundamentals)}
 
 ══════════════════════════════════════════════════
-YOUR ANALYSIS — Be concise, be honest, add edge
+YOUR ANALYSIS — Respond with EXACTLY this format:
 ══════════════════════════════════════════════════
 
-Respond with EXACTLY this format:
+CONVICTION: [1-10]
 
-CONVICTION: [1-10] — How confident is this setup overall?
+ACTION: [BUY NOW / WAIT FOR BREAKOUT / WAIT FOR PULLBACK / SKIP]
 
-WHAT THE SCANNER MISSES: [1-2 sentences — the key insight the mechanical signal doesn't capture. Consider the overhead resistance levels, volume patterns, relative strength trend, Weinstein stage maturity, and any fundamental red flags.]
+RESISTANCE VERDICT: [Is overhead resistance a problem? Should trader wait for breakout? Specify the exact price level that must break, what volume confirms it (e.g. "2x avg"), and what a failed breakout looks like. If no significant resistance, say "Clear path — enter on signal." 2-3 sentences max.]
 
-TIMING: [Enter now / Wait for pullback to $X / Wait for breakout above $X / Skip]
+WHY IT'S MOVING: [What fundamental catalyst explains the current price action? Recent earnings beat/miss? Sector rotation? New product? M&A? Macro tailwind? If nothing obvious, say "Technical momentum — no fundamental catalyst visible." 1-2 sentences.]
 
-RED FLAGS: [1-3 specific concerns, or "None" if clean setup]
+FUNDAMENTAL QUALITY: [Rate the business A/B/C/D using this framework:
+A = Strong moat, growing revenue, profitable, clean balance sheet
+B = Decent business, some growth, acceptable margins
+C = Weak fundamentals, declining margins, or high debt
+D = Speculative, no profits, or deteriorating rapidly
+Include 1 sentence explaining the rating with specific numbers.]
 
-POSITION SIZING: [Full size / Reduced (75%) / Small (50%) / Skip] — with reason
+BULL CASE: [Best realistic outcome in 3-6 months, with a price target and the catalyst that gets it there. 1-2 sentences.]
 
-Keep total response under 8 sentences. No fluff. Trader wants actionable edge."""
+BEAR CASE: [What kills this trade? Specific risk with price level. 1-2 sentences.]
+
+RED FLAGS: [1-3 specific concerns, or "None" if clean]
+
+POSITION SIZING: [Full (100%) / Reduced (75%) / Small (50%) / Skip — with 1 reason]
+
+Keep total response under 250 words. No fluff. Be specific with prices and percentages."""
 
     return prompt
 
@@ -439,40 +560,81 @@ def _parse_ai_response(text: str) -> Dict[str, Any]:
     """Parse structured fields from AI response text."""
     parsed = {
         'conviction': 0,
-        'scanner_misses': '',
-        'timing': '',
+        'action': '',
+        'resistance_verdict': '',
+        'why_moving': '',
+        'fundamental_quality': '',
+        'bull_case': '',
+        'bear_case': '',
         'red_flags': '',
         'position_sizing': '',
+        # Legacy compat
+        'scanner_misses': '',
+        'timing': '',
     }
 
     lines = text.strip().split('\n')
+    current_field = None
+    current_value = []
+
+    field_map = {
+        'CONVICTION': 'conviction',
+        'ACTION': 'action',
+        'RESISTANCE VERDICT': 'resistance_verdict',
+        'WHY IT\'S MOVING': 'why_moving',
+        'WHY ITS MOVING': 'why_moving',
+        'FUNDAMENTAL QUALITY': 'fundamental_quality',
+        'BULL CASE': 'bull_case',
+        'BEAR CASE': 'bear_case',
+        'RED FLAGS': 'red_flags',
+        'POSITION SIZING': 'position_sizing',
+        # Legacy
+        'WHAT THE SCANNER MISSES': 'scanner_misses',
+        'TIMING': 'timing',
+    }
+
+    def _flush():
+        nonlocal current_field, current_value
+        if current_field and current_value:
+            val = ' '.join(current_value).strip()
+            if current_field == 'conviction':
+                for char in val[:10]:
+                    if char.isdigit():
+                        parsed['conviction'] = int(char)
+                        break
+                if '10' in val[:5]:
+                    parsed['conviction'] = 10
+            else:
+                parsed[current_field] = val
+        current_field = None
+        current_value = []
 
     for line in lines:
-        line_upper = line.strip().upper()
         line_clean = line.strip()
+        if not line_clean:
+            continue
 
-        if line_upper.startswith('CONVICTION:'):
-            value = line_clean.split(':', 1)[1].strip()
-            # Extract number
-            for char in value:
-                if char.isdigit():
-                    parsed['conviction'] = int(char)
-                    break
-            # Check for "10"
-            if '10' in value[:5]:
-                parsed['conviction'] = 10
+        # Check if this line starts a new field
+        matched = False
+        for prefix, field_key in field_map.items():
+            if line_clean.upper().startswith(prefix + ':'):
+                _flush()
+                current_field = field_key
+                remainder = line_clean.split(':', 1)[1].strip() if ':' in line_clean else ''
+                current_value = [remainder] if remainder else []
+                matched = True
+                break
 
-        elif line_upper.startswith('WHAT THE SCANNER MISSES:'):
-            parsed['scanner_misses'] = line_clean.split(':', 1)[1].strip()
+        if not matched and current_field:
+            current_value.append(line_clean)
 
-        elif line_upper.startswith('TIMING:'):
-            parsed['timing'] = line_clean.split(':', 1)[1].strip()
+    _flush()
 
-        elif line_upper.startswith('RED FLAGS:'):
-            parsed['red_flags'] = line_clean.split(':', 1)[1].strip()
-
-        elif line_upper.startswith('POSITION SIZING:'):
-            parsed['position_sizing'] = line_clean.split(':', 1)[1].strip()
+    # Map action → timing for backward compat
+    if parsed['action'] and not parsed['timing']:
+        parsed['timing'] = parsed['action']
+    if parsed['resistance_verdict'] and not parsed['scanner_misses']:
+        parsed['scanner_misses'] = parsed['resistance_verdict']
 
     return parsed
 
@@ -484,7 +646,8 @@ def _parse_ai_response(text: str) -> Dict[str, Any]:
 def generate_system_analysis(ticker: str,
                              signal: EntrySignal,
                              recommendation: Dict,
-                             quality: Dict) -> Dict[str, Any]:
+                             quality: Dict,
+                             fundamental_profile: Dict = None) -> Dict[str, Any]:
     """
     Generate analysis without AI, using pure logic on computed data.
     Used when Gemini/OpenAI are unavailable.
@@ -492,89 +655,203 @@ def generate_system_analysis(ticker: str,
     result = {
         'raw_text': '',
         'conviction': recommendation.get('conviction', 0),
-        'scanner_misses': '',
-        'timing': '',
+        'action': '',
+        'resistance_verdict': '',
+        'why_moving': '',
+        'fundamental_quality': '',
+        'bull_case': '',
+        'bear_case': '',
         'red_flags': '',
         'position_sizing': '',
+        'scanner_misses': '',
+        'timing': '',
         'provider': 'system',
         'success': True,
         'error': None,
     }
 
-    # Scanner misses — derive from computed data
-    insights = []
-
-    # Weinstein stage insight
-    ws = signal.weinstein
-    if ws.get('stage') == 2 and ws.get('trend_maturity') == 'late':
-        insights.append("Late Stage 2 — trend may be extended, watch for Stage 3 transition")
-    elif ws.get('stage') == 2 and ws.get('trend_maturity') == 'early':
-        insights.append("Early Stage 2 — strongest part of the advance")
-    elif ws.get('stage') == 3:
-        insights.append("Stage 3 topping pattern — avoid new entries")
-    elif ws.get('stage') == 4:
-        insights.append("Stage 4 decline — avoid longs")
-    elif ws.get('stage') == 1:
-        insights.append("Stage 1 base building — not yet ready for trend trades")
-
-    # Overhead resistance insight
+    # ── Action / Timing ───────────────────────────────────────────
     ores = signal.overhead_resistance
-    if ores and ores.get('critical_level'):
-        dist = ores.get('distance_to_critical_pct', 0)
-        if dist and dist < 3:
-            insights.append(f"Critical resistance at ${ores['critical_level']['price']:.2f} "
-                          f"just {dist:.1f}% above — breakout needed")
-        elif dist and dist < 8:
-            insights.append(f"Room to ${ores['critical_level']['price']:.2f} "
-                          f"({dist:.1f}% above) before major resistance")
+    critical_near = False
+    if ores and ores.get('distance_to_critical_pct') and ores['distance_to_critical_pct'] < 3:
+        critical_near = True
 
-    # RS insight
-    rs = signal.relative_strength
-    if rs and rs.get('rs_trend') == 'deteriorating':
-        insights.append("Relative strength vs SPY deteriorating — weakening leadership")
-    elif rs and rs.get('rs_trend') == 'improving':
-        insights.append("Relative strength improving — gaining market leadership")
-
-    # Volume insight
-    vol = signal.volume
-    if vol and vol.get('accum_dist_trend') == 'distributing':
-        insights.append("Distribution detected — smart money may be selling into strength")
-    elif vol and vol.get('accum_dist_trend') == 'accumulating':
-        insights.append("Accumulation pattern — volume confirms buying interest")
-
-    result['scanner_misses'] = '. '.join(insights[:2]) if insights else 'No notable divergence from scanner signal.'
-
-    # Timing
-    if signal.is_valid and recommendation.get('conviction', 0) >= 7:
+    if signal.is_valid and recommendation.get('conviction', 0) >= 7 and not critical_near:
+        result['action'] = 'BUY NOW'
         result['timing'] = 'Enter now — signal fresh and aligned'
+    elif signal.is_valid and critical_near:
+        crit_price = ores['critical_level']['price']
+        result['action'] = f'WAIT FOR BREAKOUT above ${crit_price:.2f}'
+        result['timing'] = f'Wait for breakout above ${crit_price:.2f} on 2x volume'
     elif signal.is_valid:
+        result['action'] = 'BUY NOW'
         result['timing'] = 'Enter with caution — some concerns noted'
     elif signal.macd.get('bullish') and signal.ao.get('positive'):
+        result['action'] = 'WAIT FOR PULLBACK'
         result['timing'] = 'Wait for fresh MACD cross confirmation'
     else:
+        result['action'] = 'SKIP'
         result['timing'] = 'Skip — conditions not met'
 
-    # Red flags
+    # ── Resistance Verdict ────────────────────────────────────────
+    if ores and ores.get('critical_level'):
+        dist = ores.get('distance_to_critical_pct', 0)
+        crit = ores['critical_level']
+        vol_needed = ores.get('breakout_volume_needed', '1.5-2')
+        if dist and dist < 3:
+            result['resistance_verdict'] = (
+                f"Critical resistance at ${crit['price']:.2f} ({dist:.1f}% above). "
+                f"Wait for a daily close above ${crit['price']:.2f} on {vol_needed}x average volume. "
+                f"Failed breakout = close back below on next day → exit immediately."
+            )
+        elif dist and dist < 8:
+            result['resistance_verdict'] = (
+                f"Resistance at ${crit['price']:.2f} ({dist:.1f}% above) — room to run but "
+                f"watch for stall. Clear path if volume confirms above that level."
+            )
+        else:
+            result['resistance_verdict'] = "No immediate overhead resistance — clear path for entry."
+    else:
+        result['resistance_verdict'] = "No significant overhead resistance detected — clear path."
+
+    # ── Why It's Moving ───────────────────────────────────────────
+    insights = []
+    rs = signal.relative_strength
+    if rs and rs.get('rs_trend') == 'improving':
+        insights.append("Relative strength improving — gaining market leadership")
+    elif rs and rs.get('rs_trend') == 'deteriorating':
+        insights.append("Relative strength weakening vs SPY")
+
+    vol = signal.volume
+    if vol and vol.get('accum_dist_trend') == 'accumulating':
+        insights.append("Accumulation volume — institutional buying")
+    elif vol and vol.get('accum_dist_trend') == 'distributing':
+        insights.append("Distribution pattern — smart money selling")
+
+    ws = signal.weinstein
+    if ws.get('stage') == 2 and ws.get('trend_maturity') == 'early':
+        insights.append("Early Stage 2 advance — strongest trend phase")
+    elif ws.get('stage') == 2 and ws.get('trend_maturity') == 'late':
+        insights.append("Late Stage 2 — trend extended")
+
+    result['why_moving'] = '. '.join(insights[:2]) if insights else (
+        "Technical momentum — no fundamental catalyst visible from available data."
+    )
+    result['scanner_misses'] = result['why_moving']
+
+    # ── Fundamental Quality ───────────────────────────────────────
+    if fundamental_profile and not fundamental_profile.get('error'):
+        fp = fundamental_profile
+        grade_score = 0
+        reasons = []
+
+        # Revenue growth
+        rg = fp.get('revenue_growth_yoy')
+        if rg is not None:
+            if rg > 0.20:
+                grade_score += 3
+                reasons.append(f"Strong revenue growth {rg*100:.0f}%")
+            elif rg > 0.05:
+                grade_score += 2
+            elif rg > 0:
+                grade_score += 1
+            else:
+                reasons.append(f"Revenue declining {rg*100:.0f}%")
+
+        # Profitability
+        pm = fp.get('profit_margin')
+        if pm is not None:
+            if pm > 0.15:
+                grade_score += 2
+            elif pm > 0.05:
+                grade_score += 1
+            elif pm < 0:
+                reasons.append("Not profitable")
+
+        # FCF
+        fcf = fp.get('free_cash_flow')
+        if fcf is not None and fcf > 0:
+            grade_score += 1
+        elif fcf is not None and fcf < 0:
+            reasons.append("Negative FCF")
+
+        # Balance sheet
+        dte = fp.get('debt_to_equity')
+        if dte is not None:
+            if dte < 50:
+                grade_score += 1
+            elif dte > 200:
+                reasons.append(f"High leverage D/E={dte:.0f}")
+
+        # ROE
+        roe = fp.get('return_on_equity')
+        if roe is not None and roe > 0.15:
+            grade_score += 1
+
+        if grade_score >= 7:
+            grade = 'A'
+        elif grade_score >= 5:
+            grade = 'B'
+        elif grade_score >= 3:
+            grade = 'C'
+        else:
+            grade = 'D'
+
+        reason_str = reasons[0] if reasons else "Based on available metrics"
+        mcap = fp.get('market_cap')
+        mcap_str = f"${mcap/1e9:.1f}B" if mcap and mcap >= 1e9 else (
+            f"${mcap/1e6:.0f}M" if mcap else ""
+        )
+
+        result['fundamental_quality'] = f"{grade} — {reason_str}. {mcap_str} market cap."
+    else:
+        result['fundamental_quality'] = "N/A — Fundamental data unavailable"
+
+    # ── Bull/Bear Cases ───────────────────────────────────────────
+    current_price = signal.key_levels.get('price', 0) if signal.key_levels else 0
+    target = signal.stops.get('target', 0) if signal.stops else 0
+
+    if target and current_price:
+        upside = (target - current_price) / current_price * 100
+        result['bull_case'] = (
+            f"Technical target ${target:.2f} (+{upside:.0f}%). "
+            f"Higher timeframe alignment and momentum favor continuation."
+        )
+    else:
+        result['bull_case'] = "Momentum continuation on timeframe alignment."
+
+    stop = signal.stops.get('stop', 0) if signal.stops else 0
+    if stop and current_price:
+        downside = (current_price - stop) / current_price * 100
+        result['bear_case'] = (
+            f"Break below ${stop:.2f} ({downside:.1f}% risk) invalidates the setup. "
+        )
+        if not signal.weekly_macd.get('bullish', True):
+            result['bear_case'] += "Weekly MACD bearish adds headwind risk."
+    else:
+        result['bear_case'] = "Higher timeframe reversal or macro deterioration."
+
+    # ── Red Flags ─────────────────────────────────────────────────
     flags = []
     if ws.get('stage') in [3, 4]:
-        flags.append(f"Weinstein {ws.get('label', 'Stage ?')} — unfavorable trend structure")
+        flags.append(f"Weinstein {ws.get('label', 'Stage ?')} — unfavorable structure")
     if not signal.weekly_macd.get('bullish', False):
-        flags.append("Weekly MACD bearish — higher timeframe headwind")
+        flags.append("Weekly MACD bearish")
     if not signal.monthly_macd.get('bullish', True):
-        flags.append("Monthly MACD bearish — macro headwind")
-    if ores and ores.get('distance_to_critical_pct') and ores['distance_to_critical_pct'] < 3:
-        flags.append(f"Immediate resistance at ${ores['critical_level']['price']:.2f}")
+        flags.append("Monthly MACD bearish")
+    if critical_near:
+        flags.append(f"Resistance at ${ores['critical_level']['price']:.2f}")
     if vol and vol.get('accum_dist_trend') == 'distributing':
-        flags.append("Distribution volume pattern")
+        flags.append("Distribution volume")
     if rs and rs.get('rs_1mo') is not None and rs['rs_1mo'] < -5:
-        flags.append(f"Weak vs SPY ({rs['rs_1mo']:+.1f}% relative performance)")
+        flags.append(f"Weak vs SPY ({rs['rs_1mo']:+.1f}%)")
 
     result['red_flags'] = '; '.join(flags[:3]) if flags else 'None'
 
-    # Position sizing
+    # ── Position Sizing ───────────────────────────────────────────
     conv = recommendation.get('conviction', 0)
     if conv >= 8:
-        result['position_sizing'] = 'Full size — high conviction setup'
+        result['position_sizing'] = 'Full (100%) — high conviction setup'
     elif conv >= 6:
         result['position_sizing'] = 'Reduced (75%) — moderate conviction'
     elif conv >= 4:
@@ -585,8 +862,12 @@ def generate_system_analysis(ticker: str,
     # Build narrative text
     parts = [
         f"CONVICTION: {result['conviction']}/10",
-        f"WHAT THE SCANNER MISSES: {result['scanner_misses']}",
-        f"TIMING: {result['timing']}",
+        f"ACTION: {result['action']}",
+        f"RESISTANCE VERDICT: {result['resistance_verdict']}",
+        f"WHY IT'S MOVING: {result['why_moving']}",
+        f"FUNDAMENTAL QUALITY: {result['fundamental_quality']}",
+        f"BULL CASE: {result['bull_case']}",
+        f"BEAR CASE: {result['bear_case']}",
         f"RED FLAGS: {result['red_flags']}",
         f"POSITION SIZING: {result['position_sizing']}",
     ]
@@ -604,29 +885,25 @@ def analyze(ticker: str,
             recommendation: Dict,
             quality: Dict,
             fundamentals: Dict = None,
+            fundamental_profile: Dict = None,
             gemini_model=None,
             openai_client=None) -> Dict[str, Any]:
     """
     Run enhanced AI analysis on a ticker.
-
-    This is the main entry point. Call with pre-computed data from
-    signal_engine.validate_entry() and scanner_engine.analyze_ticker().
 
     Args:
         ticker: Stock symbol
         signal: EntrySignal from signal_engine.validate_entry()
         recommendation: Dict from scanner_engine.generate_recommendation()
         quality: Dict from scanner_engine.calculate_quality_score()
-        fundamentals: Dict from data_fetcher.fetch_all_ticker_data(include_fundamentals=True)
+        fundamentals: Dict from data_fetcher (options, insider, etc.)
+        fundamental_profile: Dict from data_fetcher.fetch_fundamental_profile()
         gemini_model: Google Gemini model instance
         openai_client: OpenAI client instance
-
-    Returns:
-        Dict with conviction, scanner_misses, timing, red_flags, position_sizing,
-        raw_text, provider, success
     """
     # Build prompt
-    prompt = build_ai_prompt(ticker, signal, recommendation, quality, fundamentals)
+    prompt = build_ai_prompt(ticker, signal, recommendation, quality,
+                             fundamentals, fundamental_profile)
 
     # Try AI first
     if gemini_model is not None or openai_client is not None:
@@ -634,14 +911,18 @@ def analyze(ticker: str,
 
         # If AI failed, use system fallback
         if not result['success']:
-            result = generate_system_analysis(ticker, signal, recommendation, quality)
+            result = generate_system_analysis(ticker, signal, recommendation,
+                                              quality, fundamental_profile)
             result['note'] = 'AI unavailable — using system analysis'
     else:
         # No AI configured — use system analysis
-        result = generate_system_analysis(ticker, signal, recommendation, quality)
+        result = generate_system_analysis(ticker, signal, recommendation,
+                                          quality, fundamental_profile)
         result['note'] = 'No AI configured — using system analysis'
 
     result['ticker'] = ticker
     result['timestamp'] = datetime.now().isoformat()
+    # Attach fundamental profile for UI display
+    result['fundamental_profile'] = fundamental_profile
 
     return result
