@@ -354,6 +354,144 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
     return result
 
 
+def fetch_fundamental_profile(ticker: str) -> Dict[str, Any]:
+    """
+    Fetch banker-grade fundamental profile from yfinance.
+
+    Returns revenue growth, margins, cash flow, debt, valuation multiples,
+    business description, and peer context for AI synthesis.
+    """
+    cache_key = f"{ticker}:fundamentals"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    profile = {
+        'error': None,
+        # Identity
+        'name': None, 'sector': None, 'industry': None,
+        'business_summary': None, 'market_cap': None,
+        'employees': None, 'country': None,
+        # Valuation
+        'trailing_pe': None, 'forward_pe': None,
+        'peg_ratio': None, 'price_to_book': None,
+        'price_to_sales': None, 'ev_to_ebitda': None,
+        'ev_to_revenue': None,
+        # Growth
+        'revenue_growth_yoy': None, 'earnings_growth_yoy': None,
+        'revenue_growth_quarterly': None, 'earnings_growth_quarterly': None,
+        # Profitability
+        'gross_margin': None, 'operating_margin': None,
+        'profit_margin': None, 'ebitda_margin': None,
+        'return_on_equity': None, 'return_on_assets': None,
+        # Financial Health
+        'total_revenue': None, 'ebitda': None, 'net_income': None,
+        'total_debt': None, 'total_cash': None,
+        'debt_to_equity': None, 'current_ratio': None,
+        'free_cash_flow': None, 'operating_cash_flow': None,
+        # Shareholder
+        'dividend_yield': None, 'payout_ratio': None,
+        'shares_outstanding': None, 'float_shares': None,
+        'insider_pct': None, 'institution_pct': None,
+        'short_pct_float': None, 'short_ratio': None,
+        # Earnings
+        'next_earnings': None,
+        'last_earnings_surprise_pct': None,
+        # Per-share
+        'revenue_per_share': None, 'book_value': None,
+    }
+
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+
+        # Identity
+        profile['name'] = info.get('longName') or info.get('shortName')
+        profile['sector'] = info.get('sector')
+        profile['industry'] = info.get('industry')
+        profile['country'] = info.get('country')
+        profile['employees'] = info.get('fullTimeEmployees')
+        summary = info.get('longBusinessSummary', '')
+        profile['business_summary'] = summary[:500] if summary else None
+        profile['market_cap'] = info.get('marketCap')
+
+        # Valuation
+        profile['trailing_pe'] = info.get('trailingPE')
+        profile['forward_pe'] = info.get('forwardPE')
+        profile['peg_ratio'] = info.get('pegRatio')
+        profile['price_to_book'] = info.get('priceToBook')
+        profile['price_to_sales'] = info.get('priceToSalesTrailing12Months')
+        profile['ev_to_ebitda'] = info.get('enterpriseToEbitda')
+        profile['ev_to_revenue'] = info.get('enterpriseToRevenue')
+
+        # Growth
+        profile['revenue_growth_yoy'] = info.get('revenueGrowth')
+        profile['earnings_growth_yoy'] = info.get('earningsGrowth')
+        profile['revenue_growth_quarterly'] = info.get('revenueQuarterlyGrowth')
+        profile['earnings_growth_quarterly'] = info.get('earningsQuarterlyGrowth')
+
+        # Profitability
+        profile['gross_margin'] = info.get('grossMargins')
+        profile['operating_margin'] = info.get('operatingMargins')
+        profile['profit_margin'] = info.get('profitMargins')
+        profile['return_on_equity'] = info.get('returnOnEquity')
+        profile['return_on_assets'] = info.get('returnOnAssets')
+
+        # Financials
+        profile['total_revenue'] = info.get('totalRevenue')
+        profile['ebitda'] = info.get('ebitda')
+        if profile['total_revenue'] and profile['ebitda']:
+            profile['ebitda_margin'] = profile['ebitda'] / profile['total_revenue']
+        profile['net_income'] = info.get('netIncomeToCommon')
+        profile['total_debt'] = info.get('totalDebt')
+        profile['total_cash'] = info.get('totalCash')
+        profile['debt_to_equity'] = info.get('debtToEquity')
+        profile['current_ratio'] = info.get('currentRatio')
+        profile['free_cash_flow'] = info.get('freeCashflow')
+        profile['operating_cash_flow'] = info.get('operatingCashflow')
+
+        # Shareholder
+        profile['dividend_yield'] = info.get('dividendYield')
+        profile['payout_ratio'] = info.get('payoutRatio')
+        profile['shares_outstanding'] = info.get('sharesOutstanding')
+        profile['float_shares'] = info.get('floatShares')
+        profile['insider_pct'] = info.get('heldPercentInsiders')
+        profile['institution_pct'] = info.get('heldPercentInstitutions')
+        profile['short_pct_float'] = info.get('shortPercentOfFloat')
+        profile['short_ratio'] = info.get('shortRatio')
+
+        # Per-share
+        profile['revenue_per_share'] = info.get('revenuePerShare')
+        profile['book_value'] = info.get('bookValue')
+
+        # Earnings
+        try:
+            cal = stock.calendar
+            if cal is not None:
+                if isinstance(cal, dict):
+                    ed = cal.get('Earnings Date')
+                    if ed:
+                        profile['next_earnings'] = str(ed[0]) if isinstance(ed, list) else str(ed)
+        except Exception:
+            pass
+
+        # Last earnings surprise
+        try:
+            earnings_hist = stock.earnings_dates
+            if earnings_hist is not None and len(earnings_hist) > 0:
+                surprise = earnings_hist.iloc[0].get('Surprise(%)')
+                if surprise is not None:
+                    profile['last_earnings_surprise_pct'] = float(surprise)
+        except Exception:
+            pass
+
+    except Exception as e:
+        profile['error'] = str(e)[:200]
+
+    _cache.set(cache_key, profile)
+    return profile
+
+
 def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     """
     Fetch next earnings date and related calendar info.
