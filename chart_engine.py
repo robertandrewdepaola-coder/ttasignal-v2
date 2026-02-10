@@ -450,7 +450,7 @@ def build_lwc_charts(
     if show_divergence:
         all_markers.extend(_divergence_markers(df))
         all_markers.extend(_wave_markers(df))
-    all_markers.extend(_signal_markers(df))
+    # APEX markers (from apex_signals.py) replace the old TTA BUY/SELL
     if extra_markers:
         all_markers.extend(extra_markers)
     if all_markers:
