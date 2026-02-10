@@ -477,14 +477,13 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 
 def _render_ai_tab(ticker: str, signal: EntrySignal,
                    rec: Dict, analysis: TickerAnalysis):
-    """AI-enhanced analysis."""
+    """AI-enhanced analysis with fundamental profile and breakout guidance."""
     quality = analysis.quality or {}
 
     # Check for Gemini/OpenAI config
     gemini = None
     openai_client = None
 
-    # Try to load Gemini
     try:
         import google.generativeai as genai
         api_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -495,18 +494,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         pass
 
     if st.button("🤖 Run AI Analysis", type="primary"):
-        with st.spinner("Analyzing..."):
-            # Fetch fundamentals for AI context
-            data_cache = st.session_state.get('ticker_data_cache', {})
-            ticker_data = data_cache.get(ticker, {})
-
-            # Get fundamentals (if not already fetched)
+        with st.spinner("Fetching fundamentals & analyzing..."):
             fundamentals = {}
+            fundamental_profile = {}
             try:
                 from data_fetcher import (
                     fetch_ticker_info, fetch_options_data,
                     fetch_insider_transactions, fetch_institutional_holders,
-                    fetch_earnings_date,
+                    fetch_earnings_date, fetch_fundamental_profile,
                 )
                 fundamentals = {
                     'info': fetch_ticker_info(ticker),
@@ -515,6 +510,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                     'institutional': fetch_institutional_holders(ticker),
                     'earnings': fetch_earnings_date(ticker),
                 }
+                fundamental_profile = fetch_fundamental_profile(ticker)
             except Exception as e:
                 st.caption(f"Fundamentals fetch error: {e}")
 
@@ -524,6 +520,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 recommendation=rec,
                 quality=quality,
                 fundamentals=fundamentals,
+                fundamental_profile=fundamental_profile,
                 gemini_model=gemini,
                 openai_client=openai_client,
             )
@@ -532,30 +529,191 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
 
     # Display result
     ai_result = st.session_state.get(f'ai_result_{ticker}')
-    if ai_result:
-        provider = ai_result.get('provider', 'unknown')
-        st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
+    if not ai_result:
+        return
 
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            conv = ai_result.get('conviction', 0)
-            color = "🟢" if conv >= 7 else ("🟡" if conv >= 4 else "🔴")
-            st.metric("Conviction", f"{color} {conv}/10")
-            st.metric("Timing", ai_result.get('timing', '?'))
-            st.metric("Sizing", ai_result.get('position_sizing', '?'))
+    provider = ai_result.get('provider', 'unknown')
+    st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
 
-        with col2:
-            st.markdown("**What the scanner misses:**")
-            st.info(ai_result.get('scanner_misses', 'N/A'))
-            st.markdown("**Red flags:**")
-            flags = ai_result.get('red_flags', 'None')
-            if flags and flags != 'None':
-                st.warning(flags)
-            else:
-                st.success("No red flags")
+    # ═══════════════════════════════════════════════════════════════
+    # TOP ROW: Action + Conviction + Sizing
+    # ═══════════════════════════════════════════════════════════════
+    conv = ai_result.get('conviction', 0)
+    action = ai_result.get('action', ai_result.get('timing', '?'))
 
-        with st.expander("Full AI Response"):
-            st.text(ai_result.get('raw_text', ''))
+    # Action banner
+    action_upper = action.upper() if action else ''
+    if 'BUY NOW' in action_upper:
+        st.success(f"🟢 **{action}**")
+    elif 'WAIT' in action_upper:
+        st.warning(f"🟡 **{action}**")
+    elif 'SKIP' in action_upper:
+        st.error(f"🔴 **{action}**")
+    else:
+        st.info(f"📊 **{action}**")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        conv_icon = "🟢" if conv >= 7 else ("🟡" if conv >= 4 else "🔴")
+        st.metric("Conviction", f"{conv_icon} {conv}/10")
+    with c2:
+        sizing = ai_result.get('position_sizing', '?')
+        st.metric("Position Size", sizing.split('—')[0].strip() if '—' in sizing else sizing)
+    with c3:
+        fq = ai_result.get('fundamental_quality', '?')
+        grade = fq[0] if fq and fq[0] in 'ABCD' else '?'
+        grade_icon = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴'}.get(grade, '⚪')
+        st.metric("Business Quality", f"{grade_icon} {grade}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # RESISTANCE VERDICT — the key actionable insight
+    # ═══════════════════════════════════════════════════════════════
+    resistance = ai_result.get('resistance_verdict', '')
+    if resistance:
+        is_wait = any(w in resistance.lower() for w in ['wait', 'breakout', 'stall', 'failed'])
+        if is_wait:
+            st.warning(f"🚧 **Resistance:** {resistance}")
+        else:
+            st.success(f"✅ **Resistance:** {resistance}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # WHY IT'S MOVING + FUNDAMENTAL QUALITY
+    # ═══════════════════════════════════════════════════════════════
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        why = ai_result.get('why_moving', '')
+        if why:
+            st.markdown(f"**📰 Why it's moving:**")
+            st.info(why)
+
+        fq_detail = ai_result.get('fundamental_quality', '')
+        if fq_detail:
+            st.markdown(f"**💼 Fundamental quality:**")
+            st.info(fq_detail)
+
+    with col_r:
+        bull = ai_result.get('bull_case', '')
+        if bull:
+            st.markdown("**🐂 Bull case:**")
+            st.success(bull)
+
+        bear = ai_result.get('bear_case', '')
+        if bear:
+            st.markdown("**🐻 Bear case:**")
+            st.error(bear)
+
+    # ═══════════════════════════════════════════════════════════════
+    # RED FLAGS
+    # ═══════════════════════════════════════════════════════════════
+    flags = ai_result.get('red_flags', '')
+    if flags and flags.lower() != 'none':
+        st.warning(f"🚩 **Red flags:** {flags}")
+    else:
+        st.success("🚩 **Red flags:** None — clean setup")
+
+    # ═══════════════════════════════════════════════════════════════
+    # FUNDAMENTAL SNAPSHOT TABLE (from profile data)
+    # ═══════════════════════════════════════════════════════════════
+    fp = ai_result.get('fundamental_profile', {})
+    if fp and not fp.get('error'):
+        with st.expander("📊 Fundamental Snapshot", expanded=False):
+            _render_fundamental_snapshot(fp)
+
+    # ═══════════════════════════════════════════════════════════════
+    # FULL AI RESPONSE
+    # ═══════════════════════════════════════════════════════════════
+    with st.expander("📝 Full AI Response"):
+        st.text(ai_result.get('raw_text', ''))
+
+
+def _render_fundamental_snapshot(fp: Dict):
+    """Render compact fundamental data table from profile."""
+
+    def _fmt_money(val):
+        if val is None:
+            return "—"
+        if abs(val) >= 1e9:
+            return f"${val/1e9:.1f}B"
+        if abs(val) >= 1e6:
+            return f"${val/1e6:.0f}M"
+        return f"${val:,.0f}"
+
+    def _fmt_pct(val):
+        if val is None:
+            return "—"
+        return f"{val*100:.1f}%"
+
+    def _fmt_num(val, decimals=1):
+        if val is None:
+            return "—"
+        return f"{val:.{decimals}f}"
+
+    # Company header
+    name = fp.get('name', '?')
+    sector = fp.get('sector', '?')
+    industry = fp.get('industry', '?')
+    st.markdown(f"**{name}** — {sector} / {industry}")
+
+    if fp.get('business_summary'):
+        st.caption(fp['business_summary'][:300] + "..." if len(fp.get('business_summary', '')) > 300 else fp['business_summary'])
+
+    # Three column layout
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("**Growth & Scale**")
+        rows = [
+            ("Market Cap", _fmt_money(fp.get('market_cap'))),
+            ("Revenue", _fmt_money(fp.get('total_revenue'))),
+            ("Revenue Growth", _fmt_pct(fp.get('revenue_growth_yoy'))),
+            ("Earnings Growth", _fmt_pct(fp.get('earnings_growth_yoy'))),
+            ("EBITDA", _fmt_money(fp.get('ebitda'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    with c2:
+        st.markdown("**Profitability**")
+        rows = [
+            ("Gross Margin", _fmt_pct(fp.get('gross_margin'))),
+            ("Operating Margin", _fmt_pct(fp.get('operating_margin'))),
+            ("Net Margin", _fmt_pct(fp.get('profit_margin'))),
+            ("ROE", _fmt_pct(fp.get('return_on_equity'))),
+            ("FCF", _fmt_money(fp.get('free_cash_flow'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    with c3:
+        st.markdown("**Valuation & Health**")
+        rows = [
+            ("P/E (Fwd)", _fmt_num(fp.get('forward_pe'))),
+            ("EV/EBITDA", _fmt_num(fp.get('ev_to_ebitda'))),
+            ("P/Sales", _fmt_num(fp.get('price_to_sales'))),
+            ("Debt/Equity", _fmt_num(fp.get('debt_to_equity'), 0)),
+            ("Short % Float", _fmt_pct(fp.get('short_pct_float'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    # Ownership bar
+    insider = fp.get('insider_pct')
+    inst = fp.get('institution_pct')
+    if insider is not None or inst is not None:
+        parts = []
+        if insider is not None:
+            parts.append(f"Insider: {insider*100:.1f}%")
+        if inst is not None:
+            parts.append(f"Institutional: {inst*100:.1f}%")
+        if fp.get('next_earnings'):
+            parts.append(f"Next Earnings: {fp['next_earnings']}")
+        if fp.get('last_earnings_surprise_pct') is not None:
+            parts.append(f"Last Surprise: {fp['last_earnings_surprise_pct']:+.1f}%")
+        st.caption(" | ".join(parts))
 
 
 def _render_trade_tab(ticker: str, signal: EntrySignal,
