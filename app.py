@@ -374,6 +374,9 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
             apex_markers = get_apex_markers(apex_signals_list)
             apex_summary = get_apex_summary(apex_signals_list)
 
+            # Store for trade tab health monitoring
+            st.session_state[f'apex_signals_{ticker}'] = apex_signals_list
+
         except Exception as e:
             st.warning(f"APEX detection error: {e}")
 
@@ -557,10 +560,15 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
 
 def _render_trade_tab(ticker: str, signal: EntrySignal,
                       analysis: TickerAnalysis):
-    """Trade entry form and position management."""
+    """Enhanced trade management: position calculator, portfolio dashboard, health monitoring."""
     jm = get_journal()
     rec = analysis.recommendation or {}
     stops = signal.stops if signal else {}
+
+    # ── Portfolio Capital Summary (always visible) ────────────────
+    _render_capital_overview(jm)
+
+    st.divider()
 
     # Check if already in a position
     open_tickers = jm.get_open_tickers()
@@ -568,101 +576,665 @@ def _render_trade_tab(ticker: str, signal: EntrySignal,
         _render_position_management(ticker, jm)
         return
 
-    # ── Entry Form ────────────────────────────────────────────────────
-    st.subheader("Entry Setup")
+    # ── Position Calculator & Entry ───────────────────────────────
+    _render_position_calculator(ticker, signal, analysis, jm, rec, stops)
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        entry_price = st.number_input("Entry Price",
-                                       value=float(stops.get('entry', 0)),
-                                       step=0.01, format="%.2f")
-    with col2:
-        stop_price = st.number_input("Stop Loss",
-                                      value=float(stops.get('stop', 0)),
-                                      step=0.01, format="%.2f")
-    with col3:
-        target_price = st.number_input("Target",
-                                        value=float(stops.get('target', 0)),
-                                        step=0.01, format="%.2f")
 
-    col4, col5 = st.columns(2)
-    with col4:
-        position_size = st.number_input("Position Size ($)",
-                                         value=10000.0, step=1000.0, format="%.0f")
-    with col5:
-        if entry_price > 0 and stop_price > 0:
-            risk_pct = (entry_price - stop_price) / entry_price * 100
-            shares = int(position_size / entry_price)
-            st.metric("Shares", shares)
-            st.caption(f"Risk: {risk_pct:.1f}% | ${(entry_price - stop_price) * shares:.0f}")
+def _render_capital_overview(jm: JournalManager):
+    """
+    Always-visible capital bar: total account, deployed, available,
+    per-ticker breakdown with health status.
+    """
+    open_trades = jm.get_open_trades()
 
-    notes = st.text_input("Notes", value=rec.get('summary', ''))
+    # Account size (persist across session)
+    if 'account_size' not in st.session_state:
+        st.session_state['account_size'] = 100000.0
 
-    if st.button("✅ Enter Trade", type="primary"):
-        trade = Trade(
-            trade_id='',
-            ticker=ticker,
-            entry_price=entry_price,
-            initial_stop=stop_price,
-            target=target_price,
-            position_size=position_size,
-            signal_type=rec.get('signal_type', ''),
-            quality_grade=analysis.quality.get('quality_grade', '') if analysis.quality else '',
-            conviction_at_entry=rec.get('conviction', 0),
-            weekly_bullish_at_entry=signal.weekly_macd.get('bullish', False) if signal else False,
-            monthly_bullish_at_entry=signal.monthly_macd.get('bullish', False) if signal else False,
-            weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
-            notes=notes,
+    account_size = st.session_state['account_size']
+
+    if not open_trades:
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            new_acct = st.number_input(
+                "💰 Account Size", value=account_size,
+                step=10000.0, format="%.0f", key="global_acct",
+                label_visibility="collapsed",
+            )
+            if new_acct != account_size:
+                st.session_state['account_size'] = new_acct
+        with col_b:
+            st.info(f"💰 **${account_size:,.0f}** available — no open positions")
+        return
+
+    # Fetch live prices
+    from data_fetcher import fetch_current_price
+
+    current_prices = {}
+    for trade in open_trades:
+        t = trade['ticker']
+        price = fetch_current_price(t)
+        if price:
+            current_prices[t] = price
+
+    # Calculate totals
+    total_deployed = 0
+    total_current_value = 0
+    total_pnl = 0
+    position_rows = []
+
+    for trade in open_trades:
+        t = trade['ticker']
+        entry = float(trade.get('entry_price', 0))
+        shares = float(trade.get('shares', 0))
+        pos_size = float(trade.get('position_size', 0))
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+        current = current_prices.get(t, entry)
+
+        total_deployed += pos_size
+        current_value = current * shares
+        total_current_value += current_value
+        pnl_dollars = (current - entry) * shares
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        total_pnl += pnl_dollars
+
+        # Distance to stop
+        stop_dist = ((current - stop) / current * 100) if current > 0 and stop > 0 else 999
+
+        # Health traffic light
+        if (stop > 0 and current <= stop) or pnl_pct < -10:
+            health = "🔴"
+            action = "CLOSE NOW"
+        elif stop_dist < 2 or pnl_pct < -5:
+            health = "🔴"
+            action = "EXIT SOON"
+        elif stop_dist < 5 or pnl_pct < -3:
+            health = "🟡"
+            action = "WATCH"
+        elif pnl_pct >= 15:
+            health = "🟢"
+            action = "TRAIL STOP"
+        else:
+            health = "🟢"
+            action = "HOLD"
+
+        # Days held
+        try:
+            days_held = (datetime.now() - datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')).days
+        except Exception:
+            days_held = 0
+
+        position_rows.append({
+            'health': health,
+            'action': action,
+            'ticker': t,
+            'shares': shares,
+            'entry': entry,
+            'current': current,
+            'cost': pos_size,
+            'value': current_value,
+            'pnl_dollars': pnl_dollars,
+            'pnl_pct': pnl_pct,
+            'stop': stop,
+            'stop_dist': stop_dist,
+            'days': days_held,
+        })
+
+    available = account_size - total_deployed
+    deployed_pct = (total_deployed / account_size * 100) if account_size > 0 else 0
+
+    # ── Capital Bar ───────────────────────────────────────────────
+    st.markdown("### 💼 Portfolio Capital")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        st.metric("Account", f"${account_size:,.0f}")
+    with c2:
+        st.metric("Deployed", f"${total_deployed:,.0f}",
+                  f"{deployed_pct:.0f}%")
+    with c3:
+        avail_color = "normal" if available > 0 else "inverse"
+        st.metric("Available", f"${available:,.0f}",
+                  f"{100 - deployed_pct:.0f}%")
+    with c4:
+        st.metric("Current Value", f"${total_current_value:,.0f}",
+                  f"{total_pnl:+,.0f}")
+    with c5:
+        total_pnl_pct = (total_pnl / total_deployed * 100) if total_deployed > 0 else 0
+        st.metric("Total P&L", f"{total_pnl_pct:+.1f}%",
+                  f"${total_pnl:+,.0f}")
+
+    # Deployment progress bar
+    bar_pct = min(deployed_pct / 100, 1.0)
+    if deployed_pct >= 90:
+        st.progress(bar_pct, text=f"⚠️ {deployed_pct:.0f}% deployed — near full allocation")
+    elif deployed_pct >= 70:
+        st.progress(bar_pct, text=f"🟡 {deployed_pct:.0f}% deployed")
+    else:
+        st.progress(bar_pct, text=f"🟢 {deployed_pct:.0f}% deployed")
+
+    # ── Positions Table with Health Lights ─────────────────────────
+    # Alert banner for red positions
+    reds = [r for r in position_rows if r['health'] == '🔴']
+    if reds:
+        tickers_at_risk = ", ".join(f"**{r['ticker']}** ({r['action']})" for r in reds)
+        st.error(f"🚨 ACTION REQUIRED: {tickers_at_risk}")
+
+    # Table
+    table_rows = []
+    for r in position_rows:
+        table_rows.append({
+            '': r['health'],
+            'Ticker': r['ticker'],
+            'Action': r['action'],
+            'Shares': f"{r['shares']:.0f}",
+            'Entry': f"${r['entry']:.2f}",
+            'Now': f"${r['current']:.2f}",
+            'P&L': f"{r['pnl_pct']:+.1f}%",
+            'P&L $': f"${r['pnl_dollars']:+,.0f}",
+            'Cost': f"${r['cost']:,.0f}",
+            'Value': f"${r['value']:,.0f}",
+            'Stop': f"${r['stop']:.2f}" if r['stop'] > 0 else "—",
+            'To Stop': f"{r['stop_dist']:.1f}%" if r['stop_dist'] < 999 else "—",
+            'Days': r['days'],
+        })
+
+    if table_rows:
+        st.dataframe(
+            pd.DataFrame(table_rows),
+            use_container_width=True,
+            hide_index=True,
         )
-        result = jm.enter_trade(trade)
-        st.success(result)
-        st.rerun()
+
+    # Account size editor (collapsed)
+    with st.expander("⚙️ Account Settings"):
+        new_acct = st.number_input(
+            "Account Size ($)", value=account_size,
+            step=10000.0, format="%.0f", key="global_acct_edit",
+        )
+        if new_acct != account_size:
+            st.session_state['account_size'] = new_acct
+            st.rerun()
+
+
+def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
+    """
+    Two-mode position calculator:
+    1. Quick mode — enter $ amount → get shares
+    2. Full mode — risk-based sizing with stop/target
+    """
+    current_price = analysis.current_price or 0
+    entry_default = float(stops.get('entry', current_price or 0))
+    stop_default = float(stops.get('stop', 0))
+    target_default = float(stops.get('target', 0))
+
+    account_size = st.session_state.get('account_size', 100000.0)
+    open_trades = jm.get_open_trades()
+    deployed = sum(float(t.get('position_size', 0)) for t in open_trades)
+    available = account_size - deployed
+    max_positions = 7  # APEX V4
+
+    st.subheader(f"📐 Position Calculator — {ticker}")
+
+    # ══════════════════════════════════════════════════════════════
+    # QUICK CALCULATOR — just enter $ amount
+    # ══════════════════════════════════════════════════════════════
+    st.markdown("**Quick Size** — enter the amount you want to invest:")
+
+    qc1, qc2, qc3 = st.columns([2, 1, 1])
+    with qc1:
+        invest_amount = st.number_input(
+            "💵 Amount to Invest ($)",
+            value=min(float(int(account_size / max_positions)), available),
+            step=1000.0, format="%.0f",
+            key=f"quick_amt_{ticker}",
+        )
+    with qc2:
+        buy_price = st.number_input(
+            "Buy Price ($)",
+            value=entry_default if entry_default > 0 else current_price,
+            step=0.01, format="%.2f",
+            key=f"quick_price_{ticker}",
+        )
+    with qc3:
+        if buy_price > 0:
+            quick_shares = int(invest_amount / buy_price)
+            actual_cost = quick_shares * buy_price
+            st.metric(
+                "Shares to Buy",
+                f"{quick_shares:,}",
+                f"${actual_cost:,.0f}",
+            )
+        else:
+            st.metric("Shares to Buy", "—", "Enter price")
+
+    # Quick validation
+    if buy_price > 0 and invest_amount > 0:
+        quick_shares = int(invest_amount / buy_price)
+        actual_cost = quick_shares * buy_price
+        pct_of_account = (actual_cost / account_size * 100) if account_size > 0 else 0
+        pct_of_available = (actual_cost / available * 100) if available > 0 else 999
+
+        info_parts = [
+            f"**{quick_shares:,} shares** × ${buy_price:.2f} = **${actual_cost:,.0f}**",
+            f"({pct_of_account:.1f}% of account)",
+        ]
+
+        if actual_cost > available:
+            st.error(f"⚠️ Exceeds available capital! Need ${actual_cost:,.0f} but only ${available:,.0f} free")
+        elif pct_of_account > 15:
+            st.warning(f"{'  |  '.join(info_parts)}  —  ⚠️ Over 15% concentration")
+        else:
+            st.success(f"{'  |  '.join(info_parts)}")
+
+    # ══════════════════════════════════════════════════════════════
+    # FULL RISK-BASED CALCULATOR
+    # ══════════════════════════════════════════════════════════════
+    with st.expander("🎯 Full Risk-Based Calculator", expanded=False):
+        st.caption("Sizes position using your risk tolerance and stop distance")
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            risk_per_trade = st.number_input(
+                "⚡ Max Risk per Trade (%)", value=2.0,
+                min_value=0.5, max_value=10.0, step=0.5, format="%.1f",
+                key=f"risk_pct_{ticker}",
+                help="Maximum portfolio % you're willing to lose on this trade"
+            )
+        with col_b:
+            max_position_pct = st.number_input(
+                "📊 Max Position Size (%)", value=12.5,
+                min_value=1.0, max_value=25.0, step=0.5, format="%.1f",
+                key=f"max_pos_{ticker}",
+                help="Maximum % of portfolio in one position (APEX V4 uses 12.5%)"
+            )
+        with col_c:
+            st.metric("Available Capital", f"${available:,.0f}",
+                      f"{len(open_trades)}/{max_positions} slots used")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            entry_price = st.number_input("Entry Price",
+                                           value=entry_default,
+                                           step=0.01, format="%.2f",
+                                           key=f"entry_{ticker}")
+        with col2:
+            stop_price = st.number_input("Stop Loss",
+                                          value=stop_default,
+                                          step=0.01, format="%.2f",
+                                          key=f"stop_{ticker}")
+        with col3:
+            target_price = st.number_input("Target",
+                                            value=target_default,
+                                            step=0.01, format="%.2f",
+                                            key=f"target_{ticker}")
+
+        if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
+            risk_per_share = entry_price - stop_price
+            risk_pct_trade = risk_per_share / entry_price * 100
+
+            max_position_dollars = account_size * (max_position_pct / 100)
+            risk_budget = account_size * (risk_per_trade / 100)
+
+            shares_from_risk = int(risk_budget / risk_per_share)
+            shares_from_max = int(max_position_dollars / entry_price)
+            shares_from_capital = int(available / entry_price) if available > 0 else 0
+
+            # Most conservative
+            shares = min(shares_from_risk, shares_from_max, shares_from_capital)
+            position_cost = shares * entry_price
+            actual_risk_dollars = shares * risk_per_share
+            actual_risk_pct = actual_risk_dollars / account_size * 100
+
+            reward_per_share = target_price - entry_price if target_price > entry_price else 0
+            rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
+            potential_profit = shares * reward_per_share if reward_per_share > 0 else 0
+
+            st.markdown("---")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Risk-Based", f"{shares_from_risk} shares",
+                          f"${shares_from_risk * entry_price:,.0f}")
+            with c2:
+                st.metric("Max Position", f"{shares_from_max} shares",
+                          f"${shares_from_max * entry_price:,.0f}")
+            with c3:
+                limiting = "risk" if shares == shares_from_risk else (
+                    "max position" if shares == shares_from_max else "available capital"
+                )
+                st.metric("✅ Final", f"{shares} shares",
+                          f"${position_cost:,.0f} — limited by {limiting}")
+
+            c4, c5, c6, c7 = st.columns(4)
+            with c4:
+                st.metric("💸 Risk", f"${actual_risk_dollars:,.0f}",
+                          f"{actual_risk_pct:.1f}% of account")
+            with c5:
+                st.metric("📉 Stop Distance", f"{risk_pct_trade:.1f}%",
+                          f"${risk_per_share:.2f}/share")
+            with c6:
+                if rr_ratio > 0:
+                    st.metric("🎯 R/R Ratio", f"{rr_ratio:.1f}:1",
+                              "Good ✅" if rr_ratio >= 2 else "Low ⚠️")
+                else:
+                    st.metric("🎯 R/R Ratio", "—", "Set target")
+            with c7:
+                if potential_profit > 0:
+                    st.metric("💰 Potential", f"${potential_profit:,.0f}",
+                              f"+{reward_per_share / entry_price * 100:.1f}%")
+
+            # Warnings
+            warnings = []
+            if risk_pct_trade > 8:
+                warnings.append("🔴 Stop distance very wide — consider tighter stop")
+            elif risk_pct_trade > 5:
+                warnings.append("🟡 Stop distance wider than typical (3-5%)")
+            if rr_ratio > 0 and rr_ratio < 1.5:
+                warnings.append("🔴 R/R below 1.5:1 — not worth the risk")
+            elif rr_ratio > 0 and rr_ratio < 2.0:
+                warnings.append("🟡 R/R below ideal 2:1")
+            if actual_risk_pct > 3:
+                warnings.append("🔴 Portfolio risk exceeds 3% — reduce position")
+            if rec.get('conviction', 0) < 5:
+                warnings.append(f"🟡 Low conviction ({rec.get('conviction', 0)}/10)")
+            if shares_from_capital < shares_from_risk:
+                warnings.append("🟡 Position limited by available capital, not risk parameters")
+
+            for w in warnings:
+                st.warning(w)
+            if not warnings:
+                st.success("✅ Position sizing within all risk parameters")
+
+        elif entry_price > 0 and stop_price > 0 and stop_price >= entry_price:
+            st.error("Stop price must be below entry price")
+
+    # ══════════════════════════════════════════════════════════════
+    # ENTER TRADE
+    # ══════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### ✅ Enter Trade")
+
+    # Determine shares — use quick calculator values as defaults
+    final_price = buy_price if buy_price > 0 else entry_default
+    final_shares = int(invest_amount / final_price) if (final_price > 0 and invest_amount > 0) else 0
+    final_stop = stop_default
+    final_target = target_default
+
+    ec1, ec2, ec3, ec4 = st.columns(4)
+    with ec1:
+        confirm_shares = st.number_input("Shares", value=final_shares,
+                                          min_value=0, step=1,
+                                          key=f"confirm_shares_{ticker}")
+    with ec2:
+        confirm_entry = st.number_input("Entry $", value=float(final_price),
+                                         step=0.01, format="%.2f",
+                                         key=f"confirm_entry_{ticker}")
+    with ec3:
+        confirm_stop = st.number_input("Stop $", value=float(final_stop),
+                                        step=0.01, format="%.2f",
+                                        key=f"confirm_stop_{ticker}")
+    with ec4:
+        confirm_target = st.number_input("Target $", value=float(final_target),
+                                          step=0.01, format="%.2f",
+                                          key=f"confirm_target_{ticker}")
+
+    if confirm_shares > 0 and confirm_entry > 0:
+        total_cost = confirm_shares * confirm_entry
+        st.caption(
+            f"**{confirm_shares} shares × ${confirm_entry:.2f} = ${total_cost:,.0f}** "
+            f"({total_cost / account_size * 100:.1f}% of account)"
+        )
+
+    notes = st.text_input("Notes", value=rec.get('summary', ''), key=f"notes_{ticker}")
+
+    if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
+        if confirm_entry <= 0 or confirm_shares <= 0:
+            st.error("Set entry price and shares first")
+        elif confirm_stop <= 0:
+            st.error("Set a stop loss — never trade without a stop")
+        elif confirm_stop >= confirm_entry:
+            st.error("Stop must be below entry price")
+        else:
+            pos_size = confirm_shares * confirm_entry
+            trade = Trade(
+                trade_id='',
+                ticker=ticker,
+                entry_price=confirm_entry,
+                initial_stop=confirm_stop,
+                target=confirm_target,
+                position_size=pos_size,
+                shares=confirm_shares,
+                signal_type=rec.get('signal_type', ''),
+                quality_grade=analysis.quality.get('quality_grade', '') if analysis.quality else '',
+                conviction_at_entry=rec.get('conviction', 0),
+                weekly_bullish_at_entry=signal.weekly_macd.get('bullish', False) if signal else False,
+                monthly_bullish_at_entry=signal.monthly_macd.get('bullish', False) if signal else False,
+                weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
+                risk_per_share=confirm_entry - confirm_stop,
+                risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
+                notes=notes,
+            )
+            result = jm.enter_trade(trade)
+            st.success(result)
+            st.rerun()
+
+
+def _render_portfolio_dashboard(jm: JournalManager):
+    """Compatibility wrapper — now redirects to capital overview."""
+    _render_capital_overview(jm)
 
 
 def _render_position_management(ticker: str, jm: JournalManager):
-    """Manage an existing open position."""
+    """Manage an existing open position with health monitoring and APEX context."""
     trades = jm.get_open_trades()
     trade = next((t for t in trades if t['ticker'] == ticker), None)
     if not trade:
         return
 
-    st.subheader(f"Open Position — {ticker}")
+    from data_fetcher import fetch_current_price
+    current = fetch_current_price(ticker) or 0
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Entry", f"${trade.get('entry_price', 0):.2f}")
-    col2.metric("Stop", f"${trade.get('current_stop', trade.get('initial_stop', 0)):.2f}")
-    col3.metric("Target", f"${trade.get('target', 0):.2f}")
+    entry = float(trade.get('entry_price', 0))
+    shares = float(trade.get('shares', 0))
+    stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+    target = float(trade.get('target', 0))
+    pos_size = float(trade.get('position_size', 0))
 
-    st.caption(f"Shares: {trade.get('shares', 0):.0f} | "
-               f"Signal: {trade.get('signal_type', '?')} | "
-               f"Opened: {trade.get('entry_date', '?')}")
+    pnl_pct = ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
+    pnl_dollars = (current - entry) * shares
+    current_value = current * shares if current > 0 else pos_size
+    stop_distance = ((current - stop) / current * 100) if current > 0 and stop > 0 else 999
+    target_distance = ((target - current) / current * 100) if current > 0 and target > 0 else 0
 
-    # Trail stop
-    st.divider()
-    new_stop = st.number_input("New Stop", value=float(trade.get('current_stop', 0)),
-                                step=0.50, format="%.2f")
-    if st.button("📈 Trail Stop"):
-        result = jm.update_stop(ticker, new_stop)
-        st.info(result)
-        st.rerun()
+    try:
+        days_held = (datetime.now() - datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')).days
+    except Exception:
+        days_held = 0
 
-    # Close position
-    st.divider()
-    col1, col2 = st.columns(2)
+    # ── Health Assessment ─────────────────────────────────────────
+    if stop > 0 and current > 0 and current <= stop:
+        health_icon = "🔴"
+        health_msg = "STOP HIT — Close this position NOW"
+        health_level = "error"
+    elif stop_distance < 2:
+        health_icon = "🔴"
+        health_msg = f"Only {stop_distance:.1f}% above stop — prepare to exit"
+        health_level = "error"
+    elif pnl_pct < -10:
+        health_icon = "🔴"
+        health_msg = f"Down {pnl_pct:.1f}% — significant loss, review immediately"
+        health_level = "error"
+    elif pnl_pct < -5:
+        health_icon = "🔴"
+        health_msg = f"Down {pnl_pct:.1f}% — approaching max pain, decide: hold or cut"
+        health_level = "error"
+    elif stop_distance < 5:
+        health_icon = "🟡"
+        health_msg = f"{stop_distance:.1f}% buffer to stop — monitor closely"
+        health_level = "warning"
+    elif pnl_pct < -3:
+        health_icon = "🟡"
+        health_msg = f"Small drawdown {pnl_pct:.1f}% — within normal range but watchful"
+        health_level = "warning"
+    elif days_held > 60 and pnl_pct < 3:
+        health_icon = "🟡"
+        health_msg = f"Held {days_held}d with only {pnl_pct:+.1f}% gain — dead money?"
+        health_level = "warning"
+    elif pnl_pct >= 20:
+        health_icon = "🟢"
+        health_msg = f"Excellent +{pnl_pct:.1f}% — trail stop to protect profits!"
+        health_level = "success"
+    elif pnl_pct >= 15:
+        health_icon = "🟢"
+        health_msg = f"Strong +{pnl_pct:.1f}% — ATR trailing stop should be active"
+        health_level = "success"
+    elif pnl_pct >= 5:
+        health_icon = "🟢"
+        health_msg = f"Healthy +{pnl_pct:.1f}% — trend intact"
+        health_level = "success"
+    else:
+        health_icon = "🟢"
+        health_msg = "Within normal parameters"
+        health_level = "success"
+
+    # Header
+    st.subheader(f"{health_icon} {ticker} — Open Position")
+
+    if health_level == "error":
+        st.error(health_msg)
+    elif health_level == "warning":
+        st.warning(health_msg)
+    else:
+        st.success(health_msg)
+
+    # ── Key Metrics ───────────────────────────────────────────────
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        exit_price = st.number_input("Exit Price", value=0.0, step=0.01, format="%.2f")
+        st.metric("Entry", f"${entry:.2f}", f"{shares:.0f} shares")
     with col2:
+        st.metric("Current", f"${current:.2f}" if current > 0 else "—",
+                  f"{pnl_pct:+.1f}%" if current > 0 else "")
+    with col3:
+        st.metric("P&L", f"${pnl_dollars:+,.0f}" if current > 0 else "—",
+                  f"${pos_size:,.0f} → ${current_value:,.0f}" if current > 0 else "")
+    with col4:
+        st.metric("Stop", f"${stop:.2f}",
+                  f"{stop_distance:.1f}% away" if stop_distance < 999 else "")
+    with col5:
+        st.metric("Target", f"${target:.2f}" if target > 0 else "—",
+                  f"{target_distance:.1f}% to go" if target > 0 and current > 0 else "")
+
+    st.caption(
+        f"Signal: {trade.get('signal_type', '?')} | "
+        f"Quality: {trade.get('quality_grade', '?')} | "
+        f"Conviction: {trade.get('conviction_at_entry', '?')}/10 | "
+        f"Opened: {trade.get('entry_date', '?')} ({days_held}d ago)"
+    )
+
+    # ── APEX Signal Context ───────────────────────────────────────
+    # Check if APEX signals are available in session state
+    apex_signals_key = f'apex_signals_{ticker}'
+    if apex_signals_key in st.session_state:
+        apex_sigs = st.session_state[apex_signals_key]
+        active_apex = [s for s in apex_sigs if s.is_active]
+        if active_apex:
+            a = active_apex[-1]
+            trail_status = '🟢 ATR Trail ON' if a.atr_trail_active else '⏳ Pre-trail'
+            st.info(
+                f"📡 **APEX Signal Active** — {a.signal_tier.replace('_', ' ')} | "
+                f"{a.monthly_regime.replace('Monthly_', '')} regime | "
+                f"Stop: {a.stop_level}% | {trail_status} | "
+                f"Highest: ${a.highest_price:.2f}"
+            )
+        elif apex_sigs:
+            last = apex_sigs[-1]
+            st.warning(
+                f"📡 **Last APEX signal closed** — {last.exit_reason} on "
+                f"{last.exit_date.strftime('%Y-%m-%d') if last.exit_date else '?'} "
+                f"({last.return_pct:+.1f}%)"
+            )
+
+    # ── Trail Stop Suggestions ────────────────────────────────────
+    if pnl_pct >= 15 and current > 0:
+        st.divider()
+        st.markdown("**💡 Trail Stop Suggestions:**")
+
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            # Breakeven + buffer
+            be_stop = entry * 1.02
+            if be_stop > stop:
+                locked = ((be_stop - entry) / entry * 100)
+                st.metric("🔒 Breakeven +2%", f"${be_stop:.2f}",
+                          f"Locks {locked:.1f}% profit")
+        with tc2:
+            # 50% profit lock
+            half_profit_stop = entry + (current - entry) * 0.5
+            if half_profit_stop > stop:
+                locked = ((half_profit_stop - entry) / entry * 100)
+                st.metric("🔐 Lock 50% Profit", f"${half_profit_stop:.2f}",
+                          f"Locks {locked:.1f}% profit")
+        with tc3:
+            # ATR trail (approximate)
+            atr_trail = current * 0.92  # ~8% from current
+            if atr_trail > stop:
+                locked = ((atr_trail - entry) / entry * 100)
+                st.metric("📊 ATR Trail (~8%)", f"${atr_trail:.2f}",
+                          f"Locks {locked:.1f}% profit")
+
+    # ── Position Scaling ──────────────────────────────────────────
+    if pnl_pct >= 10 and current > 0:
+        with st.expander("📈 Add to Winner?"):
+            account_size = st.session_state.get('account_size', 100000.0)
+            max_pos = account_size * 0.125  # 12.5%
+            room = max_pos - current_value
+
+            if room > current:
+                add_shares = int(room / current)
+                st.info(
+                    f"Room to add **{add_shares} shares** (${add_shares * current:,.0f}) "
+                    f"before hitting 12.5% max position. "
+                    f"Current position: ${current_value:,.0f} / ${max_pos:,.0f}"
+                )
+            else:
+                st.caption("Position near or above max size — no room to add")
+
+    # ── Actions ───────────────────────────────────────────────────
+    st.divider()
+    act1, act2 = st.columns(2)
+
+    with act1:
+        st.markdown("**📈 Trail Stop**")
+        new_stop = st.number_input("New Stop", value=float(stop),
+                                    step=0.50, format="%.2f",
+                                    key=f"trail_{ticker}")
+        if st.button("📈 Update Stop", key=f"trail_btn_{ticker}"):
+            if new_stop > stop:
+                result = jm.update_stop(ticker, new_stop)
+                st.info(result)
+                st.rerun()
+            else:
+                st.warning(f"New stop must be higher than current ${stop:.2f}")
+
+    with act2:
+        st.markdown("**🔴 Close Position**")
+        exit_price = st.number_input("Exit Price",
+                                      value=float(current) if current > 0 else 0.0,
+                                      step=0.01, format="%.2f",
+                                      key=f"exit_{ticker}")
         exit_reason = st.selectbox("Exit Reason",
                                     ['manual', 'stop_loss', 'target_hit',
-                                     'weekly_cross', 'time_exit'])
+                                     'weekly_cross', 'time_exit'],
+                                    key=f"exit_reason_{ticker}")
 
-    if st.button("🔴 Close Position"):
-        if exit_price > 0:
-            result = jm.close_trade(ticker, exit_price, exit_reason)
-            st.success(result)
-            st.rerun()
-        else:
-            st.warning("Enter exit price")
+        if st.button("🔴 Close Position", key=f"close_{ticker}"):
+            if exit_price > 0:
+                result = jm.close_trade(ticker, exit_price, exit_reason)
+                st.success(result)
+                st.rerun()
+            else:
+                st.warning("Enter exit price")
 
 
 # =============================================================================
