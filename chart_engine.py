@@ -401,6 +401,7 @@ def build_lwc_charts(
     show_resistance: bool = True,
     show_divergence: bool = True,
     total_height: int = 800,
+    extra_markers: list = None,
 ) -> list:
     """
     Build `charts` list for LWC v5.
@@ -450,6 +451,8 @@ def build_lwc_charts(
         all_markers.extend(_divergence_markers(df))
         all_markers.extend(_wave_markers(df))
     all_markers.extend(_signal_markers(df))
+    if extra_markers:
+        all_markers.extend(extra_markers)
     if all_markers:
         candle_config["markers"] = all_markers
 
@@ -688,6 +691,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
                     show_divergence: bool = True,
                     height: int = 800,
                     zoom_level: int = 200,
+                    extra_markers: list = None,
                     key: str = None):
     """Render TradingView chart in Streamlit."""
     from lightweight_charts_v5 import lightweight_charts_v5_component
@@ -698,6 +702,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
         show_resistance=show_resistance,
         show_divergence=show_divergence,
         total_height=height,
+        extra_markers=extra_markers,
     )
 
     lightweight_charts_v5_component(
