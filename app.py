@@ -31,6 +31,7 @@ from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
 from journal_manager import JournalManager, WatchlistItem, Trade
+from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 
 # =============================================================================
 # CONFIG
@@ -329,7 +330,7 @@ def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
 
 
 def _render_chart_tab(ticker: str, signal: EntrySignal):
-    """Interactive TradingView-style chart."""
+    """Interactive TradingView-style chart with APEX MTF signal overlay."""
     data_cache = st.session_state.get('ticker_data_cache', {})
     ticker_data = data_cache.get(ticker, {})
     daily = ticker_data.get('daily')
@@ -340,11 +341,97 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 
     from chart_engine import render_tv_chart, render_mtf_chart
 
-    # Render TradingView chart — ALL data, LWC handles zoom natively
-    render_tv_chart(daily, ticker, signal=signal, height=750,
-                    zoom_level=200, key=f"tv_{ticker}")
+    weekly = ticker_data.get('weekly')
+    monthly = ticker_data.get('monthly')
 
-    # Chart legend
+    # ── APEX Signal Detection ─────────────────────────────────────
+    show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{ticker}")
+
+    apex_markers = []
+    apex_signals_list = []
+    apex_summary = {}
+
+    if show_apex and weekly is not None and monthly is not None:
+        try:
+            # Fetch SPY/VIX for bear filter (cache across tickers)
+            if 'apex_spy_data' not in st.session_state:
+                from data_fetcher import fetch_daily
+                st.session_state['apex_spy_data'] = fetch_daily("SPY")
+                st.session_state['apex_vix_data'] = fetch_daily("^VIX")
+
+            spy_df = st.session_state.get('apex_spy_data')
+            vix_df = st.session_state.get('apex_vix_data')
+
+            apex_signals_list = detect_apex_signals(
+                ticker=ticker,
+                daily_data=daily,
+                weekly_data=weekly,
+                monthly_data=monthly,
+                spy_data=spy_df,
+                vix_data=vix_df,
+            )
+
+            apex_markers = get_apex_markers(apex_signals_list)
+            apex_summary = get_apex_summary(apex_signals_list)
+
+        except Exception as e:
+            st.warning(f"APEX detection error: {e}")
+
+    # ── Render Chart ──────────────────────────────────────────────
+    render_tv_chart(daily, ticker, signal=signal, height=750,
+                    zoom_level=200, extra_markers=apex_markers,
+                    key=f"tv_{ticker}")
+
+    # ── APEX Signal Panel ─────────────────────────────────────────
+    if apex_signals_list:
+        st.markdown("---")
+        st.markdown("### 🎯 APEX MTF Signals")
+
+        cols = st.columns(5)
+        with cols[0]:
+            st.metric("Signals", apex_summary.get('total', 0))
+        with cols[1]:
+            wr = apex_summary.get('win_rate', 0)
+            st.metric("Win Rate", f"{wr:.0f}%")
+        with cols[2]:
+            avg_r = apex_summary.get('avg_return', 0)
+            st.metric("Avg Return", f"{avg_r:+.1f}%")
+        with cols[3]:
+            st.metric("Best", f"{apex_summary.get('best_trade', 0):+.1f}%")
+        with cols[4]:
+            st.metric("Active", apex_summary.get('active', 0))
+
+        # Active trade banner
+        if 'active_trade' in apex_summary:
+            at = apex_summary['active_trade']
+            trail_status = '🟢 ATR Trail ON' if at['atr_trail_active'] else '⏳ Pre-trail'
+            st.success(
+                f"**ACTIVE** | Entry: {at['entry_date']} @ ${at['entry_price']:.2f} | "
+                f"Return: {at['current_return']:+.1f}% | "
+                f"{at['tier'].replace('_', ' ')} | {at['regime'].replace('Monthly_', '')} | "
+                f"Stop: {at['stop']}% | {trail_status}"
+            )
+
+        # Signal history table
+        with st.expander("📋 Signal History", expanded=False):
+            history_data = []
+            for sig in reversed(apex_signals_list):
+                history_data.append({
+                    'Entry': sig.entry_date.strftime('%Y-%m-%d'),
+                    'Exit': sig.exit_date.strftime('%Y-%m-%d') if sig.exit_date else '🔵 ACTIVE',
+                    'Tier': sig.signal_tier.replace('Tier_', 'T'),
+                    'Regime': sig.monthly_regime.replace('Monthly_', ''),
+                    'Return': f"{sig.return_pct:+.1f}%" if sig.return_pct is not None else '-',
+                    'Exit Type': (sig.exit_reason or 'Active').replace('_', ' '),
+                    'Weeks': f"{sig.hold_weeks:.1f}" if sig.hold_weeks else '-',
+                })
+            st.dataframe(
+                pd.DataFrame(history_data),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    # ── Chart Legend ──────────────────────────────────────────────
     with st.expander("📊 Chart Legend", expanded=False):
         c1, c2 = st.columns(2)
         with c1:
@@ -356,30 +443,30 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 - 🟣 **200 SMA** (dashed) — Long-term trend. Price above = bull market
 - 🔴 **R $xxx** — Overhead resistance levels (★ = critical resistance)
 
-**Chart Signals (Qualified Entry):**
-- 🟢 **BUY $xxx ↑** — Qualified buy: price tested SMA + MACD crossed above zero + AO confirmed positive
-- 🔴 **SELL $xxx ↓** — MACD crossed below zero
-- 🔶 **W5(div) ↓** — Bearish divergence warning (reduce exposure or exit)
-- 🟢 **W3 ↓** — Wave 3 peak label (momentum high)
-- Green/red **dots on MACD** — All crossovers for reference (not all qualify as signals)
+**TTA Signals (MACD zero-cross):**
+- 🟢 **BUY** — MACD crossed above zero + AO confirmed positive
+- 🔴 **SELL** — MACD crossed below zero + AO confirmed negative
+- 🔶 **W5(div)** — Bearish divergence (AO wave method)
+- 🟢 **W3** — Wave 3 momentum peak
 """)
         with c2:
             st.markdown("""
-**Indicator Panels:**
-- **Volume** — Green/red bars showing daily trading volume
-- **AO (Awesome Oscillator)** — Momentum: green bars = bullish, red = bearish
-- **MACD (12/26/9)** — Trend/momentum:
-  - 🔵 Blue line = MACD line (fast − slow EMA)
-  - 🟠 Orange line = Signal line (9-period SMA of MACD)
-  - Green/red histogram = difference between MACD and Signal
+**APEX MTF Signals (multi-timeframe system):**
+- 🟢 **APEX T1** — Daily + Weekly confirmed + Monthly bullish
+- 🟢 **APEX T2** — Daily + Weekly confirmed + Monthly curling
+- 🟢 **APEX T3** — Daily + Weekly early + Monthly bullish
+- 🔴 **EXIT** (red) — Stop loss hit
+- 🟡 **EXIT** (yellow) — Weekly MACD crossed down
+- 🟠 **EXIT** (orange) — ATR trailing stop (profit protection)
+- 🔵 **ACTIVE** — Trade still open with current return %
 
-**Bearish Divergence (AO Wave Method):**
-AO goes positive (Wave 3) → drops below zero (Wave 4) → returns positive (Wave 5) but with a **smaller peak** while price makes a **higher high**. This warns the uptrend is losing momentum. The ⚠ marker appears at the highest price of the weaker AO block.
+**Indicator Panels:**
+- **Volume** — Green/red bars
+- **AO** — Momentum histogram (green = bullish)
+- **MACD (12/26/9)** — Blue = MACD, Orange = Signal, Histogram = diff
 """)
 
-    # MTF chart
-    weekly = ticker_data.get('weekly')
-    monthly = ticker_data.get('monthly')
+    # ── MTF chart ─────────────────────────────────────────────────
     if weekly is not None and monthly is not None:
         with st.expander("Multi-Timeframe View"):
             render_mtf_chart(daily, weekly, monthly, ticker, height=400)
