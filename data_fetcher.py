@@ -859,3 +859,172 @@ def fetch_scan_data(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
         results[ticker] = data
     
     return results
+
+
+# =============================================================================
+# TRADINGVIEW-TA — Technical analysis confirmation
+# =============================================================================
+
+def fetch_tradingview_summary(ticker: str, interval: str = '1d') -> Dict[str, Any]:
+    """
+    Fetch TradingView technical analysis summary via tradingview_ta library.
+
+    Returns summary recommendation (STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL),
+    oscillator and moving average recommendations, and key indicator values.
+
+    interval: '1m', '5m', '15m', '1h', '4h', '1d', '1W', '1M'
+    """
+    cache_key = f"{ticker}:tv:{interval}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = {
+        'recommendation': None,
+        'buy': 0, 'sell': 0, 'neutral': 0,
+        'ma_recommendation': None,
+        'ma_buy': 0, 'ma_sell': 0, 'ma_neutral': 0,
+        'osc_recommendation': None,
+        'osc_buy': 0, 'osc_sell': 0, 'osc_neutral': 0,
+        'rsi': None, 'stoch_k': None, 'cci': None,
+        'macd_signal': None, 'adx': None,
+        'interval': interval,
+        'error': None,
+    }
+
+    try:
+        from tradingview_ta import TA_Handler, Interval
+
+        interval_map = {
+            '1m': Interval.INTERVAL_1_MINUTE,
+            '5m': Interval.INTERVAL_5_MINUTES,
+            '15m': Interval.INTERVAL_15_MINUTES,
+            '1h': Interval.INTERVAL_1_HOUR,
+            '4h': Interval.INTERVAL_4_HOURS,
+            '1d': Interval.INTERVAL_1_DAY,
+            '1W': Interval.INTERVAL_1_WEEK,
+            '1M': Interval.INTERVAL_1_MONTH,
+        }
+
+        handler = TA_Handler(
+            symbol=ticker,
+            screener="america",
+            exchange="",  # Auto-detect
+            interval=interval_map.get(interval, Interval.INTERVAL_1_DAY),
+        )
+
+        analysis = handler.get_analysis()
+
+        if analysis:
+            summary = analysis.summary or {}
+            result['recommendation'] = summary.get('RECOMMENDATION')
+            result['buy'] = summary.get('BUY', 0)
+            result['sell'] = summary.get('SELL', 0)
+            result['neutral'] = summary.get('NEUTRAL', 0)
+
+            ma = analysis.moving_averages or {}
+            result['ma_recommendation'] = ma.get('RECOMMENDATION')
+            result['ma_buy'] = ma.get('BUY', 0)
+            result['ma_sell'] = ma.get('SELL', 0)
+            result['ma_neutral'] = ma.get('NEUTRAL', 0)
+
+            osc = analysis.oscillators or {}
+            result['osc_recommendation'] = osc.get('RECOMMENDATION')
+            result['osc_buy'] = osc.get('BUY', 0)
+            result['osc_sell'] = osc.get('SELL', 0)
+            result['osc_neutral'] = osc.get('NEUTRAL', 0)
+
+            indicators = analysis.indicators or {}
+            result['rsi'] = indicators.get('RSI')
+            result['stoch_k'] = indicators.get('Stoch.K')
+            result['cci'] = indicators.get('CCI20')
+            result['macd_signal'] = indicators.get('MACD.signal')
+            result['adx'] = indicators.get('ADX')
+
+    except ImportError:
+        result['error'] = 'tradingview_ta not installed (pip install tradingview_ta)'
+    except Exception as e:
+        result['error'] = str(e)[:200]
+
+    _cache.set(cache_key, result)
+    return result
+
+
+def fetch_tradingview_mtf(ticker: str) -> Dict[str, Dict]:
+    """
+    Fetch TradingView summaries for multiple timeframes.
+    Returns: {'1h': {...}, '4h': {...}, '1d': {...}, '1W': {...}}
+    """
+    mtf = {}
+    for interval in ['1h', '4h', '1d', '1W']:
+        mtf[interval] = fetch_tradingview_summary(ticker, interval)
+    return mtf
+
+
+# =============================================================================
+# FINNHUB — News & Events (requires free API key)
+# =============================================================================
+
+def fetch_finnhub_news(ticker: str, api_key: str = None,
+                       days_back: int = 7) -> Dict[str, Any]:
+    """
+    Fetch recent news for a ticker from Finnhub.
+
+    Returns list of headlines with source, datetime, summary, and sentiment.
+    Free tier: 60 calls/minute, no auth for basic endpoints.
+
+    api_key: Finnhub API key. If None, tries env var FINNHUB_API_KEY.
+    """
+    import os
+    key = api_key or os.environ.get('FINNHUB_API_KEY', '')
+
+    result = {
+        'headlines': [],
+        'count': 0,
+        'error': None,
+    }
+
+    if not key:
+        result['error'] = 'No Finnhub API key (set FINNHUB_API_KEY or pass api_key)'
+        return result
+
+    cache_key = f"{ticker}:finnhub_news"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        import requests
+        from_date = (datetime.now() - pd.Timedelta(days=days_back)).strftime('%Y-%m-%d')
+        to_date = datetime.now().strftime('%Y-%m-%d')
+
+        url = (
+            f"https://finnhub.io/api/v1/company-news?"
+            f"symbol={ticker}&from={from_date}&to={to_date}&token={key}"
+        )
+
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            articles = resp.json()
+            headlines = []
+            for a in articles[:10]:  # Top 10
+                headlines.append({
+                    'headline': a.get('headline', ''),
+                    'source': a.get('source', ''),
+                    'datetime': datetime.fromtimestamp(a.get('datetime', 0)).strftime('%Y-%m-%d %H:%M'),
+                    'summary': (a.get('summary', '') or '')[:200],
+                    'url': a.get('url', ''),
+                    'category': a.get('category', ''),
+                })
+            result['headlines'] = headlines
+            result['count'] = len(headlines)
+        else:
+            result['error'] = f"Finnhub returned {resp.status_code}"
+
+    except ImportError:
+        result['error'] = 'requests not installed'
+    except Exception as e:
+        result['error'] = str(e)[:200]
+
+    _cache.set(cache_key, result)
+    return result
