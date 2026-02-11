@@ -298,6 +298,181 @@ def fetch_spy_daily() -> Optional[pd.DataFrame]:
 
 
 # =============================================================================
+# SECTOR ROTATION — Sector ETF performance vs SPY
+# =============================================================================
+
+# Map sectors to ETFs
+SECTOR_ETF_MAP = {
+    'Technology': 'XLK',
+    'Healthcare': 'XLV',
+    'Financial Services': 'XLF',
+    'Financials': 'XLF',
+    'Consumer Cyclical': 'XLY',
+    'Consumer Defensive': 'XLP',
+    'Industrials': 'XLI',
+    'Energy': 'XLE',
+    'Materials': 'XLB',
+    'Real Estate': 'XLRE',
+    'Utilities': 'XLU',
+    'Communication Services': 'XLC',
+    'Basic Materials': 'XLB',
+}
+
+# Short sector labels for display
+SECTOR_SHORT = {
+    'Technology': 'Tech',
+    'Healthcare': 'Health',
+    'Financial Services': 'Fin',
+    'Financials': 'Fin',
+    'Consumer Cyclical': 'ConDisc',
+    'Consumer Defensive': 'ConStap',
+    'Industrials': 'Indust',
+    'Energy': 'Energy',
+    'Materials': 'Mater',
+    'Real Estate': 'RE',
+    'Utilities': 'Util',
+    'Communication Services': 'Comm',
+    'Basic Materials': 'Mater',
+}
+
+
+def fetch_sector_rotation() -> Dict[str, Dict]:
+    """
+    Fetch sector rotation data — which sectors are leading/lagging vs SPY.
+
+    Returns dict keyed by sector name:
+        {sector: {etf, perf_20d, perf_5d, vs_spy_20d, status}}
+
+    Status: 'leading' (green), 'neutral' (yellow), 'lagging' (red)
+    """
+    cache_key = "SECTOR_ROTATION"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    rotation = {}
+
+    try:
+        # Fetch SPY 20-day performance
+        spy_df = fetch_daily("SPY", period='3mo')
+        if spy_df is None or len(spy_df) < 20:
+            return rotation
+
+        spy_perf_20 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+        spy_perf_5 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
+
+        # Fetch each sector ETF
+        unique_etfs = set(SECTOR_ETF_MAP.values())
+        etf_perf = {}
+
+        for etf in unique_etfs:
+            try:
+                df = fetch_daily(etf, period='3mo')
+                if df is not None and len(df) >= 20:
+                    perf_20 = (df['Close'].iloc[-1] / df['Close'].iloc[-20] - 1) * 100
+                    perf_5 = (df['Close'].iloc[-1] / df['Close'].iloc[-5] - 1) * 100
+                    etf_perf[etf] = {'perf_20d': perf_20, 'perf_5d': perf_5}
+            except Exception:
+                pass
+
+        # Build rotation map
+        for sector, etf in SECTOR_ETF_MAP.items():
+            if etf in etf_perf:
+                p = etf_perf[etf]
+                vs_spy = p['perf_20d'] - spy_perf_20
+
+                # Classify rotation status
+                if vs_spy > 2.0 and p['perf_5d'] > 0:
+                    status = 'leading'      # Outperforming + recent momentum
+                elif vs_spy < -2.0 and p['perf_5d'] < 0:
+                    status = 'lagging'       # Underperforming + losing momentum
+                else:
+                    status = 'neutral'
+
+                rotation[sector] = {
+                    'etf': etf,
+                    'perf_20d': round(p['perf_20d'], 1),
+                    'perf_5d': round(p['perf_5d'], 1),
+                    'vs_spy_20d': round(vs_spy, 1),
+                    'spy_perf_20d': round(spy_perf_20, 1),
+                    'status': status,
+                    'short_name': SECTOR_SHORT.get(sector, sector[:4]),
+                }
+
+    except Exception as e:
+        print(f"[data_fetcher] Sector rotation error: {e}")
+
+    _cache.set(cache_key, rotation)
+    return rotation
+
+
+def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 7) -> Dict[str, Dict]:
+    """
+    Check earnings dates for a batch of tickers.
+
+    Returns dict keyed by ticker:
+        {ticker: {next_earnings: date_str, days_until: int, within_window: bool}}
+
+    Only returns entries for tickers WITH upcoming earnings within days_ahead.
+    """
+    cache_key = "BATCH_EARNINGS_FLAGS"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    flags = {}
+
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+
+            # Try calendar first (fastest)
+            cal = stock.calendar
+            if cal is not None:
+                earn_date = None
+                if isinstance(cal, dict):
+                    earn_date = cal.get('Earnings Date')
+                    if isinstance(earn_date, list) and earn_date:
+                        earn_date = earn_date[0]
+                elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                    try:
+                        earn_date = cal.iloc[0].get('Earnings Date')
+                    except Exception:
+                        pass
+
+                if earn_date is not None:
+                    if hasattr(earn_date, 'date'):
+                        earn_dt = earn_date.date() if hasattr(earn_date, 'date') else earn_date
+                    elif isinstance(earn_date, str):
+                        from datetime import date
+                        earn_dt = datetime.strptime(earn_date[:10], '%Y-%m-%d').date()
+                    else:
+                        continue
+
+                    today = datetime.now().date()
+                    days_until = (earn_dt - today).days
+
+                    if 0 <= days_until <= days_ahead:
+                        flags[ticker] = {
+                            'next_earnings': earn_dt.strftime('%Y-%m-%d'),
+                            'days_until': days_until,
+                            'within_window': True,
+                        }
+
+        except Exception:
+            pass
+
+    _cache.set(cache_key, flags)
+    return flags
+
+
+def get_ticker_sector(ticker: str) -> Optional[str]:
+    """Get sector for a ticker from cached info."""
+    info = fetch_ticker_info(ticker)
+    return info.get('sector')
+
+
+# =============================================================================
 # FUNDAMENTAL DATA — Ticker info, sector, earnings
 # =============================================================================
 
