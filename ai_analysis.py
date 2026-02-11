@@ -450,6 +450,69 @@ def _format_news(news_data: Dict) -> str:
     return "\n".join(lines)
 
 
+def _format_market_intelligence(intel: Dict) -> str:
+    """Format market intelligence for AI prompt."""
+    if not intel or intel.get('error'):
+        return "No market intelligence available."
+
+    lines = []
+
+    # Analyst consensus
+    consensus = intel.get('analyst_consensus')
+    if consensus:
+        sb = intel.get('analyst_strong_buy', 0)
+        b = intel.get('analyst_buy', 0)
+        h = intel.get('analyst_hold', 0)
+        s = intel.get('analyst_sell', 0)
+        ss = intel.get('analyst_strong_sell', 0)
+        total = intel.get('analyst_count', 0)
+        lines.append(f"  ANALYST CONSENSUS: {consensus} ({total} analysts)")
+        lines.append(f"    Strong Buy: {sb} | Buy: {b} | Hold: {h} | Sell: {s} | Strong Sell: {ss}")
+
+    # Price targets
+    target = intel.get('target_mean')
+    if target:
+        high = intel.get('target_high')
+        low = intel.get('target_low')
+        upside = intel.get('target_upside_pct')
+        lines.append(f"  PRICE TARGETS: Mean ${target:.2f} | High ${high:.2f} | Low ${low:.2f}"
+                     f" | Upside: {upside:+.1f}%" if upside else "")
+
+    # Recent upgrades/downgrades
+    changes = intel.get('recent_changes', [])
+    if changes:
+        lines.append(f"  RECENT RATING CHANGES ({len(changes)}):")
+        for c in changes[:5]:
+            from_g = f" from {c['from_grade']}" if c.get('from_grade') else ""
+            lines.append(f"    {c.get('date', '?')} — {c.get('firm', '?')}: {c.get('action', '?')} → {c.get('to_grade', '?')}{from_g}")
+
+    # Insider activity
+    buys = intel.get('insider_buys_90d', 0)
+    sells = intel.get('insider_sells_90d', 0)
+    if buys > 0 or sells > 0:
+        net = intel.get('insider_net_shares', 0)
+        signal_str = "NET BUYING ✅" if net > 0 else ("NET SELLING ⚠️" if net < 0 else "NEUTRAL")
+        lines.append(f"  INSIDER ACTIVITY (90 days): {buys} buys, {sells} sells — {signal_str}")
+        # Show top transactions
+        txns = intel.get('insider_transactions', [])
+        for t in txns[:3]:
+            val_str = f" (${t['value']:,.0f})" if t.get('value') else ""
+            lines.append(f"    {t.get('date', '?')} — {t.get('name', '?')}: {t.get('type', '?')} "
+                         f"{t.get('shares', 0):,} shares{val_str}")
+
+    # Social sentiment
+    social = intel.get('social_score')
+    if social:
+        reddit = intel.get('social_reddit_mentions', 0)
+        twitter = intel.get('social_twitter_mentions', 0)
+        lines.append(f"  SOCIAL SENTIMENT: {social} (Reddit: {reddit} mentions | Twitter: {twitter} mentions, last 7 days)")
+
+    if not lines:
+        return "No market intelligence available."
+
+    return "\n".join(lines)
+
+
 def build_ai_prompt(ticker: str,
                     signal: EntrySignal,
                     recommendation: Dict,
@@ -457,7 +520,8 @@ def build_ai_prompt(ticker: str,
                     fundamentals: Dict = None,
                     fundamental_profile: Dict = None,
                     tradingview_data: Dict = None,
-                    news_data: Dict = None) -> str:
+                    news_data: Dict = None,
+                    market_intel: Dict = None) -> str:
     """
     Build enhanced AI analysis prompt with fundamental profile,
     TradingView confirmation, news, and actionable breakout guidance.
@@ -519,6 +583,11 @@ RECENT NEWS & CATALYSTS
 {_format_news(news_data)}
 
 ══════════════════════════════════════════════════
+MARKET INTELLIGENCE — Analysts, Insiders, Social
+══════════════════════════════════════════════════
+{_format_market_intelligence(market_intel) if market_intel else 'No market intelligence available.'}
+
+══════════════════════════════════════════════════
 MARKET SENTIMENT DATA
 ══════════════════════════════════════════════════
 {_format_fundamentals(fundamentals)}
@@ -527,13 +596,13 @@ MARKET SENTIMENT DATA
 YOUR ANALYSIS — Respond with EXACTLY this format:
 ══════════════════════════════════════════════════
 
-CONVICTION: [1-10]
+CONVICTION: [1-10, weigh: technical alignment (30%), analyst consensus (20%), fundamental quality (20%), insider activity (15%), risk factors (15%). Be specific about what raised or lowered conviction.]
 
 ACTION: [BUY NOW / WAIT FOR BREAKOUT / WAIT FOR PULLBACK / SKIP]
 
 RESISTANCE VERDICT: [Is overhead resistance a problem? Should trader wait for breakout? Specify the exact price level that must break, what volume confirms it (e.g. "2x avg"), and what a failed breakout looks like. If no significant resistance, say "Clear path — enter on signal." 2-3 sentences max.]
 
-WHY IT'S MOVING: [What fundamental catalyst explains the current price action? Use the news headlines and fundamental data. Recent earnings beat/miss? Sector rotation? New product? M&A? Macro tailwind? If nothing obvious, say "Technical momentum — no fundamental catalyst visible." 1-2 sentences.]
+WHY IT'S MOVING: [Synthesize from news headlines, analyst actions, insider activity, and social buzz. What is the NARRATIVE driving this stock right now? Recent earnings beat/miss? Analyst upgrades? Insider buying? Reddit buzz? Sector rotation? If nothing, say "Technical momentum — no catalyst visible." 2-3 sentences.]
 
 FUNDAMENTAL QUALITY: [Rate the business A/B/C/D using this framework:
 A = Strong moat, growing revenue, profitable, clean balance sheet
@@ -542,15 +611,17 @@ C = Weak fundamentals, declining margins, or high debt
 D = Speculative, no profits, or deteriorating rapidly
 Include 1 sentence explaining the rating with specific numbers.]
 
-BULL CASE: [Best realistic outcome in 3-6 months, with a price target and the catalyst that gets it there. 1-2 sentences.]
+SMART MONEY: [What are analysts and insiders telling us? Summarize: analyst consensus rating, mean price target vs current (upside %), any recent upgrades/downgrades, and insider buying/selling pattern. Is smart money aligned with the technical signal? 2-3 sentences.]
+
+BULL CASE: [Best realistic outcome in 3-6 months, with a price target and the catalyst that gets it there. Use analyst targets if available. 1-2 sentences.]
 
 BEAR CASE: [What kills this trade? Specific risk with price level. 1-2 sentences.]
 
-RED FLAGS: [1-3 specific concerns, or "None" if clean]
+RED FLAGS: [1-3 specific concerns, or "None" if clean. Consider: insider selling, analyst downgrades, high short interest, earnings risk, declining fundamentals.]
 
 POSITION SIZING: [Full (100%) / Reduced (75%) / Small (50%) / Skip — with 1 reason]
 
-Keep total response under 250 words. No fluff. Be specific with prices and percentages."""
+Keep total response under 300 words. No fluff. Be specific with prices and percentages."""
 
     return prompt
 
@@ -627,6 +698,7 @@ def _parse_ai_response(text: str) -> Dict[str, Any]:
         'resistance_verdict': '',
         'why_moving': '',
         'fundamental_quality': '',
+        'smart_money': '',
         'bull_case': '',
         'bear_case': '',
         'red_flags': '',
@@ -647,6 +719,7 @@ def _parse_ai_response(text: str) -> Dict[str, Any]:
         'WHY IT\'S MOVING': 'why_moving',
         'WHY ITS MOVING': 'why_moving',
         'FUNDAMENTAL QUALITY': 'fundamental_quality',
+        'SMART MONEY': 'smart_money',
         'BULL CASE': 'bull_case',
         'BEAR CASE': 'bear_case',
         'RED FLAGS': 'red_flags',
@@ -951,27 +1024,16 @@ def analyze(ticker: str,
             fundamental_profile: Dict = None,
             tradingview_data: Dict = None,
             news_data: Dict = None,
+            market_intel: Dict = None,
             gemini_model=None,
             openai_client=None) -> Dict[str, Any]:
     """
     Run enhanced AI analysis on a ticker.
-
-    Args:
-        ticker: Stock symbol
-        signal: EntrySignal from signal_engine.validate_entry()
-        recommendation: Dict from scanner_engine.generate_recommendation()
-        quality: Dict from scanner_engine.calculate_quality_score()
-        fundamentals: Dict from data_fetcher (options, insider, etc.)
-        fundamental_profile: Dict from data_fetcher.fetch_fundamental_profile()
-        tradingview_data: Dict from data_fetcher.fetch_tradingview_mtf()
-        news_data: Dict from data_fetcher.fetch_finnhub_news()
-        gemini_model: Google Gemini model instance
-        openai_client: OpenAI client instance
     """
     # Build prompt
     prompt = build_ai_prompt(ticker, signal, recommendation, quality,
                              fundamentals, fundamental_profile,
-                             tradingview_data, news_data)
+                             tradingview_data, news_data, market_intel)
 
     # Try AI first
     if gemini_model is not None or openai_client is not None:
@@ -1001,5 +1063,6 @@ def analyze(ticker: str,
     result['fundamental_profile'] = fundamental_profile
     result['tradingview_data'] = tradingview_data
     result['news_data'] = news_data
+    result['market_intel'] = market_intel
 
     return result
