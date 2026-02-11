@@ -181,7 +181,7 @@ def _load_ticker_for_view(ticker: str):
     try:
         data = fetch_all_ticker_data(ticker)
         if data.get('daily') is not None:
-            analysis = analyze_ticker(ticker, data)
+            analysis = analyze_ticker(data)
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = analysis
             # Cache the data
