@@ -18,19 +18,20 @@ Version: 2.0.0 (2026-02-08)
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict
 
 # Backend imports
 from signal_engine import EntrySignal
 from data_fetcher import (
     fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
+    fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
     clear_cache,
 )
 from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
-from journal_manager import JournalManager, WatchlistItem, Trade
+from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 
 # =============================================================================
@@ -48,9 +49,19 @@ st.set_page_config(
 if 'journal' not in st.session_state:
     st.session_state['journal'] = JournalManager(data_dir=".")
 
-# Initialize scan results
+# Initialize scan results — restore from disk if available
 if 'scan_results' not in st.session_state:
-    st.session_state['scan_results'] = []
+    jm_init = st.session_state['journal']
+    saved_scan = jm_init.load_scan_results()
+    if saved_scan and saved_scan.get('results'):
+        # Restore minimal scan summary for display (not full TickerAnalysis objects)
+        st.session_state['scan_results'] = []
+        st.session_state['scan_results_summary'] = saved_scan['results']
+        st.session_state['scan_timestamp'] = saved_scan.get('timestamp', '')
+    else:
+        st.session_state['scan_results'] = []
+        st.session_state['scan_results_summary'] = []
+        st.session_state['scan_timestamp'] = ''
 
 if 'selected_ticker' not in st.session_state:
     st.session_state['selected_ticker'] = None
@@ -101,16 +112,46 @@ def render_sidebar():
         if st.button("🔍 Scan", use_container_width=True, type="primary"):
             _run_scan()
 
-    # ── Open Positions ────────────────────────────────────────────────
+    # ── Open Positions (clickable) ────────────────────────────────────
     open_trades = jm.get_open_trades()
     if open_trades:
         st.sidebar.divider()
-        st.sidebar.subheader(f"Open Positions ({len(open_trades)})")
+        st.sidebar.subheader(f"📈 Open Positions ({len(open_trades)})")
         for trade in open_trades:
             ticker = trade['ticker']
             entry = trade.get('entry_price', 0)
-            stop = trade.get('current_stop', trade.get('initial_stop', 0))
-            st.sidebar.text(f"{ticker}: ${entry:.2f} | Stop: ${stop:.2f}")
+            current = fetch_current_price(ticker) or entry
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+            icon = "🟢" if pnl_pct >= 0 else "🔴"
+
+            if st.sidebar.button(
+                f"{icon} {ticker}  ${current:.2f}  ({pnl_pct:+.1f}%)",
+                key=f"sidebar_pos_{ticker}",
+                use_container_width=True,
+            ):
+                _load_ticker_for_view(ticker)
+
+    # ── Conditional Alerts ────────────────────────────────────────────
+    conditionals = jm.get_pending_conditionals()
+    if conditionals:
+        st.sidebar.divider()
+        st.sidebar.subheader(f"🎯 Breakout Alerts ({len(conditionals)})")
+        for cond in conditionals:
+            ticker = cond['ticker']
+            trigger = cond.get('trigger_price', 0)
+            cond_type = cond.get('condition_type', '').replace('_', ' ')
+            current = fetch_current_price(ticker) or 0
+            dist_pct = ((trigger - current) / current * 100) if current > 0 else 0
+
+            label = f"⏳ {ticker}  ${trigger:.2f} ({dist_pct:+.1f}%)"
+            col_a, col_b = st.sidebar.columns([3, 1])
+            with col_a:
+                if st.button(label, key=f"sidebar_cond_{ticker}", use_container_width=True):
+                    _load_ticker_for_view(ticker)
+            with col_b:
+                if st.button("✕", key=f"rm_cond_{ticker}"):
+                    jm.remove_conditional(ticker)
+                    st.rerun()
 
     # ── Market Filter ─────────────────────────────────────────────────
     st.sidebar.divider()
@@ -123,23 +164,100 @@ def render_sidebar():
     )
 
 
+def _load_ticker_for_view(ticker: str):
+    """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.)."""
+    ticker = ticker.upper().strip()
+
+    # Check if we already have analysis from a scan
+    results = st.session_state.get('scan_results', [])
+    for r in results:
+        if r.ticker == ticker:
+            st.session_state['selected_ticker'] = ticker
+            st.session_state['selected_analysis'] = r
+            st.rerun()
+            return
+
+    # Fetch fresh data and analyze on-the-fly
+    try:
+        data = fetch_all_ticker_data(ticker)
+        if data.get('daily') is not None:
+            analysis = analyze_ticker(ticker, data)
+            st.session_state['selected_ticker'] = ticker
+            st.session_state['selected_analysis'] = analysis
+            # Cache the data
+            cache = st.session_state.get('ticker_data_cache', {})
+            cache[ticker] = data
+            st.session_state['ticker_data_cache'] = cache
+            st.rerun()
+        else:
+            st.sidebar.error(f"No data for {ticker}")
+    except Exception as e:
+        st.sidebar.error(f"Error loading {ticker}: {e}")
+
+
 def _run_scan():
-    """Execute watchlist scan."""
+    """Execute watchlist scan with persistence and conditional checking."""
     jm = get_journal()
     tickers = jm.get_watchlist_tickers()
 
-    if not tickers:
+    # Also include conditional alert tickers
+    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    # And open position tickers (so they show in scan results too)
+    open_tickers = jm.get_open_tickers()
+
+    all_tickers = list(set(tickers + conditional_tickers + open_tickers))
+
+    if not all_tickers:
         st.sidebar.warning("Add tickers to watchlist first")
         return
 
-    with st.spinner(f"Scanning {len(tickers)} tickers..."):
-        all_data = fetch_scan_data(tickers)
+    with st.spinner(f"Scanning {len(all_tickers)} tickers..."):
+        all_data = fetch_scan_data(all_tickers)
         results = scan_watchlist(all_data)
 
         st.session_state['scan_results'] = results
         st.session_state['ticker_data_cache'] = all_data
         st.session_state['selected_ticker'] = None
         st.session_state['selected_analysis'] = None
+
+        # Persist scan summary to disk for cross-session restore
+        summary = []
+        for r in results:
+            rec = r.recommendation or {}
+            q = r.quality or {}
+            sig = r.signal
+            summary.append({
+                'ticker': r.ticker,
+                'recommendation': rec.get('recommendation', 'SKIP'),
+                'conviction': rec.get('conviction', 0),
+                'quality_grade': q.get('quality_grade', '?'),
+                'price': r.current_price,
+                'summary': rec.get('summary', ''),
+                'macd_bullish': sig.macd.get('bullish', False) if sig else False,
+                'ao_positive': sig.ao.get('positive', False) if sig else False,
+                'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
+                'monthly_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
+                'is_open_position': r.ticker in open_tickers,
+            })
+        jm.save_scan_results(summary)
+        st.session_state['scan_results_summary'] = summary
+        st.session_state['scan_timestamp'] = datetime.now().isoformat()
+
+        # Check conditional alerts
+        current_prices = {}
+        volume_ratios = {}
+        for ticker, data in all_data.items():
+            daily = data.get('daily')
+            if daily is not None and len(daily) > 0:
+                current_prices[ticker] = float(daily['Close'].iloc[-1])
+                if len(daily) > 50:
+                    avg_vol = daily['Volume'].tail(50).mean()
+                    if avg_vol > 0:
+                        volume_ratios[ticker] = float(daily['Volume'].iloc[-1] / avg_vol)
+
+        triggered = jm.check_conditionals(current_prices, volume_ratios)
+        if triggered:
+            st.session_state['triggered_alerts'] = triggered
 
     st.rerun()
 
@@ -149,49 +267,58 @@ def _run_scan():
 # =============================================================================
 
 def render_scanner_table():
-    """Render the scan results as an interactive table."""
+    """Render scan results with action buttons and cross-session persistence."""
     results = st.session_state.get('scan_results', [])
+    summary = st.session_state.get('scan_results_summary', [])
+    timestamp = st.session_state.get('scan_timestamp', '')
+    jm = get_journal()
 
-    if not results:
+    # Show triggered alerts banner
+    triggered = st.session_state.get('triggered_alerts', [])
+    if triggered:
+        for t in triggered:
+            st.success(
+                f"🎯 **BREAKOUT TRIGGERED: {t['ticker']}** — "
+                f"Price ${t.get('triggered_price', 0):.2f} broke above "
+                f"${t.get('trigger_price', 0):.2f} "
+                f"(Volume: {t.get('triggered_volume_ratio', 0):.1f}x avg)"
+            )
+        # Clear after showing
+        st.session_state['triggered_alerts'] = []
+
+    # No results at all
+    if not results and not summary:
         st.info("👆 Add tickers to your watchlist and click **Scan** to begin.")
         return
 
-    st.subheader(f"Scan Results — {len(results)} tickers")
+    # Build table from live scan results if available, else from persisted summary
+    if results:
+        rows = _build_rows_from_analysis(results, jm)
+        source = "live"
+    else:
+        rows = _build_rows_from_summary(summary, jm)
+        source = "restored"
+        if timestamp:
+            try:
+                ts = datetime.fromisoformat(timestamp)
+                age = datetime.now() - ts
+                age_str = f"{age.days}d {age.seconds // 3600}h ago" if age.days > 0 else f"{age.seconds // 3600}h ago"
+                st.caption(f"📌 Last scan: {ts.strftime('%Y-%m-%d %H:%M')} ({age_str}) — Re-scan for live data")
+            except Exception:
+                st.caption("📌 Showing last saved scan results — Re-scan for live data")
 
-    # Build table data
-    rows = []
-    for r in results:
-        rec = r.recommendation or {}
-        q = r.quality or {}
-        sig = r.signal
-
-        macd_status = "✅" if sig and sig.macd.get('bullish') else "❌"
-        ao_status = "✅" if sig and sig.ao.get('positive') else "❌"
-        weekly_status = "✅" if sig and sig.weekly_macd.get('bullish') else "❌"
-        monthly_status = "✅" if sig and sig.monthly_macd.get('bullish') else "❌"
-
-        rows.append({
-            'Ticker': r.ticker,
-            'Rec': rec.get('recommendation', 'SKIP'),
-            'Conv': f"{rec.get('conviction', 0)}/10",
-            'MACD': macd_status,
-            'AO': ao_status,
-            'Wkly': weekly_status,
-            'Mthly': monthly_status,
-            'Quality': q.get('quality_grade', '?'),
-            'Price': f"${r.current_price:.2f}" if r.current_price else "?",
-            'Summary': rec.get('summary', ''),
-        })
+    count = len(rows)
+    st.subheader(f"Scan Results — {count} tickers")
 
     df = pd.DataFrame(rows)
-
-    # Color-code recommendation
     st.dataframe(
-        df,
+        df[['Ticker', 'Status', 'Rec', 'Conv', 'MACD', 'AO', 'Wkly', 'Mthly',
+            'Quality', 'Price', 'Summary']],
         use_container_width=True,
         hide_index=True,
         column_config={
             'Ticker': st.column_config.TextColumn(width="small"),
+            'Status': st.column_config.TextColumn(width="small"),
             'Rec': st.column_config.TextColumn("Recommendation", width="medium"),
             'Conv': st.column_config.TextColumn("Conviction", width="small"),
             'MACD': st.column_config.TextColumn(width="small"),
@@ -204,20 +331,180 @@ def render_scanner_table():
         },
     )
 
-    # Ticker selector
+    # ── Ticker Selection + Action Buttons ─────────────────────────────
     st.divider()
-    ticker_options = [r.ticker for r in results]
-    selected = st.selectbox("Select ticker for detailed analysis", ticker_options,
-                            index=0 if ticker_options else None)
 
+    ticker_options = [r['Ticker'] for r in rows]
+    # Also add open positions that might not be in scan
+    open_tickers = jm.get_open_tickers()
+    for ot in open_tickers:
+        if ot not in ticker_options:
+            ticker_options.append(ot)
+
+    col_sel, col_act1, col_act2, col_act3 = st.columns([3, 1, 1, 1])
+
+    with col_sel:
+        current_idx = 0
+        if st.session_state.get('selected_ticker') in ticker_options:
+            current_idx = ticker_options.index(st.session_state['selected_ticker'])
+        selected = st.selectbox("Select ticker", ticker_options,
+                                index=current_idx if ticker_options else None)
+
+    with col_act1:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("📈 View", use_container_width=True, type="primary"):
+            if selected:
+                _load_ticker_for_view(selected)
+
+    with col_act2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("⭐ Watch", use_container_width=True):
+            if selected:
+                wl = jm.get_watchlist_tickers()
+                if selected not in wl:
+                    jm.add_to_watchlist(WatchlistItem(ticker=selected))
+                    st.success(f"Added {selected} to watchlist")
+                    st.rerun()
+                else:
+                    st.info(f"{selected} already in watchlist")
+
+    with col_act3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🎯 Alert", use_container_width=True):
+            if selected:
+                st.session_state['show_alert_form'] = selected
+                st.rerun()
+
+    # ── Quick Alert Form (shown when Alert button clicked) ────────────
+    alert_ticker = st.session_state.get('show_alert_form')
+    if alert_ticker:
+        _render_quick_alert_form(alert_ticker, jm)
+
+    # Auto-select ticker for detail view
     if selected and selected != st.session_state.get('selected_ticker'):
-        st.session_state['selected_ticker'] = selected
-        # Find the analysis
-        for r in results:
-            if r.ticker == selected:
-                st.session_state['selected_analysis'] = r
-                break
-        st.rerun()
+        # Check if we have full analysis
+        if results:
+            for r in results:
+                if r.ticker == selected:
+                    st.session_state['selected_ticker'] = selected
+                    st.session_state['selected_analysis'] = r
+                    break
+
+
+def _build_rows_from_analysis(results, jm) -> list:
+    """Build table rows from live TickerAnalysis objects."""
+    open_tickers = jm.get_open_tickers()
+    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    rows = []
+    for r in results:
+        rec = r.recommendation or {}
+        q = r.quality or {}
+        sig = r.signal
+
+        # Status column
+        if r.ticker in open_tickers:
+            status = "📈 Open"
+        elif r.ticker in conditional_tickers:
+            status = "🎯 Alert"
+        else:
+            status = "👀"
+
+        rows.append({
+            'Ticker': r.ticker,
+            'Status': status,
+            'Rec': rec.get('recommendation', 'SKIP'),
+            'Conv': f"{rec.get('conviction', 0)}/10",
+            'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
+            'AO': "✅" if sig and sig.ao.get('positive') else "❌",
+            'Wkly': "✅" if sig and sig.weekly_macd.get('bullish') else "❌",
+            'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') else "❌",
+            'Quality': q.get('quality_grade', '?'),
+            'Price': f"${r.current_price:.2f}" if r.current_price else "?",
+            'Summary': rec.get('summary', ''),
+        })
+    return rows
+
+
+def _build_rows_from_summary(summary, jm) -> list:
+    """Build table rows from persisted scan summary (cross-session)."""
+    open_tickers = jm.get_open_tickers()
+    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    rows = []
+    for s in summary:
+        ticker = s.get('ticker', '?')
+        if ticker in open_tickers:
+            status = "📈 Open"
+        elif ticker in conditional_tickers:
+            status = "🎯 Alert"
+        else:
+            status = "👀"
+
+        rows.append({
+            'Ticker': ticker,
+            'Status': status,
+            'Rec': s.get('recommendation', 'SKIP'),
+            'Conv': f"{s.get('conviction', 0)}/10",
+            'MACD': "✅" if s.get('macd_bullish') else "❌",
+            'AO': "✅" if s.get('ao_positive') else "❌",
+            'Wkly': "✅" if s.get('weekly_bullish') else "❌",
+            'Mthly': "✅" if s.get('monthly_bullish') else "❌",
+            'Quality': s.get('quality_grade', '?'),
+            'Price': f"${s.get('price', 0):.2f}" if s.get('price') else "?",
+            'Summary': s.get('summary', ''),
+        })
+    return rows
+
+
+def _render_quick_alert_form(ticker: str, jm: JournalManager):
+    """Inline form to set a breakout/pullback alert."""
+    st.markdown(f"### 🎯 Set Alert for {ticker}")
+
+    current = fetch_current_price(ticker) or 0
+
+    ca1, ca2, ca3, ca4 = st.columns(4)
+    with ca1:
+        cond_type = st.selectbox("Type", ['breakout_above', 'pullback_to', 'breakout_volume'],
+                                  key=f"alert_type_{ticker}")
+    with ca2:
+        # Default trigger: overhead resistance if available, else current + 3%
+        default_trigger = current * 1.03 if current > 0 else 0
+        # Try to get resistance from analysis
+        analysis = st.session_state.get('selected_analysis')
+        if analysis and analysis.signal and analysis.signal.overhead_resistance:
+            ores = analysis.signal.overhead_resistance
+            if ores.get('critical_level'):
+                default_trigger = float(ores['critical_level']['price'])
+
+        trigger = st.number_input("Trigger Price", value=default_trigger,
+                                   step=0.01, format="%.2f", key=f"alert_trigger_{ticker}")
+    with ca3:
+        vol_mult = st.number_input("Volume (x avg)", value=1.5,
+                                    min_value=1.0, max_value=5.0, step=0.1,
+                                    key=f"alert_vol_{ticker}")
+    with ca4:
+        expires = st.date_input("Expires",
+                                 value=datetime.now() + timedelta(days=30),
+                                 key=f"alert_exp_{ticker}")
+
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        if st.button("✅ Set Alert", type="primary", key=f"set_alert_{ticker}"):
+            entry = ConditionalEntry(
+                ticker=ticker,
+                condition_type=cond_type,
+                trigger_price=trigger,
+                volume_multiplier=vol_mult,
+                expires_date=expires.strftime('%Y-%m-%d'),
+                notes=f"Current: ${current:.2f}",
+            )
+            result = jm.add_conditional(entry)
+            st.success(result)
+            st.session_state.pop('show_alert_form', None)
+            st.rerun()
+    with ac2:
+        if st.button("Cancel", key=f"cancel_alert_{ticker}"):
+            st.session_state.pop('show_alert_form', None)
+            st.rerun()
 
 
 # =============================================================================
@@ -477,8 +764,9 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
 
 def _render_ai_tab(ticker: str, signal: EntrySignal,
                    rec: Dict, analysis: TickerAnalysis):
-    """AI-enhanced analysis with fundamental profile and breakout guidance."""
+    """AI-enhanced analysis with fundamental profile, TV-TA, news, and breakout guidance."""
     quality = analysis.quality or {}
+    jm = get_journal()
 
     # Check for Gemini/OpenAI config
     gemini = None
@@ -494,14 +782,18 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         pass
 
     if st.button("🤖 Run AI Analysis", type="primary"):
-        with st.spinner("Fetching fundamentals & analyzing..."):
+        with st.spinner("Fetching fundamentals, TradingView, news & analyzing..."):
             fundamentals = {}
             fundamental_profile = {}
+            tradingview_data = {}
+            news_data = {}
+
             try:
                 from data_fetcher import (
                     fetch_ticker_info, fetch_options_data,
                     fetch_insider_transactions, fetch_institutional_holders,
                     fetch_earnings_date, fetch_fundamental_profile,
+                    fetch_tradingview_mtf, fetch_finnhub_news,
                 )
                 fundamentals = {
                     'info': fetch_ticker_info(ticker),
@@ -512,7 +804,21 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 }
                 fundamental_profile = fetch_fundamental_profile(ticker)
             except Exception as e:
-                st.caption(f"Fundamentals fetch error: {e}")
+                st.caption(f"Fundamentals error: {e}")
+
+            # TradingView-TA (optional — no API key needed)
+            try:
+                tradingview_data = fetch_tradingview_mtf(ticker)
+            except Exception:
+                pass
+
+            # Finnhub news (optional — needs API key)
+            try:
+                finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                if finnhub_key:
+                    news_data = fetch_finnhub_news(ticker, api_key=finnhub_key)
+            except Exception:
+                pass
 
             result = run_ai_analysis(
                 ticker=ticker,
@@ -521,6 +827,8 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 quality=quality,
                 fundamentals=fundamentals,
                 fundamental_profile=fundamental_profile,
+                tradingview_data=tradingview_data,
+                news_data=news_data,
                 gemini_model=gemini,
                 openai_client=openai_client,
             )
@@ -566,15 +874,53 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.metric("Business Quality", f"{grade_icon} {grade}")
 
     # ═══════════════════════════════════════════════════════════════
-    # RESISTANCE VERDICT — the key actionable insight
+    # RESISTANCE VERDICT + BREAKOUT ALERT BUTTON
     # ═══════════════════════════════════════════════════════════════
     resistance = ai_result.get('resistance_verdict', '')
     if resistance:
         is_wait = any(w in resistance.lower() for w in ['wait', 'breakout', 'stall', 'failed'])
         if is_wait:
             st.warning(f"🚧 **Resistance:** {resistance}")
+
+            # Extract trigger price from resistance verdict or overhead data
+            trigger_price = None
+            ores = signal.overhead_resistance if signal else None
+            if ores and ores.get('critical_level'):
+                trigger_price = float(ores['critical_level']['price'])
+
+            # Show "Set Breakout Alert" button
+            if trigger_price:
+                ba_col1, ba_col2 = st.columns([3, 1])
+                with ba_col1:
+                    st.markdown(f"**Set alert for breakout above ${trigger_price:.2f}?**")
+                with ba_col2:
+                    if st.button("🎯 Set Breakout Alert", key=f"ba_{ticker}",
+                                 type="primary"):
+                        from journal_manager import ConditionalEntry
+                        entry = ConditionalEntry(
+                            ticker=ticker,
+                            condition_type='breakout_volume',
+                            trigger_price=trigger_price,
+                            volume_multiplier=1.5,
+                            stop_price=signal.stops.get('stop', 0) if signal.stops else 0,
+                            target_price=signal.stops.get('target', 0) if signal.stops else 0,
+                            conviction=conv,
+                            quality_grade=fq[0] if fq and fq[0] in 'ABCD' else '?',
+                            notes=f"AI: {resistance[:100]}",
+                            expires_date=(datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d'),
+                        )
+                        msg = jm.add_conditional(entry)
+                        st.success(msg)
+                        st.rerun()
         else:
             st.success(f"✅ **Resistance:** {resistance}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TRADINGVIEW CONFIRMATION
+    # ═══════════════════════════════════════════════════════════════
+    tv_data = ai_result.get('tradingview_data', {})
+    if tv_data:
+        _render_tv_confirmation(tv_data)
 
     # ═══════════════════════════════════════════════════════════════
     # WHY IT'S MOVING + FUNDAMENTAL QUALITY
@@ -613,7 +959,17 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.success("🚩 **Red flags:** None — clean setup")
 
     # ═══════════════════════════════════════════════════════════════
-    # FUNDAMENTAL SNAPSHOT TABLE (from profile data)
+    # NEWS HEADLINES
+    # ═══════════════════════════════════════════════════════════════
+    news = ai_result.get('news_data', {})
+    if news and news.get('headlines'):
+        with st.expander(f"📰 Recent News ({news.get('count', 0)} articles)", expanded=False):
+            for h in news['headlines'][:5]:
+                st.markdown(f"**{h.get('datetime', '')}** — {h.get('headline', '')} "
+                            f"*({h.get('source', '')})*")
+
+    # ═══════════════════════════════════════════════════════════════
+    # FUNDAMENTAL SNAPSHOT TABLE
     # ═══════════════════════════════════════════════════════════════
     fp = ai_result.get('fundamental_profile', {})
     if fp and not fp.get('error'):
@@ -625,6 +981,35 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # ═══════════════════════════════════════════════════════════════
     with st.expander("📝 Full AI Response"):
         st.text(ai_result.get('raw_text', ''))
+
+
+def _render_tv_confirmation(tv_data: Dict):
+    """Render TradingView-TA confirmation strip."""
+    has_data = False
+    cols = st.columns(4)
+    labels = {'1h': '1 Hour', '4h': '4 Hour', '1d': 'Daily', '1W': 'Weekly'}
+
+    for i, (interval, label) in enumerate(labels.items()):
+        data = tv_data.get(interval, {})
+        if data.get('error'):
+            continue
+        rec = data.get('recommendation', '')
+        if not rec:
+            continue
+        has_data = True
+
+        with cols[i]:
+            if 'STRONG_BUY' in rec:
+                st.success(f"**{label}:** {rec}")
+            elif 'BUY' in rec:
+                st.info(f"**{label}:** {rec}")
+            elif 'SELL' in rec:
+                st.error(f"**{label}:** {rec}")
+            else:
+                st.warning(f"**{label}:** {rec}")
+
+    if not has_data:
+        st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
 
 
 def _render_fundamental_snapshot(fp: Dict):
