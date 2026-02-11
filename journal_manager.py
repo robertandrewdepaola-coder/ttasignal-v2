@@ -38,10 +38,38 @@ EXIT_REASONS = [
 
 SIGNAL_TYPES = ['PRIMARY', 'AO_CONFIRMATION', 'RE_ENTRY', 'LATE_ENTRY']
 
+CONDITION_TYPES = [
+    'breakout_above',   # Buy when price breaks above level on volume
+    'pullback_to',      # Buy when price pulls back to level
+    'breakout_volume',  # Breakout + volume confirmation
+]
+
 
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
+
+@dataclass
+class ConditionalEntry:
+    """A pending conditional order — triggers when price/volume conditions are met."""
+    ticker: str
+    condition_type: str = 'breakout_above'  # One of CONDITION_TYPES
+    trigger_price: float = 0                # Price that must be exceeded
+    volume_multiplier: float = 1.5          # Required volume vs average (e.g. 1.5x)
+    stop_price: float = 0                   # Pre-planned stop loss
+    target_price: float = 0                 # Pre-planned target
+    position_size_pct: float = 12.5         # % of account to deploy
+    notes: str = ''
+    conviction: int = 0
+    signal_type: str = ''
+    quality_grade: str = ''
+    created_date: str = ''
+    expires_date: str = ''                  # Auto-expire if not triggered
+    status: str = 'PENDING'                 # PENDING, TRIGGERED, EXPIRED, CANCELLED
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
 
 @dataclass
 class WatchlistItem:
@@ -123,10 +151,13 @@ class JournalManager:
         self.watchlist_file = self.data_dir / "v2_watchlist.json"
         self.open_trades_file = self.data_dir / "v2_open_trades.json"
         self.history_file = self.data_dir / "v2_trade_history.json"
+        self.conditionals_file = self.data_dir / "v2_conditionals.json"
+        self.scan_results_file = self.data_dir / "v2_last_scan.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
         self.open_trades: List[Dict] = self._load(self.open_trades_file, [])
         self.trade_history: List[Dict] = self._load(self.history_file, [])
+        self.conditionals: List[Dict] = self._load(self.conditionals_file, [])
 
     # ── Persistence ───────────────────────────────────────────────────
 
@@ -514,3 +545,160 @@ class JournalManager:
             sector = ticker_sectors.get(trade['ticker'], 'Unknown')
             exposure[sector] = exposure.get(sector, 0) + 1
         return exposure
+
+    # ── Conditional Entries (Breakout/Pullback Alerts) ────────────────
+
+    def add_conditional(self, entry: ConditionalEntry) -> str:
+        """Add a conditional entry (breakout alert)."""
+        ticker = entry.ticker.upper().strip()
+        entry.ticker = ticker
+        entry.created_date = entry.created_date or datetime.now().strftime('%Y-%m-%d')
+        entry.status = 'PENDING'
+
+        # Check for duplicate
+        existing = [c for c in self.conditionals
+                    if c['ticker'] == ticker and c['status'] == 'PENDING']
+        if existing:
+            # Update existing
+            for i, c in enumerate(self.conditionals):
+                if c['ticker'] == ticker and c['status'] == 'PENDING':
+                    self.conditionals[i] = entry.to_dict()
+                    break
+            self._save(self.conditionals_file, self.conditionals)
+            return f"Updated conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}"
+
+        self.conditionals.append(entry.to_dict())
+        self._save(self.conditionals_file, self.conditionals)
+        return f"Set conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}"
+
+    def remove_conditional(self, ticker: str) -> str:
+        ticker = ticker.upper().strip()
+        before = len(self.conditionals)
+        self.conditionals = [c for c in self.conditionals
+                             if not (c['ticker'] == ticker and c['status'] == 'PENDING')]
+        if len(self.conditionals) < before:
+            self._save(self.conditionals_file, self.conditionals)
+            return f"Removed conditional for {ticker}"
+        return f"No pending conditional for {ticker}"
+
+    def get_pending_conditionals(self) -> List[Dict]:
+        return [c for c in self.conditionals if c.get('status') == 'PENDING']
+
+    def get_conditional(self, ticker: str) -> Optional[Dict]:
+        ticker = ticker.upper().strip()
+        for c in self.conditionals:
+            if c['ticker'] == ticker and c['status'] == 'PENDING':
+                return c
+        return None
+
+    def check_conditionals(self, current_prices: Dict[str, float],
+                           volume_ratios: Dict[str, float] = None) -> List[Dict]:
+        """
+        Check all pending conditionals against current prices.
+        Returns list of triggered conditionals.
+
+        current_prices: {ticker: current_price}
+        volume_ratios: {ticker: today_volume / avg_volume_50d}
+        """
+        volume_ratios = volume_ratios or {}
+        triggered = []
+
+        for cond in self.conditionals:
+            if cond.get('status') != 'PENDING':
+                continue
+
+            ticker = cond['ticker']
+            price = current_prices.get(ticker)
+            if price is None:
+                continue
+
+            trigger = float(cond.get('trigger_price', 0))
+            vol_required = float(cond.get('volume_multiplier', 1.5))
+            vol_actual = volume_ratios.get(ticker, 0)
+            cond_type = cond.get('condition_type', '')
+
+            # Check expiry
+            expires = cond.get('expires_date', '')
+            if expires:
+                try:
+                    if datetime.strptime(expires, '%Y-%m-%d') < datetime.now():
+                        cond['status'] = 'EXPIRED'
+                        continue
+                except Exception:
+                    pass
+
+            is_triggered = False
+            if cond_type == 'breakout_above' and trigger > 0 and price > trigger:
+                is_triggered = True
+            elif cond_type == 'breakout_volume' and trigger > 0 and price > trigger:
+                if vol_actual >= vol_required:
+                    is_triggered = True
+            elif cond_type == 'pullback_to' and trigger > 0 and price <= trigger:
+                is_triggered = True
+
+            if is_triggered:
+                cond['status'] = 'TRIGGERED'
+                cond['triggered_price'] = price
+                cond['triggered_date'] = datetime.now().strftime('%Y-%m-%d')
+                cond['triggered_volume_ratio'] = vol_actual
+                triggered.append(cond)
+
+        if triggered:
+            self._save(self.conditionals_file, self.conditionals)
+
+        return triggered
+
+    def expire_old_conditionals(self, days: int = 30):
+        """Expire conditionals older than N days."""
+        cutoff = datetime.now()
+        changed = False
+        for cond in self.conditionals:
+            if cond.get('status') != 'PENDING':
+                continue
+            created = cond.get('created_date', '')
+            try:
+                created_dt = datetime.strptime(created, '%Y-%m-%d')
+                if (cutoff - created_dt).days > days:
+                    cond['status'] = 'EXPIRED'
+                    changed = True
+            except Exception:
+                pass
+        if changed:
+            self._save(self.conditionals_file, self.conditionals)
+
+    # ── Scan Results Persistence ──────────────────────────────────────
+
+    def save_scan_results(self, results: List[Dict]):
+        """
+        Save scan results summary to JSON for cross-session persistence.
+        results: list of dicts with ticker, recommendation, conviction, etc.
+        """
+        payload = {
+            'timestamp': datetime.now().isoformat(),
+            'count': len(results),
+            'results': results,
+        }
+        self._save(self.scan_results_file, payload)
+
+    def load_scan_results(self) -> Optional[Dict]:
+        """Load last scan results. Returns {timestamp, count, results} or None."""
+        data = self._load(self.scan_results_file, None)
+        return data
+
+    # ── All Tracked Tickers ───────────────────────────────────────────
+
+    def get_all_tracked_tickers(self) -> Dict[str, str]:
+        """
+        Get all tickers being tracked with their status.
+        Returns: {ticker: status} where status is 'watchlist', 'open', 'conditional'
+        """
+        result = {}
+        for w in self.watchlist:
+            result[w['ticker']] = 'watchlist'
+        for c in self.conditionals:
+            if c.get('status') == 'PENDING':
+                result[c['ticker']] = 'conditional'
+        for t in self.open_trades:
+            if t.get('status') == 'OPEN':
+                result[t['ticker']] = 'open'
+        return result
