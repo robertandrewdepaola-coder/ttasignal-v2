@@ -78,7 +78,8 @@ def get_journal() -> JournalManager:
 
 
 # =============================================================================
-# SIDEBAR — Watchlist & Controls
+# =============================================================================
+# SIDEBAR — Slim: Scan controls, Open Positions, Alerts, Market
 # =============================================================================
 
 def render_sidebar():
@@ -87,75 +88,23 @@ def render_sidebar():
     st.sidebar.title("📊 TTA v2")
     st.sidebar.caption("Technical Trading Assistant")
 
-    # ── Watchlist Manager ─────────────────────────────────────────────
-    st.sidebar.subheader("Watchlist")
-
+    # ── Scan Controls ─────────────────────────────────────────────────
     watchlist_tickers = jm.get_watchlist_tickers()
+    ticker_count = len(watchlist_tickers)
 
-    # Add ticker input
-    add_col1, add_col2 = st.sidebar.columns([3, 1])
-    with add_col1:
-        new_ticker = st.text_input("Add ticker", placeholder="e.g. AAPL",
-                                    key="add_ticker_input", label_visibility="collapsed")
-    with add_col2:
-        if st.button("➕", key="add_ticker_btn", use_container_width=True):
-            if new_ticker:
-                ticker_clean = new_ticker.strip().upper()
-                if ticker_clean and ticker_clean not in watchlist_tickers:
-                    jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
-                    st.rerun()
-                elif ticker_clean in watchlist_tickers:
-                    st.sidebar.caption(f"{ticker_clean} already in list")
+    # Count unscanned
+    existing_summary = st.session_state.get('scan_results_summary', [])
+    scanned = {s.get('ticker', '') for s in existing_summary}
+    new_count = len([t for t in watchlist_tickers if t not in scanned])
 
-    # Display current tickers with remove buttons
-    if watchlist_tickers:
-        # Show in compact rows of 2
-        for i in range(0, len(watchlist_tickers), 2):
-            cols = st.sidebar.columns(2)
-            for j, col in enumerate(cols):
-                idx = i + j
-                if idx < len(watchlist_tickers):
-                    t = watchlist_tickers[idx]
-                    with col:
-                        tc1, tc2 = st.columns([3, 1])
-                        with tc1:
-                            st.caption(t)
-                        with tc2:
-                            if st.button("✕", key=f"rm_wl_{t}"):
-                                # Remove from watchlist
-                                remaining = [x for x in watchlist_tickers if x != t]
-                                jm.clear_watchlist()
-                                jm.set_watchlist_tickers(remaining)
-                                # Also remove from scan results if present
-                                if 'scan_results' in st.session_state:
-                                    st.session_state['scan_results'] = [
-                                        r for r in st.session_state['scan_results']
-                                        if r.ticker != t
-                                    ]
-                                if 'scan_results_summary' in st.session_state:
-                                    st.session_state['scan_results_summary'] = [
-                                        s for s in st.session_state['scan_results_summary']
-                                        if s.get('ticker') != t
-                                    ]
-                                st.rerun()
+    st.sidebar.caption(f"📋 {ticker_count} tickers in watchlist")
 
-        st.sidebar.caption(f"{len(watchlist_tickers)} tickers")
-    else:
-        st.sidebar.caption("No tickers — add some above")
-
-    # Scan buttons
     scan_col1, scan_col2 = st.sidebar.columns(2)
     with scan_col1:
-        if st.button("🔍 Scan All", use_container_width=True, type="primary"):
+        if st.button("🔍 Scan All", use_container_width=True, type="primary",
+                     disabled=(ticker_count == 0)):
             _run_scan(mode='all')
     with scan_col2:
-        # Count how many are new (not yet scanned)
-        scanned = set()
-        existing_summary = st.session_state.get('scan_results_summary', [])
-        for s in existing_summary:
-            scanned.add(s.get('ticker', ''))
-        new_count = len([t for t in watchlist_tickers if t not in scanned])
-
         btn_label = f"⚡ New ({new_count})" if new_count > 0 else "⚡ New"
         if st.button(btn_label, use_container_width=True,
                      disabled=(new_count == 0)):
@@ -165,7 +114,7 @@ def render_sidebar():
     open_trades = jm.get_open_trades()
     if open_trades:
         st.sidebar.divider()
-        st.sidebar.subheader(f"📈 Open Positions ({len(open_trades)})")
+        st.sidebar.subheader(f"📈 Open ({len(open_trades)})")
         for trade in open_trades:
             ticker = trade['ticker']
             entry = trade.get('entry_price', 0)
@@ -184,11 +133,10 @@ def render_sidebar():
     conditionals = jm.get_pending_conditionals()
     if conditionals:
         st.sidebar.divider()
-        st.sidebar.subheader(f"🎯 Breakout Alerts ({len(conditionals)})")
+        st.sidebar.subheader(f"🎯 Alerts ({len(conditionals)})")
         for cond in conditionals:
             ticker = cond['ticker']
             trigger = cond.get('trigger_price', 0)
-            cond_type = cond.get('condition_type', '').replace('_', ' ')
             current = fetch_current_price(ticker) or 0
             dist_pct = ((trigger - current) / current * 100) if current > 0 else 0
 
@@ -350,13 +298,15 @@ def _run_scan(mode='all'):
 # =============================================================================
 
 def render_scanner_table():
-    """Render scan results with action buttons and cross-session persistence."""
+    """Render scan results with watchlist management, filters, and click-to-view."""
     results = st.session_state.get('scan_results', [])
     summary = st.session_state.get('scan_results_summary', [])
     timestamp = st.session_state.get('scan_timestamp', '')
     jm = get_journal()
 
-    # Show triggered alerts banner
+    # ══════════════════════════════════════════════════════════════════
+    # TRIGGERED ALERTS BANNER
+    # ══════════════════════════════════════════════════════════════════
     triggered = st.session_state.get('triggered_alerts', [])
     if triggered:
         for t in triggered:
@@ -366,12 +316,67 @@ def render_scanner_table():
                 f"${t.get('trigger_price', 0):.2f} "
                 f"(Volume: {t.get('triggered_volume_ratio', 0):.1f}x avg)"
             )
-        # Clear after showing
         st.session_state['triggered_alerts'] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    # WATCHLIST EDITOR (collapsible)
+    # ══════════════════════════════════════════════════════════════════
+    watchlist_tickers = jm.get_watchlist_tickers()
+
+    with st.expander(f"📋 Watchlist ({len(watchlist_tickers)} tickers) — click to edit",
+                     expanded=(len(watchlist_tickers) == 0)):
+        st.caption("Paste tickers separated by commas, spaces, or new lines. "
+                   "Example: AAPL, NVDA, META, TSLA")
+
+        # Bulk text area
+        default_text = ", ".join(watchlist_tickers) if watchlist_tickers else ""
+        new_text = st.text_area(
+            "Tickers",
+            value=default_text,
+            height=100 if len(watchlist_tickers) > 20 else 68,
+            label_visibility="collapsed",
+            key="watchlist_editor",
+        )
+
+        wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
+        with wl_col1:
+            if st.button("💾 Save Watchlist", use_container_width=True, type="primary"):
+                # Parse: handle commas, spaces, newlines, tabs
+                import re
+                raw = re.split(r'[,\s\n\t]+', new_text)
+                tickers = [t.strip().upper() for t in raw if t.strip()]
+                # Remove duplicates preserving order
+                seen = set()
+                unique = []
+                for t in tickers:
+                    if t not in seen:
+                        seen.add(t)
+                        unique.append(t)
+
+                jm.clear_watchlist()
+                jm.set_watchlist_tickers(unique)
+                st.success(f"✅ Saved {len(unique)} tickers")
+                st.rerun()
+
+        with wl_col2:
+            if st.button("🗑️ Clear All", use_container_width=True):
+                jm.clear_watchlist()
+                st.session_state.pop('scan_results', None)
+                st.session_state.pop('scan_results_summary', None)
+                st.session_state.pop('ticker_data_cache', None)
+                st.rerun()
+
+        with wl_col3:
+            st.caption(f"{len(watchlist_tickers)} saved"
+                       + (f" • {len(summary)} scanned" if summary else ""))
+
+    # ══════════════════════════════════════════════════════════════════
+    # SCAN RESULTS
+    # ══════════════════════════════════════════════════════════════════
 
     # No results at all
     if not results and not summary:
-        st.info("👆 Add tickers to your watchlist and click **Scan** to begin.")
+        st.info("👆 Add tickers to your watchlist (above) and click **Scan All** in the sidebar.")
         return
 
     # Build table from live scan results if available, else from persisted summary
@@ -386,92 +391,135 @@ def render_scanner_table():
                 ts = datetime.fromisoformat(timestamp)
                 age = datetime.now() - ts
                 age_str = f"{age.days}d {age.seconds // 3600}h ago" if age.days > 0 else f"{age.seconds // 3600}h ago"
-                st.caption(f"📌 Last scan: {ts.strftime('%Y-%m-%d %H:%M')} ({age_str}) — Re-scan for live data")
+                st.caption(f"📌 Last scan: {ts.strftime('%Y-%m-%d %H:%M')} ({age_str}) — Scan All for fresh data")
             except Exception:
-                st.caption("📌 Showing last saved scan results — Re-scan for live data")
+                st.caption("📌 Showing last saved scan results — Scan All for fresh data")
 
-    count = len(rows)
-    st.subheader(f"Scan Results — {count} tickers")
+    if not rows:
+        return
 
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df[['Ticker', 'Status', 'Rec', 'Conv', 'MACD', 'AO', 'Wkly', 'Mthly',
-            'Quality', 'Price', 'Summary']],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            'Ticker': st.column_config.TextColumn(width="small"),
-            'Status': st.column_config.TextColumn(width="small"),
-            'Rec': st.column_config.TextColumn("Recommendation", width="medium"),
-            'Conv': st.column_config.TextColumn("Conviction", width="small"),
-            'MACD': st.column_config.TextColumn(width="small"),
-            'AO': st.column_config.TextColumn(width="small"),
-            'Wkly': st.column_config.TextColumn("Weekly", width="small"),
-            'Mthly': st.column_config.TextColumn("Monthly", width="small"),
-            'Quality': st.column_config.TextColumn(width="small"),
-            'Price': st.column_config.TextColumn(width="small"),
-            'Summary': st.column_config.TextColumn(width="large"),
-        },
-    )
+    # ── Filter Bar ────────────────────────────────────────────────────
+    filt_col1, filt_col2, filt_col3, filt_col4 = st.columns([2, 2, 2, 2])
 
-    # ── Ticker Selection + Action Buttons ─────────────────────────────
+    with filt_col1:
+        rec_filter = st.selectbox("Filter", [
+            "All", "Signals Only", "BUY+", "Quality A-B", "Open Positions"
+        ], key="scan_filter", label_visibility="collapsed")
+
+    with filt_col2:
+        sort_by = st.selectbox("Sort", [
+            "Default", "Conviction ↓", "Quality ↓", "Price ↓", "Price ↑"
+        ], key="scan_sort", label_visibility="collapsed")
+
+    with filt_col3:
+        search = st.text_input("Search", placeholder="Filter by ticker...",
+                                key="scan_search", label_visibility="collapsed")
+
+    with filt_col4:
+        st.caption(f"**{len(rows)}** total results")
+
+    # Apply filters
+    filtered = rows.copy()
+
+    if search:
+        search_upper = search.upper()
+        filtered = [r for r in filtered if search_upper in r['Ticker'].upper()]
+
+    if rec_filter == "Signals Only":
+        filtered = [r for r in filtered if r['Rec'] != 'SKIP']
+    elif rec_filter == "BUY+":
+        filtered = [r for r in filtered if r['Rec'] in ('BUY NOW', 'RE-ENTRY', 'FRESH ENTRY')]
+    elif rec_filter == "Quality A-B":
+        filtered = [r for r in filtered if r['Quality'] in ('A', 'B')]
+    elif rec_filter == "Open Positions":
+        filtered = [r for r in filtered if 'Open' in r.get('Status', '')]
+
+    # Apply sort
+    if sort_by == "Conviction ↓":
+        filtered.sort(key=lambda r: int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0, reverse=True)
+    elif sort_by == "Quality ↓":
+        q_order = {'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1, '?': 0}
+        filtered.sort(key=lambda r: q_order.get(r.get('Quality', '?'), 0), reverse=True)
+    elif sort_by == "Price ↓":
+        filtered.sort(key=lambda r: float(r['Price'].replace('$', '').replace(',', '') or '0'), reverse=True)
+    elif sort_by == "Price ↑":
+        filtered.sort(key=lambda r: float(r['Price'].replace('$', '').replace(',', '') or '0'))
+
+    showing = len(filtered)
+    if showing != len(rows):
+        st.caption(f"Showing {showing} of {len(rows)}")
+
+    # ── Results as clickable ticker buttons ────────────────────────────
+    if not filtered:
+        st.info("No tickers match the current filter.")
+        return
+
+    # Table header
+    hdr_cols = st.columns([1.2, 1, 0.7, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 3])
+    headers = ['Ticker', 'Rec', 'Conv', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
+    for col, h in zip(hdr_cols, headers):
+        col.markdown(f"**{h}**")
+
+    # Table rows — each ticker is a button
+    for idx, row in enumerate(filtered):
+        cols = st.columns([1.2, 1, 0.7, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 3])
+
+        # Ticker as clickable button
+        with cols[0]:
+            ticker_label = row['Ticker']
+            status = row.get('Status', '')
+            if 'Open' in status:
+                ticker_label = f"📈 {ticker_label}"
+            elif 'Alert' in status:
+                ticker_label = f"🎯 {ticker_label}"
+
+            if st.button(ticker_label, key=f"row_{row['Ticker']}_{idx}",
+                        use_container_width=True):
+                _load_ticker_for_view(row['Ticker'])
+
+        # Recommendation with color
+        rec_val = row.get('Rec', 'SKIP')
+        rec_colors = {
+            'BUY NOW': '🟢', 'FRESH ENTRY': '🟢', 'RE-ENTRY': '🔵',
+            'SKIP': '⚪', 'WAIT': '🟡',
+        }
+        rec_icon = rec_colors.get(rec_val, '⚪')
+        cols[1].caption(f"{rec_icon} {rec_val}")
+        cols[2].caption(row.get('Conv', '0/10'))
+        cols[3].caption(row.get('MACD', '❌'))
+        cols[4].caption(row.get('AO', '❌'))
+        cols[5].caption(row.get('Wkly', '❌'))
+        cols[6].caption(row.get('Mthly', '❌'))
+
+        # Quality with color
+        q = row.get('Quality', '?')
+        q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
+        cols[7].caption(f"{q_colors.get(q, '⚪')} {q}")
+
+        cols[8].caption(row.get('Price', '?'))
+        cols[9].caption(row.get('Summary', '')[:80])
+
+    # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
 
-    ticker_options = [r['Ticker'] for r in rows]
-    # Also add open positions that might not be in scan
-    open_tickers = jm.get_open_tickers()
-    for ot in open_tickers:
-        if ot not in ticker_options:
-            ticker_options.append(ot)
-
-    col_sel, col_act1, col_act2, col_act3 = st.columns([3, 1, 1, 1])
-
-    with col_sel:
-        current_idx = 0
-        if st.session_state.get('selected_ticker') in ticker_options:
-            current_idx = ticker_options.index(st.session_state['selected_ticker'])
-        selected = st.selectbox("Select ticker", ticker_options,
-                                index=current_idx if ticker_options else None)
-
-    with col_act1:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("📈 View", use_container_width=True, type="primary"):
-            if selected:
-                _load_ticker_for_view(selected)
-
-    with col_act2:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("⭐ Watch", use_container_width=True):
-            if selected:
+    # Inline quick-add ticker
+    qa_col1, qa_col2 = st.columns([3, 1])
+    with qa_col1:
+        quick_ticker = st.text_input("Quick add ticker", placeholder="Type ticker and press Enter",
+                                      key="quick_add_main", label_visibility="collapsed")
+    with qa_col2:
+        if st.button("➕ Add & Scan", use_container_width=True):
+            if quick_ticker:
+                ticker_clean = quick_ticker.strip().upper()
                 wl = jm.get_watchlist_tickers()
-                if selected not in wl:
-                    jm.add_to_watchlist(WatchlistItem(ticker=selected))
-                    st.success(f"Added {selected} to watchlist")
-                    st.rerun()
-                else:
-                    st.info(f"{selected} already in watchlist")
+                if ticker_clean not in wl:
+                    jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                _load_ticker_for_view(ticker_clean)
 
-    with col_act3:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🎯 Alert", use_container_width=True):
-            if selected:
-                st.session_state['show_alert_form'] = selected
-                st.rerun()
-
-    # ── Quick Alert Form (shown when Alert button clicked) ────────────
+    # Alert form (if requested from detail view)
     alert_ticker = st.session_state.get('show_alert_form')
     if alert_ticker:
         _render_quick_alert_form(alert_ticker, jm)
-
-    # Auto-select ticker for detail view
-    if selected and selected != st.session_state.get('selected_ticker'):
-        # Check if we have full analysis
-        if results:
-            for r in results:
-                if r.ticker == selected:
-                    st.session_state['selected_ticker'] = selected
-                    st.session_state['selected_analysis'] = r
-                    break
 
 
 def _build_rows_from_analysis(results, jm) -> list:
