@@ -977,11 +977,17 @@ def analyze(ticker: str,
     if gemini_model is not None or openai_client is not None:
         result = call_ai(prompt, gemini_model=gemini_model, openai_client=openai_client)
 
-        # If AI failed, use system fallback
+        # If AI failed, use system fallback but preserve error info
         if not result['success']:
+            ai_errors = {
+                'gemini_error': result.get('gemini_error'),
+                'openai_error': result.get('openai_error'),
+                'error': result.get('error'),
+            }
             result = generate_system_analysis(ticker, signal, recommendation,
                                               quality, fundamental_profile)
             result['note'] = 'AI unavailable — using system analysis'
+            result.update({k: v for k, v in ai_errors.items() if v})
     else:
         # No AI configured — use system analysis
         result = generate_system_analysis(ticker, signal, recommendation,
