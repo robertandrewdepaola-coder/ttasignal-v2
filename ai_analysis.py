@@ -582,8 +582,26 @@ def call_ai(prompt: str,
 
     narrative = None
 
-    # Try Gemini
-    if gemini_model is not None:
+    # Try Groq/OpenAI first (primary — free, fast, generous limits)
+    if openai_client is not None:
+        try:
+            response = openai_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system",
+                     "content": "You are a senior technical analyst. Be concise, honest, actionable."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.5
+            )
+            narrative = response.choices[0].message.content
+            result['provider'] = 'groq'
+        except Exception as e:
+            result['groq_error'] = str(e)[:200]
+
+    # Try Gemini fallback
+    if narrative is None and gemini_model is not None:
         try:
             response = gemini_model.generate_content(prompt)
             narrative = response.text
@@ -591,30 +609,12 @@ def call_ai(prompt: str,
         except Exception as e:
             result['gemini_error'] = str(e)[:200]
 
-    # Try OpenAI fallback
-    if narrative is None and openai_client is not None:
-        try:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system",
-                     "content": "You are a senior technical analyst. Be concise, honest, actionable."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=600,
-                temperature=0.5
-            )
-            narrative = response.choices[0].message.content
-            result['provider'] = 'openai'
-        except Exception as e:
-            result['openai_error'] = str(e)[:200]
-
     if narrative:
         result['raw_text'] = narrative
         result['success'] = True
         result.update(_parse_ai_response(narrative))
     else:
-        result['error'] = 'Both AI providers failed'
+        result['error'] = 'All AI providers failed'
 
     return result
 
@@ -980,6 +980,7 @@ def analyze(ticker: str,
         # If AI failed, use system fallback but preserve error info
         if not result['success']:
             ai_errors = {
+                'groq_error': result.get('groq_error'),
                 'gemini_error': result.get('gemini_error'),
                 'openai_error': result.get('openai_error'),
                 'error': result.get('error'),
