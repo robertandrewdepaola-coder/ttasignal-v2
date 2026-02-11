@@ -970,8 +970,255 @@ def fetch_scan_data(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
 
 
 # =============================================================================
-# TRADINGVIEW-TA — Technical analysis confirmation
+# MARKET INTELLIGENCE — Analysts, Insiders, Social Sentiment
 # =============================================================================
+
+def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str, Any]:
+    """
+    Comprehensive market intelligence aggregator.
+    Pulls analyst ratings, price targets, insider activity, and social sentiment.
+
+    Returns structured dict for AI prompt and UI display.
+    """
+    cache_key = f"{ticker}:market_intel"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    intel = {
+        'error': None,
+        # Analyst consensus
+        'analyst_count': None,
+        'analyst_buy': 0, 'analyst_hold': 0, 'analyst_sell': 0,
+        'analyst_strong_buy': 0, 'analyst_strong_sell': 0,
+        'analyst_consensus': None,  # Strong Buy / Buy / Hold / Sell / Strong Sell
+        # Price targets
+        'target_mean': None, 'target_median': None,
+        'target_high': None, 'target_low': None,
+        'target_count': None,
+        'target_upside_pct': None,  # vs current price
+        # Recent upgrades/downgrades
+        'recent_changes': [],  # [{firm, date, action, from_grade, to_grade}]
+        # Insider activity
+        'insider_buys_90d': 0, 'insider_sells_90d': 0,
+        'insider_net_shares': 0,
+        'insider_transactions': [],  # [{name, title, date, shares, value, type}]
+        # Social sentiment (Finnhub)
+        'social_reddit_mentions': None,
+        'social_twitter_mentions': None,
+        'social_score': None,
+        # Finnhub analyst consensus
+        'finnhub_buy': 0, 'finnhub_hold': 0, 'finnhub_sell': 0,
+        'finnhub_strong_buy': 0, 'finnhub_strong_sell': 0,
+        'finnhub_target': None,
+    }
+
+    stock = None
+    try:
+        stock = yf.Ticker(ticker)
+    except Exception:
+        intel['error'] = 'Failed to create yfinance ticker'
+        _cache.set(cache_key, intel)
+        return intel
+
+    # ── Analyst Recommendations ───────────────────────────────────
+    try:
+        recs = stock.recommendations
+        if recs is not None and len(recs) > 0:
+            # Latest row contains aggregated counts
+            latest = recs.iloc[-1] if len(recs) > 0 else None
+            if latest is not None:
+                sb = int(latest.get('strongBuy', 0) or 0)
+                b = int(latest.get('buy', 0) or 0)
+                h = int(latest.get('hold', 0) or 0)
+                s = int(latest.get('sell', 0) or 0)
+                ss = int(latest.get('strongSell', 0) or 0)
+                total = sb + b + h + s + ss
+
+                intel['analyst_strong_buy'] = sb
+                intel['analyst_buy'] = b
+                intel['analyst_hold'] = h
+                intel['analyst_sell'] = s
+                intel['analyst_strong_sell'] = ss
+                intel['analyst_count'] = total
+
+                if total > 0:
+                    score = (sb * 5 + b * 4 + h * 3 + s * 2 + ss * 1) / total
+                    if score >= 4.5:
+                        intel['analyst_consensus'] = 'Strong Buy'
+                    elif score >= 3.5:
+                        intel['analyst_consensus'] = 'Buy'
+                    elif score >= 2.5:
+                        intel['analyst_consensus'] = 'Hold'
+                    elif score >= 1.5:
+                        intel['analyst_consensus'] = 'Sell'
+                    else:
+                        intel['analyst_consensus'] = 'Strong Sell'
+    except Exception:
+        pass
+
+    # ── Price Targets ─────────────────────────────────────────────
+    try:
+        targets = stock.analyst_price_targets
+        if targets is not None:
+            if isinstance(targets, dict):
+                intel['target_mean'] = targets.get('mean')
+                intel['target_median'] = targets.get('median')
+                intel['target_high'] = targets.get('high')
+                intel['target_low'] = targets.get('low')
+                intel['target_count'] = targets.get('numberOfAnalystOpinions')
+
+                # Calculate upside
+                current = targets.get('current')
+                if current and intel['target_mean']:
+                    intel['target_upside_pct'] = round(
+                        (intel['target_mean'] - current) / current * 100, 1)
+    except Exception:
+        pass
+
+    # ── Recent Upgrades/Downgrades ────────────────────────────────
+    try:
+        upgrades = stock.upgrades_downgrades
+        if upgrades is not None and len(upgrades) > 0:
+            recent = upgrades.head(10)
+            changes = []
+            for idx, row in recent.iterrows():
+                changes.append({
+                    'firm': row.get('Firm', '?'),
+                    'date': idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)[:10],
+                    'action': row.get('Action', '?'),
+                    'to_grade': row.get('ToGrade', '?'),
+                    'from_grade': row.get('FromGrade', ''),
+                })
+            intel['recent_changes'] = changes
+    except Exception:
+        pass
+
+    # ── Insider Transactions ──────────────────────────────────────
+    try:
+        insiders = stock.insider_transactions
+        if insiders is not None and len(insiders) > 0:
+            buys_90d = 0
+            sells_90d = 0
+            net_shares = 0
+            transactions = []
+            cutoff = datetime.now() - pd.Timedelta(days=90)
+
+            for _, row in insiders.head(20).iterrows():
+                tx_date = row.get('Start Date')
+                shares = row.get('Shares', 0) or 0
+                value = row.get('Value', 0) or 0
+                tx_type = str(row.get('Transaction', '')).lower()
+                text = row.get('Text', '')
+
+                is_recent = True
+                if tx_date and hasattr(tx_date, 'timestamp'):
+                    try:
+                        is_recent = tx_date >= cutoff
+                    except Exception:
+                        pass
+
+                is_buy = 'purchase' in tx_type or 'buy' in tx_type or 'acquisition' in text.lower()
+                is_sell = 'sale' in tx_type or 'sell' in tx_type or 'disposition' in text.lower()
+
+                if is_recent:
+                    if is_buy:
+                        buys_90d += 1
+                        net_shares += abs(shares)
+                    elif is_sell:
+                        sells_90d += 1
+                        net_shares -= abs(shares)
+
+                transactions.append({
+                    'name': row.get('Insider', '?'),
+                    'title': row.get('Position', ''),
+                    'date': tx_date.strftime('%Y-%m-%d') if hasattr(tx_date, 'strftime') else str(tx_date)[:10] if tx_date else '?',
+                    'shares': int(shares),
+                    'value': float(value),
+                    'type': 'Buy' if is_buy else ('Sell' if is_sell else 'Other'),
+                })
+
+            intel['insider_buys_90d'] = buys_90d
+            intel['insider_sells_90d'] = sells_90d
+            intel['insider_net_shares'] = net_shares
+            intel['insider_transactions'] = transactions[:10]
+    except Exception:
+        pass
+
+    # ── Finnhub Data (if API key available) ───────────────────────
+    import os
+    fh_key = finnhub_key or os.environ.get('FINNHUB_API_KEY', '')
+
+    if fh_key:
+        import requests as req
+
+        # Analyst consensus from Finnhub
+        try:
+            url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={fh_key}"
+            resp = req.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and len(data) > 0:
+                    latest = data[0]
+                    intel['finnhub_strong_buy'] = latest.get('strongBuy', 0)
+                    intel['finnhub_buy'] = latest.get('buy', 0)
+                    intel['finnhub_hold'] = latest.get('hold', 0)
+                    intel['finnhub_sell'] = latest.get('sell', 0)
+                    intel['finnhub_strong_sell'] = latest.get('strongSell', 0)
+        except Exception:
+            pass
+
+        # Price target from Finnhub
+        try:
+            url = f"https://finnhub.io/api/v1/stock/price-target?symbol={ticker}&token={fh_key}"
+            resp = req.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    intel['finnhub_target'] = data.get('targetMean')
+                    if not intel['target_mean']:
+                        intel['target_mean'] = data.get('targetMean')
+                        intel['target_high'] = data.get('targetHigh')
+                        intel['target_low'] = data.get('targetLow')
+                        intel['target_median'] = data.get('targetMedian')
+        except Exception:
+            pass
+
+        # Social sentiment from Finnhub
+        try:
+            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from=2024-01-01&token={fh_key}"
+            resp = req.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                reddit = data.get('reddit', [])
+                twitter = data.get('twitter', [])
+
+                if reddit:
+                    total_mentions = sum(r.get('mention', 0) for r in reddit[-7:])
+                    intel['social_reddit_mentions'] = total_mentions
+
+                if twitter:
+                    total_mentions = sum(t.get('mention', 0) for t in twitter[-7:])
+                    intel['social_twitter_mentions'] = total_mentions
+
+                # Simple social score: mentions in last week
+                r_count = intel['social_reddit_mentions'] or 0
+                t_count = intel['social_twitter_mentions'] or 0
+                if r_count + t_count > 0:
+                    if r_count + t_count > 100:
+                        intel['social_score'] = 'High buzz'
+                    elif r_count + t_count > 20:
+                        intel['social_score'] = 'Moderate'
+                    else:
+                        intel['social_score'] = 'Low'
+        except Exception:
+            pass
+
+    _cache.set(cache_key, intel)
+    return intel
+
+
+
 
 def fetch_tradingview_summary(ticker: str, interval: str = '1d') -> Dict[str, Any]:
     """
