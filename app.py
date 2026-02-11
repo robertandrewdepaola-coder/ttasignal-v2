@@ -793,6 +793,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                     fetch_ticker_info, fetch_options_data,
                     fetch_insider_transactions, fetch_institutional_holders,
                     fetch_earnings_date, fetch_fundamental_profile,
+                    fetch_earnings_history,
                     fetch_tradingview_mtf, fetch_finnhub_news,
                 )
                 fundamentals = {
@@ -805,6 +806,13 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 fundamental_profile = fetch_fundamental_profile(ticker)
             except Exception as e:
                 st.caption(f"Fundamentals error: {e}")
+
+            # Earnings history
+            earnings_history = {}
+            try:
+                earnings_history = fetch_earnings_history(ticker)
+            except Exception:
+                pass
 
             # TradingView-TA (optional — no API key needed)
             try:
@@ -832,6 +840,9 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 gemini_model=gemini,
                 openai_client=openai_client,
             )
+
+            # Attach extra data for UI display
+            result['earnings_history'] = earnings_history
 
             st.session_state[f'ai_result_{ticker}'] = result
 
@@ -959,6 +970,13 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.success("🚩 **Red flags:** None — clean setup")
 
     # ═══════════════════════════════════════════════════════════════
+    # EARNINGS SECTION
+    # ═══════════════════════════════════════════════════════════════
+    earnings = ai_result.get('earnings_history', {})
+    if earnings and not earnings.get('error'):
+        _render_earnings_section(earnings)
+
+    # ═══════════════════════════════════════════════════════════════
     # NEWS HEADLINES
     # ═══════════════════════════════════════════════════════════════
     news = ai_result.get('news_data', {})
@@ -984,32 +1002,185 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
 
 
 def _render_tv_confirmation(tv_data: Dict):
-    """Render TradingView-TA confirmation strip."""
-    has_data = False
-    cols = st.columns(4)
-    labels = {'1h': '1 Hour', '4h': '4 Hour', '1d': 'Daily', '1W': 'Weekly'}
+    """Render TradingView-TA conviction with overall verdict and timeframe breakdown."""
+    if not tv_data:
+        return
 
-    for i, (interval, label) in enumerate(labels.items()):
+    # Calculate overall conviction from all timeframes
+    rec_scores = {'STRONG_BUY': 2, 'BUY': 1, 'NEUTRAL': 0, 'SELL': -1, 'STRONG_SELL': -2}
+    rec_labels = {2: 'STRONG BUY', 1: 'BUY', 0: 'NEUTRAL', -1: 'SELL', -2: 'STRONG SELL'}
+    rec_icons = {
+        'STRONG_BUY': '🟢🟢', 'BUY': '🟢', 'NEUTRAL': '🟡',
+        'SELL': '🔴', 'STRONG_SELL': '🔴🔴',
+    }
+
+    scores = []
+    valid_data = {}
+    for interval in ['1h', '4h', '1d', '1W']:
         data = tv_data.get(interval, {})
-        if data.get('error'):
+        if data.get('error') or not data.get('recommendation'):
             continue
+        valid_data[interval] = data
+        rec = data['recommendation']
+        if rec in rec_scores:
+            scores.append(rec_scores[rec])
+
+    if not scores:
+        st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
+        return
+
+    # Overall verdict
+    avg_score = sum(scores) / len(scores)
+    if avg_score >= 1.5:
+        overall = 'STRONG BUY'
+        overall_color = 'success'
+        icon = '🟢🟢'
+    elif avg_score >= 0.5:
+        overall = 'BUY'
+        overall_color = 'success'
+        icon = '🟢'
+    elif avg_score >= -0.5:
+        overall = 'NEUTRAL'
+        overall_color = 'warning'
+        icon = '🟡'
+    elif avg_score >= -1.5:
+        overall = 'SELL'
+        overall_color = 'error'
+        icon = '🔴'
+    else:
+        overall = 'STRONG SELL'
+        overall_color = 'error'
+        icon = '🔴🔴'
+
+    # Display overall verdict
+    getattr(st, overall_color)(f"{icon} **TradingView Conviction: {overall}** "
+                                f"(avg score: {avg_score:+.1f})")
+
+    # Timeframe breakdown
+    labels = {'1h': '1 Hour', '4h': '4 Hour', '1d': 'Daily', '1W': 'Weekly'}
+    cols = st.columns(len(valid_data))
+
+    for i, (interval, data) in enumerate(valid_data.items()):
         rec = data.get('recommendation', '')
-        if not rec:
-            continue
-        has_data = True
+        buy = data.get('buy', 0)
+        sell = data.get('sell', 0)
+        neutral = data.get('neutral', 0)
+        total = buy + sell + neutral
+        label = labels.get(interval, interval)
+        ri = rec_icons.get(rec, '⚪')
 
         with cols[i]:
-            if 'STRONG_BUY' in rec:
-                st.success(f"**{label}:** {rec}")
-            elif 'BUY' in rec:
-                st.info(f"**{label}:** {rec}")
-            elif 'SELL' in rec:
-                st.error(f"**{label}:** {rec}")
-            else:
-                st.warning(f"**{label}:** {rec}")
+            st.markdown(f"**{label}**")
+            st.markdown(f"{ri} **{rec.replace('_', ' ')}**")
+            if total > 0:
+                st.caption(f"Buy: {buy} | Neutral: {neutral} | Sell: {sell}")
 
-    if not has_data:
-        st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
+    # Key indicators from daily
+    daily = valid_data.get('1d', {})
+    indicator_parts = []
+    if daily.get('rsi') is not None:
+        rsi = daily['rsi']
+        rsi_label = "overbought" if rsi > 70 else ("oversold" if rsi < 30 else "neutral")
+        indicator_parts.append(f"RSI: {rsi:.1f} ({rsi_label})")
+    if daily.get('adx') is not None:
+        adx = daily['adx']
+        trend_str = "strong trend" if adx > 25 else "weak trend"
+        indicator_parts.append(f"ADX: {adx:.1f} ({trend_str})")
+    if daily.get('cci') is not None:
+        indicator_parts.append(f"CCI: {daily['cci']:.0f}")
+
+    if indicator_parts:
+        st.caption(" | ".join(indicator_parts))
+
+
+def _render_earnings_section(earnings: Dict):
+    """Render earnings history with next date, streak, and quarterly results."""
+    next_date = earnings.get('next_earnings')
+    days_until = earnings.get('days_until_earnings')
+    quarters = earnings.get('quarters', [])
+    streak = earnings.get('streak', 0)
+
+    if not next_date and not quarters:
+        return
+
+    st.markdown("### 📅 Earnings")
+
+    # ── Next Earnings Banner ──────────────────────────────────────
+    if next_date:
+        next_eps = earnings.get('next_eps_estimate')
+
+        if days_until is not None and days_until <= 14:
+            # Imminent — warning
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.error(f"⚠️ **Next Earnings: {next_date} ({days_until} days)**{eps_str} — "
+                     f"Consider waiting or reducing size")
+        elif days_until is not None and days_until <= 30:
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.warning(f"📅 **Next Earnings: {next_date} ({days_until} days)**{eps_str}")
+        else:
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.info(f"📅 **Next Earnings: {next_date}"
+                    f"{f' ({days_until} days)' if days_until else ''}**{eps_str}")
+
+    # ── Streak + Summary ──────────────────────────────────────────
+    if quarters:
+        col_streak, col_avg = st.columns(2)
+
+        with col_streak:
+            if streak > 0:
+                st.success(f"🔥 **{streak} consecutive beat{'s' if streak > 1 else ''}**")
+            elif streak < 0:
+                st.error(f"📉 **{abs(streak)} consecutive miss{'es' if abs(streak) > 1 else ''}**")
+            else:
+                st.info("➡️ **Mixed results**")
+
+        with col_avg:
+            avg = earnings.get('avg_surprise_pct')
+            if avg is not None:
+                if avg > 0:
+                    st.success(f"📊 **Avg surprise: +{avg:.1f}%**")
+                else:
+                    st.error(f"📊 **Avg surprise: {avg:.1f}%**")
+
+    # ── Quarterly Table ───────────────────────────────────────────
+    if quarters:
+        rows = []
+        for q in quarters:
+            date = q.get('date', '?')
+            eps_est = q.get('eps_estimate')
+            eps_act = q.get('eps_actual')
+            surprise = q.get('surprise_pct')
+            beat = q.get('beat')
+
+            est_str = f"${eps_est:.2f}" if eps_est is not None else "—"
+            act_str = f"${eps_act:.2f}" if eps_act is not None else "—"
+            surp_str = f"{surprise:+.1f}%" if surprise is not None else "—"
+
+            if beat is True:
+                verdict = "✅ Beat"
+            elif beat is False:
+                verdict = "❌ Miss"
+            else:
+                verdict = "—"
+
+            rows.append({
+                'Date': date,
+                'EPS Est': est_str,
+                'EPS Act': act_str,
+                'Surprise': surp_str,
+                'Result': verdict,
+            })
+
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True,
+                      column_config={
+                          'Date': st.column_config.TextColumn(width="medium"),
+                          'EPS Est': st.column_config.TextColumn("Estimate", width="small"),
+                          'EPS Act': st.column_config.TextColumn("Actual", width="small"),
+                          'Surprise': st.column_config.TextColumn(width="small"),
+                          'Result': st.column_config.TextColumn(width="small"),
+                      })
 
 
 def _render_fundamental_snapshot(fp: Dict):
