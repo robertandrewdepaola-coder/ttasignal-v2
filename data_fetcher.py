@@ -546,9 +546,117 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     return result
 
 
-# =============================================================================
-# OPTIONS DATA — Put/Call ratio, open interest, max pain
-# =============================================================================
+def fetch_earnings_history(ticker: str) -> Dict[str, Any]:
+    """
+    Fetch earnings history — last 4 quarters of EPS estimates vs actuals,
+    plus next earnings date and consensus estimate.
+    """
+    cache_key = f"{ticker}:earnings_hist"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = {
+        'next_earnings': None,
+        'days_until_earnings': None,
+        'next_eps_estimate': None,
+        'quarters': [],       # Last 4 quarters: {date, eps_estimate, eps_actual, surprise_pct, beat}
+        'streak': 0,          # Consecutive beats (positive) or misses (negative)
+        'avg_surprise_pct': None,
+        'error': None,
+    }
+
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Next earnings date
+        try:
+            cal = stock.calendar
+            if cal is not None:
+                if isinstance(cal, dict):
+                    ed = cal.get('Earnings Date')
+                    if ed:
+                        next_date = ed[0] if isinstance(ed, list) and len(ed) > 0 else ed
+                        if hasattr(next_date, 'strftime'):
+                            result['next_earnings'] = next_date.strftime('%Y-%m-%d')
+                            delta = (next_date - datetime.now()).days
+                            result['days_until_earnings'] = max(0, delta)
+                        elif isinstance(next_date, str):
+                            result['next_earnings'] = str(next_date)
+                elif isinstance(cal, pd.DataFrame) and 'Earnings Date' in cal.columns:
+                    next_date = cal['Earnings Date'].iloc[0]
+                    if hasattr(next_date, 'strftime'):
+                        result['next_earnings'] = next_date.strftime('%Y-%m-%d')
+                        delta = (next_date - datetime.now()).days
+                        result['days_until_earnings'] = max(0, delta)
+        except Exception:
+            pass
+
+        # Earnings history — EPS estimates vs actuals
+        try:
+            earnings_dates = stock.earnings_dates
+            if earnings_dates is not None and len(earnings_dates) > 0:
+                quarters = []
+                for idx, row in earnings_dates.head(8).iterrows():
+                    eps_est = row.get('EPS Estimate')
+                    eps_act = row.get('Reported EPS')
+                    surprise = row.get('Surprise(%)')
+
+                    # Skip future dates with no actual
+                    if eps_act is None or (isinstance(eps_act, float) and pd.isna(eps_act)):
+                        # This might be the next upcoming — grab estimate
+                        if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
+                            result['next_eps_estimate'] = float(eps_est)
+                        continue
+
+                    q = {
+                        'date': idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx),
+                        'eps_estimate': float(eps_est) if eps_est is not None and not pd.isna(eps_est) else None,
+                        'eps_actual': float(eps_act) if eps_act is not None and not pd.isna(eps_act) else None,
+                        'surprise_pct': float(surprise) if surprise is not None and not pd.isna(surprise) else None,
+                    }
+
+                    # Determine beat/miss
+                    if q['eps_estimate'] is not None and q['eps_actual'] is not None:
+                        q['beat'] = q['eps_actual'] > q['eps_estimate']
+                    elif q['surprise_pct'] is not None:
+                        q['beat'] = q['surprise_pct'] > 0
+                    else:
+                        q['beat'] = None
+
+                    quarters.append(q)
+                    if len(quarters) >= 4:
+                        break
+
+                result['quarters'] = quarters
+
+                # Calculate streak
+                streak = 0
+                for q in quarters:
+                    if q.get('beat') is True:
+                        streak += 1
+                    elif q.get('beat') is False:
+                        if streak == 0:
+                            streak -= 1
+                        else:
+                            break
+                    else:
+                        break
+                result['streak'] = streak
+
+                # Average surprise
+                surprises = [q['surprise_pct'] for q in quarters if q.get('surprise_pct') is not None]
+                if surprises:
+                    result['avg_surprise_pct'] = sum(surprises) / len(surprises)
+
+        except Exception:
+            pass
+
+    except Exception as e:
+        result['error'] = str(e)[:200]
+
+    _cache.set(cache_key, result)
+    return result
 
 def fetch_options_data(ticker: str) -> Dict[str, Any]:
     """
