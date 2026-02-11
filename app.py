@@ -1229,7 +1229,19 @@ def _render_tv_confirmation(tv_data: Dict):
             scores.append(rec_scores[rec])
 
     if not scores:
-        st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
+        # Check for specific errors
+        first_err = None
+        for data in tv_data.values():
+            err = data.get('error')
+            if err:
+                first_err = err
+                break
+        if first_err and 'not installed' in first_err:
+            st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
+        elif first_err:
+            st.caption(f"TradingView-TA: {first_err}")
+        else:
+            st.caption("TradingView-TA: No data returned")
         return
 
     # Overall verdict
