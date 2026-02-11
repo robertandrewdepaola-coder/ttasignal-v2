@@ -862,6 +862,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     provider = ai_result.get('provider', 'unknown')
     st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
 
+    # Show AI errors if present
+    if ai_result.get('gemini_error'):
+        st.warning(f"⚠️ Gemini error: {ai_result['gemini_error']}")
+    if ai_result.get('openai_error'):
+        st.warning(f"⚠️ OpenAI error: {ai_result['openai_error']}")
+    if ai_result.get('error'):
+        st.warning(f"⚠️ Error: {ai_result['error']}")
+
     # ═══════════════════════════════════════════════════════════════
     # TOP ROW: Action + Conviction + Sizing
     # ═══════════════════════════════════════════════════════════════
