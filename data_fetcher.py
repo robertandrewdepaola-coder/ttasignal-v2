@@ -1261,14 +1261,23 @@ def fetch_tradingview_summary(ticker: str, interval: str = '1d') -> Dict[str, An
             '1M': Interval.INTERVAL_1_MONTH,
         }
 
-        handler = TA_Handler(
-            symbol=ticker,
-            screener="america",
-            exchange="",  # Auto-detect
-            interval=interval_map.get(interval, Interval.INTERVAL_1_DAY),
-        )
+        # Try common US exchanges in order
+        exchanges = ["NASDAQ", "NYSE", "AMEX"]
+        analysis = None
 
-        analysis = handler.get_analysis()
+        for exchange in exchanges:
+            try:
+                handler = TA_Handler(
+                    symbol=ticker,
+                    screener="america",
+                    exchange=exchange,
+                    interval=interval_map.get(interval, Interval.INTERVAL_1_DAY),
+                )
+                analysis = handler.get_analysis()
+                if analysis:
+                    break
+            except Exception:
+                continue
 
         if analysis:
             summary = analysis.summary or {}
