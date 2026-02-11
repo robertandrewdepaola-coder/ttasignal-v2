@@ -399,15 +399,68 @@ def _format_quality(quality: Dict) -> str:
 # PROMPT BUILDER
 # =============================================================================
 
+def _format_tradingview(tv_data: Dict) -> str:
+    """Format TradingView-TA multi-timeframe summary for prompt."""
+    if not tv_data:
+        return "TradingView-TA not available."
+
+    lines = []
+    for interval, data in tv_data.items():
+        if data.get('error'):
+            continue
+        rec = data.get('recommendation', '?')
+        buy = data.get('buy', 0)
+        sell = data.get('sell', 0)
+        neutral = data.get('neutral', 0)
+        ma_rec = data.get('ma_recommendation', '?')
+        osc_rec = data.get('osc_recommendation', '?')
+        lines.append(f"  {interval}: {rec} (Buy:{buy} Sell:{sell} Neutral:{neutral}) "
+                     f"| MAs: {ma_rec} | Oscillators: {osc_rec}")
+
+    if not lines:
+        return "TradingView-TA not available."
+
+    # Add key indicators from daily
+    daily = tv_data.get('1d', {})
+    extras = []
+    if daily.get('rsi') is not None:
+        extras.append(f"RSI: {daily['rsi']:.1f}")
+    if daily.get('adx') is not None:
+        extras.append(f"ADX: {daily['adx']:.1f}")
+    if daily.get('cci') is not None:
+        extras.append(f"CCI: {daily['cci']:.1f}")
+    if extras:
+        lines.append(f"  Indicators: {', '.join(extras)}")
+
+    return "\n".join(lines)
+
+
+def _format_news(news_data: Dict) -> str:
+    """Format Finnhub news headlines for prompt."""
+    if not news_data or news_data.get('error'):
+        return "No recent news available."
+
+    headlines = news_data.get('headlines', [])
+    if not headlines:
+        return "No recent news found."
+
+    lines = []
+    for h in headlines[:5]:
+        lines.append(f"  [{h.get('datetime', '?')}] {h.get('headline', '?')} ({h.get('source', '?')})")
+    return "\n".join(lines)
+
+
 def build_ai_prompt(ticker: str,
                     signal: EntrySignal,
                     recommendation: Dict,
                     quality: Dict,
                     fundamentals: Dict = None,
-                    fundamental_profile: Dict = None) -> str:
+                    fundamental_profile: Dict = None,
+                    tradingview_data: Dict = None,
+                    news_data: Dict = None) -> str:
     """
-    Build enhanced AI analysis prompt with fundamental profile
-    and actionable breakout/resistance guidance.
+    Build enhanced AI analysis prompt with fundamental profile,
+    TradingView confirmation, news, and actionable breakout guidance.
     """
     prompt = f"""You are a senior equity analyst at a top investment bank reviewing {ticker} for a swing/position trade.
 Your job is to synthesize technical signals with fundamental reality to give an actionable decision.
@@ -456,6 +509,16 @@ FUNDAMENTAL PROFILE
 {_format_fundamental_profile(fundamental_profile) if fundamental_profile else 'No fundamental data.'}
 
 ══════════════════════════════════════════════════
+TRADINGVIEW TECHNICAL SUMMARY (independent confirmation)
+══════════════════════════════════════════════════
+{_format_tradingview(tradingview_data)}
+
+══════════════════════════════════════════════════
+RECENT NEWS & CATALYSTS
+══════════════════════════════════════════════════
+{_format_news(news_data)}
+
+══════════════════════════════════════════════════
 MARKET SENTIMENT DATA
 ══════════════════════════════════════════════════
 {_format_fundamentals(fundamentals)}
@@ -470,7 +533,7 @@ ACTION: [BUY NOW / WAIT FOR BREAKOUT / WAIT FOR PULLBACK / SKIP]
 
 RESISTANCE VERDICT: [Is overhead resistance a problem? Should trader wait for breakout? Specify the exact price level that must break, what volume confirms it (e.g. "2x avg"), and what a failed breakout looks like. If no significant resistance, say "Clear path — enter on signal." 2-3 sentences max.]
 
-WHY IT'S MOVING: [What fundamental catalyst explains the current price action? Recent earnings beat/miss? Sector rotation? New product? M&A? Macro tailwind? If nothing obvious, say "Technical momentum — no fundamental catalyst visible." 1-2 sentences.]
+WHY IT'S MOVING: [What fundamental catalyst explains the current price action? Use the news headlines and fundamental data. Recent earnings beat/miss? Sector rotation? New product? M&A? Macro tailwind? If nothing obvious, say "Technical momentum — no fundamental catalyst visible." 1-2 sentences.]
 
 FUNDAMENTAL QUALITY: [Rate the business A/B/C/D using this framework:
 A = Strong moat, growing revenue, profitable, clean balance sheet
@@ -886,6 +949,8 @@ def analyze(ticker: str,
             quality: Dict,
             fundamentals: Dict = None,
             fundamental_profile: Dict = None,
+            tradingview_data: Dict = None,
+            news_data: Dict = None,
             gemini_model=None,
             openai_client=None) -> Dict[str, Any]:
     """
@@ -898,12 +963,15 @@ def analyze(ticker: str,
         quality: Dict from scanner_engine.calculate_quality_score()
         fundamentals: Dict from data_fetcher (options, insider, etc.)
         fundamental_profile: Dict from data_fetcher.fetch_fundamental_profile()
+        tradingview_data: Dict from data_fetcher.fetch_tradingview_mtf()
+        news_data: Dict from data_fetcher.fetch_finnhub_news()
         gemini_model: Google Gemini model instance
         openai_client: OpenAI client instance
     """
     # Build prompt
     prompt = build_ai_prompt(ticker, signal, recommendation, quality,
-                             fundamentals, fundamental_profile)
+                             fundamentals, fundamental_profile,
+                             tradingview_data, news_data)
 
     # Try AI first
     if gemini_model is not None or openai_client is not None:
@@ -922,7 +990,9 @@ def analyze(ticker: str,
 
     result['ticker'] = ticker
     result['timestamp'] = datetime.now().isoformat()
-    # Attach fundamental profile for UI display
+    # Attach extra data for UI display
     result['fundamental_profile'] = fundamental_profile
+    result['tradingview_data'] = tradingview_data
+    result['news_data'] = news_data
 
     return result
