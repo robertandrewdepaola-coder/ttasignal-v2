@@ -772,14 +772,22 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     gemini = None
     openai_client = None
 
+    gemini_error = None
     try:
         import google.generativeai as genai
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if api_key:
             genai.configure(api_key=api_key)
             gemini = genai.GenerativeModel('gemini-2.0-flash')
-    except Exception:
-        pass
+        else:
+            gemini_error = "No GEMINI_API_KEY in secrets"
+    except ImportError:
+        gemini_error = "google-generativeai not installed — add to requirements.txt"
+    except Exception as e:
+        gemini_error = str(e)[:200]
+
+    if gemini_error:
+        st.caption(f"⚠️ Gemini: {gemini_error}")
 
     if st.button("🤖 Run AI Analysis", type="primary"):
         with st.spinner("Fetching fundamentals, TradingView, news & analyzing..."):
