@@ -768,26 +768,49 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     quality = analysis.quality or {}
     jm = get_journal()
 
-    # Check for Gemini/OpenAI config
+    # Check for AI providers: Groq (primary) → Gemini (fallback)
     gemini = None
-    openai_client = None
+    openai_client = None  # Used for Groq (same API format)
 
+    # Groq — primary (free, fast, generous limits)
+    groq_error = None
+    try:
+        groq_key = st.secrets.get("GROQ_API_KEY", "")
+        if groq_key:
+            from openai import OpenAI
+            openai_client = OpenAI(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+            )
+        else:
+            groq_error = "No GROQ_API_KEY in secrets"
+    except ImportError:
+        groq_error = "openai package not installed — add to requirements.txt"
+    except Exception as e:
+        groq_error = str(e)[:200]
+
+    # Gemini — fallback
     gemini_error = None
     try:
         import google.generativeai as genai
         api_key = st.secrets.get("GEMINI_API_KEY", "")
         if api_key:
             genai.configure(api_key=api_key)
-            gemini = genai.GenerativeModel('gemini-2.0-flash-lite')
+            gemini = genai.GenerativeModel('gemini-2.0-flash')
         else:
             gemini_error = "No GEMINI_API_KEY in secrets"
     except ImportError:
-        gemini_error = "google-generativeai not installed — add to requirements.txt"
+        gemini_error = "google-generativeai not installed"
     except Exception as e:
         gemini_error = str(e)[:200]
 
-    if gemini_error:
-        st.caption(f"⚠️ Gemini: {gemini_error}")
+    if not openai_client and not gemini:
+        errors = []
+        if groq_error:
+            errors.append(f"Groq: {groq_error}")
+        if gemini_error:
+            errors.append(f"Gemini: {gemini_error}")
+        st.caption(f"⚠️ {' | '.join(errors)}")
 
     if st.button("🤖 Run AI Analysis", type="primary"):
         with st.spinner("Fetching fundamentals, TradingView, news & analyzing..."):
@@ -863,6 +886,8 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
 
     # Show AI errors if present
+    if ai_result.get('groq_error'):
+        st.warning(f"⚠️ Groq error: {ai_result['groq_error']}")
     if ai_result.get('gemini_error'):
         st.warning(f"⚠️ Gemini error: {ai_result['gemini_error']}")
     if ai_result.get('openai_error'):
