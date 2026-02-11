@@ -154,11 +154,33 @@ def render_sidebar():
     st.sidebar.divider()
     mkt = fetch_market_filter()
     spy_ok = mkt.get('spy_above_200', True)
+    vix_close = mkt.get('vix_close', 0) or 0
     vix_ok = mkt.get('vix_below_30', True)
-    st.sidebar.markdown(
-        f"**Market:** SPY {'✅' if spy_ok else '❌'} ${mkt.get('spy_close', '?')} | "
-        f"VIX {'✅' if vix_ok else '❌'} {mkt.get('vix_close', '?')}"
-    )
+
+    # SPY color
+    spy_str = f"SPY {'✅' if spy_ok else '❌'} ${mkt.get('spy_close', '?')}"
+
+    # VIX color — graduated risk
+    if vix_close < 15:
+        vix_icon = "🟢"  # Low fear
+    elif vix_close < 20:
+        vix_icon = "🟡"  # Elevated
+    elif vix_close < 25:
+        vix_icon = "🟠"  # High
+    elif vix_close < 30:
+        vix_icon = "🔴"  # Very high
+    else:
+        vix_icon = "🔴🔴"  # Extreme
+
+    vix_str = f"VIX {vix_icon} {vix_close}"
+
+    # Overall market health
+    if spy_ok and vix_close < 20:
+        st.sidebar.success(f"**Market:** {spy_str} | {vix_str}")
+    elif spy_ok and vix_close < 30:
+        st.sidebar.warning(f"**Market:** {spy_str} | {vix_str}")
+    else:
+        st.sidebar.error(f"**Market:** {spy_str} | {vix_str}")
 
 
 def _load_ticker_for_view(ticker: str):
@@ -227,6 +249,35 @@ def _run_scan(mode='all'):
         all_data = fetch_scan_data(tickers_to_scan)
         new_results = scan_watchlist(all_data)
 
+        # Fetch sector rotation (once per scan, shared across all tickers)
+        try:
+            from data_fetcher import fetch_sector_rotation, fetch_batch_earnings_flags, get_ticker_sector
+            sector_rotation = fetch_sector_rotation()
+            st.session_state['sector_rotation'] = sector_rotation
+
+            # Fetch earnings flags for all tickers
+            all_scan_tickers = [r.ticker for r in new_results]
+            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=7)
+            # Merge with existing if new_only
+            if mode == 'new_only':
+                existing_flags = st.session_state.get('earnings_flags', {})
+                existing_flags.update(earnings_flags)
+                st.session_state['earnings_flags'] = existing_flags
+            else:
+                st.session_state['earnings_flags'] = earnings_flags
+
+            # Fetch sectors for scanned tickers
+            ticker_sectors = st.session_state.get('ticker_sectors', {})
+            for r in new_results:
+                if r.ticker not in ticker_sectors:
+                    sector = get_ticker_sector(r.ticker)
+                    if sector:
+                        ticker_sectors[r.ticker] = sector
+            st.session_state['ticker_sectors'] = ticker_sectors
+
+        except Exception as e:
+            print(f"Sector/earnings fetch error: {e}")
+
         # Merge with existing results if new_only mode
         if mode == 'new_only':
             existing_results = st.session_state.get('scan_results', [])
@@ -250,6 +301,8 @@ def _run_scan(mode='all'):
         # Build full summary (merge if new_only)
         results_for_summary = st.session_state['scan_results']
 
+        ticker_sectors = st.session_state.get('ticker_sectors', {})
+
         summary = []
         for r in results_for_summary:
             rec = r.recommendation or {}
@@ -267,6 +320,7 @@ def _run_scan(mode='all'):
                 'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
                 'monthly_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'is_open_position': r.ticker in open_tickers,
+                'sector': ticker_sectors.get(r.ticker, ''),
             })
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
@@ -398,12 +452,34 @@ def render_scanner_table():
     if not rows:
         return
 
+    # ── Sector Rotation Strip ─────────────────────────────────────────
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    if sector_rotation:
+        # Build compact sector strip
+        leading = []
+        lagging = []
+        for sector, info in sector_rotation.items():
+            short = info.get('short_name', sector[:4])
+            vs = info.get('vs_spy_20d', 0)
+            if info.get('status') == 'leading':
+                leading.append(f"{short} ({vs:+.1f}%)")
+            elif info.get('status') == 'lagging':
+                lagging.append(f"{short} ({vs:+.1f}%)")
+
+        parts = []
+        if leading:
+            parts.append(f"🟢 **Leading:** {', '.join(leading)}")
+        if lagging:
+            parts.append(f"🔴 **Lagging:** {', '.join(lagging)}")
+        if parts:
+            st.caption(" | ".join(parts))
+
     # ── Filter Bar ────────────────────────────────────────────────────
     filt_col1, filt_col2, filt_col3, filt_col4 = st.columns([2, 2, 2, 2])
 
     with filt_col1:
         rec_filter = st.selectbox("Filter", [
-            "All", "Signals Only", "BUY+", "Quality A-B", "Open Positions"
+            "All", "Signals Only", "BUY+", "Quality A-B", "Open Positions", "⚡ Earnings Soon"
         ], key="scan_filter", label_visibility="collapsed")
 
     with filt_col2:
@@ -433,6 +509,8 @@ def render_scanner_table():
         filtered = [r for r in filtered if r['Quality'] in ('A', 'B')]
     elif rec_filter == "Open Positions":
         filtered = [r for r in filtered if 'Open' in r.get('Status', '')]
+    elif rec_filter == "⚡ Earnings Soon":
+        filtered = [r for r in filtered if r.get('Earn', '')]
 
     # Apply sort
     if sort_by == "Conviction ↓":
@@ -455,23 +533,26 @@ def render_scanner_table():
         return
 
     # Table header
-    hdr_cols = st.columns([1.2, 1, 0.7, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 3])
-    headers = ['Ticker', 'Rec', 'Conv', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
+    hdr_cols = st.columns([1.2, 1.0, 0.5, 0.9, 0.6, 0.5, 0.5, 0.5, 0.5, 0.7, 2.5])
+    headers = ['Ticker', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
     # Table rows — each ticker is a button
     for idx, row in enumerate(filtered):
-        cols = st.columns([1.2, 1, 0.7, 0.6, 0.6, 0.6, 0.6, 0.6, 0.7, 3])
+        cols = st.columns([1.2, 1.0, 0.5, 0.9, 0.6, 0.5, 0.5, 0.5, 0.5, 0.7, 2.5])
 
-        # Ticker as clickable button
+        # Ticker as clickable button with earnings flag
         with cols[0]:
             ticker_label = row['Ticker']
             status = row.get('Status', '')
+            earn = row.get('Earn', '')
             if 'Open' in status:
                 ticker_label = f"📈 {ticker_label}"
             elif 'Alert' in status:
                 ticker_label = f"🎯 {ticker_label}"
+            if earn:
+                ticker_label = f"{ticker_label} ⚡"
 
             if st.button(ticker_label, key=f"row_{row['Ticker']}_{idx}",
                         use_container_width=True):
@@ -486,18 +567,19 @@ def render_scanner_table():
         rec_icon = rec_colors.get(rec_val, '⚪')
         cols[1].caption(f"{rec_icon} {rec_val}")
         cols[2].caption(row.get('Conv', '0/10'))
-        cols[3].caption(row.get('MACD', '❌'))
-        cols[4].caption(row.get('AO', '❌'))
-        cols[5].caption(row.get('Wkly', '❌'))
-        cols[6].caption(row.get('Mthly', '❌'))
+        cols[3].caption(row.get('Sector', ''))
+        cols[4].caption(row.get('MACD', '❌'))
+        cols[5].caption(row.get('AO', '❌'))
+        cols[6].caption(row.get('Wkly', '❌'))
+        cols[7].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[7].caption(f"{q_colors.get(q, '⚪')} {q}")
+        cols[8].caption(f"{q_colors.get(q, '⚪')} {q}")
 
-        cols[8].caption(row.get('Price', '?'))
-        cols[9].caption(row.get('Summary', '')[:80])
+        cols[9].caption(row.get('Price', '?'))
+        cols[10].caption(row.get('Summary', '')[:60])
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
@@ -526,6 +608,10 @@ def _build_rows_from_analysis(results, jm) -> list:
     """Build table rows from live TickerAnalysis objects."""
     open_tickers = jm.get_open_tickers()
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    ticker_sectors = st.session_state.get('ticker_sectors', {})
+    earnings_flags = st.session_state.get('earnings_flags', {})
+
     rows = []
     for r in results:
         rec = r.recommendation or {}
@@ -540,9 +626,29 @@ def _build_rows_from_analysis(results, jm) -> list:
         else:
             status = "👀"
 
+        # Sector rotation
+        sector = ticker_sectors.get(r.ticker, '')
+        sector_info = sector_rotation.get(sector, {})
+        sector_status = sector_info.get('status', '')
+        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        if sector_status == 'leading':
+            sector_dot = f"🟢 {sector_short}"
+        elif sector_status == 'lagging':
+            sector_dot = f"🔴 {sector_short}"
+        elif sector_short:
+            sector_dot = f"🟡 {sector_short}"
+        else:
+            sector_dot = ""
+
+        # Earnings flag
+        earn = earnings_flags.get(r.ticker)
+        earn_flag = f"⚡{earn['days_until']}d" if earn else ""
+
         rows.append({
             'Ticker': r.ticker,
             'Status': status,
+            'Sector': sector_dot,
+            'Earn': earn_flag,
             'Rec': rec.get('recommendation', 'SKIP'),
             'Conv': f"{rec.get('conviction', 0)}/10",
             'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
@@ -560,6 +666,9 @@ def _build_rows_from_summary(summary, jm) -> list:
     """Build table rows from persisted scan summary (cross-session)."""
     open_tickers = jm.get_open_tickers()
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    earnings_flags = st.session_state.get('earnings_flags', {})
+
     rows = []
     for s in summary:
         ticker = s.get('ticker', '?')
@@ -570,9 +679,29 @@ def _build_rows_from_summary(summary, jm) -> list:
         else:
             status = "👀"
 
+        # Sector rotation
+        sector = s.get('sector', '')
+        sector_info = sector_rotation.get(sector, {})
+        sector_status = sector_info.get('status', '')
+        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        if sector_status == 'leading':
+            sector_dot = f"🟢 {sector_short}"
+        elif sector_status == 'lagging':
+            sector_dot = f"🔴 {sector_short}"
+        elif sector_short:
+            sector_dot = f"🟡 {sector_short}"
+        else:
+            sector_dot = ""
+
+        # Earnings flag
+        earn = earnings_flags.get(ticker)
+        earn_flag = f"⚡{earn['days_until']}d" if earn else ""
+
         rows.append({
             'Ticker': ticker,
             'Status': status,
+            'Sector': sector_dot,
+            'Earn': earn_flag,
             'Rec': s.get('recommendation', 'SKIP'),
             'Conv': f"{s.get('conviction', 0)}/10",
             'MACD': "✅" if s.get('macd_bullish') else "❌",
