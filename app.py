@@ -87,30 +87,79 @@ def render_sidebar():
     st.sidebar.title("📊 TTA v2")
     st.sidebar.caption("Technical Trading Assistant")
 
-    # ── Watchlist Input ───────────────────────────────────────────────
+    # ── Watchlist Manager ─────────────────────────────────────────────
     st.sidebar.subheader("Watchlist")
 
     watchlist_tickers = jm.get_watchlist_tickers()
-    default_text = ", ".join(watchlist_tickers) if watchlist_tickers else ""
 
-    new_tickers = st.sidebar.text_area(
-        "Tickers (comma separated)",
-        value=default_text,
-        height=80,
-        help="Enter tickers separated by commas. Example: AAPL, NVDA, META",
-    )
+    # Add ticker input
+    add_col1, add_col2 = st.sidebar.columns([3, 1])
+    with add_col1:
+        new_ticker = st.text_input("Add ticker", placeholder="e.g. AAPL",
+                                    key="add_ticker_input", label_visibility="collapsed")
+    with add_col2:
+        if st.button("➕", key="add_ticker_btn", use_container_width=True):
+            if new_ticker:
+                ticker_clean = new_ticker.strip().upper()
+                if ticker_clean and ticker_clean not in watchlist_tickers:
+                    jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                    st.rerun()
+                elif ticker_clean in watchlist_tickers:
+                    st.sidebar.caption(f"{ticker_clean} already in list")
 
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        if st.button("💾 Save", use_container_width=True):
-            tickers = [t.strip().upper() for t in new_tickers.split(",") if t.strip()]
-            jm.clear_watchlist()
-            jm.set_watchlist_tickers(tickers)
-            st.sidebar.success(f"Saved {len(tickers)} tickers")
-            st.rerun()
-    with col2:
-        if st.button("🔍 Scan", use_container_width=True, type="primary"):
-            _run_scan()
+    # Display current tickers with remove buttons
+    if watchlist_tickers:
+        # Show in compact rows of 2
+        for i in range(0, len(watchlist_tickers), 2):
+            cols = st.sidebar.columns(2)
+            for j, col in enumerate(cols):
+                idx = i + j
+                if idx < len(watchlist_tickers):
+                    t = watchlist_tickers[idx]
+                    with col:
+                        tc1, tc2 = st.columns([3, 1])
+                        with tc1:
+                            st.caption(t)
+                        with tc2:
+                            if st.button("✕", key=f"rm_wl_{t}"):
+                                # Remove from watchlist
+                                remaining = [x for x in watchlist_tickers if x != t]
+                                jm.clear_watchlist()
+                                jm.set_watchlist_tickers(remaining)
+                                # Also remove from scan results if present
+                                if 'scan_results' in st.session_state:
+                                    st.session_state['scan_results'] = [
+                                        r for r in st.session_state['scan_results']
+                                        if r.ticker != t
+                                    ]
+                                if 'scan_results_summary' in st.session_state:
+                                    st.session_state['scan_results_summary'] = [
+                                        s for s in st.session_state['scan_results_summary']
+                                        if s.get('ticker') != t
+                                    ]
+                                st.rerun()
+
+        st.sidebar.caption(f"{len(watchlist_tickers)} tickers")
+    else:
+        st.sidebar.caption("No tickers — add some above")
+
+    # Scan buttons
+    scan_col1, scan_col2 = st.sidebar.columns(2)
+    with scan_col1:
+        if st.button("🔍 Scan All", use_container_width=True, type="primary"):
+            _run_scan(mode='all')
+    with scan_col2:
+        # Count how many are new (not yet scanned)
+        scanned = set()
+        existing_summary = st.session_state.get('scan_results_summary', [])
+        for s in existing_summary:
+            scanned.add(s.get('ticker', ''))
+        new_count = len([t for t in watchlist_tickers if t not in scanned])
+
+        btn_label = f"⚡ New ({new_count})" if new_count > 0 else "⚡ New"
+        if st.button(btn_label, use_container_width=True,
+                     disabled=(new_count == 0)):
+            _run_scan(mode='new_only')
 
     # ── Open Positions (clickable) ────────────────────────────────────
     open_trades = jm.get_open_trades()
@@ -195,34 +244,66 @@ def _load_ticker_for_view(ticker: str):
         st.sidebar.error(f"Error loading {ticker}: {e}")
 
 
-def _run_scan():
-    """Execute watchlist scan with persistence and conditional checking."""
-    jm = get_journal()
-    tickers = jm.get_watchlist_tickers()
+def _run_scan(mode='all'):
+    """
+    Execute watchlist scan with persistence and conditional checking.
 
-    # Also include conditional alert tickers
+    mode='all': Rescan everything (daily refresh, full watchlist)
+    mode='new_only': Only scan tickers not in current results
+    """
+    jm = get_journal()
+    all_watchlist = jm.get_watchlist_tickers()
+
+    # Also include conditional alert tickers and open positions
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
-    # And open position tickers (so they show in scan results too)
     open_tickers = jm.get_open_tickers()
 
-    all_tickers = list(set(tickers + conditional_tickers + open_tickers))
+    full_list = list(set(all_watchlist + conditional_tickers + open_tickers))
 
-    if not all_tickers:
+    if not full_list:
         st.sidebar.warning("Add tickers to watchlist first")
         return
 
-    with st.spinner(f"Scanning {len(all_tickers)} tickers..."):
-        all_data = fetch_scan_data(all_tickers)
-        results = scan_watchlist(all_data)
+    # Determine which tickers to scan
+    if mode == 'new_only':
+        existing_summary = st.session_state.get('scan_results_summary', [])
+        already_scanned = {s.get('ticker', '') for s in existing_summary}
+        tickers_to_scan = [t for t in full_list if t not in already_scanned]
+        if not tickers_to_scan:
+            st.sidebar.info("All tickers already scanned")
+            return
+    else:
+        tickers_to_scan = full_list
 
-        st.session_state['scan_results'] = results
-        st.session_state['ticker_data_cache'] = all_data
+    with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
+        all_data = fetch_scan_data(tickers_to_scan)
+        new_results = scan_watchlist(all_data)
+
+        # Merge with existing results if new_only mode
+        if mode == 'new_only':
+            existing_results = st.session_state.get('scan_results', [])
+            existing_tickers = {r.ticker for r in new_results}
+            # Keep old results that aren't being rescanned
+            merged_results = [r for r in existing_results if r.ticker not in existing_tickers]
+            merged_results.extend(new_results)
+            st.session_state['scan_results'] = merged_results
+
+            # Merge data cache
+            existing_cache = st.session_state.get('ticker_data_cache', {})
+            existing_cache.update(all_data)
+            st.session_state['ticker_data_cache'] = existing_cache
+        else:
+            st.session_state['scan_results'] = new_results
+            st.session_state['ticker_data_cache'] = all_data
+
         st.session_state['selected_ticker'] = None
         st.session_state['selected_analysis'] = None
 
-        # Persist scan summary to disk for cross-session restore
+        # Build full summary (merge if new_only)
+        results_for_summary = st.session_state['scan_results']
+
         summary = []
-        for r in results:
+        for r in results_for_summary:
             rec = r.recommendation or {}
             q = r.quality or {}
             sig = r.signal
@@ -244,9 +325,11 @@ def _run_scan():
         st.session_state['scan_timestamp'] = datetime.now().isoformat()
 
         # Check conditional alerts
+        # Use all cached data (both old and new)
+        full_cache = st.session_state.get('ticker_data_cache', {})
         current_prices = {}
         volume_ratios = {}
-        for ticker, data in all_data.items():
+        for ticker, data in full_cache.items():
             daily = data.get('daily')
             if daily is not None and len(daily) > 0:
                 current_prices[ticker] = float(daily['Close'].iloc[-1])
