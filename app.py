@@ -859,6 +859,15 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
             except Exception:
                 pass
 
+            # Market intelligence — analysts, insiders, social
+            market_intel = {}
+            try:
+                from data_fetcher import fetch_market_intelligence
+                finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                market_intel = fetch_market_intelligence(ticker, finnhub_key=finnhub_key)
+            except Exception as e:
+                st.caption(f"Market intel error: {e}")
+
             result = run_ai_analysis(
                 ticker=ticker,
                 signal=signal,
@@ -868,12 +877,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                 fundamental_profile=fundamental_profile,
                 tradingview_data=tradingview_data,
                 news_data=news_data,
+                market_intel=market_intel,
                 gemini_model=gemini,
                 openai_client=openai_client,
             )
 
             # Attach extra data for UI display
             result['earnings_history'] = earnings_history
+            result['market_intel'] = market_intel
 
             st.session_state[f'ai_result_{ticker}'] = result
 
@@ -1002,6 +1013,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
             st.error(bear)
 
     # ═══════════════════════════════════════════════════════════════
+    # SMART MONEY (AI-synthesized analyst + insider view)
+    # ═══════════════════════════════════════════════════════════════
+    smart = ai_result.get('smart_money', '')
+    if smart:
+        st.markdown("**🏦 Smart Money:**")
+        st.info(smart)
+
+    # ═══════════════════════════════════════════════════════════════
     # RED FLAGS
     # ═══════════════════════════════════════════════════════════════
     flags = ai_result.get('red_flags', '')
@@ -1009,6 +1028,13 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.warning(f"🚩 **Red flags:** {flags}")
     else:
         st.success("🚩 **Red flags:** None — clean setup")
+
+    # ═══════════════════════════════════════════════════════════════
+    # MARKET INTELLIGENCE PANEL
+    # ═══════════════════════════════════════════════════════════════
+    mi = ai_result.get('market_intel', {})
+    if mi and not mi.get('error'):
+        _render_market_intelligence(mi)
 
     # ═══════════════════════════════════════════════════════════════
     # EARNINGS SECTION
@@ -1040,6 +1066,142 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # ═══════════════════════════════════════════════════════════════
     with st.expander("📝 Full AI Response"):
         st.text(ai_result.get('raw_text', ''))
+
+
+def _render_market_intelligence(intel: Dict):
+    """Render market intelligence panel — analysts, insiders, social."""
+    st.markdown("### 🏦 Market Intelligence")
+
+    # ── Analyst Consensus + Price Targets ─────────────────────────
+    col_analyst, col_targets = st.columns(2)
+
+    with col_analyst:
+        consensus = intel.get('analyst_consensus')
+        total = intel.get('analyst_count', 0)
+
+        if consensus and total:
+            # Color-coded consensus
+            c_map = {
+                'Strong Buy': ('success', '🟢🟢'),
+                'Buy': ('success', '🟢'),
+                'Hold': ('warning', '🟡'),
+                'Sell': ('error', '🔴'),
+                'Strong Sell': ('error', '🔴🔴'),
+            }
+            method, icon = c_map.get(consensus, ('info', '⚪'))
+            getattr(st, method)(f"{icon} **Analyst Consensus: {consensus}** ({total} analysts)")
+
+            # Breakdown bar
+            sb = intel.get('analyst_strong_buy', 0)
+            b = intel.get('analyst_buy', 0)
+            h = intel.get('analyst_hold', 0)
+            s = intel.get('analyst_sell', 0)
+            ss = intel.get('analyst_strong_sell', 0)
+
+            st.caption(f"Strong Buy: {sb} | Buy: {b} | Hold: {h} | Sell: {s} | Strong Sell: {ss}")
+        else:
+            st.caption("No analyst data available")
+
+    with col_targets:
+        target = intel.get('target_mean')
+        if target:
+            high = intel.get('target_high')
+            low = intel.get('target_low')
+            upside = intel.get('target_upside_pct')
+
+            if upside is not None:
+                if upside > 15:
+                    st.success(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% upside)")
+                elif upside > 0:
+                    st.info(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% upside)")
+                else:
+                    st.error(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% — below current)")
+
+            if high and low:
+                st.caption(f"Range: ${low:.2f} (bear) → ${high:.2f} (bull)")
+        else:
+            st.caption("No price targets available")
+
+    # ── Recent Rating Changes ─────────────────────────────────────
+    changes = intel.get('recent_changes', [])
+    if changes:
+        with st.expander(f"📋 Recent Upgrades/Downgrades ({len(changes)})", expanded=False):
+            rows = []
+            for c in changes[:8]:
+                action = c.get('action', '?')
+                # Color code
+                if 'upgrade' in action.lower() or 'initiated' in action.lower():
+                    action_str = f"⬆️ {action}"
+                elif 'downgrade' in action.lower():
+                    action_str = f"⬇️ {action}"
+                else:
+                    action_str = f"➡️ {action}"
+
+                from_g = f" (from {c.get('from_grade', '')})" if c.get('from_grade') else ""
+                rows.append({
+                    'Date': c.get('date', '?'),
+                    'Firm': c.get('firm', '?'),
+                    'Action': action_str,
+                    'Rating': f"{c.get('to_grade', '?')}{from_g}",
+                })
+
+            import pandas as pd
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── Insider Activity + Social ─────────────────────────────────
+    col_insider, col_social = st.columns(2)
+
+    with col_insider:
+        buys = intel.get('insider_buys_90d', 0)
+        sells = intel.get('insider_sells_90d', 0)
+
+        if buys > 0 or sells > 0:
+            net = intel.get('insider_net_shares', 0)
+            if net > 0:
+                st.success(f"👔 **Insiders (90d): {buys} buys, {sells} sells — NET BUYING**")
+            elif net < 0:
+                st.warning(f"👔 **Insiders (90d): {buys} buys, {sells} sells — NET SELLING**")
+            else:
+                st.info(f"👔 **Insiders (90d): {buys} buys, {sells} sells — Neutral**")
+
+            # Show top transactions
+            txns = intel.get('insider_transactions', [])
+            if txns:
+                with st.expander("Insider Transactions", expanded=False):
+                    rows = []
+                    for t in txns[:8]:
+                        val = t.get('value', 0)
+                        val_str = f"${val:,.0f}" if val else "—"
+                        rows.append({
+                            'Date': t.get('date', '?'),
+                            'Name': t.get('name', '?'),
+                            'Type': t.get('type', '?'),
+                            'Shares': f"{t.get('shares', 0):,}",
+                            'Value': val_str,
+                        })
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No insider transactions found")
+
+    with col_social:
+        social = intel.get('social_score')
+        reddit = intel.get('social_reddit_mentions')
+        twitter = intel.get('social_twitter_mentions')
+
+        if social:
+            s_map = {'High buzz': ('success', '🔥'), 'Moderate': ('info', '📊'), 'Low': ('warning', '😴')}
+            method, icon = s_map.get(social, ('info', '📊'))
+            getattr(st, method)(f"{icon} **Social: {social}**")
+            parts = []
+            if reddit is not None:
+                parts.append(f"Reddit: {reddit}")
+            if twitter is not None:
+                parts.append(f"Twitter: {twitter}")
+            if parts:
+                st.caption(f"7-day mentions — {' | '.join(parts)}")
+        else:
+            st.caption("Social sentiment not available (needs Finnhub)")
 
 
 def _render_tv_confirmation(tv_data: Dict):
