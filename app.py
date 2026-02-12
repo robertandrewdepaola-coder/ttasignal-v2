@@ -505,24 +505,32 @@ def _run_scan(mode='all'):
         all_data = fetch_scan_data(tickers_to_scan)
         new_results = scan_watchlist(all_data)
 
-        # Fetch sector rotation (once per scan, shared across all tickers)
+        # Fetch sector rotation (independent — failure doesn't block earnings)
         try:
-            from data_fetcher import fetch_sector_rotation, fetch_batch_earnings_flags, get_ticker_sector
+            from data_fetcher import fetch_sector_rotation
             sector_rotation = fetch_sector_rotation()
             st.session_state['sector_rotation'] = sector_rotation
+        except Exception as e:
+            print(f"Sector rotation error: {e}")
 
-            # Fetch earnings flags for all tickers
+        # Fetch earnings flags (independent — failure doesn't block sectors)
+        try:
+            from data_fetcher import fetch_batch_earnings_flags
             all_scan_tickers = [r.ticker for r in new_results]
             earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=14)
-            # Merge with existing if new_only
-            if mode == 'new_only':
-                existing_flags = st.session_state.get('earnings_flags', {})
-                existing_flags.update(earnings_flags)
-                st.session_state['earnings_flags'] = existing_flags
-            else:
-                st.session_state['earnings_flags'] = earnings_flags
+            if earnings_flags:  # Only update if we got results
+                if mode == 'new_only':
+                    existing_flags = st.session_state.get('earnings_flags', {})
+                    existing_flags.update(earnings_flags)
+                    st.session_state['earnings_flags'] = existing_flags
+                else:
+                    st.session_state['earnings_flags'] = earnings_flags
+        except Exception as e:
+            print(f"Earnings flags error: {e}")
 
-            # Fetch sectors for scanned tickers
+        # Fetch sectors for scanned tickers (independent)
+        try:
+            from data_fetcher import get_ticker_sector
             ticker_sectors = st.session_state.get('ticker_sectors', {})
             for r in new_results:
                 if r.ticker not in ticker_sectors:
@@ -530,9 +538,8 @@ def _run_scan(mode='all'):
                     if sector:
                         ticker_sectors[r.ticker] = sector
             st.session_state['ticker_sectors'] = ticker_sectors
-
         except Exception as e:
-            print(f"Sector/earnings fetch error: {e}")
+            print(f"Sector assignment error: {e}")
 
         # Merge with existing results if new_only mode
         if mode == 'new_only':
@@ -1520,13 +1527,13 @@ def render_detail_view():
     st.caption(rec.get('summary', ''))
 
     # ── Tabs (with optional default tab from chart-first navigation) ──
-    tab_names = ["📊 Signal", "📈 Chart", "🤖 AI Intel", "💼 Trade"]
+    tab_names = ["📊 Signal", "📈 Chart", "🤖 AI Intel", "💬 Ask AI", "💼 Trade"]
     default_tab = st.session_state.pop('default_detail_tab', 0)
 
     # Streamlit tabs don't support programmatic selection directly,
     # so we reorder tabs to put the desired one first, then reorder back
     # Actually, we can't reorder. We use a workaround with session state key.
-    tab_signal, tab_chart, tab_ai, tab_trade = st.tabs(tab_names)
+    tab_signal, tab_chart, tab_ai, tab_chat, tab_trade = st.tabs(tab_names)
 
     # ── Signal Tab ────────────────────────────────────────────────────
     with tab_signal:
@@ -1539,6 +1546,10 @@ def render_detail_view():
     # ── AI Intel Tab ──────────────────────────────────────────────────
     with tab_ai:
         _render_ai_tab(ticker, signal, rec, analysis)
+
+    # ── Ask AI Chat Tab ───────────────────────────────────────────────
+    with tab_chat:
+        _render_chat_tab(ticker, signal, rec, analysis)
 
     # ── Trade Tab ─────────────────────────────────────────────────────
     with tab_trade:
@@ -2066,8 +2077,10 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # MARKET INTELLIGENCE PANEL
     # ═══════════════════════════════════════════════════════════════
     mi = ai_result.get('market_intel', {})
-    if mi and not mi.get('error'):
+    if mi:
         _render_market_intelligence(mi)
+    else:
+        st.caption("Market intelligence not available — re-run analysis to fetch")
 
     # ═══════════════════════════════════════════════════════════════
     # EARNINGS SECTION
@@ -2191,22 +2204,23 @@ def _render_market_intelligence(intel: Dict):
     col_insider, col_social = st.columns(2)
 
     with col_insider:
+        st.markdown("**👔 Insider Transactions (90d)**")
         buys = intel.get('insider_buys_90d', 0)
         sells = intel.get('insider_sells_90d', 0)
 
         if buys > 0 or sells > 0:
             net = intel.get('insider_net_shares', 0)
             if net > 0:
-                st.success(f"👔 **Insiders (90d): {buys} buys, {sells} sells — NET BUYING**")
+                st.success(f"**{buys} buys, {sells} sells — NET BUYING**")
             elif net < 0:
-                st.warning(f"👔 **Insiders (90d): {buys} buys, {sells} sells — NET SELLING**")
+                st.warning(f"**{buys} buys, {sells} sells — NET SELLING**")
             else:
-                st.info(f"👔 **Insiders (90d): {buys} buys, {sells} sells — Neutral**")
+                st.info(f"**{buys} buys, {sells} sells — Neutral**")
 
             # Show top transactions
             txns = intel.get('insider_transactions', [])
             if txns:
-                with st.expander("Insider Transactions", expanded=False):
+                with st.expander("Transaction Details", expanded=False):
                     rows = []
                     for t in txns[:8]:
                         val = t.get('value', 0)
@@ -2221,9 +2235,10 @@ def _render_market_intelligence(intel: Dict):
                     import pandas as pd
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
-            st.caption("No insider transactions found")
+            st.caption("No insider transactions found in last 90 days")
 
     with col_social:
+        st.markdown("**📊 Social / Volume Buzz**")
         social = intel.get('social_score')
         reddit = intel.get('social_reddit_mentions')
         twitter = intel.get('social_twitter_mentions')
@@ -2242,22 +2257,29 @@ def _render_market_intelligence(intel: Dict):
             getattr(st, method)(f"{icon} **{social}**")
 
             parts = []
-            if reddit is not None:
+            if reddit is not None and reddit > 0:
                 parts.append(f"Reddit: {reddit}")
-            if twitter is not None:
+            if twitter is not None and twitter > 0:
                 parts.append(f"Twitter: {twitter}")
             if vol_surge is not None and social_source == 'volume_proxy':
                 parts.append(f"Vol ratio: {vol_surge:.1f}x avg")
             if parts:
                 source_label = "7-day mentions" if social_source != 'volume_proxy' else "5-day vs 50-day avg"
                 st.caption(f"{source_label} — {' | '.join(parts)}")
-            elif social_source == 'volume_proxy':
-                st.caption("Using volume as social proxy (no Finnhub key)")
+
+            # Show source info
+            if social_source == 'volume_proxy':
+                if social_error == 'Finnhub premium required':
+                    st.caption("ℹ️ Finnhub social requires premium plan — using volume as proxy")
+                else:
+                    st.caption("ℹ️ Using volume surge as social proxy")
             elif social_source == 'unavailable':
                 st.caption("Volume data unavailable for this ticker")
         else:
-            error_msg = social_error or "Social data not available"
-            st.caption(f"📊 {error_msg}")
+            if social_error:
+                st.caption(f"📊 {social_error}")
+            else:
+                st.caption("📊 Social data not available")
 
 
 def _render_tv_confirmation(tv_data: Dict):
@@ -2541,6 +2563,380 @@ def _render_fundamental_snapshot(fp: Dict):
         if fp.get('last_earnings_surprise_pct') is not None:
             parts.append(f"Last Surprise: {fp['last_earnings_surprise_pct']:+.1f}%")
         st.caption(" | ".join(parts))
+
+
+# =============================================================================
+# ASK AI CHAT — Interactive conversation about the stock
+# =============================================================================
+
+def _build_stock_context(ticker: str, signal: EntrySignal, rec: Dict,
+                         analysis: TickerAnalysis) -> str:
+    """Build comprehensive stock context string for AI chat system prompt."""
+    lines = [f"═══ FULL DATA CONTEXT FOR {ticker} ═══\n"]
+
+    # Current price & recommendation
+    if analysis.current_price:
+        lines.append(f"CURRENT PRICE: ${analysis.current_price:.2f}")
+    lines.append(f"RECOMMENDATION: {rec.get('recommendation', 'N/A')} (Conviction: {rec.get('conviction', 0)}/10)")
+    lines.append(f"SUMMARY: {rec.get('summary', 'N/A')}")
+
+    # Quality
+    q = analysis.quality or {}
+    if q:
+        lines.append(f"\nQUALITY GRADE: {q.get('quality_grade', '?')}")
+        for factor in ['trend_alignment', 'volume_confirmation', 'momentum_health',
+                       'multi_timeframe', 'risk_reward']:
+            val = q.get(factor)
+            if val is not None:
+                lines.append(f"  {factor}: {val}")
+
+    # Signal data
+    if signal:
+        lines.append(f"\n── DAILY SIGNALS ──")
+        m = signal.macd
+        lines.append(f"  MACD: {'Bullish' if m.get('bullish') else 'Bearish'} | Hist: {m.get('histogram', 0):+.4f}")
+        if m.get('near_cross'):
+            lines.append(f"  ⚠ MACD near crossover")
+        if m.get('weakening'):
+            lines.append(f"  ⚠ MACD histogram weakening")
+
+        ao = signal.ao
+        lines.append(f"  AO: {'Positive' if ao.get('positive') else 'Negative'} | Value: {ao.get('value', 0):+.4f}")
+        if ao.get('saucer'):
+            lines.append(f"  🟢 AO Saucer (bullish acceleration)")
+
+        lines.append(f"\n── WEEKLY ──")
+        wm = signal.weekly_macd
+        lines.append(f"  Weekly MACD: {'Bullish' if wm.get('bullish') else 'Bearish'}")
+
+        lines.append(f"\n── MONTHLY ──")
+        mm = signal.monthly_macd
+        lines.append(f"  Monthly MACD: {'Bullish' if mm.get('bullish') else 'Bearish'}")
+
+        # Volume
+        if analysis.volume_ratio:
+            lines.append(f"\n  Volume Ratio: {analysis.volume_ratio:.1f}x average")
+
+    # Re-entry / Late entry
+    if analysis.reentry and analysis.reentry.get('is_valid'):
+        re = analysis.reentry
+        lines.append(f"\n── RE-ENTRY SIGNAL ──")
+        lines.append(f"  MACD cross {re.get('macd_cross_bars_ago', '?')} bars ago")
+        lines.append(f"  AO confirmation: {re.get('ao_confirmed', False)}")
+
+    # Apex
+    if analysis.apex_buy:
+        lines.append(f"\n🎯 APEX BUY SIGNAL ACTIVE")
+
+    # AO Divergence
+    if analysis.ao_divergence_active:
+        lines.append(f"\n⚡ AO DIVERGENCE DETECTED (bullish divergence)")
+
+    # AI Analysis results (if already run)
+    ai_result = st.session_state.get(f'ai_result_{ticker}')
+    if ai_result:
+        lines.append(f"\n── AI ANALYSIS (previous run) ──")
+        for key in ['action', 'conviction', 'resistance_verdict', 'why_moving',
+                     'fundamental_quality', 'smart_money', 'bull_case', 'bear_case',
+                     'red_flags', 'position_sizing']:
+            val = ai_result.get(key)
+            if val:
+                lines.append(f"  {key.upper().replace('_', ' ')}: {val}")
+
+        # Market intelligence
+        mi = ai_result.get('market_intel', {})
+        if mi:
+            lines.append(f"\n── MARKET INTELLIGENCE ──")
+            # Analysts
+            ac = mi.get('analyst_consensus')
+            if ac:
+                lines.append(f"  Analyst Consensus: {ac} ({mi.get('analyst_count', 0)} analysts)")
+            target = mi.get('target_mean')
+            if target:
+                upside = mi.get('target_upside_pct', 0)
+                lines.append(f"  Price Target: ${target:.2f} ({upside:+.1f}% upside)")
+            # Insiders
+            buys = mi.get('insider_buys_90d', 0)
+            sells = mi.get('insider_sells_90d', 0)
+            if buys > 0 or sells > 0:
+                lines.append(f"  Insider Transactions: {buys} buys, {sells} sells (90d)")
+            else:
+                lines.append(f"  Insider Transactions: None found in last 90 days")
+            # Social
+            social = mi.get('social_score')
+            if social:
+                lines.append(f"  Social Sentiment: {social} (source: {mi.get('social_source', '?')})")
+            # Recent changes
+            changes = mi.get('recent_changes', [])
+            if changes:
+                lines.append(f"  Recent Upgrades/Downgrades:")
+                for c in changes[:3]:
+                    lines.append(f"    {c.get('date', '?')} — {c.get('firm', '?')}: {c.get('action', '?')} → {c.get('to_grade', '?')}")
+
+        # Fundamental profile
+        fp = ai_result.get('fundamental_profile') or st.session_state.get(f'fund_profile_{ticker}', {})
+        if not fp:
+            # Try to get from fundamentals
+            pass
+
+    # Sector
+    sector = st.session_state.get('ticker_sectors', {}).get(ticker)
+    if sector:
+        rotation = st.session_state.get('sector_rotation', {}).get(sector, {})
+        if rotation:
+            lines.append(f"\n── SECTOR ──")
+            lines.append(f"  Sector: {sector} ({rotation.get('phase', '?')})")
+            lines.append(f"  Vs SPY (20d): {rotation.get('vs_spy_20d', 0):+.1f}%")
+
+    # Earnings
+    earn = st.session_state.get('earnings_flags', {}).get(ticker)
+    if earn:
+        lines.append(f"\n── EARNINGS ──")
+        lines.append(f"  Next: {earn.get('next_earnings', '?')} ({earn.get('days_until', '?')} days)")
+
+    return "\n".join(lines)
+
+
+def _fetch_web_context(ticker: str) -> str:
+    """Fetch additional web context (news, Yahoo data) for the chat."""
+    lines = [f"\n═══ ADDITIONAL WEB DATA FOR {ticker} (just fetched) ═══\n"]
+
+    # Finnhub news
+    try:
+        finnhub_key = ""
+        try:
+            finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+        except Exception:
+            pass
+
+        if finnhub_key:
+            from data_fetcher import fetch_finnhub_news
+            news = fetch_finnhub_news(ticker, api_key=finnhub_key)
+            if news and news.get('articles'):
+                lines.append("RECENT NEWS (Finnhub):")
+                for article in news['articles'][:8]:
+                    headline = article.get('headline', article.get('title', '?'))
+                    source = article.get('source', '?')
+                    date = article.get('datetime', '')
+                    if isinstance(date, (int, float)) and date > 0:
+                        from datetime import datetime as dt
+                        try:
+                            date = dt.fromtimestamp(date).strftime('%Y-%m-%d')
+                        except Exception:
+                            date = ''
+                    summary = article.get('summary', '')[:200]
+                    lines.append(f"  [{date}] {headline} ({source})")
+                    if summary:
+                        lines.append(f"    {summary}")
+            else:
+                lines.append("NEWS: No recent articles found on Finnhub")
+        else:
+            lines.append("NEWS: No Finnhub API key configured")
+    except Exception as e:
+        lines.append(f"NEWS: Error fetching — {str(e)[:100]}")
+
+    # Yahoo Finance info (quick fundamental snapshot)
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+        if info:
+            lines.append(f"\nYAHOO FINANCE SNAPSHOT:")
+            for key, label in [
+                ('shortName', 'Company'), ('industry', 'Industry'),
+                ('marketCap', 'Market Cap'), ('trailingPE', 'P/E'),
+                ('forwardPE', 'Forward P/E'), ('revenueGrowth', 'Revenue Growth'),
+                ('recommendationKey', 'Yahoo Recommendation'),
+                ('targetMeanPrice', 'Target Price'),
+                ('shortPercentOfFloat', 'Short % Float'),
+                ('fiftyTwoWeekHigh', '52w High'), ('fiftyTwoWeekLow', '52w Low'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    if key == 'marketCap' and isinstance(val, (int, float)):
+                        if val >= 1e12:
+                            val = f"${val/1e12:.1f}T"
+                        elif val >= 1e9:
+                            val = f"${val/1e9:.1f}B"
+                        elif val >= 1e6:
+                            val = f"${val/1e6:.0f}M"
+                    elif key in ('revenueGrowth', 'shortPercentOfFloat') and isinstance(val, (int, float)):
+                        val = f"{val*100:.1f}%"
+                    lines.append(f"  {label}: {val}")
+
+            # Recent news from Yahoo
+            try:
+                news_items = stock.news
+                if news_items:
+                    lines.append(f"\nYAHOO NEWS:")
+                    for item in news_items[:5]:
+                        title = item.get('title', '?')
+                        publisher = item.get('publisher', '?')
+                        lines.append(f"  • {title} ({publisher})")
+            except Exception:
+                pass
+    except Exception as e:
+        lines.append(f"YAHOO: Error — {str(e)[:100]}")
+
+    return "\n".join(lines)
+
+
+def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
+                     analysis: TickerAnalysis):
+    """Interactive AI chat about the stock with full data context."""
+
+    # ── Initialize Groq client ────────────────────────────────────────
+    openai_client = None
+    try:
+        groq_key = ""
+        try:
+            groq_key = st.secrets.get("GROQ_API_KEY", "")
+        except Exception:
+            pass
+        if groq_key:
+            from openai import OpenAI
+            openai_client = OpenAI(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+            )
+    except Exception:
+        pass
+
+    if not openai_client:
+        st.info("💬 Configure GROQ_API_KEY in secrets to enable the AI chat. "
+                "This feature lets you have a conversation with AI about this stock.")
+        return
+
+    # ── Chat history management (per ticker) ──────────────────────────
+    chat_key = f'chat_history_{ticker}'
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    # Reset chat when switching tickers
+    if st.session_state.get('chat_active_ticker') != ticker:
+        st.session_state[chat_key] = []
+        st.session_state['chat_active_ticker'] = ticker
+        st.session_state.pop('chat_web_context', None)
+
+    # ── Header with controls ──────────────────────────────────────────
+    ctrl1, ctrl2, ctrl3 = st.columns([4, 2, 2])
+    with ctrl1:
+        st.markdown(f"**💬 Ask anything about {ticker}** — AI sees all signals, fundamentals & market intel")
+    with ctrl2:
+        if st.button("🔍 Fetch Latest News", key="chat_fetch_news",
+                     help="Pull fresh news & Yahoo data into the conversation"):
+            with st.spinner("Searching for latest info..."):
+                web_context = _fetch_web_context(ticker)
+                st.session_state['chat_web_context'] = web_context
+                # Add as system context message
+                st.session_state[chat_key].append({
+                    'role': 'assistant',
+                    'content': f"📡 I've just fetched the latest news and data for {ticker}. Ask me anything about what I found!"
+                })
+                st.session_state[f'chat_web_fetched_{ticker}'] = True
+                st.rerun()
+    with ctrl3:
+        if st.button("🗑️ Clear Chat", key="chat_clear"):
+            st.session_state[chat_key] = []
+            st.session_state.pop('chat_web_context', None)
+            st.session_state.pop(f'chat_web_fetched_{ticker}', None)
+            st.rerun()
+
+    # Show web context status
+    if st.session_state.get(f'chat_web_fetched_{ticker}'):
+        st.caption("✅ Latest news loaded — ask about recent developments, catalysts, or sentiment")
+
+    # ── Display conversation history ──────────────────────────────────
+    history = st.session_state[chat_key]
+
+    if not history:
+        st.caption("💡 Try asking: *\"What are the key risks?\"* · *\"Is this a good entry point?\"* · "
+                   "*\"What do the insiders think?\"* · *\"Compare the bull and bear case\"* · "
+                   "*\"What would make you change your mind?\"*")
+
+    for msg in history:
+        with st.chat_message(msg['role']):
+            st.markdown(msg['content'])
+
+    # ── Chat input ────────────────────────────────────────────────────
+    user_input = st.chat_input(f"Ask about {ticker}...", key=f"chat_input_{ticker}")
+
+    if user_input:
+        # Add user message to history
+        history.append({'role': 'user', 'content': user_input})
+
+        # Display user message immediately
+        with st.chat_message('user'):
+            st.markdown(user_input)
+
+        # Build system prompt with full stock context
+        stock_context = _build_stock_context(ticker, signal, rec, analysis)
+
+        # Add web context if fetched
+        web_context = st.session_state.get('chat_web_context', '')
+
+        system_prompt = f"""You are an expert stock analyst assistant embedded in a trading application called TTA (Technical Trading Assistant).
+You have access to ALL the data this app has collected about {ticker}.
+
+YOUR DATA CONTEXT:
+{stock_context}
+{web_context}
+
+BEHAVIOR RULES:
+- Reference specific data points from the context above (prices, signals, analyst targets, etc.)
+- Be direct and actionable — this user is a swing/position trader
+- If asked about something not in your data, say what you'd need to check and suggest clicking "Fetch Latest News"
+- Use the signal data to support your analysis (MACD, AO, weekly/monthly alignment)
+- When discussing risk, reference specific price levels
+- If insider data shows "None found", do NOT claim there is insider selling — ownership % is NOT the same as selling
+- Keep responses focused and under 250 words unless the question warrants more detail
+- You can discuss entry points, stop losses, targets, position sizing, catalysts, risks
+- If the user asks you to search for something, recommend they click the "🔍 Fetch Latest News" button for the most current data"""
+
+        # Build messages for API call
+        messages = [{'role': 'system', 'content': system_prompt}]
+
+        # Add conversation history (limit to last 10 exchanges to stay within context)
+        recent_history = history[-20:]  # Last 20 messages (10 exchanges)
+        for msg in recent_history:
+            messages.append({'role': msg['role'], 'content': msg['content']})
+
+        # Call Groq
+        with st.chat_message('assistant'):
+            try:
+                with st.spinner("Thinking..."):
+                    response = openai_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=messages,
+                        max_tokens=1000,
+                        temperature=0.4,
+                    )
+                    reply = response.choices[0].message.content
+
+                st.markdown(reply)
+
+                # Save assistant response to history
+                history.append({'role': 'assistant', 'content': reply})
+                st.session_state[chat_key] = history
+
+            except Exception as e:
+                error_msg = str(e)[:300]
+                st.error(f"AI Error: {error_msg}")
+                # Try fallback model
+                try:
+                    with st.spinner("Retrying with fallback model..."):
+                        response = openai_client.chat.completions.create(
+                            model="llama-3.1-8b-instant",
+                            messages=messages,
+                            max_tokens=800,
+                            temperature=0.4,
+                        )
+                        reply = response.choices[0].message.content
+                    st.markdown(reply)
+                    history.append({'role': 'assistant', 'content': reply})
+                    st.session_state[chat_key] = history
+                except Exception as e2:
+                    st.error(f"Fallback also failed: {str(e2)[:200]}")
 
 
 def _render_trade_tab(ticker: str, signal: EntrySignal,
