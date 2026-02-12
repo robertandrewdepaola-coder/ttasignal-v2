@@ -63,6 +63,14 @@ if 'scan_results' not in st.session_state:
         st.session_state['scan_results_summary'] = []
         st.session_state['scan_timestamp'] = ''
 
+# Fetch sector rotation on startup if not already loaded (critical for sector colors)
+if 'sector_rotation' not in st.session_state:
+    try:
+        from data_fetcher import fetch_sector_rotation
+        st.session_state['sector_rotation'] = fetch_sector_rotation()
+    except Exception:
+        st.session_state['sector_rotation'] = {}
+
 if 'selected_ticker' not in st.session_state:
     st.session_state['selected_ticker'] = None
 
@@ -384,27 +392,6 @@ def render_sidebar():
             ):
                 _load_ticker_for_view(ticker)
 
-    # ── Conditional Alerts ────────────────────────────────────────────
-    conditionals = jm.get_pending_conditionals()
-    if conditionals:
-        st.sidebar.divider()
-        st.sidebar.subheader(f"🎯 Alerts ({len(conditionals)})")
-        for cond in conditionals:
-            ticker = cond['ticker']
-            trigger = cond.get('trigger_price', 0)
-            current = fetch_current_price(ticker) or 0
-            dist_pct = ((trigger - current) / current * 100) if current > 0 else 0
-
-            label = f"⏳ {ticker}  ${trigger:.2f} ({dist_pct:+.1f}%)"
-            col_a, col_b = st.sidebar.columns([3, 1])
-            with col_a:
-                if st.button(label, key=f"sidebar_cond_{ticker}", use_container_width=True):
-                    _load_ticker_for_view(ticker)
-            with col_b:
-                if st.button("✕", key=f"rm_cond_{ticker}"):
-                    jm.remove_conditional(ticker)
-                    st.rerun()
-
     # ── Market Brief (replaces old green/yellow/red rectangle) ──────
     st.sidebar.divider()
     _render_factual_market_brief()
@@ -420,6 +407,7 @@ def _load_ticker_for_view(ticker: str):
         if r.ticker == ticker:
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
+            st.session_state['_scroll_to_detail'] = True
             st.rerun()
             return
 
@@ -430,6 +418,7 @@ def _load_ticker_for_view(ticker: str):
             analysis = analyze_ticker(data)
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = analysis
+            st.session_state['_scroll_to_detail'] = True
             # Cache the data
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
@@ -484,7 +473,7 @@ def _run_scan(mode='all'):
 
             # Fetch earnings flags for all tickers
             all_scan_tickers = [r.ticker for r in new_results]
-            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=7)
+            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=14)
             # Merge with existing if new_only
             if mode == 'new_only':
                 existing_flags = st.session_state.get('earnings_flags', {})
@@ -535,6 +524,22 @@ def _run_scan(mode='all'):
             rec = r.recommendation or {}
             q = r.quality or {}
             sig = r.signal
+
+            # Volume string for persistence
+            vol = r.volume or 0
+            avg_vol = r.avg_volume_50d or 0
+            vol_ratio = r.volume_ratio or 0
+            if vol >= 1_000_000:
+                vol_str = f"{vol/1_000_000:.1f}M"
+            elif vol >= 1_000:
+                vol_str = f"{vol/1_000:.0f}K"
+            else:
+                vol_str = str(int(vol)) if vol else ""
+            if vol_ratio >= 2.0:
+                vol_str = f"🔥{vol_str}"
+            elif vol_ratio >= 1.5:
+                vol_str = f"📈{vol_str}"
+
             summary.append({
                 'ticker': r.ticker,
                 'recommendation': rec.get('recommendation', 'SKIP'),
@@ -548,6 +553,10 @@ def _run_scan(mode='all'):
                 'monthly_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'is_open_position': r.ticker in open_tickers,
                 'sector': ticker_sectors.get(r.ticker, ''),
+                'ao_divergence_active': r.ao_divergence_active,
+                'apex_buy': r.apex_buy,
+                'volume_str': vol_str,
+                'volume_ratio': vol_ratio,
             })
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
@@ -774,20 +783,30 @@ def render_scanner_table():
     # ── Sector Rotation Strip ─────────────────────────────────────────
     sector_rotation = st.session_state.get('sector_rotation', {})
     if sector_rotation:
-        # Build compact sector strip
+        # Build compact sector strip using phase classification
         leading = []
+        emerging = []
+        fading = []
         lagging = []
         for sector, info in sector_rotation.items():
             short = info.get('short_name', sector[:4])
             vs = info.get('vs_spy_20d', 0)
-            if info.get('status') == 'leading':
-                leading.append(f"{short} ({vs:+.1f}%)")
-            elif info.get('status') == 'lagging':
-                lagging.append(f"{short} ({vs:+.1f}%)")
+            phase = info.get('phase', '')
+            label = f"{short} ({vs:+.1f}%)"
+            if phase == 'LEADING':
+                leading.append(label)
+            elif phase == 'EMERGING':
+                emerging.append(label)
+            elif phase == 'FADING':
+                fading.append(label)
+            elif phase == 'LAGGING':
+                lagging.append(label)
 
         parts = []
         if leading:
             parts.append(f"🟢 **Leading:** {', '.join(leading)}")
+        if emerging:
+            parts.append(f"🔵 **Emerging:** {', '.join(emerging)}")
         if lagging:
             parts.append(f"🔴 **Lagging:** {', '.join(lagging)}")
         if parts:
@@ -865,7 +884,7 @@ def render_scanner_table():
         'RE-ENTRY': 6, 'RE-ENTRY (CAUTIOUS)': 5,
         'WATCH (AO)': 4, 'WATCH (AO CONFIRM)': 4,
         'WATCH': 3, 'WATCH (RE-ENTRY)': 3, 'WATCH (LATE)': 3,
-        'WAIT': 2,
+        'WAIT': 2, 'WAIT (D)': 2,
         'SKIP': 0,
     }
 
@@ -911,9 +930,9 @@ def render_scanner_table():
         st.info("No tickers match the current filter.")
         return
 
-    # Table header — added Focus column
-    hdr_cols = st.columns([1.0, 0.4, 0.5, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
-    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
+    # Table header — added Focus, Earnings Date, Volume, Apex columns
+    hdr_cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
+    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
@@ -925,7 +944,7 @@ def render_scanner_table():
 
     # Table rows — each ticker is a button
     for idx, row in enumerate(filtered):
-        cols = st.columns([1.0, 0.4, 0.5, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
+        cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
 
         # Ticker as clickable button with earnings flag
         with cols[0]:
@@ -945,12 +964,14 @@ def render_scanner_table():
             if st.button(ticker_label, key=f"row_{row['Ticker']}_{idx}",
                         use_container_width=True):
                 st.session_state['default_detail_tab'] = 0  # Signal tab
+                st.session_state['scroll_to_detail'] = True
                 _load_ticker_for_view(row['Ticker'])
 
         # Chart button — opens directly to chart tab
         with cols[1]:
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{idx}"):
                 st.session_state['default_detail_tab'] = 1  # Chart tab
+                st.session_state['scroll_to_detail'] = True
                 _load_ticker_for_view(row['Ticker'])
 
         # Focus label — click to cycle through colors
@@ -959,40 +980,48 @@ def render_scanner_table():
             curr_icon = _focus_icons.get(curr_label, '⚪')
             if st.button(curr_icon, key=f"focus_{row['Ticker']}_{idx}",
                         help="Click to cycle: ⚪→🟢→🟡→🔴→🔵"):
-                # Cycle to next label
                 curr_idx = _focus_cycle.index(curr_label) if curr_label in _focus_cycle else 0
                 next_label = _focus_cycle[(curr_idx + 1) % len(_focus_cycle)]
                 jm.set_focus_label(row['Ticker'], next_label)
                 st.rerun()
 
-        # Recommendation with color
+        # Recommendation with color + divergence flag
         rec_val = row.get('Rec', 'SKIP')
+        div_flag = row.get('DivFlag', '')
         rec_colors = {
             'STRONG BUY': '🟢', 'BUY': '🟢', 'BUY (CAUTION)': '🟢',
             'BUY (AO)': '🔵', 'BUY (AO CONFIRM)': '🔵',
             'RE-ENTRY': '🔵', 'RE-ENTRY (CAUTIOUS)': '🔵',
             'WATCH (AO)': '🟡', 'WATCH (AO CONFIRM)': '🟡',
             'WATCH': '🟡', 'WATCH (RE-ENTRY)': '🟡', 'WATCH (LATE)': '🟡',
-            'WAIT': '🟡', 'SKIP': '⚪',
+            'WAIT': '🟡', 'WAIT (D)': '🟠', 'SKIP': '⚪',
         }
-        rec_icon = rec_colors.get(rec_val.split(' (+')[0], '⚪')  # Handle LATE ENTRY (+3d)
+        rec_icon = rec_colors.get(rec_val.split(' (+')[0], '⚪')
         if 'LATE ENTRY' in rec_val:
             rec_icon = '🕐'
-        cols[3].caption(f"{rec_icon}{rec_val}")
+        cols[3].caption(f"{rec_icon}{rec_val}{div_flag}")
         cols[4].caption(row.get('Conv', '0/10'))
         cols[5].caption(row.get('Sector', ''))
-        cols[6].caption(row.get('MACD', '❌'))
-        cols[7].caption(row.get('AO', '❌'))
-        cols[8].caption(row.get('Wkly', '❌'))
-        cols[9].caption(row.get('Mthly', '❌'))
+
+        # Apex buy indicator
+        cols[6].caption(row.get('ApexFlag', ''))
+
+        cols[7].caption(row.get('MACD', '❌'))
+        cols[8].caption(row.get('AO', '❌'))
+        cols[9].caption(row.get('Wkly', '❌'))
+        cols[10].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[10].caption(f"{q_colors.get(q, '⚪')}{q}")
+        cols[11].caption(f"{q_colors.get(q, '⚪')}{q}")
 
-        cols[11].caption(row.get('Price', '?'))
-        cols[12].caption(row.get('Summary', '')[:55])
+        cols[12].caption(row.get('Price', '?'))
+        cols[13].caption(row.get('Volume', ''))
+
+        # Earnings date with highlight
+        cols[14].caption(row.get('EarnDate', ''))
+        cols[15].caption(row.get('Summary', '')[:45])
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
@@ -1039,17 +1068,21 @@ def _build_rows_from_analysis(results, jm) -> list:
         else:
             status = "👀"
 
-        # Sector rotation
+        # Sector rotation — use phase for color (LEADING/EMERGING/FADING/LAGGING)
         sector = ticker_sectors.get(r.ticker, '')
         sector_info = sector_rotation.get(sector, {})
-        sector_status = sector_info.get('status', '')
+        sector_phase = sector_info.get('phase', '')
         sector_short = sector_info.get('short_name', sector[:4] if sector else '')
-        if sector_status == 'leading':
+        if sector_phase == 'LEADING':
             sector_dot = f"🟢 {sector_short}"
-        elif sector_status == 'lagging':
+        elif sector_phase == 'EMERGING':
+            sector_dot = f"🔵 {sector_short}"
+        elif sector_phase == 'FADING':
+            sector_dot = f"🟡 {sector_short}"
+        elif sector_phase == 'LAGGING':
             sector_dot = f"🔴 {sector_short}"
         elif sector_short:
-            sector_dot = f"🟡 {sector_short}"
+            sector_dot = f"⚪ {sector_short}"
         else:
             sector_dot = ""
 
@@ -1057,11 +1090,43 @@ def _build_rows_from_analysis(results, jm) -> list:
         earn = earnings_flags.get(r.ticker)
         earn_flag = f"⚡{earn['days_until']}d" if earn else ""
 
+        # Volume
+        vol = r.volume or 0
+        avg_vol = r.avg_volume_50d or 0
+        vol_ratio = r.volume_ratio or 0
+        if vol >= 1_000_000:
+            vol_str = f"{vol/1_000_000:.1f}M"
+        elif vol >= 1_000:
+            vol_str = f"{vol/1_000:.0f}K"
+        else:
+            vol_str = str(int(vol)) if vol else ""
+
+        # Volume ratio indicator
+        if vol_ratio >= 2.0:
+            vol_str = f"🔥{vol_str}"  # 2x+ above average
+        elif vol_ratio >= 1.5:
+            vol_str = f"📈{vol_str}"  # 1.5x+ above average
+
+        # Earnings date
+        earn_date_str = ""
+        if earn:
+            days = earn['days_until']
+            earn_date_str = earn.get('next_earnings', '')
+            if days <= 7:
+                earn_date_str = f"⚡{earn_date_str}"
+            elif days <= 14:
+                earn_date_str = f"⏰{earn_date_str}"
+
+        # AO divergence + Apex indicators
+        div_flag = " (D)" if r.ao_divergence_active else ""
+        apex_flag = "🎯" if r.apex_buy else ""
+
         rows.append({
             'Ticker': r.ticker,
             'Status': status,
             'Sector': sector_dot,
             'Earn': earn_flag,
+            'EarnDate': earn_date_str,
             'Rec': rec.get('recommendation', 'SKIP'),
             'Conv': f"{rec.get('conviction', 0)}/10",
             'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
@@ -1070,6 +1135,9 @@ def _build_rows_from_analysis(results, jm) -> list:
             'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') else "❌",
             'Quality': q.get('quality_grade', '?'),
             'Price': f"${r.current_price:.2f}" if r.current_price else "?",
+            'Volume': vol_str,
+            'DivFlag': div_flag,
+            'ApexFlag': apex_flag,
             'Summary': rec.get('summary', ''),
         })
     return rows
@@ -1092,17 +1160,21 @@ def _build_rows_from_summary(summary, jm) -> list:
         else:
             status = "👀"
 
-        # Sector rotation
+        # Sector rotation — use phase for color
         sector = s.get('sector', '')
         sector_info = sector_rotation.get(sector, {})
-        sector_status = sector_info.get('status', '')
+        sector_phase = sector_info.get('phase', '')
         sector_short = sector_info.get('short_name', sector[:4] if sector else '')
-        if sector_status == 'leading':
+        if sector_phase == 'LEADING':
             sector_dot = f"🟢 {sector_short}"
-        elif sector_status == 'lagging':
+        elif sector_phase == 'EMERGING':
+            sector_dot = f"🔵 {sector_short}"
+        elif sector_phase == 'FADING':
+            sector_dot = f"🟡 {sector_short}"
+        elif sector_phase == 'LAGGING':
             sector_dot = f"🔴 {sector_short}"
         elif sector_short:
-            sector_dot = f"🟡 {sector_short}"
+            sector_dot = f"⚪ {sector_short}"
         else:
             sector_dot = ""
 
@@ -1110,11 +1182,27 @@ def _build_rows_from_summary(summary, jm) -> list:
         earn = earnings_flags.get(ticker)
         earn_flag = f"⚡{earn['days_until']}d" if earn else ""
 
+        # Earnings date
+        earn_date_str = ""
+        if earn:
+            days = earn['days_until']
+            earn_date_str = earn.get('next_earnings', '')
+            if days <= 7:
+                earn_date_str = f"⚡{earn_date_str}"
+            elif days <= 14:
+                earn_date_str = f"⏰{earn_date_str}"
+
+        # Volume from persisted data
+        vol_str = s.get('volume_str', '')
+        div_flag = " (D)" if s.get('ao_divergence_active') else ""
+        apex_flag = "🎯" if s.get('apex_buy') else ""
+
         rows.append({
             'Ticker': ticker,
             'Status': status,
             'Sector': sector_dot,
             'Earn': earn_flag,
+            'EarnDate': earn_date_str,
             'Rec': s.get('recommendation', 'SKIP'),
             'Conv': f"{s.get('conviction', 0)}/10",
             'MACD': "✅" if s.get('macd_bullish') else "❌",
@@ -1123,6 +1211,9 @@ def _build_rows_from_summary(summary, jm) -> list:
             'Mthly': "✅" if s.get('monthly_bullish') else "❌",
             'Quality': s.get('quality_grade', '?'),
             'Price': f"${s.get('price', 0):.2f}" if s.get('price') else "?",
+            'Volume': vol_str,
+            'DivFlag': div_flag,
+            'ApexFlag': apex_flag,
             'Summary': s.get('summary', ''),
         })
     return rows
@@ -1194,7 +1285,32 @@ def render_detail_view():
     signal = analysis.signal
     rec = analysis.recommendation or {}
 
-    st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+    # Auto-scroll anchor — when a ticker is clicked, scroll here
+    st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
+
+    # Auto-scroll JavaScript — fires once when a new ticker is selected
+    if st.session_state.get('_scroll_to_detail'):
+        import streamlit.components.v1 as components
+        components.html(
+            """<script>
+            const el = window.parent.document.getElementById('detail-anchor');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+            </script>""",
+            height=0,
+        )
+        st.session_state['_scroll_to_detail'] = False
+
+    # Header with scroll-to-top button
+    hdr_col1, hdr_col2 = st.columns([8, 1])
+    with hdr_col1:
+        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+    with hdr_col2:
+        if st.button("⬆️ Top", key="scroll_top", help="Scroll to top"):
+            import streamlit.components.v1 as components
+            components.html(
+                "<script>window.parent.document.querySelector('section.main').scrollTo({top:0,behavior:'smooth'});</script>",
+                height=0,
+            )
     st.caption(rec.get('summary', ''))
 
     # ── Tabs (with optional default tab from chart-first navigation) ──
@@ -1489,7 +1605,22 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
             errors.append(f"Gemini: {gemini_error}")
         st.caption(f"⚠️ {' | '.join(errors)}")
 
-    if st.button("🤖 Run AI Analysis", type="primary"):
+    # Auto-run on first view for this ticker, or manual re-run
+    has_cached = st.session_state.get(f'ai_result_{ticker}') is not None
+    should_run = False
+
+    if has_cached:
+        # Show refresh button only if already have results
+        if st.button("🔄 Re-run AI Analysis", type="secondary"):
+            should_run = True
+    else:
+        # Auto-run on first view (no button needed)
+        if openai_client or gemini:
+            should_run = True
+        else:
+            st.info("Configure GROQ_API_KEY or GEMINI_API_KEY in secrets to enable AI analysis.")
+
+    if should_run:
         with st.spinner("Fetching fundamentals, TradingView, news & analyzing..."):
             fundamentals = {}
             fundamental_profile = {}
@@ -1727,8 +1858,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     if news and news.get('headlines'):
         with st.expander(f"📰 Recent News ({news.get('count', 0)} articles)", expanded=False):
             for h in news['headlines'][:5]:
-                st.markdown(f"**{h.get('datetime', '')}** — {h.get('headline', '')} "
-                            f"*({h.get('source', '')})*")
+                url = h.get('url', '')
+                headline = h.get('headline', '')
+                source = h.get('source', '')
+                dt = h.get('datetime', '')
+                if url:
+                    st.markdown(f"**{dt}** — [{headline}]({url}) *({source})*")
+                else:
+                    st.markdown(f"**{dt}** — {headline} *({source})*")
 
     # ═══════════════════════════════════════════════════════════════
     # FUNDAMENTAL SNAPSHOT TABLE
@@ -3025,9 +3162,11 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
 def main():
     render_sidebar()
 
-    # Main content area
-    tab_scanner, tab_positions, tab_perf = st.tabs([
-        "🔍 Scanner", "🏦 Position Manager", "📊 Performance"
+    # Main content area — added Alerts tab
+    conditionals = jm.get_pending_conditionals()
+    alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
+    tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+        "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
     ])
 
     with tab_scanner:
@@ -3035,13 +3174,66 @@ def main():
 
         if st.session_state.get('selected_analysis'):
             st.divider()
+
+            # Auto-scroll to detail view when ticker clicked
+            if st.session_state.pop('scroll_to_detail', False):
+                st.components.v1.html(
+                    '<script>window.parent.document.querySelector("[data-testid=stVerticalBlock]'
+                    ' [data-testid=stVerticalBlock]").scrollIntoView({behavior:"smooth"});</script>',
+                    height=0
+                )
+
+            # Scroll to Top button
+            top_col1, top_col2 = st.columns([4, 1])
+            with top_col2:
+                if st.button("⬆️ Top", key="scroll_top"):
+                    st.components.v1.html(
+                        '<script>window.parent.document.querySelector("header").scrollIntoView({behavior:"smooth"});</script>',
+                        height=0
+                    )
+
             render_detail_view()
+
+    with tab_alerts:
+        _render_alerts_panel()
 
     with tab_positions:
         render_position_manager()
 
     with tab_perf:
         render_performance()
+
+
+def _render_alerts_panel():
+    """Dedicated alerts panel — moved from sidebar."""
+    from data_fetcher import fetch_current_price
+
+    conditionals = jm.get_pending_conditionals()
+    if not conditionals:
+        st.info("No active alerts. Set alerts from the trade tab when analyzing a ticker.")
+        return
+
+    st.subheader(f"🎯 Active Alerts ({len(conditionals)})")
+
+    for cond in conditionals:
+        ticker = cond['ticker']
+        trigger = cond.get('trigger_price', 0)
+        current = fetch_current_price(ticker) or 0
+        dist_pct = ((trigger - current) / current * 100) if current > 0 else 0
+
+        col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 0.5])
+        with col1:
+            if st.button(f"📊 {ticker}", key=f"alert_view_{ticker}", use_container_width=True):
+                _load_ticker_for_view(ticker)
+        with col2:
+            st.caption(f"Trigger: **${trigger:.2f}**")
+        with col3:
+            color = "🟢" if abs(dist_pct) < 3 else "🟡"
+            st.caption(f"Current: ${current:.2f} ({color}{dist_pct:+.1f}%)")
+        with col4:
+            if st.button("✕", key=f"rm_alert_{ticker}"):
+                jm.remove_conditional(ticker)
+                st.rerun()
 
 
 if __name__ == "__main__":
