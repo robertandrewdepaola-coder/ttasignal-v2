@@ -280,26 +280,61 @@ def _render_factual_market_brief():
         with st.sidebar.expander(f"{icon} Market Brief — {regime}"):
             st.caption(narrative_data.get('narrative', '')[:400])
 
-            # Raw data
+            # Raw data — multi-timeframe momentum analysis
             macro = narrative_data.get('macro_data', {})
             if macro:
                 st.divider()
+                st.caption("**Index Momentum**")
                 for name, info in macro.get('indices', {}).items():
+                    d1 = info.get('1d', 0)
+                    d5 = info.get('5d', 0)
                     d20 = info.get('20d', 0)
-                    ic = '🟢' if d20 > 0 else '🔴'
-                    st.caption(f"{ic} {name}: ${info.get('price', '?')} ({d20:+.1f}%)")
+                    price = info.get('price', '?')
+
+                    # Color based on multi-timeframe health:
+                    # Green = strong (positive on all), Yellow = mixed, Red = weak
+                    pos_count = sum(1 for x in [d1, d5, d20] if x > 0)
+                    if pos_count == 3 and d5 > 1.0:
+                        ic = '🟢'  # Strong uptrend
+                    elif pos_count >= 2:
+                        ic = '🟡'  # Mixed — momentum fading or just starting
+                    elif pos_count == 1:
+                        ic = '🟠'  # Mostly negative — caution
+                    else:
+                        ic = '🔴'  # Downtrend on all timeframes
+
+                    # Show directional arrows for each timeframe
+                    d1_arrow = '↑' if d1 > 0.3 else ('↓' if d1 < -0.3 else '→')
+                    d5_arrow = '↑' if d5 > 0.5 else ('↓' if d5 < -0.5 else '→')
+                    d20_arrow = '↑' if d20 > 1.0 else ('↓' if d20 < -1.0 else '→')
+
+                    st.caption(
+                        f"{ic} **{name}**: ${price} — "
+                        f"1d:{d1_arrow}{d1:+.1f}% | 5d:{d5_arrow}{d5:+.1f}% | 20d:{d20_arrow}{d20:+.1f}%"
+                    )
 
                 vix_data = macro.get('vix', {})
                 if vix_data:
-                    st.caption(f"VIX: {vix_data.get('level', '?')} ({vix_data.get('regime', '')})")
+                    vix_lvl = vix_data.get('level', 0)
+                    vix_chg = vix_data.get('change_5d', 0)
+                    vix_regime = vix_data.get('regime', '')
+                    vix_ic = '🟢' if vix_lvl < 15 else ('🟡' if vix_lvl < 20 else ('🟠' if vix_lvl < 25 else '🔴'))
+                    chg_arrow = '↑' if vix_chg > 1 else ('↓' if vix_chg < -1 else '→')
+                    st.caption(f"{vix_ic} **VIX**: {vix_lvl} ({vix_regime}) | 5d:{chg_arrow}{vix_chg:+.1f}")
 
                 sectors = macro.get('sectors', {})
                 if sectors:
-                    st.caption(f"Sectors: {sectors.get('regime', '')} (spread: {sectors.get('spread', 0):+.1f}%)")
+                    spread = sectors.get('spread', 0)
+                    regime_str = sectors.get('regime', '')
+                    sec_ic = '🟢' if spread > 2 else ('🔴' if spread < -2 else '🟡')
+                    st.caption(f"{sec_ic} **Rotation**: {regime_str} (Off-Def: {spread:+.1f}%)")
 
                 breadth = macro.get('breadth', {})
                 if breadth:
-                    st.caption(f"Breadth: {breadth.get('regime', '')} (RSP-SPY: {breadth.get('spread', 0):+.1f}%)")
+                    br_spread = breadth.get('spread', 0)
+                    br_regime = breadth.get('regime', '')
+                    br_ic = '🟢' if br_spread > 1 else ('🔴' if br_spread < -1 else '🟡')
+                    st.caption(f"{br_ic} **Breadth**: {br_regime} (RSP-SPY: {br_spread:+.1f}%)")
 
         # Refresh button
         if st.sidebar.button("🔄 Refresh Brief", use_container_width=True, key="refresh_brief"):
@@ -540,6 +575,23 @@ def _run_scan(mode='all'):
             elif vol_ratio >= 1.5:
                 vol_str = f"📈{vol_str}"
 
+            # Earnings data for persistence
+            earn = earnings_flags.get(r.ticker, {})
+            earn_date = earn.get('next_earnings', '')
+            earn_days = earn.get('days_until', 999)
+
+            # Re-entry recency (bars ago)
+            reentry_bars_ago = 0
+            if r.reentry and r.reentry.get('is_valid'):
+                reentry_bars_ago = r.reentry.get('macd_cross_bars_ago', 0)
+            elif r.late_entry and r.late_entry.get('is_valid'):
+                reentry_bars_ago = r.late_entry.get('days_since_cross', 0)
+
+            # Sector phase for filtering persistence
+            sector_name = ticker_sectors.get(r.ticker, '')
+            sector_info = sector_rotation.get(sector_name, {})
+            sector_phase = sector_info.get('phase', '')
+
             summary.append({
                 'ticker': r.ticker,
                 'recommendation': rec.get('recommendation', 'SKIP'),
@@ -552,11 +604,15 @@ def _run_scan(mode='all'):
                 'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
                 'monthly_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'is_open_position': r.ticker in open_tickers,
-                'sector': ticker_sectors.get(r.ticker, ''),
+                'sector': sector_name,
+                'sector_phase': sector_phase,
                 'ao_divergence_active': r.ao_divergence_active,
                 'apex_buy': r.apex_buy,
                 'volume_str': vol_str,
                 'volume_ratio': vol_ratio,
+                'earn_date': earn_date,
+                'earn_days': earn_days,
+                'reentry_bars_ago': reentry_bars_ago,
             })
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
@@ -813,7 +869,7 @@ def render_scanner_table():
             st.caption(" | ".join(parts))
 
     # ── Filter Bar ────────────────────────────────────────────────────
-    filt_col1, filt_col2, filt_col3, filt_col4 = st.columns([2, 2, 2, 2])
+    filt_col1, filt_col2, filt_col3, filt_col4, filt_col5 = st.columns([2, 1.5, 1.5, 2, 1])
 
     with filt_col1:
         rec_filter = st.selectbox("Filter", [
@@ -823,17 +879,22 @@ def render_scanner_table():
         ], key="scan_filter", label_visibility="collapsed")
 
     with filt_col2:
+        sector_filter = st.selectbox("Sector", [
+            "All Sectors", "🟢 Leading", "🔵 Emerging", "🟡 Fading", "🔴 Lagging"
+        ], key="sector_filter", label_visibility="collapsed")
+
+    with filt_col3:
         sort_by = st.selectbox("Sort", [
             "Signal Strength ↓", "Conviction ↓", "Name A-Z", "Name Z-A",
             "Quality ↓", "Price ↓", "Price ↑", "Default"
         ], key="scan_sort", label_visibility="collapsed")
 
-    with filt_col3:
+    with filt_col4:
         search = st.text_input("Search", placeholder="Filter by ticker...",
                                 key="scan_search", label_visibility="collapsed")
 
-    with filt_col4:
-        st.caption(f"**{len(rows)}** total results")
+    with filt_col5:
+        st.caption(f"**{len(rows)}** total")
 
     # ── Build focus label lookup ──────────────────────────────────────
     focus_labels = jm.get_focus_labels()
@@ -873,6 +934,16 @@ def render_scanner_table():
     elif rec_filter == "Any Focus":
         filtered = [r for r in filtered if focus_labels.get(r['Ticker'], '') != '']
 
+    # Apply sector phase filter
+    _sector_phase_map = {
+        "🟢 Leading": "LEADING", "🔵 Emerging": "EMERGING",
+        "🟡 Fading": "FADING", "🔴 Lagging": "LAGGING",
+    }
+    if sector_filter != "All Sectors":
+        target_phase = _sector_phase_map.get(sector_filter, '')
+        if target_phase:
+            filtered = [r for r in filtered if r.get('SectorPhase', '') == target_phase]
+
     # Always sort favorites to top first
     fav_tickers = set(jm.get_favorite_tickers())
 
@@ -903,7 +974,11 @@ def render_scanner_table():
     elif sort_by == "Name A-Z":
         filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1, r['Ticker']))
     elif sort_by == "Name Z-A":
-        filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1, r['Ticker']), reverse=True)
+        # Use negative ord values to reverse alpha while keeping favorites first
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            [-ord(c) for c in r['Ticker']],
+        ))
     elif sort_by == "Quality ↓":
         q_order = {'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1, '?': 0}
         filtered.sort(key=lambda r: (
@@ -985,7 +1060,7 @@ def render_scanner_table():
                 jm.set_focus_label(row['Ticker'], next_label)
                 st.rerun()
 
-        # Recommendation with color + divergence flag
+        # Recommendation with color + divergence flag + re-entry recency
         rec_val = row.get('Rec', 'SKIP')
         div_flag = row.get('DivFlag', '')
         rec_colors = {
@@ -999,7 +1074,22 @@ def render_scanner_table():
         rec_icon = rec_colors.get(rec_val.split(' (+')[0], '⚪')
         if 'LATE ENTRY' in rec_val:
             rec_icon = '🕐'
-        cols[3].caption(f"{rec_icon}{rec_val}{div_flag}")
+
+        # RE-ENTRY / LATE ENTRY recency color coding
+        reentry_age = row.get('ReentryAge', 0)
+        age_tag = ""
+        if ('RE-ENTRY' in rec_val or 'LATE ENTRY' in rec_val):
+            if reentry_age <= 3:
+                age_tag = f" 🟢{reentry_age}d"      # Fresh — ideal entry
+                rec_icon = '🟢'
+            elif reentry_age <= 7:
+                age_tag = f" 🟡{reentry_age}d"      # Acceptable — move quickly
+                rec_icon = '🟡'
+            elif reentry_age > 7:
+                age_tag = f" 🔴{reentry_age}d"      # Stale — higher risk
+                rec_icon = '🔴'
+
+        cols[3].caption(f"{rec_icon}{rec_val}{div_flag}{age_tag}")
         cols[4].caption(row.get('Conv', '0/10'))
         cols[5].caption(row.get('Sector', ''))
 
@@ -1121,10 +1211,18 @@ def _build_rows_from_analysis(results, jm) -> list:
         div_flag = " (D)" if r.ao_divergence_active else ""
         apex_flag = "🎯" if r.apex_buy else ""
 
+        # Re-entry recency (for color coding)
+        reentry_bars_ago = 0
+        if r.reentry and r.reentry.get('is_valid'):
+            reentry_bars_ago = r.reentry.get('macd_cross_bars_ago', 0)
+        elif r.late_entry and r.late_entry.get('is_valid'):
+            reentry_bars_ago = r.late_entry.get('days_since_cross', 0)
+
         rows.append({
             'Ticker': r.ticker,
             'Status': status,
             'Sector': sector_dot,
+            'SectorPhase': sector_phase,  # For filtering
             'Earn': earn_flag,
             'EarnDate': earn_date_str,
             'Rec': rec.get('recommendation', 'SKIP'),
@@ -1138,6 +1236,7 @@ def _build_rows_from_analysis(results, jm) -> list:
             'Volume': vol_str,
             'DivFlag': div_flag,
             'ApexFlag': apex_flag,
+            'ReentryAge': reentry_bars_ago,
             'Summary': rec.get('summary', ''),
         })
     return rows
@@ -1160,10 +1259,14 @@ def _build_rows_from_summary(summary, jm) -> list:
         else:
             status = "👀"
 
-        # Sector rotation — use phase for color
+        # Sector rotation — prefer persisted phase, fallback to runtime lookup
         sector = s.get('sector', '')
+        sector_phase = s.get('sector_phase', '')  # Persisted from scan
+        if not sector_phase:
+            # Fallback to runtime sector_rotation (may be empty after page refresh)
+            sector_info = sector_rotation.get(sector, {})
+            sector_phase = sector_info.get('phase', '')
         sector_info = sector_rotation.get(sector, {})
-        sector_phase = sector_info.get('phase', '')
         sector_short = sector_info.get('short_name', sector[:4] if sector else '')
         if sector_phase == 'LEADING':
             sector_dot = f"🟢 {sector_short}"
@@ -1178,29 +1281,41 @@ def _build_rows_from_summary(summary, jm) -> list:
         else:
             sector_dot = ""
 
-        # Earnings flag
+        # Earnings — prefer persisted data from summary, fallback to session state
         earn = earnings_flags.get(ticker)
-        earn_flag = f"⚡{earn['days_until']}d" if earn else ""
+        earn_date = s.get('earn_date', '')
+        earn_days = s.get('earn_days', 999)
 
-        # Earnings date
-        earn_date_str = ""
-        if earn:
-            days = earn['days_until']
+        # If persisted data exists, use it; otherwise try session state
+        if earn_date:
+            earn_flag = f"⚡{earn_days}d" if earn_days <= 14 else ""
+            earn_date_str = earn_date
+            if earn_days <= 7:
+                earn_date_str = f"⚡{earn_date}"
+            elif earn_days <= 14:
+                earn_date_str = f"⏰{earn_date}"
+        elif earn:
+            earn_flag = f"⚡{earn['days_until']}d"
             earn_date_str = earn.get('next_earnings', '')
-            if days <= 7:
+            if earn['days_until'] <= 7:
                 earn_date_str = f"⚡{earn_date_str}"
-            elif days <= 14:
+            elif earn['days_until'] <= 14:
                 earn_date_str = f"⏰{earn_date_str}"
+        else:
+            earn_flag = ""
+            earn_date_str = ""
 
         # Volume from persisted data
         vol_str = s.get('volume_str', '')
         div_flag = " (D)" if s.get('ao_divergence_active') else ""
         apex_flag = "🎯" if s.get('apex_buy') else ""
+        reentry_bars_ago = s.get('reentry_bars_ago', 0)
 
         rows.append({
             'Ticker': ticker,
             'Status': status,
             'Sector': sector_dot,
+            'SectorPhase': sector_phase,
             'Earn': earn_flag,
             'EarnDate': earn_date_str,
             'Rec': s.get('recommendation', 'SKIP'),
@@ -1214,6 +1329,7 @@ def _build_rows_from_summary(summary, jm) -> list:
             'Volume': vol_str,
             'DivFlag': div_flag,
             'ApexFlag': apex_flag,
+            'ReentryAge': reentry_bars_ago,
             'Summary': s.get('summary', ''),
         })
     return rows
@@ -1305,11 +1421,28 @@ def render_detail_view():
         st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
     with hdr_col2:
         if st.button("⬆️ Top", key="scroll_top", help="Scroll to top"):
-            import streamlit.components.v1 as components
-            components.html(
-                "<script>window.parent.document.querySelector('section.main').scrollTo({top:0,behavior:'smooth'});</script>",
-                height=0,
-            )
+            st.session_state['_do_scroll_top'] = True
+            st.rerun()
+
+    # Scroll-to-top JS — fires on next render after button click
+    if st.session_state.pop('_do_scroll_top', False):
+        import streamlit.components.v1 as components
+        components.html(
+            """<script>
+            setTimeout(function() {
+                var doc = window.parent.document;
+                // Try iframe parent scroll
+                doc.querySelectorAll('[data-testid="stAppViewContainer"], section.main, .main, [data-testid="stMain"]').forEach(function(el) {
+                    el.scrollTop = 0;
+                });
+                window.parent.scrollTo(0, 0);
+                doc.documentElement.scrollTop = 0;
+                doc.body.scrollTop = 0;
+            }, 100);
+            </script>""",
+            height=0,
+        )
+
     st.caption(rec.get('summary', ''))
 
     # ── Tabs (with optional default tab from chart-first navigation) ──
@@ -2010,6 +2143,7 @@ def _render_market_intelligence(intel: Dict):
                 'High buzz': ('success', '🔥'), 'Moderate': ('info', '📊'), 'Low': ('warning', '😴'),
                 'High volume surge': ('success', '🔥'), 'Elevated volume': ('info', '📈'),
                 'Above avg volume': ('info', '📊'), 'Normal volume': ('warning', '😴'),
+                'No volume data': ('warning', '📊'), 'Volume check failed': ('warning', '⚠️'),
             }
             method, icon = s_map.get(social, ('info', '📊'))
             getattr(st, method)(f"{icon} **{social}**")
@@ -2024,6 +2158,10 @@ def _render_market_intelligence(intel: Dict):
             if parts:
                 source_label = "7-day mentions" if social_source != 'volume_proxy' else "5-day vs 50-day avg"
                 st.caption(f"{source_label} — {' | '.join(parts)}")
+            elif social_source == 'volume_proxy':
+                st.caption("Using volume as social proxy (no Finnhub key)")
+            elif social_source == 'unavailable':
+                st.caption("Volume data unavailable for this ticker")
         else:
             error_msg = social_error or "Social data not available"
             st.caption(f"📊 {error_msg}")
