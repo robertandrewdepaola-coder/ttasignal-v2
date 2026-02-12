@@ -605,8 +605,16 @@ def generate_recommendation(signal: EntrySignal,
     Priority: PRIMARY > AO_CONFIRMATION > RE_ENTRY > LATE_ENTRY > WATCH > SKIP
 
     Returns dict with: signal_type, recommendation, summary, conviction (1-10)
+
+    Conviction scoring uses quality_score (0-100) for granularity within grades:
+      STRONG BUY: base 7-10 (A=8-10, B=7-8), refined by quality_score
+      BUY:        base 5-7
+      RE-ENTRY:   base 4-6
+      WATCH:      base 2-4
+      SKIP:       0-1
     """
     grade = quality.get('quality_grade', 'N/A')
+    q_score = quality.get('quality_score', 0)  # 0-100 for fine-tuning
     weekly_bullish = signal.weekly_macd.get('bullish', False)
     monthly_bullish = signal.monthly_macd.get('bullish', True)
     monthly_warning = " ⚠️ Monthly bearish headwind!" if not monthly_bullish else ""
@@ -618,6 +626,11 @@ def generate_recommendation(signal: EntrySignal,
         'conviction': 0,
     }
 
+    # Helper: scale quality_score into a range
+    # e.g. _q_refine(7, 10, q_score) → 7.0 to 10.0 based on quality_score 0-100
+    def _q_refine(low, high, qs):
+        return int(round(low + (high - low) * min(qs, 100) / 100))
+
     # --- PRIMARY SIGNAL ---
     if signal.is_valid:
         result['signal_type'] = 'PRIMARY'
@@ -625,19 +638,23 @@ def generate_recommendation(signal: EntrySignal,
         if grade in ['A', 'B'] and weekly_bullish and monthly_bullish:
             result['recommendation'] = 'STRONG BUY'
             result['summary'] = f"✅ Entry signal valid, Weekly + Monthly bullish, Quality {grade}"
-            result['conviction'] = 9 if grade == 'A' else 7
+            # A grade: 8-10, B grade: 7-9, refined by quality_score
+            if grade == 'A':
+                result['conviction'] = _q_refine(8, 10, q_score)
+            else:
+                result['conviction'] = _q_refine(7, 9, q_score)
         elif grade in ['A', 'B'] and weekly_bullish:
-            result['recommendation'] = 'BUY (CAUTION)'
+            result['recommendation'] = 'BUY'
             result['summary'] = f"✅ Entry valid, Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = 6
+            result['conviction'] = _q_refine(6, 8, q_score)
         elif grade in ['A', 'B']:
             result['recommendation'] = 'BUY'
             result['summary'] = f"✅ Entry valid, Quality {grade}, Weekly pending{monthly_warning}"
-            result['conviction'] = 5
+            result['conviction'] = _q_refine(5, 7, q_score)
         elif grade == 'C':
             result['recommendation'] = 'WAIT'
             result['summary'] = f"⚠️ Entry valid but Quality {grade}{monthly_warning}"
-            result['conviction'] = 3
+            result['conviction'] = _q_refine(3, 5, q_score)
         else:
             result['recommendation'] = 'SKIP'
             result['summary'] = f"❌ Entry valid but Quality {grade}"
@@ -650,13 +667,13 @@ def generate_recommendation(signal: EntrySignal,
         ao_q = ao_confirm.get('quality_score', 0)
 
         if grade in ['A', 'B'] and ao_q >= 80 and weekly_bullish:
-            result['recommendation'] = 'BUY (AO CONFIRM)'
+            result['recommendation'] = 'BUY (AO)'
             result['summary'] = f"🔄 AO Confirmation, Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = 6
+            result['conviction'] = _q_refine(6, 8, q_score)
         elif grade in ['A', 'B'] and ao_q >= 65:
-            result['recommendation'] = 'WATCH (AO CONFIRM)'
+            result['recommendation'] = 'WATCH (AO)'
             result['summary'] = f"🟡 AO Confirmation, Quality {grade}{monthly_warning}"
-            result['conviction'] = 4
+            result['conviction'] = _q_refine(4, 6, q_score)
         else:
             result['recommendation'] = 'SKIP'
             result['summary'] = f"⚠️ AO Confirmation but weak"
@@ -671,15 +688,15 @@ def generate_recommendation(signal: EntrySignal,
         if grade in ['A', 'B'] and weekly_bullish:
             result['recommendation'] = 'RE-ENTRY'
             result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = 5
+            result['conviction'] = _q_refine(5, 7, q_score)
         elif grade in ['A', 'B']:
-            result['recommendation'] = 'RE-ENTRY (CAUTIOUS)'
+            result['recommendation'] = 'RE-ENTRY'
             result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Quality {grade}{monthly_warning}"
-            result['conviction'] = 4
+            result['conviction'] = _q_refine(4, 6, q_score)
         else:
-            result['recommendation'] = 'WATCH (RE-ENTRY)'
+            result['recommendation'] = 'WATCH'
             result['summary'] = f"🟡 Re-Entry but Quality {grade}"
-            result['conviction'] = 2
+            result['conviction'] = _q_refine(2, 4, q_score)
         return result
 
     # --- LATE ENTRY ---
@@ -691,11 +708,11 @@ def generate_recommendation(signal: EntrySignal,
         if grade in ['A', 'B'] and premium <= 3:
             result['recommendation'] = f'LATE ENTRY (+{days}d)'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Quality {grade}{monthly_warning}"
-            result['conviction'] = 4
+            result['conviction'] = _q_refine(4, 6, q_score)
         else:
-            result['recommendation'] = 'WATCH (LATE)'
+            result['recommendation'] = 'WATCH'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
-            result['conviction'] = 2
+            result['conviction'] = _q_refine(2, 3, q_score)
         return result
 
     # --- NO SIGNAL ---
