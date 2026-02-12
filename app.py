@@ -798,12 +798,15 @@ def render_scanner_table():
 
     with filt_col1:
         rec_filter = st.selectbox("Filter", [
-            "All", "Signals Only", "BUY+", "Quality A-B", "Open Positions", "⚡ Earnings Soon"
+            "All", "Signals Only", "BUY+", "STRONG BUY", "Quality A-B",
+            "🟢 Focus", "🟡 Focus", "🔴 Focus", "🔵 Focus", "Any Focus",
+            "Open Positions", "⚡ Earnings Soon"
         ], key="scan_filter", label_visibility="collapsed")
 
     with filt_col2:
         sort_by = st.selectbox("Sort", [
-            "Default", "Conviction ↓", "Quality ↓", "Price ↓", "Price ↑"
+            "Signal Strength ↓", "Conviction ↓", "Name A-Z", "Name Z-A",
+            "Quality ↓", "Price ↓", "Price ↑", "Default"
         ], key="scan_sort", label_visibility="collapsed")
 
     with filt_col3:
@@ -812,6 +815,9 @@ def render_scanner_table():
 
     with filt_col4:
         st.caption(f"**{len(rows)}** total results")
+
+    # ── Build focus label lookup ──────────────────────────────────────
+    focus_labels = jm.get_focus_labels()
 
     # Apply filters
     filtered = rows.copy()
@@ -823,28 +829,78 @@ def render_scanner_table():
     if rec_filter == "Signals Only":
         filtered = [r for r in filtered if r['Rec'] != 'SKIP']
     elif rec_filter == "BUY+":
-        filtered = [r for r in filtered if r['Rec'] in ('BUY NOW', 'RE-ENTRY', 'FRESH ENTRY')]
+        # Match ALL buy-type recommendations (both old and new names)
+        filtered = [r for r in filtered
+                    if any(kw in r['Rec'].upper() for kw in
+                           ['STRONG BUY', 'BUY', 'RE-ENTRY', 'LATE ENTRY', 'FRESH', 'AO'])
+                    and 'SKIP' not in r['Rec'] and 'WATCH' not in r['Rec']
+                    and 'WAIT' not in r['Rec']]
+    elif rec_filter == "STRONG BUY":
+        filtered = [r for r in filtered if r['Rec'] == 'STRONG BUY']
     elif rec_filter == "Quality A-B":
         filtered = [r for r in filtered if r['Quality'] in ('A', 'B')]
     elif rec_filter == "Open Positions":
         filtered = [r for r in filtered if 'Open' in r.get('Status', '')]
     elif rec_filter == "⚡ Earnings Soon":
         filtered = [r for r in filtered if r.get('Earn', '')]
+    elif rec_filter == "🟢 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'green']
+    elif rec_filter == "🟡 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'yellow']
+    elif rec_filter == "🔴 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'red']
+    elif rec_filter == "🔵 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'blue']
+    elif rec_filter == "Any Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker'], '') != '']
 
     # Always sort favorites to top first
     fav_tickers = set(jm.get_favorite_tickers())
-    filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1))
+
+    # Signal strength hierarchy for sorting (handles both old and new names)
+    _rec_rank = {
+        'STRONG BUY': 10,
+        'BUY': 8,
+        'BUY (AO)': 7, 'BUY (AO CONFIRM)': 7, 'BUY (CAUTION)': 7,
+        'RE-ENTRY': 6, 'RE-ENTRY (CAUTIOUS)': 5,
+        'WATCH (AO)': 4, 'WATCH (AO CONFIRM)': 4,
+        'WATCH': 3, 'WATCH (RE-ENTRY)': 3, 'WATCH (LATE)': 3,
+        'WAIT': 2,
+        'SKIP': 0,
+    }
 
     # Apply sort
-    if sort_by == "Conviction ↓":
-        filtered.sort(key=lambda r: int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0, reverse=True)
+    if sort_by == "Signal Strength ↓":
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -_rec_rank.get(r['Rec'].split(' (+')[0], 5 if 'LATE ENTRY' in r['Rec'] else 0),
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
+    elif sort_by == "Conviction ↓":
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
+    elif sort_by == "Name A-Z":
+        filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1, r['Ticker']))
+    elif sort_by == "Name Z-A":
+        filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1, r['Ticker']), reverse=True)
     elif sort_by == "Quality ↓":
         q_order = {'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1, '?': 0}
-        filtered.sort(key=lambda r: q_order.get(r.get('Quality', '?'), 0), reverse=True)
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -q_order.get(r.get('Quality', '?'), 0),
+        ))
     elif sort_by == "Price ↓":
-        filtered.sort(key=lambda r: float(r['Price'].replace('$', '').replace(',', '') or '0'), reverse=True)
+        filtered.sort(key=lambda r: -float(r['Price'].replace('$', '').replace(',', '') or '0'))
     elif sort_by == "Price ↑":
         filtered.sort(key=lambda r: float(r['Price'].replace('$', '').replace(',', '') or '0'))
+    else:
+        # Default: favorites first, then by conviction
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
 
     showing = len(filtered)
     if showing != len(rows):
@@ -855,15 +911,21 @@ def render_scanner_table():
         st.info("No tickers match the current filter.")
         return
 
-    # Table header
-    hdr_cols = st.columns([1.0, 0.4, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
-    headers = ['Ticker', '📈', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
+    # Table header — added Focus column
+    hdr_cols = st.columns([1.0, 0.4, 0.5, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
+    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
+    # Focus label icons
+    _focus_icons = {
+        'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'blue': '🔵', '': '⚪'
+    }
+    _focus_cycle = ['', 'green', 'yellow', 'red', 'blue']  # Click to cycle
+
     # Table rows — each ticker is a button
     for idx, row in enumerate(filtered):
-        cols = st.columns([1.0, 0.4, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
+        cols = st.columns([1.0, 0.4, 0.5, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
 
         # Ticker as clickable button with earnings flag
         with cols[0]:
@@ -891,28 +953,46 @@ def render_scanner_table():
                 st.session_state['default_detail_tab'] = 1  # Chart tab
                 _load_ticker_for_view(row['Ticker'])
 
+        # Focus label — click to cycle through colors
+        with cols[2]:
+            curr_label = focus_labels.get(row['Ticker'], '')
+            curr_icon = _focus_icons.get(curr_label, '⚪')
+            if st.button(curr_icon, key=f"focus_{row['Ticker']}_{idx}",
+                        help="Click to cycle: ⚪→🟢→🟡→🔴→🔵"):
+                # Cycle to next label
+                curr_idx = _focus_cycle.index(curr_label) if curr_label in _focus_cycle else 0
+                next_label = _focus_cycle[(curr_idx + 1) % len(_focus_cycle)]
+                jm.set_focus_label(row['Ticker'], next_label)
+                st.rerun()
+
         # Recommendation with color
         rec_val = row.get('Rec', 'SKIP')
         rec_colors = {
-            'BUY NOW': '🟢', 'FRESH ENTRY': '🟢', 'RE-ENTRY': '🔵',
-            'SKIP': '⚪', 'WAIT': '🟡',
+            'STRONG BUY': '🟢', 'BUY': '🟢', 'BUY (CAUTION)': '🟢',
+            'BUY (AO)': '🔵', 'BUY (AO CONFIRM)': '🔵',
+            'RE-ENTRY': '🔵', 'RE-ENTRY (CAUTIOUS)': '🔵',
+            'WATCH (AO)': '🟡', 'WATCH (AO CONFIRM)': '🟡',
+            'WATCH': '🟡', 'WATCH (RE-ENTRY)': '🟡', 'WATCH (LATE)': '🟡',
+            'WAIT': '🟡', 'SKIP': '⚪',
         }
-        rec_icon = rec_colors.get(rec_val, '⚪')
-        cols[2].caption(f"{rec_icon} {rec_val}")
-        cols[3].caption(row.get('Conv', '0/10'))
-        cols[4].caption(row.get('Sector', ''))
-        cols[5].caption(row.get('MACD', '❌'))
-        cols[6].caption(row.get('AO', '❌'))
-        cols[7].caption(row.get('Wkly', '❌'))
-        cols[8].caption(row.get('Mthly', '❌'))
+        rec_icon = rec_colors.get(rec_val.split(' (+')[0], '⚪')  # Handle LATE ENTRY (+3d)
+        if 'LATE ENTRY' in rec_val:
+            rec_icon = '🕐'
+        cols[3].caption(f"{rec_icon}{rec_val}")
+        cols[4].caption(row.get('Conv', '0/10'))
+        cols[5].caption(row.get('Sector', ''))
+        cols[6].caption(row.get('MACD', '❌'))
+        cols[7].caption(row.get('AO', '❌'))
+        cols[8].caption(row.get('Wkly', '❌'))
+        cols[9].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[9].caption(f"{q_colors.get(q, '⚪')} {q}")
+        cols[10].caption(f"{q_colors.get(q, '⚪')}{q}")
 
-        cols[10].caption(row.get('Price', '?'))
-        cols[11].caption(row.get('Summary', '')[:55])
+        cols[11].caption(row.get('Price', '?'))
+        cols[12].caption(row.get('Summary', '')[:55])
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
