@@ -1485,11 +1485,11 @@ SCORE: [integer -5 to +5]
 LABEL: [e.g. "BEARISH ENVIRONMENT" or "BULLISH — OFFENSIVE ROTATION" or "CAUTIOUS — DEFENSIVE SHIFT"]
 
 FACTOR SCORES:
-S&P 500: [🟢 or 🔴] [one-line, e.g. "Above 50MA, momentum positive"]
-VIX/Commercials: [🟢 or 🔴] [one-line, e.g. "Selling protection (VIX=17.6)"]
-US Dollar: [🟢 or 🔴] [one-line, e.g. "Strong (Risk-Off headwind)"]
-Cost of Money: [🟢 or 🔴] [one-line, e.g. "Yields rising, growth headwind"]
-Rotation/Breadth: [🟢 or 🔴] [one-line, e.g. "Defensive leadership, breadth narrowing"]
+S&P 500: [🟢 or 🟡 or 🔴] [one-line, e.g. "Above 200MA, momentum positive" — use 🟡 if above 200MA but momentum weak]
+VIX/Commercials: [🟢 or 🟡 or 🔴] [one-line — 🟢 below 15, 🟡 15-20, 🔴 above 20]
+US Dollar: [🟢 or 🟡 or 🔴] [one-line — 🟢 weakening >1%, 🟡 flat, 🔴 strengthening >1%]
+Cost of Money: [🟢 or 🟡 or 🔴] [one-line — 🟢 yields falling >1.5%, 🟡 flat, 🔴 yields rising >1.5%]
+Rotation/Breadth: [🟢 or 🟡 or 🔴] [one-line — 🟢 broad leadership, 🟡 mixed, 🔴 narrow/defensive]
 
 SECTOR ROTATION NARRATIVE:
 [3-4 sentences: This is the MOST IMPORTANT section. Explain WHERE institutional money is flowing
@@ -1529,7 +1529,7 @@ def _parse_deep_analysis(text: str) -> Dict:
         if line_stripped.upper().startswith('SCORE:'):
             try:
                 score_text = line_stripped.split(':', 1)[1].strip()
-                score_num = score_text.split('/')[0].strip()
+                score_num = score_text.split('/')[0].strip().replace('+', '')
                 result['score'] = max(-5, min(5, int(score_num)))
             except Exception:
                 pass
@@ -1538,16 +1538,16 @@ def _parse_deep_analysis(text: str) -> Dict:
         elif line_stripped.upper().startswith('LABEL:'):
             result['score_label'] = line_stripped.split(':', 1)[1].strip().strip('"\'')
 
-        # Parse factor scores
-        elif 'S&P 500:' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+        # Parse factor scores — match any line with factor name + any signal emoji
+        elif 'S&P 500' in line_stripped and any(e in line_stripped for e in ['🟢', '🔴', '🟡', '🟠', '+']):
             result['factors']['sp500'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
-        elif 'VIX' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+        elif 'VIX' in line_stripped and any(e in line_stripped for e in ['🟢', '🔴', '🟡', '🟠', '+']):
             result['factors']['vix'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
-        elif 'Dollar' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+        elif 'Dollar' in line_stripped and any(e in line_stripped for e in ['🟢', '🔴', '🟡', '🟠', '+']):
             result['factors']['dollar'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
-        elif 'Cost' in line_stripped and 'Money' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+        elif 'Cost' in line_stripped and 'Money' in line_stripped and any(e in line_stripped for e in ['🟢', '🔴', '🟡', '🟠', '+']):
             result['factors']['cost_of_money'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
-        elif ('Rotation' in line_stripped or 'Breadth' in line_stripped) and ('🟢' in line_stripped or '🔴' in line_stripped):
+        elif ('Rotation' in line_stripped or 'Breadth' in line_stripped) and any(e in line_stripped for e in ['🟢', '🔴', '🟡', '🟠', '+']):
             result['factors']['rotation'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
 
     return result
@@ -1556,81 +1556,125 @@ def _parse_deep_analysis(text: str) -> Dict:
 def _generate_system_deep_analysis(macro_data: Dict,
                                     market_filter: Dict = None,
                                     phases: Dict = None) -> Dict:
-    """Fallback deep analysis when AI is unavailable."""
+    """Fallback deep analysis when AI is unavailable — with nuanced scoring."""
     score = 0
     factors = {}
 
-    # Factor 1: S&P
+    # Factor 1: S&P — above 200MA AND positive momentum = green, above 200 but weak = neutral
     indices = macro_data.get('indices', {})
     spy = indices.get('S&P 500', {})
     spy_above = market_filter.get('spy_above_200', True) if market_filter else True
-    if spy_above and spy.get('20d', 0) > 0:
-        factors['sp500'] = f"🟢 Above 200MA, 20d: {spy.get('20d', 0):+.1f}%"
+    spy_20d = spy.get('20d', 0) or 0
+    spy_5d = spy.get('5d', 0) or 0
+
+    if spy_above and spy_20d > 1.0:
+        factors['sp500'] = f"🟢 Above 200MA, strong momentum (20d: {spy_20d:+.1f}%)"
         score += 1
+    elif spy_above and spy_20d > -1.0:
+        factors['sp500'] = f"🟡 Above 200MA but momentum flat (20d: {spy_20d:+.1f}%, 5d: {spy_5d:+.1f}%)"
+        # Neutral — no score change
+    elif not spy_above:
+        factors['sp500'] = f"🔴 Below 200MA ({spy_20d:+.1f}%) — structural damage"
+        score -= 1
     else:
-        neg_reason = 'Below 200MA' if not spy_above else 'Negative momentum'
-        spy_20d = spy.get('20d', 0)
-        factors['sp500'] = f"🔴 {neg_reason} ({spy_20d:+.1f}%)"
+        factors['sp500'] = f"🔴 Negative momentum (20d: {spy_20d:+.1f}%)"
         score -= 1
 
-    # Factor 2: VIX
+    # Factor 2: VIX — levels matter more than just above/below 20
     vix = macro_data.get('vix', {})
-    if vix.get('level', 20) < 20:
-        factors['vix'] = f"🟢 Low fear (VIX={vix.get('level', '?')})"
+    vix_level = vix.get('level', 20) or 20
+    vix_change = vix.get('change_5d', 0) or 0
+
+    if vix_level < 15:
+        factors['vix'] = f"🟢 Low fear (VIX={vix_level:.1f}) — complacency zone"
         score += 1
+    elif vix_level < 20:
+        if vix_change > 2:
+            factors['vix'] = f"🟡 Moderate but rising (VIX={vix_level:.1f}, +{vix_change:.1f} 5d)"
+        else:
+            factors['vix'] = f"🟡 Moderate (VIX={vix_level:.1f}) — normal range"
+        # Neutral — no score change
+    elif vix_level < 25:
+        factors['vix'] = f"🟠 Elevated (VIX={vix_level:.1f}) — caution"
+        score -= 1
     else:
-        factors['vix'] = f"🔴 Elevated (VIX={vix.get('level', '?')})"
+        factors['vix'] = f"🔴 High fear (VIX={vix_level:.1f}) — risk-off"
         score -= 1
 
-    # Factor 3: Dollar
+    # Factor 3: Dollar — needs meaningful move, not noise
     macro = macro_data.get('macro', {})
     dollar = macro.get('Dollar', {})
-    if dollar.get('20d', 0) < 0:
-        factors['dollar'] = f"🟢 Weakening ({dollar.get('20d', 0):+.1f}%) — risk-on"
-        score += 1
-    else:
-        factors['dollar'] = f"🔴 Strong ({dollar.get('20d', 0):+.1f}%) — risk-off"
-        score -= 1
+    dollar_20d = dollar.get('20d', 0) or 0
 
-    # Factor 4: Cost of money
+    if dollar_20d < -1.0:
+        factors['dollar'] = f"🟢 Weakening ({dollar_20d:+.1f}%) — risk-on tailwind"
+        score += 1
+    elif dollar_20d > 1.0:
+        factors['dollar'] = f"🔴 Strengthening ({dollar_20d:+.1f}%) — risk-off headwind"
+        score -= 1
+    else:
+        factors['dollar'] = f"🟡 Flat ({dollar_20d:+.1f}%) — no strong signal"
+        # Neutral — no score change
+
+    # Factor 4: Cost of money — TLT direction matters
     bonds = macro.get('20Y Bond', {})
-    if bonds.get('20d', 0) > 0:
-        factors['cost_of_money'] = f"🟢 Yields falling (TLT {bonds.get('20d', 0):+.1f}%)"
-        score += 1
-    else:
-        factors['cost_of_money'] = f"🔴 Yields rising (TLT {bonds.get('20d', 0):+.1f}%)"
-        score -= 1
+    bonds_20d = bonds.get('20d', 0) or 0
 
-    # Factor 5: Rotation/Breadth
+    if bonds_20d > 1.5:
+        factors['cost_of_money'] = f"🟢 Yields falling (TLT {bonds_20d:+.1f}%) — growth tailwind"
+        score += 1
+    elif bonds_20d < -1.5:
+        factors['cost_of_money'] = f"🔴 Yields rising (TLT {bonds_20d:+.1f}%) — growth headwind"
+        score -= 1
+    else:
+        factors['cost_of_money'] = f"🟡 Yields flat (TLT {bonds_20d:+.1f}%) — no clear direction"
+        # Neutral — no score change
+
+    # Factor 5: Rotation/Breadth — sector leadership matters
     if phases:
         n_leading = len(phases.get('LEADING', []))
         n_emerging = len(phases.get('EMERGING', []))
+        n_fading = len(phases.get('FADING', []))
         n_lagging = len(phases.get('LAGGING', []))
-        if n_leading >= 3:
-            factors['rotation'] = f"🟢 {n_leading} sectors leading, broad rotation"
+
+        if n_leading >= 4:
+            factors['rotation'] = f"🟢 {n_leading} sectors leading — broad offensive rotation"
+            score += 1
+        elif n_leading >= 2 and n_emerging >= 2:
+            factors['rotation'] = f"🟢 {n_leading} leading + {n_emerging} emerging — healthy rotation"
             score += 1
         elif n_lagging >= 5:
-            factors['rotation'] = f"🔴 {n_lagging} sectors lagging, narrow market"
+            factors['rotation'] = f"🔴 {n_lagging} sectors lagging — narrow/defensive market"
+            score -= 1
+        elif n_fading >= 3 and n_leading <= 1:
+            factors['rotation'] = f"🟠 {n_fading} fading, only {n_leading} leading — rotation deteriorating"
             score -= 1
         else:
-            factors['rotation'] = f"🟡 Mixed ({n_leading} leading, {n_emerging} emerging, {n_lagging} lagging)"
+            factors['rotation'] = f"🟡 Mixed ({n_leading}L / {n_emerging}E / {n_fading}F / {n_lagging}X)"
+            # Neutral — no score change
     else:
         sectors = macro_data.get('sectors', {})
-        if sectors.get('regime') == 'Risk-On':
-            factors['rotation'] = f"🟢 Offensive leading ({sectors.get('spread', 0):+.1f}%)"
+        breadth = macro_data.get('breadth', {})
+        spread = breadth.get('spread', 0) or 0
+        if spread > 1.0:
+            factors['rotation'] = f"🟢 Broad participation (RSP-SPY: {spread:+.1f}%)"
             score += 1
-        elif sectors.get('regime') == 'Risk-Off':
-            factors['rotation'] = f"🔴 Defensive leading ({sectors.get('spread', 0):+.1f}%)"
+        elif spread < -2.0:
+            factors['rotation'] = f"🔴 Narrow leadership (RSP-SPY: {spread:+.1f}%)"
             score -= 1
         else:
-            factors['rotation'] = f"🟡 Balanced"
+            factors['rotation'] = f"🟡 Neutral breadth (RSP-SPY: {spread:+.1f}%)"
 
-    # Score label
-    if score >= 3:
+    # Score label — maps to 11-point scale (-5 to +5)
+    if score >= 4:
+        label = "STRONGLY BULLISH"
+    elif score >= 2:
         label = "BULLISH ENVIRONMENT"
     elif score >= 1:
         label = "CAUTIOUSLY BULLISH"
-    elif score <= -3:
+    elif score <= -4:
+        label = "STRONGLY BEARISH"
+    elif score <= -2:
         label = "BEARISH ENVIRONMENT"
     elif score <= -1:
         label = "CAUTION — HEADWINDS"
