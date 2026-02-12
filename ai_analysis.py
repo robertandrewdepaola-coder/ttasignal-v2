@@ -1271,29 +1271,47 @@ def generate_deep_market_analysis(macro_data: Dict,
                                    gemini_model=None,
                                    openai_client=None) -> Dict[str, Any]:
     """
-    Generate a deep, interpretive market structure analysis.
-    
-    Unlike the morning briefing (factual summary), this provides:
-    - WHY markets are moving
-    - Institutional flow interpretation
-    - Sector leadership/laggard dynamics
-    - Actionable stock selection guidance
-    - Juan Maldonado-style 5-factor scoring
-    
+    Generate a deep, interpretive market structure analysis centered on
+    sector ETF rotation — which sectors are LEADING, EMERGING, FADING, LAGGING,
+    and the narrative WHY money is flowing where it is.
+
     Returns: {analysis: str, score: int, score_label: str, factors: dict,
-              provider: str, success: bool}
+              sectors_by_phase: dict, provider: str, success: bool}
     """
     result = {
         'analysis': '',
         'score': 0,
         'score_label': '',
         'factors': {},
+        'sectors_by_phase': {},
         'provider': None,
         'success': False,
         'error': None,
     }
 
-    prompt = _build_deep_analysis_prompt(macro_data, market_filter, sector_rotation)
+    # Classify sectors by momentum phase
+    phases = {'LEADING': [], 'EMERGING': [], 'FADING': [], 'LAGGING': []}
+    if sector_rotation:
+        seen_etfs = set()
+        for sector, info in sector_rotation.items():
+            etf = info.get('etf', '')
+            if etf in seen_etfs:
+                continue  # Skip duplicate ETFs (Financials / Financial Services)
+            seen_etfs.add(etf)
+            phase = info.get('phase', 'LAGGING')
+            phases[phase].append({
+                'sector': sector,
+                'etf': etf,
+                'short': info.get('short_name', sector[:4]),
+                'perf_1d': info.get('perf_1d', 0),
+                'perf_5d': info.get('perf_5d', 0),
+                'perf_20d': info.get('perf_20d', 0),
+                'vs_spy_20d': info.get('vs_spy_20d', 0),
+                'vs_spy_5d': info.get('vs_spy_5d', 0),
+            })
+    result['sectors_by_phase'] = phases
+
+    prompt = _build_deep_analysis_prompt(macro_data, market_filter, sector_rotation, phases)
 
     raw_text = None
 
@@ -1305,15 +1323,16 @@ def generate_deep_market_analysis(macro_data: Dict,
                 messages=[
                     {"role": "system",
                      "content": (
-                         "You are an elite institutional macro strategist who interprets market structure, "
-                         "institutional flows, and inter-market relationships. You think like a hedge fund "
-                         "portfolio manager explaining the WHY behind market moves. You score the market "
-                         "environment on a -5 to +5 scale like Juan Maldonado's 5-Factor Institutional Flow model. "
-                         "Be direct, opinionated, and actionable. No hedging language."
+                         "You are an elite institutional macro strategist and sector rotation analyst. "
+                         "Your specialty is reading where institutional money is flowing by analyzing "
+                         "sector ETF performance, then explaining WHY money is moving there and what "
+                         "stocks/sectors a swing trader should target. You think like Juan Maldonado's "
+                         "5-Factor Institutional Flow model — scoring the market environment and giving "
+                         "a clear directional bias. Be direct, opinionated, and actionable. No hedging."
                      )},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=800,
+                max_tokens=1000,
                 temperature=0.6
             )
             raw_text = response.choices[0].message.content
@@ -1333,12 +1352,12 @@ def generate_deep_market_analysis(macro_data: Dict,
     if raw_text:
         result['analysis'] = raw_text.strip()
         result['success'] = True
-        # Parse structured fields
         parsed = _parse_deep_analysis(raw_text)
         result.update(parsed)
+        result['sectors_by_phase'] = phases  # Keep phases even after update
     else:
         # System fallback
-        result.update(_generate_system_deep_analysis(macro_data, market_filter))
+        result.update(_generate_system_deep_analysis(macro_data, market_filter, phases))
         result['provider'] = 'system'
         result['success'] = True
 
@@ -1347,111 +1366,145 @@ def generate_deep_market_analysis(macro_data: Dict,
 
 def _build_deep_analysis_prompt(macro_data: Dict,
                                  market_filter: Dict = None,
-                                 sector_rotation: Dict = None) -> str:
-    """Build the deep analysis prompt with all available market context."""
-    
-    parts = ["""MARKET STRUCTURE ANALYSIS — Deep Institutional Interpretation
+                                 sector_rotation: Dict = None,
+                                 phases: Dict = None) -> str:
+    """Build sector-rotation-centric deep analysis prompt."""
 
-You are scoring the market environment using a 5-Factor Institutional Flow model.
-Analyze each factor, assign a score, and provide an overall market read.
+    parts = ["""MARKET STRUCTURE & SECTOR ROTATION ANALYSIS
 
-CURRENT MARKET DATA:
+You are scoring the market using Juan Maldonado's 5-Factor Institutional Flow model.
+The CORE of your analysis is SECTOR ETF ROTATION — where is institutional money flowing
+and WHY? What does the rotation pattern TELL US about the market regime?
+
+═══════════════════════════════════════════════
+SECTOR ETF ROTATION DATA (sorted by momentum phase)
+═══════════════════════════════════════════════
 """]
+
+    def _fmt_sector(s):
+        return (f"  {s['etf']} ({s['sector']}): "
+                f"1d: {s['perf_1d']:+.1f}% | 5d: {s['perf_5d']:+.1f}% | 20d: {s['perf_20d']:+.1f}% | "
+                f"vs SPY 5d: {s['vs_spy_5d']:+.1f}% | vs SPY 20d: {s['vs_spy_20d']:+.1f}%")
+
+    if phases:
+        leading = phases.get('LEADING', [])
+        emerging = phases.get('EMERGING', [])
+        fading = phases.get('FADING', [])
+        lagging = phases.get('LAGGING', [])
+
+        parts.append("🟢 LEADING (outperforming SPY on both 5d + 20d — dominant sectors, trade these):")
+        if leading:
+            for s in sorted(leading, key=lambda x: x['vs_spy_20d'], reverse=True):
+                parts.append(_fmt_sector(s))
+        else:
+            parts.append("  (none — no sector clearly dominant)")
+
+        parts.append("\n🔵 EMERGING (5d accelerating but 20d still catching up — money rotating IN, watch for entries):")
+        if emerging:
+            for s in sorted(emerging, key=lambda x: x['vs_spy_5d'], reverse=True):
+                parts.append(_fmt_sector(s))
+        else:
+            parts.append("  (none)")
+
+        parts.append("\n🟡 FADING (20d still positive but 5d losing momentum — money rotating OUT, tighten stops):")
+        if fading:
+            for s in sorted(fading, key=lambda x: x['vs_spy_5d']):
+                parts.append(_fmt_sector(s))
+        else:
+            parts.append("  (none)")
+
+        parts.append("\n🔴 LAGGING (underperforming SPY on both timeframes — avoid, no institutional interest):")
+        if lagging:
+            for s in sorted(lagging, key=lambda x: x['vs_spy_20d']):
+                parts.append(_fmt_sector(s))
+        else:
+            parts.append("  (none)")
+
+    parts.append("\n═══════════════════════════════════════════════")
+    parts.append("5-FACTOR MACRO CONTEXT")
+    parts.append("═══════════════════════════════════════════════\n")
 
     # Factor 1: S&P 500 Trend
     indices = macro_data.get('indices', {})
     spy = indices.get('S&P 500', {})
     if spy:
         parts.append(f"FACTOR 1 — S&P 500 TREND:")
-        parts.append(f"  Price: ${spy.get('price', '?')} | 1d: {spy.get('1d', 0):+.1f}% | 5d: {spy.get('5d', 0):+.1f}% | 20d: {spy.get('20d', 0):+.1f}%")
+        parts.append(f"  ${spy.get('price', '?')} | 1d: {spy.get('1d', 0):+.1f}% | 5d: {spy.get('5d', 0):+.1f}% | 20d: {spy.get('20d', 0):+.1f}%")
     if market_filter:
-        sma200 = market_filter.get('spy_sma200', '?')
-        above = market_filter.get('spy_above_200', True)
-        parts.append(f"  200 SMA: ${sma200} — Price {'ABOVE' if above else 'BELOW'} 200 SMA")
-        parts.append(f"  50 SMA status: {'Above' if market_filter.get('spy_above_50', True) else 'Below'}")
+        above200 = market_filter.get('spy_above_200', True)
+        parts.append(f"  200 SMA: ${market_filter.get('spy_sma200', '?')} — Price {'ABOVE' if above200 else 'BELOW'}")
 
-    # Factor 2: VIX / Volatility / Commercials
+    # Factor 2: VIX
     vix = macro_data.get('vix', {})
     if vix:
-        parts.append(f"\nFACTOR 2 — VIX / VOLATILITY:")
-        parts.append(f"  VIX: {vix.get('level', '?')} (5d change: {vix.get('change_5d', 0):+.1f})")
-        parts.append(f"  Regime: {vix.get('regime', '?')}")
-        # Interpretation hint
-        if vix.get('level', 20) < 15:
-            parts.append(f"  Note: VIX below 15 = complacency, commercials may be selling protection")
-        elif vix.get('level', 20) > 25:
-            parts.append(f"  Note: VIX above 25 = institutional hedging, commercials buying protection")
+        parts.append(f"\nFACTOR 2 — VIX / VOLATILITY / COMMERCIALS:")
+        parts.append(f"  VIX: {vix.get('level', '?')} (5d change: {vix.get('change_5d', 0):+.1f}) — {vix.get('regime', '?')}")
 
-    # Factor 3: US Dollar (risk-on/risk-off gauge)
+    # Factor 3: US Dollar
     macro = macro_data.get('macro', {})
     dollar = macro.get('Dollar', {})
     if dollar:
-        parts.append(f"\nFACTOR 3 — US DOLLAR (risk-on/risk-off proxy):")
+        parts.append(f"\nFACTOR 3 — US DOLLAR:")
         parts.append(f"  UUP: ${dollar.get('price', '?')} | 20d: {dollar.get('20d', 0):+.1f}%")
-        parts.append(f"  Strong dollar = risk-off / headwind for multinationals and commodities")
+        parts.append(f"  (Strong dollar = risk-off headwind for equities & commodities)")
 
-    # Factor 4: Cost of Money (bonds/yields)
+    # Factor 4: Cost of Money
     bonds = macro.get('20Y Bond', {})
     if bonds:
-        parts.append(f"\nFACTOR 4 — COST OF MONEY (interest rates):")
-        parts.append(f"  TLT (20Y Bond): ${bonds.get('price', '?')} | 20d: {bonds.get('20d', 0):+.1f}%")
-        parts.append(f"  TLT falling = yields rising = cost of money increasing = headwind for growth stocks")
+        parts.append(f"\nFACTOR 4 — COST OF MONEY (bonds/yields):")
+        parts.append(f"  TLT: ${bonds.get('price', '?')} | 20d: {bonds.get('20d', 0):+.1f}%")
+        parts.append(f"  (TLT falling = yields rising = headwind for growth/duration)")
 
-    # Factor 5: Sector Rotation / Breadth
-    sectors = macro_data.get('sectors', {})
+    # Factor 5: Breadth
     breadth = macro_data.get('breadth', {})
-    if sectors:
-        parts.append(f"\nFACTOR 5 — SECTOR ROTATION & BREADTH:")
-        parts.append(f"  Offensive sectors (XLK/XLY/XLC) avg 20d: {sectors.get('offensive_avg_20d', '?')}%")
-        parts.append(f"  Defensive sectors (XLU/XLP/XLV) avg 20d: {sectors.get('defensive_avg_20d', '?')}%")
-        parts.append(f"  Spread: {sectors.get('spread', 0):+.1f}% → {sectors.get('regime', '?')}")
     if breadth:
-        parts.append(f"  Breadth: RSP vs SPY spread: {breadth.get('spread', 0):+.1f}% → {breadth.get('regime', '?')}")
+        parts.append(f"\nFACTOR 5 — MARKET BREADTH:")
+        parts.append(f"  RSP vs SPY spread: {breadth.get('spread', 0):+.1f}% → {breadth.get('regime', '?')}")
+        parts.append(f"  (Positive = broad participation, negative = narrow mega-cap leadership)")
 
-    # Sector rotation detail
-    if sector_rotation:
-        leading = [f"{v.get('short_name', k)} ({v.get('perf_20d', 0):+.1f}%)"
-                   for k, v in sector_rotation.items() if v.get('status') == 'leading']
-        lagging = [f"{v.get('short_name', k)} ({v.get('perf_20d', 0):+.1f}%)"
-                   for k, v in sector_rotation.items() if v.get('status') == 'lagging']
-        if leading:
-            parts.append(f"  Leading: {', '.join(leading)}")
-        if lagging:
-            parts.append(f"  Lagging: {', '.join(lagging)}")
-
-    # Additional indices context
+    # Additional context
     qqq = indices.get('Nasdaq 100', {})
     iwm = indices.get('Russell 2000', {})
+    if qqq or iwm:
+        parts.append(f"\nINDEX DIVERGENCES:")
     if qqq:
-        parts.append(f"\nADDITIONAL CONTEXT:")
-        parts.append(f"  QQQ: ${qqq.get('price', '?')} (20d: {qqq.get('20d', 0):+.1f}%)")
+        parts.append(f"  QQQ: ${qqq.get('price', '?')} (5d: {qqq.get('5d', 0):+.1f}%, 20d: {qqq.get('20d', 0):+.1f}%)")
     if iwm:
-        parts.append(f"  IWM: ${iwm.get('price', '?')} (20d: {iwm.get('20d', 0):+.1f}%)")
-        if spy and iwm:
-            iwm_vs_spy = (iwm.get('20d', 0) or 0) - (spy.get('20d', 0) or 0)
-            parts.append(f"  Small vs Large cap spread: {iwm_vs_spy:+.1f}% ({'small caps leading' if iwm_vs_spy > 0 else 'large caps leading'})")
+        parts.append(f"  IWM: ${iwm.get('price', '?')} (5d: {iwm.get('5d', 0):+.1f}%, 20d: {iwm.get('20d', 0):+.1f}%)")
+        if spy:
+            spread = (iwm.get('20d', 0) or 0) - (spy.get('20d', 0) or 0)
+            parts.append(f"  Small vs Large cap 20d spread: {spread:+.1f}%")
 
     parts.append("""
 
-YOUR TASK: Provide a structured market analysis in EXACTLY this format:
+═══════════════════════════════════════════════
+YOUR ANALYSIS — provide in EXACTLY this format:
+═══════════════════════════════════════════════
 
-SCORE: [integer from -5 to +5]
-LABEL: [e.g. "BEARISH ENVIRONMENT" or "BULLISH WITH CAUTION" or "RISK-ON"]
+SCORE: [integer -5 to +5]
+LABEL: [e.g. "BEARISH ENVIRONMENT" or "BULLISH — OFFENSIVE ROTATION" or "CAUTIOUS — DEFENSIVE SHIFT"]
 
 FACTOR SCORES:
-S&P 500: [🟢 or 🔴] [one-line assessment, e.g. "Above 50MA, momentum positive"]
+S&P 500: [🟢 or 🔴] [one-line, e.g. "Above 50MA, momentum positive"]
 VIX/Commercials: [🟢 or 🔴] [one-line, e.g. "Selling protection (VIX=17.6)"]
-US Dollar: [🟢 or 🔴] [one-line, e.g. "Strong (Risk-Off)"]
-Cost of Money: [🟢 or 🔴] [one-line, e.g. "Rising rates, headwind"]
-Inflation/Rotation: [🟢 or 🔴] [one-line, e.g. "Defensive sectors leading"]
+US Dollar: [🟢 or 🔴] [one-line, e.g. "Strong (Risk-Off headwind)"]
+Cost of Money: [🟢 or 🔴] [one-line, e.g. "Yields rising, growth headwind"]
+Rotation/Breadth: [🟢 or 🔴] [one-line, e.g. "Defensive leadership, breadth narrowing"]
 
-STRUCTURAL READ:
-[2-3 sentences: Explain the WHY behind the current market structure. What are institutions doing?
-What's driving the moves? Are there divergences to watch? Be opinionated.]
+SECTOR ROTATION NARRATIVE:
+[3-4 sentences: This is the MOST IMPORTANT section. Explain WHERE institutional money is flowing
+based on the ETF data above. WHY are the leading sectors leading? What macro/fundamental story
+explains the rotation? Are emerging sectors signaling a regime change? What does the fading of
+certain sectors tell us? Connect the dots between sector flows and the broader macro picture.
+Name specific ETFs (XLK, XLE, etc.) and their sectors.]
 
-ACTIONABLE GUIDANCE:
-[2-3 sentences: What sectors/stocks should a swing trader target RIGHT NOW and WHY?
-What to avoid? Any inflection points approaching? End with a clear directional bias.]
+WHAT TO TRADE:
+[2-3 sentences: Based on the rotation analysis, which SPECIFIC sectors should a swing trader
+focus on RIGHT NOW? Name the ETFs. Why those sectors? What type of stocks within those sectors
+(growth, value, mega-cap, mid-cap)? What setups to look for?]
+
+WHAT TO AVOID:
+[1-2 sentences: Which sectors to stay away from and why. Which fading/lagging sectors are traps?]
 """)
 
     return "\n".join(parts)
@@ -1466,7 +1519,6 @@ def _parse_deep_analysis(text: str) -> Dict:
     }
 
     lines = text.strip().split('\n')
-    current_section = None
 
     for line in lines:
         line_stripped = line.strip()
@@ -1477,7 +1529,6 @@ def _parse_deep_analysis(text: str) -> Dict:
         if line_stripped.upper().startswith('SCORE:'):
             try:
                 score_text = line_stripped.split(':', 1)[1].strip()
-                # Handle formats like "-3/5", "-3", "+2/5"
                 score_num = score_text.split('/')[0].strip()
                 result['score'] = max(-5, min(5, int(score_num)))
             except Exception:
@@ -1496,14 +1547,15 @@ def _parse_deep_analysis(text: str) -> Dict:
             result['factors']['dollar'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
         elif 'Cost' in line_stripped and 'Money' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
             result['factors']['cost_of_money'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
-        elif ('Inflation' in line_stripped or 'Rotation' in line_stripped) and ('🟢' in line_stripped or '🔴' in line_stripped):
+        elif ('Rotation' in line_stripped or 'Breadth' in line_stripped) and ('🟢' in line_stripped or '🔴' in line_stripped):
             result['factors']['rotation'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
 
     return result
 
 
 def _generate_system_deep_analysis(macro_data: Dict,
-                                    market_filter: Dict = None) -> Dict:
+                                    market_filter: Dict = None,
+                                    phases: Dict = None) -> Dict:
     """Fallback deep analysis when AI is unavailable."""
     score = 0
     factors = {}
@@ -1513,10 +1565,12 @@ def _generate_system_deep_analysis(macro_data: Dict,
     spy = indices.get('S&P 500', {})
     spy_above = market_filter.get('spy_above_200', True) if market_filter else True
     if spy_above and spy.get('20d', 0) > 0:
-        factors['sp500'] = f"🟢 Above 200MA, 20d momentum: {spy.get('20d', 0):+.1f}%"
+        factors['sp500'] = f"🟢 Above 200MA, 20d: {spy.get('20d', 0):+.1f}%"
         score += 1
     else:
-        factors['sp500'] = f"🔴 {'Below 200MA' if not spy_above else 'Negative momentum'}"
+        neg_reason = 'Below 200MA' if not spy_above else 'Negative momentum'
+        spy_20d = spy.get('20d', 0)
+        factors['sp500'] = f"🔴 {neg_reason} ({spy_20d:+.1f}%)"
         score -= 1
 
     # Factor 2: VIX
@@ -1532,33 +1586,46 @@ def _generate_system_deep_analysis(macro_data: Dict,
     macro = macro_data.get('macro', {})
     dollar = macro.get('Dollar', {})
     if dollar.get('20d', 0) < 0:
-        factors['dollar'] = f"🟢 Weakening ({dollar.get('20d', 0):+.1f}% 20d) — risk-on"
+        factors['dollar'] = f"🟢 Weakening ({dollar.get('20d', 0):+.1f}%) — risk-on"
         score += 1
     else:
-        factors['dollar'] = f"🔴 Strong ({dollar.get('20d', 0):+.1f}% 20d) — risk-off"
+        factors['dollar'] = f"🔴 Strong ({dollar.get('20d', 0):+.1f}%) — risk-off"
         score -= 1
 
     # Factor 4: Cost of money
     bonds = macro.get('20Y Bond', {})
     if bonds.get('20d', 0) > 0:
-        factors['cost_of_money'] = f"🟢 Yields falling (TLT +{bonds.get('20d', 0):.1f}%)"
+        factors['cost_of_money'] = f"🟢 Yields falling (TLT {bonds.get('20d', 0):+.1f}%)"
         score += 1
     else:
         factors['cost_of_money'] = f"🔴 Yields rising (TLT {bonds.get('20d', 0):+.1f}%)"
         score -= 1
 
-    # Factor 5: Rotation
-    sectors = macro_data.get('sectors', {})
-    if sectors.get('regime') == 'Risk-On':
-        factors['rotation'] = f"🟢 Offensive leading (spread: {sectors.get('spread', 0):+.1f}%)"
-        score += 1
-    elif sectors.get('regime') == 'Risk-Off':
-        factors['rotation'] = f"🔴 Defensive leading (spread: {sectors.get('spread', 0):+.1f}%)"
-        score -= 1
+    # Factor 5: Rotation/Breadth
+    if phases:
+        n_leading = len(phases.get('LEADING', []))
+        n_emerging = len(phases.get('EMERGING', []))
+        n_lagging = len(phases.get('LAGGING', []))
+        if n_leading >= 3:
+            factors['rotation'] = f"🟢 {n_leading} sectors leading, broad rotation"
+            score += 1
+        elif n_lagging >= 5:
+            factors['rotation'] = f"🔴 {n_lagging} sectors lagging, narrow market"
+            score -= 1
+        else:
+            factors['rotation'] = f"🟡 Mixed ({n_leading} leading, {n_emerging} emerging, {n_lagging} lagging)"
     else:
-        factors['rotation'] = f"🟡 Balanced rotation"
+        sectors = macro_data.get('sectors', {})
+        if sectors.get('regime') == 'Risk-On':
+            factors['rotation'] = f"🟢 Offensive leading ({sectors.get('spread', 0):+.1f}%)"
+            score += 1
+        elif sectors.get('regime') == 'Risk-Off':
+            factors['rotation'] = f"🔴 Defensive leading ({sectors.get('spread', 0):+.1f}%)"
+            score -= 1
+        else:
+            factors['rotation'] = f"🟡 Balanced"
 
-    # Label
+    # Score label
     if score >= 3:
         label = "BULLISH ENVIRONMENT"
     elif score >= 1:
@@ -1570,12 +1637,25 @@ def _generate_system_deep_analysis(macro_data: Dict,
     else:
         label = "MIXED / NEUTRAL"
 
-    analysis = (f"{score}/5 {label}. "
-                f"System analysis: {sum(1 for f in factors.values() if '🟢' in f)}/5 factors positive. "
-                f"AI unavailable for deep interpretation — refresh when online.")
+    # Build sector narrative from phases
+    narrative_parts = [f"{score}/5 {label}."]
+    if phases:
+        leading = phases.get('LEADING', [])
+        emerging = phases.get('EMERGING', [])
+        fading = phases.get('FADING', [])
+        if leading:
+            names = ', '.join(f"{s['etf']} ({s['short']})" for s in leading)
+            narrative_parts.append(f"LEADING sectors: {names}.")
+        if emerging:
+            names = ', '.join(f"{s['etf']} ({s['short']})" for s in emerging)
+            narrative_parts.append(f"EMERGING (rotation in): {names}.")
+        if fading:
+            names = ', '.join(f"{s['etf']} ({s['short']})" for s in fading)
+            narrative_parts.append(f"FADING (rotation out): {names}.")
+        narrative_parts.append("AI unavailable for deep interpretation — refresh when online.")
 
     return {
-        'analysis': analysis,
+        'analysis': ' '.join(narrative_parts),
         'score': score,
         'score_label': label,
         'factors': factors,
