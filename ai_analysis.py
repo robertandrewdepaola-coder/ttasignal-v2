@@ -221,16 +221,21 @@ def _format_fundamentals(fundamentals: Dict) -> str:
         if opt.get('max_pain'):
             lines.append(f"  Max pain: ${opt['max_pain']:.2f}")
 
-    # Insider activity
+    # Insider TRANSACTIONS (actual buys/sells, NOT ownership %)
     ins = fundamentals.get('insider', {})
     if ins and not ins.get('error'):
-        lines.append(f"\nINSIDER ACTIVITY (90 days):")
-        lines.append(f"  Buys: {ins.get('buys_90d', 0)}, Sells: {ins.get('sells_90d', 0)}")
-        lines.append(f"  Net: {ins.get('net_activity', '?')}")
-        if ins.get('total_buy_value', 0) > 0:
-            lines.append(f"  Buy value: ${ins['total_buy_value']:,.0f}")
-        if ins.get('total_sell_value', 0) > 0:
-            lines.append(f"  Sell value: ${ins['total_sell_value']:,.0f}")
+        buys = ins.get('buys_90d', 0)
+        sells = ins.get('sells_90d', 0)
+        if buys > 0 or sells > 0:
+            lines.append(f"\nINSIDER TRANSACTIONS (90 days):")
+            lines.append(f"  Buys: {buys}, Sells: {sells}")
+            lines.append(f"  Net: {ins.get('net_activity', '?')}")
+            if ins.get('total_buy_value', 0) > 0:
+                lines.append(f"  Buy value: ${ins['total_buy_value']:,.0f}")
+            if ins.get('total_sell_value', 0) > 0:
+                lines.append(f"  Sell value: ${ins['total_sell_value']:,.0f}")
+        else:
+            lines.append(f"\nINSIDER TRANSACTIONS (90 days): None found — no recent insider buying or selling")
 
     # Institutional
     inst = fundamentals.get('institutional', {})
@@ -359,11 +364,11 @@ def _format_fundamental_profile(profile: Dict) -> str:
             lines.append(f"  {label}: {val:.2f}")
 
     # Ownership & Short Interest
-    lines.append("\nOWNERSHIP:")
+    lines.append("\nOWNERSHIP (static stake, NOT recent trading activity):")
     if profile.get('insider_pct') is not None:
-        lines.append(f"  Insider: {profile['insider_pct']*100:.1f}%")
+        lines.append(f"  Insider Ownership: {profile['insider_pct']*100:.1f}% (this is ownership stake, NOT selling)")
     if profile.get('institution_pct') is not None:
-        lines.append(f"  Institutional: {profile['institution_pct']*100:.1f}%")
+        lines.append(f"  Institutional Ownership: {profile['institution_pct']*100:.1f}%")
     if profile.get('short_pct_float') is not None:
         lines.append(f"  Short % Float: {profile['short_pct_float']*100:.1f}%")
     if profile.get('short_ratio') is not None:
@@ -486,26 +491,36 @@ def _format_market_intelligence(intel: Dict) -> str:
             from_g = f" from {c['from_grade']}" if c.get('from_grade') else ""
             lines.append(f"    {c.get('date', '?')} — {c.get('firm', '?')}: {c.get('action', '?')} → {c.get('to_grade', '?')}{from_g}")
 
-    # Insider activity
+    # Insider activity — ALWAYS show status (prevents AI hallucinating "insider selling" when no data)
     buys = intel.get('insider_buys_90d', 0)
     sells = intel.get('insider_sells_90d', 0)
     if buys > 0 or sells > 0:
         net = intel.get('insider_net_shares', 0)
         signal_str = "NET BUYING ✅" if net > 0 else ("NET SELLING ⚠️" if net < 0 else "NEUTRAL")
-        lines.append(f"  INSIDER ACTIVITY (90 days): {buys} buys, {sells} sells — {signal_str}")
+        lines.append(f"  INSIDER TRANSACTIONS (90 days): {buys} buys, {sells} sells — {signal_str}")
         # Show top transactions
         txns = intel.get('insider_transactions', [])
         for t in txns[:3]:
             val_str = f" (${t['value']:,.0f})" if t.get('value') else ""
             lines.append(f"    {t.get('date', '?')} — {t.get('name', '?')}: {t.get('type', '?')} "
                          f"{t.get('shares', 0):,} shares{val_str}")
+    else:
+        lines.append("  INSIDER TRANSACTIONS (90 days): None found — no insider buying or selling detected")
 
-    # Social sentiment
+    # Social sentiment — always show status
     social = intel.get('social_score')
     if social:
         reddit = intel.get('social_reddit_mentions', 0)
         twitter = intel.get('social_twitter_mentions', 0)
-        lines.append(f"  SOCIAL SENTIMENT: {social} (Reddit: {reddit} mentions | Twitter: {twitter} mentions, last 7 days)")
+        source = intel.get('social_source', '')
+        if source == 'volume_proxy':
+            vol_surge = intel.get('volume_surge_ratio', 1.0)
+            lines.append(f"  SOCIAL SENTIMENT: {social} (volume proxy: {vol_surge:.1f}x avg — Finnhub social requires premium)")
+        else:
+            lines.append(f"  SOCIAL SENTIMENT: {social} (Reddit: {reddit} mentions | Twitter: {twitter} mentions, last 7 days)")
+    else:
+        error = intel.get('social_error', '')
+        lines.append(f"  SOCIAL SENTIMENT: Not available ({error or 'no data source'})")
 
     if not lines:
         return "No market intelligence available."
@@ -611,13 +626,13 @@ C = Weak fundamentals, declining margins, or high debt
 D = Speculative, no profits, or deteriorating rapidly
 Include 1 sentence explaining the rating with specific numbers.]
 
-SMART MONEY: [What are analysts and insiders telling us? Summarize: analyst consensus rating, mean price target vs current (upside %), any recent upgrades/downgrades, and insider buying/selling pattern. Is smart money aligned with the technical signal? 2-3 sentences.]
+SMART MONEY: [What are analysts and insiders telling us? Summarize: analyst consensus rating, mean price target vs current (upside %), any recent upgrades/downgrades, and insider buying/selling pattern. CRITICAL: Only report insider SELLING or BUYING if there are actual insider TRANSACTIONS shown in the data. Insider OWNERSHIP % is NOT selling — it is a static stake. If no insider transactions found, say "No recent insider transactions." Is smart money aligned with the technical signal? 2-3 sentences.]
 
 BULL CASE: [Best realistic outcome in 3-6 months, with a price target and the catalyst that gets it there. Use analyst targets if available. 1-2 sentences.]
 
 BEAR CASE: [What kills this trade? Specific risk with price level. 1-2 sentences.]
 
-RED FLAGS: [1-3 specific concerns, or "None" if clean. Consider: insider selling, analyst downgrades, high short interest, earnings risk, declining fundamentals.]
+RED FLAGS: [1-3 specific concerns, or "None" if clean. CRITICAL: Do NOT flag "insider selling" unless there are actual insider SELL TRANSACTIONS in the data. Insider ownership % is a static stake, NOT evidence of selling. Consider ONLY actual evidence: insider sell transactions, analyst downgrades, high short interest, earnings risk, declining fundamentals.]
 
 POSITION SIZING: [Full (100%) / Reduced (75%) / Small (50%) / Skip — with 1 reason]
 
