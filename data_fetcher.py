@@ -1572,7 +1572,8 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
         # Social sentiment from Finnhub
         try:
-            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from=2024-01-01&token={fh_key}"
+            from_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from={from_date}&token={fh_key}"
             resp = req.get(url, timeout=8)
             if resp.status_code == 200:
                 data = resp.json()
