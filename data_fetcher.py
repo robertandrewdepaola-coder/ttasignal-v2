@@ -341,9 +341,14 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
     Fetch sector rotation data — which sectors are leading/lagging vs SPY.
 
     Returns dict keyed by sector name:
-        {sector: {etf, perf_20d, perf_5d, vs_spy_20d, status}}
+        {sector: {etf, perf_1d, perf_5d, perf_20d, vs_spy_20d, vs_spy_5d,
+                  status, phase, short_name, spy_perf_20d}}
 
     Status: 'leading' (green), 'neutral' (yellow), 'lagging' (red)
+    Phase:  'LEADING'  — outperforming on both 5d and 20d
+            'EMERGING' — 5d accelerating, 20d still catching up (rotation IN)
+            'FADING'   — 20d still up, but 5d momentum dying (rotation OUT)
+            'LAGGING'  — underperforming on both timeframes
     """
     cache_key = "SECTOR_ROTATION"
     cached = _cache.get(cache_key)
@@ -353,13 +358,14 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
     rotation = {}
 
     try:
-        # Fetch SPY 20-day performance
+        # Fetch SPY performance across timeframes
         spy_df = fetch_daily("SPY", period='3mo')
         if spy_df is None or len(spy_df) < 20:
             return rotation
 
-        spy_perf_20 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+        spy_perf_1 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-2] - 1) * 100 if len(spy_df) >= 2 else 0
         spy_perf_5 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
+        spy_perf_20 = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
 
         # Fetch each sector ETF
         unique_etfs = set(SECTOR_ETF_MAP.values())
@@ -369,33 +375,57 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
             try:
                 df = fetch_daily(etf, period='3mo')
                 if df is not None and len(df) >= 20:
-                    perf_20 = (df['Close'].iloc[-1] / df['Close'].iloc[-20] - 1) * 100
+                    perf_1 = (df['Close'].iloc[-1] / df['Close'].iloc[-2] - 1) * 100 if len(df) >= 2 else 0
                     perf_5 = (df['Close'].iloc[-1] / df['Close'].iloc[-5] - 1) * 100
-                    etf_perf[etf] = {'perf_20d': perf_20, 'perf_5d': perf_5}
+                    perf_20 = (df['Close'].iloc[-1] / df['Close'].iloc[-20] - 1) * 100
+                    etf_perf[etf] = {
+                        'perf_1d': perf_1,
+                        'perf_5d': perf_5,
+                        'perf_20d': perf_20,
+                    }
             except Exception:
                 pass
 
-        # Build rotation map
+        # Build rotation map with momentum phase classification
         for sector, etf in SECTOR_ETF_MAP.items():
             if etf in etf_perf:
                 p = etf_perf[etf]
-                vs_spy = p['perf_20d'] - spy_perf_20
+                vs_spy_20 = p['perf_20d'] - spy_perf_20
+                vs_spy_5 = p['perf_5d'] - spy_perf_5
 
-                # Classify rotation status
-                if vs_spy > 2.0 and p['perf_5d'] > 0:
-                    status = 'leading'      # Outperforming + recent momentum
-                elif vs_spy < -2.0 and p['perf_5d'] < 0:
-                    status = 'lagging'       # Underperforming + losing momentum
+                # Legacy status (for scanner display)
+                if vs_spy_20 > 2.0 and p['perf_5d'] > 0:
+                    status = 'leading'
+                elif vs_spy_20 < -2.0 and p['perf_5d'] < 0:
+                    status = 'lagging'
                 else:
                     status = 'neutral'
 
+                # MOMENTUM PHASE — 4-quadrant classification
+                # Based on short-term (5d vs SPY) and medium-term (20d vs SPY)
+                strong_5d = vs_spy_5 > 1.0   # Beating SPY over 5 days
+                strong_20d = vs_spy_20 > 1.5  # Beating SPY over 20 days
+
+                if strong_20d and strong_5d:
+                    phase = 'LEADING'    # Dominant — trade these NOW
+                elif not strong_20d and strong_5d:
+                    phase = 'EMERGING'   # Money rotating IN — watch for entries
+                elif strong_20d and not strong_5d:
+                    phase = 'FADING'     # Money rotating OUT — tighten stops
+                else:
+                    phase = 'LAGGING'    # Avoid — no institutional interest
+
                 rotation[sector] = {
                     'etf': etf,
+                    'perf_1d': round(p['perf_1d'], 2),
+                    'perf_5d': round(p['perf_5d'], 2),
                     'perf_20d': round(p['perf_20d'], 1),
-                    'perf_5d': round(p['perf_5d'], 1),
-                    'vs_spy_20d': round(vs_spy, 1),
+                    'vs_spy_20d': round(vs_spy_20, 1),
+                    'vs_spy_5d': round(vs_spy_5, 2),
                     'spy_perf_20d': round(spy_perf_20, 1),
+                    'spy_perf_5d': round(spy_perf_5, 2),
                     'status': status,
+                    'phase': phase,
                     'short_name': SECTOR_SHORT.get(sector, sector[:4]),
                 }
 
