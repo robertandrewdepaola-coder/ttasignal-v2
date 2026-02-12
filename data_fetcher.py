@@ -387,13 +387,15 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
                 pass
 
         # Build rotation map with momentum phase classification
+        # Use RELATIVE ranking so there's always a distribution even in broad rallies
+        sector_scores = []
         for sector, etf in SECTOR_ETF_MAP.items():
             if etf in etf_perf:
                 p = etf_perf[etf]
                 vs_spy_20 = p['perf_20d'] - spy_perf_20
                 vs_spy_5 = p['perf_5d'] - spy_perf_5
 
-                # Legacy status (for scanner display)
+                # Legacy status (for backward compat)
                 if vs_spy_20 > 2.0 and p['perf_5d'] > 0:
                     status = 'leading'
                 elif vs_spy_20 < -2.0 and p['perf_5d'] < 0:
@@ -401,22 +403,11 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
                 else:
                     status = 'neutral'
 
-                # MOMENTUM PHASE — 4-quadrant classification
-                # Based on short-term (5d vs SPY) and medium-term (20d vs SPY)
-                strong_5d = vs_spy_5 > 1.0   # Beating SPY over 5 days
-                strong_20d = vs_spy_20 > 1.5  # Beating SPY over 20 days
+                # Composite score for ranking: weight 5d momentum slightly more
+                composite = vs_spy_5 * 0.6 + vs_spy_20 * 0.4
 
-                if strong_20d and strong_5d:
-                    phase = 'LEADING'    # Dominant — trade these NOW
-                elif not strong_20d and strong_5d:
-                    phase = 'EMERGING'   # Money rotating IN — watch for entries
-                elif strong_20d and not strong_5d:
-                    phase = 'FADING'     # Money rotating OUT — tighten stops
-                else:
-                    phase = 'LAGGING'    # Avoid — no institutional interest
-
-                rotation[sector] = {
-                    'etf': etf,
+                sector_scores.append({
+                    'sector': sector, 'etf': etf,
                     'perf_1d': round(p['perf_1d'], 2),
                     'perf_5d': round(p['perf_5d'], 2),
                     'perf_20d': round(p['perf_20d'], 1),
@@ -425,9 +416,47 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
                     'spy_perf_20d': round(spy_perf_20, 1),
                     'spy_perf_5d': round(spy_perf_5, 2),
                     'status': status,
-                    'phase': phase,
+                    'composite': composite,
                     'short_name': SECTOR_SHORT.get(sector, sector[:4]),
-                }
+                })
+
+        # De-duplicate by ETF (keep first occurrence)
+        seen_etfs = set()
+        unique_sectors = []
+        for s in sector_scores:
+            if s['etf'] not in seen_etfs:
+                seen_etfs.add(s['etf'])
+                unique_sectors.append(s)
+
+        # Rank by composite score — split into quartiles
+        unique_sectors.sort(key=lambda x: x['composite'], reverse=True)
+        n = len(unique_sectors)
+        for i, s in enumerate(unique_sectors):
+            pct = i / max(n - 1, 1)  # 0 = top, 1 = bottom
+            if pct <= 0.25:
+                phase = 'LEADING'    # Top ~25% — trade these NOW
+            elif pct <= 0.50:
+                phase = 'EMERGING'   # 25-50% — money rotating IN, watch
+            elif pct <= 0.75:
+                phase = 'FADING'     # 50-75% — money rotating OUT, tighten
+            else:
+                phase = 'LAGGING'    # Bottom ~25% — avoid
+
+            s['phase'] = phase
+            rotation[s['sector']] = s
+
+        # Add aliases so both yfinance sector names resolve
+        # (e.g., yfinance returns 'Financials' but SECTOR_ETF_MAP has 'Financial Services')
+        alias_map = {}
+        for sector, etf in SECTOR_ETF_MAP.items():
+            if sector not in rotation:
+                # Find the canonical entry for this ETF
+                for canon_sector, info in rotation.items():
+                    if info.get('etf') == etf:
+                        alias_map[sector] = canon_sector
+                        break
+        for alias, canonical in alias_map.items():
+            rotation[alias] = rotation[canonical]
 
     except Exception as e:
         print(f"[data_fetcher] Sector rotation error: {e}")
@@ -436,63 +465,90 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
     return rotation
 
 
-def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 7) -> Dict[str, Dict]:
+def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str, Dict]:
     """
     Check earnings dates for a batch of tickers.
 
     Returns dict keyed by ticker:
         {ticker: {next_earnings: date_str, days_until: int, within_window: bool}}
 
-    Only returns entries for tickers WITH upcoming earnings within days_ahead.
+    Returns ALL tickers with known upcoming earnings (not just within window).
+    within_window flag indicates if earnings are within days_ahead days.
     """
-    cache_key = "BATCH_EARNINGS_FLAGS"
+    cache_key = f"BATCH_EARN_{hash(tuple(sorted(tickers)))}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
 
     flags = {}
+    today = datetime.now().date()
 
     for ticker in tickers:
         try:
             stock = yf.Ticker(ticker)
+            earn_dt = None
 
-            # Try calendar first (fastest)
-            cal = stock.calendar
-            if cal is not None:
-                earn_date = None
-                if isinstance(cal, dict):
-                    earn_date = cal.get('Earnings Date')
-                    if isinstance(earn_date, list) and earn_date:
-                        earn_date = earn_date[0]
-                elif isinstance(cal, pd.DataFrame) and not cal.empty:
-                    try:
-                        earn_date = cal.iloc[0].get('Earnings Date')
-                    except Exception:
-                        pass
+            # Strategy 1: Try calendar first (fastest)
+            try:
+                cal = stock.calendar
+                if cal is not None:
+                    raw_date = None
+                    if isinstance(cal, dict):
+                        raw_date = cal.get('Earnings Date')
+                        if isinstance(raw_date, list) and raw_date:
+                            raw_date = raw_date[0]
+                    elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                        try:
+                            raw_date = cal.iloc[0].get('Earnings Date')
+                        except Exception:
+                            pass
 
-                if earn_date is not None:
-                    if hasattr(earn_date, 'date'):
-                        earn_dt = earn_date.date() if hasattr(earn_date, 'date') else earn_date
-                    elif isinstance(earn_date, str):
-                        from datetime import date
-                        earn_dt = datetime.strptime(earn_date[:10], '%Y-%m-%d').date()
-                    else:
-                        continue
+                    if raw_date is not None:
+                        if hasattr(raw_date, 'date'):
+                            earn_dt = raw_date.date() if callable(getattr(raw_date, 'date', None)) else raw_date
+                        elif isinstance(raw_date, str) and len(raw_date) >= 10:
+                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+            except Exception:
+                pass
 
-                    today = datetime.now().date()
-                    days_until = (earn_dt - today).days
+            # Strategy 2: Try earnings_dates (more reliable for many tickers)
+            if earn_dt is None:
+                try:
+                    edates = stock.earnings_dates
+                    if edates is not None and len(edates) > 0:
+                        # earnings_dates index is datetime — find next upcoming
+                        for dt_idx in sorted(edates.index):
+                            try:
+                                if hasattr(dt_idx, 'date') and callable(getattr(dt_idx, 'date')):
+                                    d = dt_idx.date()
+                                elif hasattr(dt_idx, 'to_pydatetime'):
+                                    d = dt_idx.to_pydatetime().date()
+                                else:
+                                    continue
+                                days_diff = (d - today).days
+                                if days_diff >= -7:  # Accept recent past + future
+                                    earn_dt = d
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
 
-                    if 0 <= days_until <= days_ahead:
-                        flags[ticker] = {
-                            'next_earnings': earn_dt.strftime('%Y-%m-%d'),
-                            'days_until': days_until,
-                            'within_window': True,
-                        }
+            if earn_dt is not None:
+                days_until = (earn_dt - today).days
+                # Include future earnings and recently reported (up to 7 days past)
+                if days_until >= -7:
+                    flags[ticker] = {
+                        'next_earnings': earn_dt.strftime('%Y-%m-%d'),
+                        'days_until': days_until,
+                        'within_window': 0 <= days_until <= days_ahead,
+                    }
 
         except Exception:
             pass
 
-    _cache.set(cache_key, flags)
+    if flags:  # Only cache if we got results
+        _cache.set(cache_key, flags)
     return flags
 
 
@@ -1570,7 +1626,7 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
         except Exception:
             pass
 
-        # Social sentiment from Finnhub
+        # Social sentiment from Finnhub (requires premium on many tickers)
         try:
             from_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
             url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from={from_date}&token={fh_key}"
@@ -1598,8 +1654,65 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
                         intel['social_score'] = 'Moderate'
                     else:
                         intel['social_score'] = 'Low'
-        except Exception:
-            pass
+            elif resp.status_code in (401, 403):
+                intel['social_error'] = 'Finnhub premium required'
+            else:
+                intel['social_error'] = f'Finnhub {resp.status_code}'
+        except Exception as e:
+            intel['social_error'] = str(e)[:100]
+
+    # ── Volume-Based Social Proxy (fallback) ──────────────────────
+    # If Finnhub social sentiment unavailable, use volume surge as a proxy
+    if not intel.get('social_score'):
+        try:
+            vol_data = None
+
+            # Prefer cached daily data (already fetched during scan) to avoid extra API call
+            try:
+                daily = fetch_daily(ticker, period='3mo')
+                if daily is not None and len(daily) >= 20:
+                    vol_col = 'Volume' if 'Volume' in daily.columns else (
+                        'volume' if 'volume' in daily.columns else None)
+                    if vol_col:
+                        vol_data = daily.rename(columns={vol_col: 'Volume'}) if vol_col != 'Volume' else daily
+            except Exception:
+                pass
+
+            # Fallback: direct yfinance call
+            if vol_data is None and stock is not None:
+                try:
+                    hist = stock.history(period='3mo')
+                    if hist is not None and len(hist) >= 20:
+                        vol_col = 'Volume' if 'Volume' in hist.columns else (
+                            'volume' if 'volume' in hist.columns else None)
+                        if vol_col:
+                            vol_data = hist.rename(columns={vol_col: 'Volume'}) if vol_col != 'Volume' else hist
+                except Exception:
+                    pass
+
+            if vol_data is not None and len(vol_data) >= 20 and 'Volume' in vol_data.columns:
+                recent_vol = float(vol_data['Volume'].iloc[-5:].mean())
+                avg_vol_50 = float(vol_data['Volume'].tail(min(50, len(vol_data))).mean())
+
+                vol_surge = recent_vol / avg_vol_50 if avg_vol_50 > 0 else 1.0
+                intel['volume_surge_ratio'] = round(vol_surge, 2)
+
+                if vol_surge >= 3.0:
+                    intel['social_score'] = 'High volume surge'
+                elif vol_surge >= 2.0:
+                    intel['social_score'] = 'Elevated volume'
+                elif vol_surge >= 1.5:
+                    intel['social_score'] = 'Above avg volume'
+                else:
+                    intel['social_score'] = 'Normal volume'
+                intel['social_source'] = 'volume_proxy'
+            else:
+                intel['social_score'] = 'No volume data'
+                intel['social_source'] = 'unavailable'
+        except Exception as e:
+            intel['social_score'] = 'Volume check failed'
+            intel['social_source'] = 'error'
+            intel['social_error'] = str(e)[:100]
 
     _cache.set(cache_key, intel)
     return intel
