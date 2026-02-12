@@ -433,20 +433,25 @@ def render_sidebar():
 
 
 def _load_ticker_for_view(ticker: str):
-    """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.)."""
+    """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.).
+    
+    NOTE: No st.rerun() needed here. Button clicks already trigger a Streamlit rerun.
+    Setting session state is enough — render_detail_view() runs later in the same pass
+    and picks up the new state. Avoiding rerun eliminates a full double-repaint of the
+    200+ ticker scanner table.
+    """
     ticker = ticker.upper().strip()
 
-    # Check if we already have analysis from a scan
+    # Check if we already have analysis from a scan (instant — no API call)
     results = st.session_state.get('scan_results', [])
     for r in results:
         if r.ticker == ticker:
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
             st.session_state['scroll_to_detail'] = True
-            st.rerun()
-            return
+            return  # No rerun — current pass will render detail view
 
-    # Fetch fresh data and analyze on-the-fly
+    # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
     try:
         data = fetch_all_ticker_data(ticker)
         if data.get('daily') is not None:
@@ -458,7 +463,7 @@ def _load_ticker_for_view(ticker: str):
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
             st.session_state['ticker_data_cache'] = cache
-            st.rerun()
+            # No rerun — current pass will render detail view
         else:
             st.sidebar.error(f"No data for {ticker}")
     except Exception as e:
@@ -896,6 +901,12 @@ def render_scanner_table():
     with filt_col5:
         st.caption(f"**{len(rows)}** total")
 
+    # Reset pagination when filter/sort/search changes
+    _filter_sig = f"{rec_filter}|{sector_filter}|{sort_by}|{search}"
+    if st.session_state.get('_last_filter_sig') != _filter_sig:
+        st.session_state['scanner_page'] = 0
+        st.session_state['_last_filter_sig'] = _filter_sig
+
     # ── Build focus label lookup ──────────────────────────────────────
     focus_labels = jm.get_focus_labels()
 
@@ -1005,6 +1016,45 @@ def render_scanner_table():
         st.info("No tickers match the current filter.")
         return
 
+    # ── Pagination — render 25 rows at a time to keep UI fast ─────────
+    PAGE_SIZE = 25
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    # Track page in session state
+    if 'scanner_page' not in st.session_state:
+        st.session_state['scanner_page'] = 0
+    current_page = st.session_state['scanner_page']
+    # Clamp to valid range
+    if current_page >= total_pages:
+        current_page = total_pages - 1
+        st.session_state['scanner_page'] = current_page
+
+    start_idx = current_page * PAGE_SIZE
+    end_idx = min(start_idx + PAGE_SIZE, len(filtered))
+    page_rows = filtered[start_idx:end_idx]
+
+    # Pagination controls (top)
+    if total_pages > 1:
+        pg_col1, pg_col2, pg_col3, pg_col4, pg_col5 = st.columns([1, 1, 3, 1, 1])
+        with pg_col1:
+            if st.button("⏮", key="page_first", disabled=current_page == 0):
+                st.session_state['scanner_page'] = 0
+                st.rerun()
+        with pg_col2:
+            if st.button("◀", key="page_prev", disabled=current_page == 0):
+                st.session_state['scanner_page'] = current_page - 1
+                st.rerun()
+        with pg_col3:
+            st.caption(f"Page {current_page + 1} of {total_pages}  ·  Rows {start_idx + 1}–{end_idx} of {len(filtered)}")
+        with pg_col4:
+            if st.button("▶", key="page_next", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = current_page + 1
+                st.rerun()
+        with pg_col5:
+            if st.button("⏭", key="page_last", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = total_pages - 1
+                st.rerun()
+
     # Table header — added Focus, Earnings Date, Volume, Apex columns
     hdr_cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
     headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Summary']
@@ -1017,8 +1067,10 @@ def render_scanner_table():
     }
     _focus_cycle = ['', 'green', 'yellow', 'red', 'blue']  # Click to cycle
 
-    # Table rows — each ticker is a button
-    for idx, row in enumerate(filtered):
+    # Table rows — ONLY render current page (25 rows max = fast)
+    for idx, row in enumerate(page_rows):
+        # Use global index for unique keys
+        global_idx = start_idx + idx
         cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
 
         # Ticker as clickable button with earnings flag
@@ -1036,7 +1088,7 @@ def render_scanner_table():
             if earn:
                 ticker_label = f"{ticker_label} ⚡"
 
-            if st.button(ticker_label, key=f"row_{row['Ticker']}_{idx}",
+            if st.button(ticker_label, key=f"row_{row['Ticker']}_{global_idx}",
                         use_container_width=True):
                 st.session_state['default_detail_tab'] = 0  # Signal tab
                 st.session_state['scroll_to_detail'] = True
@@ -1044,7 +1096,7 @@ def render_scanner_table():
 
         # Chart button — opens directly to chart tab
         with cols[1]:
-            if st.button("📈", key=f"chart_row_{row['Ticker']}_{idx}"):
+            if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
                 st.session_state['default_detail_tab'] = 1  # Chart tab
                 st.session_state['scroll_to_detail'] = True
                 _load_ticker_for_view(row['Ticker'])
@@ -1053,7 +1105,7 @@ def render_scanner_table():
         with cols[2]:
             curr_label = focus_labels.get(row['Ticker'], '')
             curr_icon = _focus_icons.get(curr_label, '⚪')
-            if st.button(curr_icon, key=f"focus_{row['Ticker']}_{idx}",
+            if st.button(curr_icon, key=f"focus_{row['Ticker']}_{global_idx}",
                         help="Click to cycle: ⚪→🟢→🟡→🔴→🔵"):
                 curr_idx = _focus_cycle.index(curr_label) if curr_label in _focus_cycle else 0
                 next_label = _focus_cycle[(curr_idx + 1) % len(_focus_cycle)]
@@ -1112,6 +1164,28 @@ def render_scanner_table():
         # Earnings date with highlight
         cols[14].caption(row.get('EarnDate', ''))
         cols[15].caption(row.get('Summary', '')[:45])
+
+    # ── Bottom pagination ─────────────────────────────────────────────
+    if total_pages > 1:
+        bpg1, bpg2, bpg3, bpg4, bpg5 = st.columns([1, 1, 3, 1, 1])
+        with bpg1:
+            if st.button("⏮", key="bpage_first", disabled=current_page == 0):
+                st.session_state['scanner_page'] = 0
+                st.rerun()
+        with bpg2:
+            if st.button("◀", key="bpage_prev", disabled=current_page == 0):
+                st.session_state['scanner_page'] = current_page - 1
+                st.rerun()
+        with bpg3:
+            st.caption(f"Page {current_page + 1}/{total_pages}")
+        with bpg4:
+            if st.button("▶", key="bpage_next", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = current_page + 1
+                st.rerun()
+        with bpg5:
+            if st.button("⏭", key="bpage_last", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = total_pages - 1
+                st.rerun()
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
@@ -1746,14 +1820,11 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         if st.button("🔄 Re-run AI Analysis", type="secondary"):
             should_run = True
     else:
-        # Auto-run on first view (no button needed)
-        if openai_client or gemini:
-            should_run = True
-        else:
-            st.info("Configure GROQ_API_KEY or GEMINI_API_KEY in secrets to enable AI analysis.")
+        # Always run data fetch; AI generation only if provider available
+        should_run = True
 
     if should_run:
-        with st.spinner("Fetching fundamentals, TradingView, news & analyzing..."):
+        with st.spinner("Fetching fundamentals, market intel & analyzing..."):
             fundamentals = {}
             fundamental_profile = {}
             tradingview_data = {}
@@ -1793,34 +1864,56 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
 
             # Finnhub news (optional — needs API key)
             try:
-                finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                finnhub_key = ""
+                try:
+                    finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                except Exception:
+                    pass
                 if finnhub_key:
                     news_data = fetch_finnhub_news(ticker, api_key=finnhub_key)
             except Exception:
                 pass
 
-            # Market intelligence — analysts, insiders, social
+            # Market intelligence — ALWAYS fetch (analysts, insiders, social proxy)
             market_intel = {}
             try:
                 from data_fetcher import fetch_market_intelligence
-                finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                # Safe secrets access — st.secrets.get() throws if no secrets.toml
+                finnhub_key = ""
+                try:
+                    finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                except Exception:
+                    pass
                 market_intel = fetch_market_intelligence(ticker, finnhub_key=finnhub_key)
             except Exception as e:
                 st.caption(f"Market intel error: {e}")
 
-            result = run_ai_analysis(
-                ticker=ticker,
-                signal=signal,
-                recommendation=rec,
-                quality=quality,
-                fundamentals=fundamentals,
-                fundamental_profile=fundamental_profile,
-                tradingview_data=tradingview_data,
-                news_data=news_data,
-                market_intel=market_intel,
-                gemini_model=gemini,
-                openai_client=openai_client,
-            )
+            # AI analysis — only if provider available
+            if openai_client or gemini:
+                result = run_ai_analysis(
+                    ticker=ticker,
+                    signal=signal,
+                    recommendation=rec,
+                    quality=quality,
+                    fundamentals=fundamentals,
+                    fundamental_profile=fundamental_profile,
+                    tradingview_data=tradingview_data,
+                    news_data=news_data,
+                    market_intel=market_intel,
+                    gemini_model=gemini,
+                    openai_client=openai_client,
+                )
+            else:
+                # No AI provider — build result from data only
+                result = {
+                    'provider': 'none',
+                    'note': 'No AI provider configured. Showing data only.',
+                    'conviction': 0,
+                    'action': rec.get('recommendation', 'N/A'),
+                    'position_sizing': 'N/A',
+                    'fundamental_quality': 'N/A',
+                    'analysis': 'Configure GROQ_API_KEY or GEMINI_API_KEY for AI analysis.',
+                }
 
             # Attach extra data for UI display
             result['earnings_history'] = earnings_history
