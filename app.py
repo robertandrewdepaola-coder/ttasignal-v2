@@ -19,7 +19,7 @@ Version: 2.0.0 (2026-02-08)
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict
+from typing import Dict, List
 
 # Backend imports
 from signal_engine import EntrySignal
@@ -79,6 +79,75 @@ def get_journal() -> JournalManager:
 
 # =============================================================================
 # =============================================================================
+# MORNING BRIEFING — AI Market Narrative (sidebar)
+# =============================================================================
+
+def _render_morning_briefing():
+    """Render daily market narrative in sidebar. Cached once per session."""
+    # Check if already generated today
+    narrative_data = st.session_state.get('morning_narrative')
+    narrative_date = st.session_state.get('morning_narrative_date', '')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    if narrative_data and narrative_date == today:
+        # Display cached narrative
+        regime = narrative_data.get('regime', 'Neutral')
+        regime_colors = {
+            'Risk-On': '🟢', 'Bullish': '🟢', 'Cautiously Bullish': '🟢',
+            'Neutral': '🟡', 'Balanced': '🟡',
+            'Caution': '🟠', 'Rotation to Safety': '🟠',
+            'Risk-Off': '🔴', 'Bearish': '🔴',
+        }
+        icon = regime_colors.get(regime, '🟡')
+
+        st.sidebar.markdown(f"### {icon} {regime}")
+        st.sidebar.caption(narrative_data.get('narrative', '')[:300])
+
+        with st.sidebar.expander("📊 Raw Data"):
+            macro = narrative_data.get('macro_data', {})
+            # Indices
+            for name, info in macro.get('indices', {}).items():
+                d20 = info.get('20d', 0)
+                icon_i = '🟢' if d20 > 0 else '🔴'
+                st.caption(f"{icon_i} {name}: ${info.get('price', '?')} ({d20:+.1f}%)")
+            # VIX
+            vix = macro.get('vix', {})
+            if vix:
+                st.caption(f"VIX: {vix.get('level', '?')} ({vix.get('regime', '')})")
+            # Sectors
+            sectors = macro.get('sectors', {})
+            if sectors:
+                st.caption(f"Sectors: {sectors.get('regime', '')} (spread: {sectors.get('spread', 0):+.1f}%)")
+
+    # Refresh button
+    if st.sidebar.button("🔄 Refresh Briefing", use_container_width=True,
+                         key="refresh_narrative"):
+        with st.spinner("Generating market briefing..."):
+            try:
+                from data_fetcher import fetch_macro_narrative_data
+                from ai_analysis import generate_market_narrative
+
+                macro_data = fetch_macro_narrative_data()
+
+                # Get AI clients
+                gemini_model = st.session_state.get('gemini_model')
+                openai_client = st.session_state.get('openai_client')
+
+                narrative_result = generate_market_narrative(
+                    macro_data,
+                    gemini_model=gemini_model,
+                    openai_client=openai_client,
+                )
+
+                narrative_result['macro_data'] = macro_data
+                st.session_state['morning_narrative'] = narrative_result
+                st.session_state['morning_narrative_date'] = today
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Briefing error: {e}")
+
+
+# =============================================================================
 # SIDEBAR — Slim: Scan controls, Open Positions, Alerts, Market
 # =============================================================================
 
@@ -87,6 +156,13 @@ def render_sidebar():
 
     st.sidebar.title("📊 TTA v2")
     st.sidebar.caption("Technical Trading Assistant")
+
+    # ══════════════════════════════════════════════════════════════════
+    # MORNING BRIEFING — AI Market Narrative
+    # ══════════════════════════════════════════════════════════════════
+    _render_morning_briefing()
+
+    st.sidebar.divider()
 
     # ── Scan Controls ─────────────────────────────────────────────────
     watchlist_tickers = jm.get_watchlist_tickers()
@@ -376,53 +452,106 @@ def render_scanner_table():
     # WATCHLIST EDITOR (collapsible)
     # ══════════════════════════════════════════════════════════════════
     watchlist_tickers = jm.get_watchlist_tickers()
+    favorite_tickers = set(jm.get_favorite_tickers())
 
     with st.expander(f"📋 Watchlist ({len(watchlist_tickers)} tickers) — click to edit",
                      expanded=(len(watchlist_tickers) == 0)):
-        st.caption("Paste tickers separated by commas, spaces, or new lines. "
-                   "Example: AAPL, NVDA, META, TSLA")
 
-        # Bulk text area
-        default_text = ", ".join(watchlist_tickers) if watchlist_tickers else ""
-        new_text = st.text_area(
-            "Tickers",
-            value=default_text,
-            height=100 if len(watchlist_tickers) > 20 else 68,
-            label_visibility="collapsed",
-            key="watchlist_editor",
-        )
+        # ── Quick Add (single ticker) ─────────────────────────────────
+        qa1, qa2 = st.columns([3, 1])
+        with qa1:
+            new_ticker = st.text_input("Add ticker", placeholder="e.g. AAPL",
+                                       key="wl_add_input", label_visibility="collapsed")
+        with qa2:
+            if st.button("➕ Add", key="wl_add_btn", use_container_width=True):
+                if new_ticker:
+                    ticker_clean = new_ticker.strip().upper()
+                    if ticker_clean and ticker_clean not in watchlist_tickers:
+                        jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                        st.rerun()
 
-        wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
-        with wl_col1:
-            if st.button("💾 Save Watchlist", use_container_width=True, type="primary"):
-                # Parse: handle commas, spaces, newlines, tabs
-                import re
-                raw = re.split(r'[,\s\n\t]+', new_text)
-                tickers = [t.strip().upper() for t in raw if t.strip()]
-                # Remove duplicates preserving order
-                seen = set()
-                unique = []
-                for t in tickers:
-                    if t not in seen:
-                        seen.add(t)
-                        unique.append(t)
+        # ── Interactive List with Favorite/Delete ─────────────────────
+        if watchlist_tickers:
+            # Sort favorites to top
+            sorted_tickers = sorted(
+                watchlist_tickers,
+                key=lambda t: (0 if t in favorite_tickers else 1, t)
+            )
 
-                jm.clear_watchlist()
-                jm.set_watchlist_tickers(unique)
-                st.success(f"✅ Saved {len(unique)} tickers")
-                st.rerun()
+            # Show in compact rows
+            for t in sorted_tickers:
+                is_fav = t in favorite_tickers
+                fav_icon = "⭐" if is_fav else "☆"
 
-        with wl_col2:
-            if st.button("🗑️ Clear All", use_container_width=True):
-                jm.clear_watchlist()
-                st.session_state.pop('scan_results', None)
-                st.session_state.pop('scan_results_summary', None)
-                st.session_state.pop('ticker_data_cache', None)
-                st.rerun()
+                tc1, tc2, tc3, tc4 = st.columns([0.5, 2.5, 0.5, 0.5])
+                with tc1:
+                    if st.button(fav_icon, key=f"fav_{t}",
+                                 help="Toggle favorite"):
+                        jm.toggle_favorite(t)
+                        st.rerun()
+                with tc2:
+                    st.caption(f"{'⭐ ' if is_fav else ''}{t}")
+                with tc3:
+                    if st.button("📈", key=f"chart_{t}",
+                                 help="Open chart"):
+                        st.session_state['default_detail_tab'] = 1  # Chart tab index
+                        _load_ticker_for_view(t)
+                with tc4:
+                    if st.button("🗑️", key=f"del_{t}",
+                                 help="Delete"):
+                        jm.delete_single_ticker(t)
+                        # Also remove from scan results
+                        if 'scan_results' in st.session_state:
+                            st.session_state['scan_results'] = [
+                                r for r in st.session_state['scan_results']
+                                if r.ticker != t
+                            ]
+                        if 'scan_results_summary' in st.session_state:
+                            st.session_state['scan_results_summary'] = [
+                                s for s in st.session_state['scan_results_summary']
+                                if s.get('ticker') != t
+                            ]
+                        st.rerun()
 
-        with wl_col3:
-            st.caption(f"{len(watchlist_tickers)} saved"
-                       + (f" • {len(summary)} scanned" if summary else ""))
+        # ── Bulk Editor (for pasting 200 tickers) ─────────────────────
+        with st.expander("📝 Bulk Edit (paste tickers)"):
+            st.caption("Paste tickers separated by commas, spaces, or new lines.")
+            default_text = ", ".join(watchlist_tickers) if watchlist_tickers else ""
+            new_text = st.text_area(
+                "Tickers",
+                value=default_text,
+                height=100 if len(watchlist_tickers) > 20 else 68,
+                label_visibility="collapsed",
+                key="watchlist_editor",
+            )
+
+            wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
+            with wl_col1:
+                if st.button("💾 Save", use_container_width=True, type="primary",
+                             key="wl_save"):
+                    import re
+                    raw = re.split(r'[,\s\n\t]+', new_text)
+                    tickers = [t.strip().upper() for t in raw if t.strip()]
+                    seen = set()
+                    unique = []
+                    for t in tickers:
+                        if t not in seen:
+                            seen.add(t)
+                            unique.append(t)
+                    jm.clear_watchlist()
+                    jm.set_watchlist_tickers(unique)
+                    st.success(f"✅ Saved {len(unique)} tickers")
+                    st.rerun()
+            with wl_col2:
+                if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
+                    jm.clear_watchlist()
+                    st.session_state.pop('scan_results', None)
+                    st.session_state.pop('scan_results_summary', None)
+                    st.session_state.pop('ticker_data_cache', None)
+                    st.rerun()
+            with wl_col3:
+                st.caption(f"{len(watchlist_tickers)} saved"
+                           + (f" | ⭐ {len(favorite_tickers)} favorites" if favorite_tickers else ""))
 
     # ══════════════════════════════════════════════════════════════════
     # SCAN RESULTS
@@ -512,6 +641,10 @@ def render_scanner_table():
     elif rec_filter == "⚡ Earnings Soon":
         filtered = [r for r in filtered if r.get('Earn', '')]
 
+    # Always sort favorites to top first
+    fav_tickers = set(jm.get_favorite_tickers())
+    filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1))
+
     # Apply sort
     if sort_by == "Conviction ↓":
         filtered.sort(key=lambda r: int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0, reverse=True)
@@ -533,21 +666,24 @@ def render_scanner_table():
         return
 
     # Table header
-    hdr_cols = st.columns([1.2, 1.0, 0.5, 0.9, 0.6, 0.5, 0.5, 0.5, 0.5, 0.7, 2.5])
-    headers = ['Ticker', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
+    hdr_cols = st.columns([1.0, 0.4, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
+    headers = ['Ticker', '📈', 'Rec', 'Conv', 'Sector', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
     # Table rows — each ticker is a button
     for idx, row in enumerate(filtered):
-        cols = st.columns([1.2, 1.0, 0.5, 0.9, 0.6, 0.5, 0.5, 0.5, 0.5, 0.7, 2.5])
+        cols = st.columns([1.0, 0.4, 1.0, 0.5, 0.9, 0.5, 0.5, 0.5, 0.5, 0.5, 0.7, 2.2])
 
         # Ticker as clickable button with earnings flag
         with cols[0]:
             ticker_label = row['Ticker']
             status = row.get('Status', '')
             earn = row.get('Earn', '')
-            if 'Open' in status:
+            is_fav = row['Ticker'] in fav_tickers
+            if is_fav:
+                ticker_label = f"⭐ {ticker_label}"
+            elif 'Open' in status:
                 ticker_label = f"📈 {ticker_label}"
             elif 'Alert' in status:
                 ticker_label = f"🎯 {ticker_label}"
@@ -556,6 +692,13 @@ def render_scanner_table():
 
             if st.button(ticker_label, key=f"row_{row['Ticker']}_{idx}",
                         use_container_width=True):
+                st.session_state['default_detail_tab'] = 0  # Signal tab
+                _load_ticker_for_view(row['Ticker'])
+
+        # Chart button — opens directly to chart tab
+        with cols[1]:
+            if st.button("📈", key=f"chart_row_{row['Ticker']}_{idx}"):
+                st.session_state['default_detail_tab'] = 1  # Chart tab
                 _load_ticker_for_view(row['Ticker'])
 
         # Recommendation with color
@@ -565,21 +708,21 @@ def render_scanner_table():
             'SKIP': '⚪', 'WAIT': '🟡',
         }
         rec_icon = rec_colors.get(rec_val, '⚪')
-        cols[1].caption(f"{rec_icon} {rec_val}")
-        cols[2].caption(row.get('Conv', '0/10'))
-        cols[3].caption(row.get('Sector', ''))
-        cols[4].caption(row.get('MACD', '❌'))
-        cols[5].caption(row.get('AO', '❌'))
-        cols[6].caption(row.get('Wkly', '❌'))
-        cols[7].caption(row.get('Mthly', '❌'))
+        cols[2].caption(f"{rec_icon} {rec_val}")
+        cols[3].caption(row.get('Conv', '0/10'))
+        cols[4].caption(row.get('Sector', ''))
+        cols[5].caption(row.get('MACD', '❌'))
+        cols[6].caption(row.get('AO', '❌'))
+        cols[7].caption(row.get('Wkly', '❌'))
+        cols[8].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[8].caption(f"{q_colors.get(q, '⚪')} {q}")
+        cols[9].caption(f"{q_colors.get(q, '⚪')} {q}")
 
-        cols[9].caption(row.get('Price', '?'))
-        cols[10].caption(row.get('Summary', '')[:60])
+        cols[10].caption(row.get('Price', '?'))
+        cols[11].caption(row.get('Summary', '')[:55])
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
@@ -784,10 +927,14 @@ def render_detail_view():
     st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
     st.caption(rec.get('summary', ''))
 
-    # ── Tabs ──────────────────────────────────────────────────────────
-    tab_signal, tab_chart, tab_ai, tab_trade = st.tabs([
-        "📊 Signal", "📈 Chart", "🤖 AI Intel", "💼 Trade"
-    ])
+    # ── Tabs (with optional default tab from chart-first navigation) ──
+    tab_names = ["📊 Signal", "📈 Chart", "🤖 AI Intel", "💼 Trade"]
+    default_tab = st.session_state.pop('default_detail_tab', 0)
+
+    # Streamlit tabs don't support programmatic selection directly,
+    # so we reorder tabs to put the desired one first, then reorder back
+    # Actually, we can't reorder. We use a workaround with session state key.
+    tab_signal, tab_chart, tab_ai, tab_trade = st.tabs(tab_names)
 
     # ── Signal Tab ────────────────────────────────────────────────────
     with tab_signal:
@@ -1948,10 +2095,11 @@ def _render_capital_overview(jm: JournalManager):
 
 def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     """
-    Two-mode position calculator:
-    1. Quick mode — enter $ amount → get shares
-    2. Full mode — risk-based sizing with stop/target
+    Institutional-grade position calculator using position_sizer.py.
+    Shows full audit trail of sizing decision.
     """
+    from position_sizer import calculate_position_size
+
     current_price = analysis.current_price or 0
     entry_default = float(stops.get('entry', current_price or 0))
     stop_default = float(stops.get('stop', 0))
@@ -1959,184 +2107,102 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     account_size = st.session_state.get('account_size', 100000.0)
     open_trades = jm.get_open_trades()
-    deployed = sum(float(t.get('position_size', 0)) for t in open_trades)
-    available = account_size - deployed
-    max_positions = 7  # APEX V4
 
-    st.subheader(f"📐 Position Calculator — {ticker}")
+    # Get performance context
+    win_rate = jm.get_recent_win_rate(last_n=20)
+    losing_streak = jm.get_current_losing_streak()
 
-    # ══════════════════════════════════════════════════════════════
-    # QUICK CALCULATOR — just enter $ amount
-    # ══════════════════════════════════════════════════════════════
-    st.markdown("**Quick Size** — enter the amount you want to invest:")
+    st.subheader(f"📐 Position Sizer — {ticker}")
 
-    qc1, qc2, qc3 = st.columns([2, 1, 1])
-    with qc1:
-        invest_amount = st.number_input(
-            "💵 Amount to Invest ($)",
-            value=min(float(int(account_size / max_positions)), available),
-            step=1000.0, format="%.0f",
-            key=f"quick_amt_{ticker}",
+    # ── Performance Context ───────────────────────────────────────────
+    if losing_streak >= 2:
+        st.warning(f"⚠️ On a {losing_streak}-trade losing streak — position sizes auto-reduced")
+    if win_rate < 0.4 and jm.get_trade_history(last_n=5):
+        st.warning(f"⚠️ Recent win rate: {win_rate:.0%} — consider reducing exposure")
+
+    # ── Input Row ─────────────────────────────────────────────────────
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        entry_price = st.number_input("Entry Price",
+                                       value=entry_default if entry_default > 0 else current_price,
+                                       step=0.01, format="%.2f",
+                                       key=f"sizer_entry_{ticker}")
+    with col2:
+        stop_price = st.number_input("Stop Loss",
+                                      value=stop_default,
+                                      step=0.01, format="%.2f",
+                                      key=f"sizer_stop_{ticker}")
+    with col3:
+        target_price = st.number_input("Target",
+                                        value=target_default,
+                                        step=0.01, format="%.2f",
+                                        key=f"sizer_target_{ticker}")
+    with col4:
+        max_risk = st.number_input("Max Risk %", value=1.5,
+                                    min_value=0.5, max_value=5.0, step=0.25, format="%.2f",
+                                    key=f"sizer_risk_{ticker}")
+
+    # ── Run Sizer ─────────────────────────────────────────────────────
+    if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
+        result = calculate_position_size(
+            ticker=ticker,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            account_size=account_size,
+            open_positions=open_trades,
+            recent_win_rate=win_rate,
+            current_losing_streak=losing_streak,
+            max_risk_pct=max_risk,
         )
-    with qc2:
-        buy_price = st.number_input(
-            "Buy Price ($)",
-            value=entry_default if entry_default > 0 else current_price,
-            step=0.01, format="%.2f",
-            key=f"quick_price_{ticker}",
-        )
-    with qc3:
-        if buy_price > 0:
-            quick_shares = int(invest_amount / buy_price)
-            actual_cost = quick_shares * buy_price
-            st.metric(
-                "Shares to Buy",
-                f"{quick_shares:,}",
-                f"${actual_cost:,.0f}",
-            )
-        else:
-            st.metric("Shares to Buy", "—", "Enter price")
 
-    # Quick validation
-    if buy_price > 0 and invest_amount > 0:
-        quick_shares = int(invest_amount / buy_price)
-        actual_cost = quick_shares * buy_price
-        pct_of_account = (actual_cost / account_size * 100) if account_size > 0 else 0
-        pct_of_available = (actual_cost / available * 100) if available > 0 else 999
+        # ── Results Display ───────────────────────────────────────────
+        st.markdown("---")
 
-        info_parts = [
-            f"**{quick_shares:,} shares** × ${buy_price:.2f} = **${actual_cost:,.0f}**",
-            f"({pct_of_account:.1f}% of account)",
-        ]
+        # Main recommendation
+        if result.recommended_shares > 0:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("✅ Recommended", f"{result.recommended_shares:,} shares",
+                      f"${result.position_cost:,.0f}")
+            r2.metric("💸 Risk", f"${result.risk_dollars:,.0f}",
+                      f"{result.risk_pct_of_equity:.1f}% of equity")
+            r3.metric("🔥 Heat", f"{result.portfolio_heat_before:.1f}% → {result.portfolio_heat_after:.1f}%",
+                      f"{'✅' if result.portfolio_heat_after < 8 else '⚠️'}")
+            if result.reward_risk_ratio > 0:
+                r4.metric("🎯 R:R", f"{result.reward_risk_ratio:.1f}:1",
+                          "Good ✅" if result.reward_risk_ratio >= 2 else "Low ⚠️")
+            else:
+                r4.metric("📊 Concentration", f"{result.concentration_pct:.1f}%",
+                          f"{'✅' if result.concentration_pct < 20 else '⚠️'}")
 
-        if actual_cost > available:
-            st.error(f"⚠️ Exceeds available capital! Need ${actual_cost:,.0f} but only ${available:,.0f} free")
-        elif pct_of_account > 15:
-            st.warning(f"{'  |  '.join(info_parts)}  —  ⚠️ Over 15% concentration")
-        else:
-            st.success(f"{'  |  '.join(info_parts)}")
+            # Show constraint breakdown
+            with st.expander("📊 Sizing Breakdown"):
+                st.caption(f"**Risk limit (1.5%):** {result.shares_from_risk:,} shares")
+                st.caption(f"**Heat limit (8%):** {result.shares_from_heat:,} shares")
+                st.caption(f"**Concentration (20%):** {result.shares_from_concentration:,} shares")
+                st.caption(f"**Available capital:** {result.shares_from_capital:,} shares")
+                st.caption(f"**Binding constraint:** {result.limiting_factor.replace('_', ' ').title()}")
 
-    # ══════════════════════════════════════════════════════════════
-    # FULL RISK-BASED CALCULATOR
-    # ══════════════════════════════════════════════════════════════
-    with st.expander("🎯 Full Risk-Based Calculator", expanded=False):
-        st.caption("Sizes position using your risk tolerance and stop distance")
+                if result.scale_factor < 1.0:
+                    st.warning(f"⚠️ Base size: {result.base_shares:,} shares → "
+                               f"Reduced to {result.recommended_shares:,} — {result.scale_reason}")
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            risk_per_trade = st.number_input(
-                "⚡ Max Risk per Trade (%)", value=2.0,
-                min_value=0.5, max_value=10.0, step=0.5, format="%.1f",
-                key=f"risk_pct_{ticker}",
-                help="Maximum portfolio % you're willing to lose on this trade"
-            )
-        with col_b:
-            max_position_pct = st.number_input(
-                "📊 Max Position Size (%)", value=12.5,
-                min_value=1.0, max_value=25.0, step=0.5, format="%.1f",
-                key=f"max_pos_{ticker}",
-                help="Maximum % of portfolio in one position (APEX V4 uses 12.5%)"
-            )
-        with col_c:
-            st.metric("Available Capital", f"${available:,.0f}",
-                      f"{len(open_trades)}/{max_positions} slots used")
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            entry_price = st.number_input("Entry Price",
-                                           value=entry_default,
-                                           step=0.01, format="%.2f",
-                                           key=f"entry_{ticker}")
-        with col2:
-            stop_price = st.number_input("Stop Loss",
-                                          value=stop_default,
-                                          step=0.01, format="%.2f",
-                                          key=f"stop_{ticker}")
-        with col3:
-            target_price = st.number_input("Target",
-                                            value=target_default,
-                                            step=0.01, format="%.2f",
-                                            key=f"target_{ticker}")
-
-        if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
-            risk_per_share = entry_price - stop_price
-            risk_pct_trade = risk_per_share / entry_price * 100
-
-            max_position_dollars = account_size * (max_position_pct / 100)
-            risk_budget = account_size * (risk_per_trade / 100)
-
-            shares_from_risk = int(risk_budget / risk_per_share)
-            shares_from_max = int(max_position_dollars / entry_price)
-            shares_from_capital = int(available / entry_price) if available > 0 else 0
-
-            # Most conservative
-            shares = min(shares_from_risk, shares_from_max, shares_from_capital)
-            position_cost = shares * entry_price
-            actual_risk_dollars = shares * risk_per_share
-            actual_risk_pct = actual_risk_dollars / account_size * 100
-
-            reward_per_share = target_price - entry_price if target_price > entry_price else 0
-            rr_ratio = reward_per_share / risk_per_share if risk_per_share > 0 else 0
-            potential_profit = shares * reward_per_share if reward_per_share > 0 else 0
-
-            st.markdown("---")
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.metric("Risk-Based", f"{shares_from_risk} shares",
-                          f"${shares_from_risk * entry_price:,.0f}")
-            with c2:
-                st.metric("Max Position", f"{shares_from_max} shares",
-                          f"${shares_from_max * entry_price:,.0f}")
-            with c3:
-                limiting = "risk" if shares == shares_from_risk else (
-                    "max position" if shares == shares_from_max else "available capital"
-                )
-                st.metric("✅ Final", f"{shares} shares",
-                          f"${position_cost:,.0f} — limited by {limiting}")
-
-            c4, c5, c6, c7 = st.columns(4)
-            with c4:
-                st.metric("💸 Risk", f"${actual_risk_dollars:,.0f}",
-                          f"{actual_risk_pct:.1f}% of account")
-            with c5:
-                st.metric("📉 Stop Distance", f"{risk_pct_trade:.1f}%",
-                          f"${risk_per_share:.2f}/share")
-            with c6:
-                if rr_ratio > 0:
-                    st.metric("🎯 R/R Ratio", f"{rr_ratio:.1f}:1",
-                              "Good ✅" if rr_ratio >= 2 else "Low ⚠️")
-                else:
-                    st.metric("🎯 R/R Ratio", "—", "Set target")
-            with c7:
-                if potential_profit > 0:
-                    st.metric("💰 Potential", f"${potential_profit:,.0f}",
-                              f"+{reward_per_share / entry_price * 100:.1f}%")
+                st.caption(f"Win rate (last 20): {win_rate:.0%} | Losing streak: {losing_streak}")
 
             # Warnings
-            warnings = []
-            if risk_pct_trade > 8:
-                warnings.append("🔴 Stop distance very wide — consider tighter stop")
-            elif risk_pct_trade > 5:
-                warnings.append("🟡 Stop distance wider than typical (3-5%)")
-            if rr_ratio > 0 and rr_ratio < 1.5:
-                warnings.append("🔴 R/R below 1.5:1 — not worth the risk")
-            elif rr_ratio > 0 and rr_ratio < 2.0:
-                warnings.append("🟡 R/R below ideal 2:1")
-            if actual_risk_pct > 3:
-                warnings.append("🔴 Portfolio risk exceeds 3% — reduce position")
-            if rec.get('conviction', 0) < 5:
-                warnings.append(f"🟡 Low conviction ({rec.get('conviction', 0)}/10)")
-            if shares_from_capital < shares_from_risk:
-                warnings.append("🟡 Position limited by available capital, not risk parameters")
-
-            for w in warnings:
+            for w in result.warnings:
                 st.warning(w)
-            if not warnings:
+            if not result.warnings:
                 st.success("✅ Position sizing within all risk parameters")
 
-        elif entry_price > 0 and stop_price > 0 and stop_price >= entry_price:
-            st.error("Stop price must be below entry price")
+            # Store for trade entry
+            st.session_state[f'sizer_result_{ticker}'] = result.recommended_shares
+
+        else:
+            st.error(result.explanation)
+
+    elif entry_price > 0 and stop_price > 0 and stop_price >= entry_price:
+        st.error("Stop price must be below entry price")
 
     # ══════════════════════════════════════════════════════════════
     # ENTER TRADE
@@ -2144,11 +2210,11 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     st.divider()
     st.markdown("### ✅ Enter Trade")
 
-    # Determine shares — use quick calculator values as defaults
-    final_price = buy_price if buy_price > 0 else entry_default
-    final_shares = int(invest_amount / final_price) if (final_price > 0 and invest_amount > 0) else 0
-    final_stop = stop_default
-    final_target = target_default
+    # Use sizer recommendation as default
+    sizer_shares = st.session_state.get(f'sizer_result_{ticker}', 0)
+    final_shares = sizer_shares if sizer_shares > 0 else (
+        int(account_size * 0.125 / entry_price) if entry_price > 0 else 0
+    )
 
     ec1, ec2, ec3, ec4 = st.columns(4)
     with ec1:
@@ -2156,15 +2222,15 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                                           min_value=0, step=1,
                                           key=f"confirm_shares_{ticker}")
     with ec2:
-        confirm_entry = st.number_input("Entry $", value=float(final_price),
+        confirm_entry = st.number_input("Entry $", value=float(entry_price) if entry_price > 0 else float(entry_default),
                                          step=0.01, format="%.2f",
                                          key=f"confirm_entry_{ticker}")
     with ec3:
-        confirm_stop = st.number_input("Stop $", value=float(final_stop),
+        confirm_stop = st.number_input("Stop $", value=float(stop_default),
                                         step=0.01, format="%.2f",
                                         key=f"confirm_stop_{ticker}")
     with ec4:
-        confirm_target = st.number_input("Target $", value=float(final_target),
+        confirm_target = st.number_input("Target $", value=float(target_default),
                                           step=0.01, format="%.2f",
                                           key=f"confirm_target_{ticker}")
 
@@ -2483,6 +2549,206 @@ def render_performance():
 
 
 # =============================================================================
+# POSITION MANAGER — Exit Advisor Tab
+# =============================================================================
+
+def render_position_manager():
+    """Position Manager: AI-driven exit analysis for all open positions."""
+    jm = get_journal()
+    open_trades = jm.get_open_trades()
+
+    st.subheader(f"🏦 Position Manager ({len(open_trades)} open)")
+
+    if not open_trades:
+        st.info("No open positions. Enter trades from the Trade tab to use the Position Manager.")
+        return
+
+    # ── Portfolio Summary ─────────────────────────────────────────────
+    from data_fetcher import fetch_current_price
+
+    total_deployed = 0
+    total_unrealized = 0
+    position_rows = []
+
+    for trade in open_trades:
+        ticker = trade['ticker']
+        entry = float(trade.get('entry_price', 0))
+        shares = float(trade.get('shares', 0))
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+        current = fetch_current_price(ticker) or entry
+
+        pos_size = shares * entry
+        total_deployed += pos_size
+        pnl = (current - entry) * shares
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        total_unrealized += pnl
+
+        # Days held
+        days_held = 0
+        entry_date = trade.get('entry_date', '')
+        if entry_date:
+            try:
+                days_held = (datetime.now() - datetime.strptime(entry_date, '%Y-%m-%d')).days
+            except Exception:
+                pass
+
+        # Get last AI advice if available
+        last_advice = st.session_state.get(f'exit_advice_{ticker}', {})
+
+        position_rows.append({
+            'ticker': ticker,
+            'entry': entry,
+            'current': current,
+            'shares': shares,
+            'stop': stop,
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'days_held': days_held,
+            'pos_size': pos_size,
+            'advice': last_advice,
+        })
+
+    # Summary metrics
+    account_size = st.session_state.get('account_size', 100000.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Deployed", f"${total_deployed:,.0f}",
+              f"{total_deployed / account_size * 100:.0f}% of account")
+    c2.metric("Unrealized P&L", f"${total_unrealized:+,.0f}",
+              f"{total_unrealized / total_deployed * 100:+.1f}%" if total_deployed > 0 else "")
+    c3.metric("Positions", f"{len(open_trades)}")
+
+    # Portfolio heat
+    risk_summary = jm.get_portfolio_risk_summary()
+    heat_pct = (risk_summary['total_risk_dollars'] / account_size * 100) if account_size > 0 else 0
+    heat_color = "normal" if heat_pct < 6 else ("off" if heat_pct < 8 else "inverse")
+    c4.metric("Portfolio Heat", f"{heat_pct:.1f}%",
+              f"${risk_summary['total_risk_dollars']:,.0f} at risk",
+              delta_color=heat_color)
+
+    st.divider()
+
+    # ── Position Table with AI Advice ─────────────────────────────────
+    for pos in position_rows:
+        ticker = pos['ticker']
+        pnl_icon = "🟢" if pos['pnl'] >= 0 else "🔴"
+        advice = pos.get('advice', {})
+        action = advice.get('action', '')
+
+        action_icons = {
+            'HOLD': '🟢 HOLD', 'TAKE_PARTIAL': '🟡 TAKE PARTIAL',
+            'CLOSE': '🔴 CLOSE', 'TIGHTEN_STOP': '🔵 TIGHTEN STOP',
+        }
+        action_display = action_icons.get(action, '⚪ Not analyzed')
+
+        pc1, pc2, pc3, pc4, pc5, pc6 = st.columns([1.2, 1, 1, 1, 1.5, 1.5])
+        pc1.markdown(f"**{pnl_icon} {ticker}**")
+        pc2.caption(f"${pos['current']:.2f} ({pos['pnl_pct']:+.1f}%)")
+        pc3.caption(f"${pos['pnl']:+,.0f}")
+        pc4.caption(f"{pos['days_held']}d | Stop: ${pos['stop']:.2f}")
+        pc5.markdown(f"**{action_display}**")
+
+        with pc6:
+            if st.button("📈 Chart", key=f"pm_chart_{ticker}"):
+                st.session_state['default_detail_tab'] = 1
+                _load_ticker_for_view(ticker)
+
+        # Show advice details if available
+        if advice.get('reasoning'):
+            with st.expander(f"💡 {ticker} — {advice.get('reasoning', '')[:80]}"):
+                st.caption(f"**Reasoning:** {advice.get('reasoning', '')}")
+                st.caption(f"**Confidence:** {advice.get('confidence', 0)}/10 | Provider: {advice.get('provider', '')}")
+                if advice.get('risk_note'):
+                    st.caption(f"**Risk:** {advice.get('risk_note', '')}")
+                if action == 'TIGHTEN_STOP' and advice.get('suggested_stop', 0) > 0:
+                    st.caption(f"**Suggested Stop:** ${advice['suggested_stop']:.2f}")
+                if action == 'TAKE_PARTIAL' and advice.get('partial_pct', 0) > 0:
+                    st.caption(f"**Sell:** {advice['partial_pct']}% of position")
+
+    # ── Analyze All Button ────────────────────────────────────────────
+    st.divider()
+    an_col1, an_col2, an_col3 = st.columns([1, 1, 2])
+
+    with an_col1:
+        if st.button("🤖 Analyze All Positions", type="primary", use_container_width=True):
+            _run_exit_analysis(open_trades)
+
+    with an_col2:
+        if st.button("📧 Analyze + Email Report", use_container_width=True):
+            _run_exit_analysis(open_trades, send_email=True)
+
+    with an_col3:
+        st.caption("AI will analyze each position and recommend: HOLD, TAKE PARTIAL, CLOSE, or TIGHTEN STOP")
+
+    # ── Audit Log ─────────────────────────────────────────────────────
+    with st.expander("📋 Audit Log (last 20 analyses)"):
+        try:
+            from exit_advisor import get_audit_history
+            history = get_audit_history(last_n=20)
+            if history:
+                for h in history:
+                    action_icon = {'HOLD': '🟢', 'TAKE_PARTIAL': '🟡',
+                                   'CLOSE': '🔴', 'TIGHTEN_STOP': '🔵'}.get(h.get('action', ''), '⚪')
+                    st.caption(
+                        f"{h.get('analyzed_at', '')[:16]} | {action_icon} {h.get('ticker', '')} "
+                        f"→ {h.get('action', '')} ({h.get('confidence', 0)}/10) "
+                        f"| P&L: {h.get('unrealized_pnl_pct', 0):+.1f}% | {h.get('provider', '')}"
+                    )
+            else:
+                st.caption("No audit history yet.")
+        except Exception:
+            st.caption("Audit log unavailable.")
+
+
+def _run_exit_analysis(open_trades: List, send_email: bool = False):
+    """Execute exit analysis for all open positions."""
+    with st.spinner(f"Analyzing {len(open_trades)} positions..."):
+        try:
+            from exit_advisor import analyze_all_positions, save_audit_batch, send_email_report
+            from data_fetcher import fetch_current_price, fetch_signal_for_exit
+
+            gemini_model = st.session_state.get('gemini_model')
+            openai_client = st.session_state.get('openai_client')
+
+            advices = analyze_all_positions(
+                open_trades,
+                fetch_price_fn=fetch_current_price,
+                fetch_signal_fn=fetch_signal_for_exit,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+            )
+
+            # Store results in session state for display
+            for advice in advices:
+                st.session_state[f'exit_advice_{advice.ticker}'] = advice.to_dict()
+
+            # Save to audit log
+            save_audit_batch(advices)
+
+            # Send email if requested
+            if send_email:
+                import os
+                smtp_email = os.environ.get('SMTP_EMAIL', '')
+                smtp_password = os.environ.get('SMTP_PASSWORD', '')
+                recipient = os.environ.get('ALERT_EMAIL', smtp_email)
+
+                if smtp_email and smtp_password:
+                    sent = send_email_report(advices, smtp_email, smtp_password, recipient)
+                    if sent:
+                        st.success(f"✅ Analyzed {len(advices)} positions + email sent to {recipient}")
+                    else:
+                        st.warning(f"✅ Analyzed {len(advices)} positions but email failed")
+                else:
+                    st.warning("Email not configured. Set SMTP_EMAIL, SMTP_PASSWORD, ALERT_EMAIL in Streamlit secrets.")
+            else:
+                st.success(f"✅ Analyzed {len(advices)} positions")
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Exit analysis error: {e}")
+
+
+# =============================================================================
 # APP MAIN
 # =============================================================================
 
@@ -2490,7 +2756,9 @@ def main():
     render_sidebar()
 
     # Main content area
-    tab_scanner, tab_perf = st.tabs(["🔍 Scanner", "📊 Performance"])
+    tab_scanner, tab_positions, tab_perf = st.tabs([
+        "🔍 Scanner", "🏦 Position Manager", "📊 Performance"
+    ])
 
     with tab_scanner:
         render_scanner_table()
@@ -2498,6 +2766,9 @@ def main():
         if st.session_state.get('selected_analysis'):
             st.divider()
             render_detail_view()
+
+    with tab_positions:
+        render_position_manager()
 
     with tab_perf:
         render_performance()
