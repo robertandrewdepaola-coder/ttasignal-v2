@@ -762,6 +762,17 @@ class TickerAnalysis:
     # Current price
     current_price: float = None
 
+    # AO divergence (bearish warning)
+    ao_divergence_active: bool = False
+
+    # Volume data
+    volume: float = 0
+    avg_volume_50d: float = 0
+    volume_ratio: float = 0  # today_vol / avg_50d
+
+    # Apex signal
+    apex_buy: bool = False
+
     # Error
     error: str = None
 
@@ -776,6 +787,11 @@ class TickerAnalysis:
             'late_entry': self.late_entry,
             'quality': self.quality,
             'recommendation': self.recommendation,
+            'ao_divergence_active': self.ao_divergence_active,
+            'volume': self.volume,
+            'avg_volume_50d': self.avg_volume_50d,
+            'volume_ratio': self.volume_ratio,
+            'apex_buy': self.apex_buy,
             'error': self.error,
         }
 
@@ -855,6 +871,51 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
     backtest_weekly = ticker_data.get('weekly')  # Already 2y
     result.quality = calculate_quality_score(backtest_daily, backtest_weekly, ticker=ticker)
 
+    # --- AO Bearish Divergence Detection ---
+    try:
+        from signal_engine import detect_bearish_divergence
+        div_df = detect_bearish_divergence(daily)
+        if div_df is not None and 'bearish_div_active' in div_df.columns:
+            # Check if divergence is currently active (last bar)
+            result.ao_divergence_active = bool(div_df['bearish_div_active'].iloc[-1])
+    except Exception:
+        pass
+
+    # --- Volume Data ---
+    try:
+        if daily is not None and len(daily) > 50 and 'Volume' in daily.columns:
+            result.volume = float(daily['Volume'].iloc[-1])
+            result.avg_volume_50d = float(daily['Volume'].tail(50).mean())
+            if result.avg_volume_50d > 0:
+                result.volume_ratio = round(result.volume / result.avg_volume_50d, 2)
+    except Exception:
+        pass
+
+    # --- Apex Buy Signal Detection ---
+    try:
+        from apex_signals import detect_apex_signals
+        if weekly is not None and monthly is not None:
+            spy = ticker_data.get('spy_daily')
+            apex = detect_apex_signals(daily, weekly, monthly, spy_daily=spy)
+            if apex and apex.get('signals'):
+                # Check if most recent signal is a buy and within last 5 bars
+                last_sig = apex['signals'][-1] if apex['signals'] else None
+                if last_sig and last_sig.get('type') == 'buy':
+                    signal_date = last_sig.get('date')
+                    if signal_date and len(daily) > 0:
+                        last_date = daily.index[-1]
+                        # Within last 5 trading days
+                        if hasattr(signal_date, 'date'):
+                            signal_date = signal_date
+                        try:
+                            days_ago = (last_date - signal_date).days
+                            if days_ago <= 7:  # 7 calendar days ~ 5 trading days
+                                result.apex_buy = True
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
     # --- Recommendation ---
     result.recommendation = generate_recommendation(
         signal=signal,
@@ -863,6 +924,18 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
         reentry=result.reentry,
         late_entry=result.late_entry,
     )
+
+    # --- AO Divergence Downgrade ---
+    # If bearish divergence is active, downgrade BUY-type signals
+    if result.ao_divergence_active:
+        rec = result.recommendation
+        original_rec = rec.get('recommendation', '')
+        if original_rec in ('STRONG BUY', 'BUY', 'BUY (AO)'):
+            rec['recommendation'] = 'WAIT (D)'
+            rec['summary'] = f"⚠️ {rec.get('summary', '')} — AO divergence active"
+            rec['conviction'] = max(1, rec.get('conviction', 0) - 2)
+            rec['ao_divergence_downgrade'] = True
+            rec['original_recommendation'] = original_rec
 
     return result
 
