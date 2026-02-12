@@ -2002,20 +2002,32 @@ def _render_market_intelligence(intel: Dict):
         social = intel.get('social_score')
         reddit = intel.get('social_reddit_mentions')
         twitter = intel.get('social_twitter_mentions')
+        social_source = intel.get('social_source', '')
+        social_error = intel.get('social_error', '')
+        vol_surge = intel.get('volume_surge_ratio')
 
         if social:
-            s_map = {'High buzz': ('success', '🔥'), 'Moderate': ('info', '📊'), 'Low': ('warning', '😴')}
+            s_map = {
+                'High buzz': ('success', '🔥'), 'Moderate': ('info', '📊'), 'Low': ('warning', '😴'),
+                'High volume surge': ('success', '🔥'), 'Elevated volume': ('info', '📈'),
+                'Above avg volume': ('info', '📊'), 'Normal volume': ('warning', '😴'),
+            }
             method, icon = s_map.get(social, ('info', '📊'))
-            getattr(st, method)(f"{icon} **Social: {social}**")
+            getattr(st, method)(f"{icon} **{social}**")
+
             parts = []
             if reddit is not None:
                 parts.append(f"Reddit: {reddit}")
             if twitter is not None:
                 parts.append(f"Twitter: {twitter}")
+            if vol_surge is not None and social_source == 'volume_proxy':
+                parts.append(f"Vol ratio: {vol_surge:.1f}x avg")
             if parts:
-                st.caption(f"7-day mentions — {' | '.join(parts)}")
+                source_label = "7-day mentions" if social_source != 'volume_proxy' else "5-day vs 50-day avg"
+                st.caption(f"{source_label} — {' | '.join(parts)}")
         else:
-            st.caption("Social sentiment not available (needs Finnhub)")
+            error_msg = social_error or "Social data not available"
+            st.caption(f"📊 {error_msg}")
 
 
 def _render_tv_confirmation(tv_data: Dict):
@@ -3162,6 +3174,8 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
 def main():
     render_sidebar()
 
+    jm = get_journal()
+
     # Main content area — added Alerts tab
     conditionals = jm.get_pending_conditionals()
     alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
@@ -3207,6 +3221,7 @@ def main():
 def _render_alerts_panel():
     """Dedicated alerts panel — moved from sidebar."""
     from data_fetcher import fetch_current_price
+    jm = get_journal()
 
     conditionals = jm.get_pending_conditionals()
     if not conditionals:
