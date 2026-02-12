@@ -1066,3 +1066,196 @@ def analyze(ticker: str,
     result['market_intel'] = market_intel
 
     return result
+
+
+# =============================================================================
+# MORNING BRIEFING — Market Narrative Generator
+# =============================================================================
+
+def generate_market_narrative(macro_data: Dict,
+                              gemini_model=None,
+                              openai_client=None) -> Dict[str, Any]:
+    """
+    Generate a concise market narrative from macro data.
+
+    Returns: {narrative: str, regime: str, provider: str, success: bool}
+    """
+    result = {
+        'narrative': '',
+        'regime': '',
+        'provider': None,
+        'success': False,
+        'error': None,
+    }
+
+    # Build prompt from macro data
+    prompt = _build_narrative_prompt(macro_data)
+
+    # Call AI
+    narrative_text = None
+
+    if openai_client is not None:
+        try:
+            response = openai_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system",
+                     "content": "You are a senior macro strategist giving a morning briefing to a swing trader."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=300,
+                temperature=0.5
+            )
+            narrative_text = response.choices[0].message.content
+            result['provider'] = 'groq'
+        except Exception as e:
+            result['groq_error'] = str(e)[:200]
+
+    if narrative_text is None and gemini_model is not None:
+        try:
+            response = gemini_model.generate_content(prompt)
+            narrative_text = response.text
+            result['provider'] = 'gemini'
+        except Exception as e:
+            result['gemini_error'] = str(e)[:200]
+
+    if narrative_text:
+        result['narrative'] = narrative_text.strip()
+        result['success'] = True
+
+        # Extract regime from text
+        for regime in ['Risk-On', 'Risk-Off', 'Caution', 'Rotation to Safety',
+                       'Balanced', 'Bullish', 'Bearish', 'Neutral']:
+            if regime.lower() in narrative_text.lower():
+                result['regime'] = regime
+                break
+        if not result['regime']:
+            result['regime'] = 'Neutral'
+    else:
+        result['narrative'] = _generate_system_narrative(macro_data)
+        result['regime'] = _infer_regime(macro_data)
+        result['provider'] = 'system'
+        result['success'] = True
+
+    return result
+
+
+def _build_narrative_prompt(data: Dict) -> str:
+    """Build the prompt for narrative generation."""
+    parts = ["DAILY MARKET DATA (generate a morning briefing):\n"]
+
+    # Indices
+    indices = data.get('indices', {})
+    if indices:
+        parts.append("MAJOR INDICES (20-day performance):")
+        for name, info in indices.items():
+            price = info.get('price', '?')
+            d1 = info.get('1d', '?')
+            d5 = info.get('5d', '?')
+            d20 = info.get('20d', '?')
+            parts.append(f"  {name}: ${price} | 1d: {d1:+.1f}% | 5d: {d5:+.1f}% | 20d: {d20:+.1f}%")
+
+    # Breadth
+    breadth = data.get('breadth', {})
+    if breadth:
+        parts.append(f"\nBREADTH: RSP 20d: {breadth.get('rsp_20d', '?')}% vs SPY 20d: {breadth.get('spy_20d', '?')}%")
+        parts.append(f"  Spread: {breadth.get('spread', '?')}% → {breadth.get('regime', '?')}")
+
+    # VIX
+    vix = data.get('vix', {})
+    if vix:
+        parts.append(f"\nVOLATILITY: VIX {vix.get('level', '?')} (5d change: {vix.get('change_5d', '?'):+.1f})")
+        parts.append(f"  Regime: {vix.get('regime', '?')}")
+
+    # Sectors
+    sectors = data.get('sectors', {})
+    if sectors:
+        parts.append(f"\nSECTOR ROTATION: Offensive avg 20d: {sectors.get('offensive_avg_20d', '?')}% | "
+                     f"Defensive avg 20d: {sectors.get('defensive_avg_20d', '?')}%")
+        parts.append(f"  Spread: {sectors.get('spread', '?')}% → {sectors.get('regime', '?')}")
+
+    # Macro
+    macro = data.get('macro', {})
+    if macro:
+        parts.append("\nMACRO:")
+        for name, info in macro.items():
+            price = info.get('price', '?')
+            d20 = info.get('20d', '?')
+            parts.append(f"  {name}: ${price} (20d: {d20:+.1f}%)")
+
+    parts.append("""
+TASK: Write a concise 100-word morning briefing paragraph for a swing trader.
+- Describe the current market regime (Risk-On, Risk-Off, Caution, Rotation, etc.)
+- Highlight which sectors are leading/lagging
+- Note any divergences (e.g. narrow breadth, VIX rising while market up)
+- End with ONE sentence starting with "Net Read:" summarizing the trading bias
+- Be direct and actionable, not academic
+""")
+
+    return "\n".join(parts)
+
+
+def _generate_system_narrative(data: Dict) -> str:
+    """Fallback narrative when AI is unavailable."""
+    parts = []
+
+    indices = data.get('indices', {})
+    spy = indices.get('S&P 500', {})
+    if spy:
+        direction = "higher" if spy.get('20d', 0) > 0 else "lower"
+        parts.append(f"S&P 500 trending {direction} over 20 days ({spy.get('20d', 0):+.1f}%).")
+
+    vix = data.get('vix', {})
+    if vix:
+        parts.append(f"VIX at {vix.get('level', '?')} ({vix.get('regime', 'unknown')}).")
+
+    sectors = data.get('sectors', {})
+    if sectors:
+        parts.append(f"Sector rotation: {sectors.get('regime', 'Balanced')}.")
+
+    breadth = data.get('breadth', {})
+    if breadth:
+        parts.append(f"Breadth: {breadth.get('regime', 'Neutral')}.")
+
+    regime = _infer_regime(data)
+    parts.append(f"Net Read: Market posture is {regime} — size positions accordingly.")
+
+    return " ".join(parts)
+
+
+def _infer_regime(data: Dict) -> str:
+    """Infer market regime from data without AI."""
+    score = 0
+
+    indices = data.get('indices', {})
+    spy = indices.get('S&P 500', {})
+    if spy.get('20d', 0) > 3:
+        score += 2
+    elif spy.get('20d', 0) > 0:
+        score += 1
+    elif spy.get('20d', 0) < -3:
+        score -= 2
+    else:
+        score -= 1
+
+    vix = data.get('vix', {})
+    if vix.get('level', 20) < 15:
+        score += 1
+    elif vix.get('level', 20) > 25:
+        score -= 2
+
+    sectors = data.get('sectors', {})
+    if sectors.get('regime') == 'Risk-On':
+        score += 1
+    elif sectors.get('regime') == 'Risk-Off':
+        score -= 1
+
+    if score >= 3:
+        return 'Risk-On'
+    elif score >= 1:
+        return 'Cautiously Bullish'
+    elif score <= -3:
+        return 'Risk-Off'
+    elif score <= -1:
+        return 'Caution'
+    return 'Neutral'
