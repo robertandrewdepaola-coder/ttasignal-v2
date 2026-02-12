@@ -83,6 +83,7 @@ class WatchlistItem:
     entry_zone_high: float = 0
     stop_price: float = 0
     notes: str = ''
+    is_favorite: bool = False
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -230,6 +231,33 @@ class JournalManager:
                 self.watchlist.append(item.to_dict())
                 existing.add(t)
         self._save(self.watchlist_file, self.watchlist)
+
+    def toggle_favorite(self, ticker: str) -> bool:
+        """Toggle is_favorite for a ticker. Returns new favorite state."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                current = w.get('is_favorite', False)
+                w['is_favorite'] = not current
+                self._save(self.watchlist_file, self.watchlist)
+                return w['is_favorite']
+        return False
+
+    def is_favorite(self, ticker: str) -> bool:
+        """Check if a ticker is favorited."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                return w.get('is_favorite', False)
+        return False
+
+    def get_favorite_tickers(self) -> List[str]:
+        """Get list of favorited tickers."""
+        return [w['ticker'] for w in self.watchlist if w.get('is_favorite', False)]
+
+    def delete_single_ticker(self, ticker: str) -> str:
+        """Delete a single ticker from watchlist with immediate persistence."""
+        return self.remove_from_watchlist(ticker)
 
     # ── Trade Entry ───────────────────────────────────────────────────
 
@@ -534,6 +562,57 @@ class JournalManager:
         }
 
     # ── Sector Exposure ───────────────────────────────────────────────
+
+    def get_recent_win_rate(self, last_n: int = 20) -> float:
+        """Win rate over last N closed trades. Returns 0-1."""
+        trades = self.get_trade_history(last_n=last_n)
+        if not trades:
+            return 0.5  # Default when no history
+        wins = sum(1 for t in trades if t.get('realized_pnl_pct', 0) > 0)
+        return round(wins / len(trades), 2)
+
+    def get_current_losing_streak(self) -> int:
+        """Count consecutive losses from most recent trade backwards."""
+        trades = self.get_trade_history()
+        streak = 0
+        for t in trades:
+            if t.get('realized_pnl_pct', 0) <= 0:
+                streak += 1
+            else:
+                break
+        return streak
+
+    def get_portfolio_risk_summary(self) -> Dict:
+        """
+        Get risk metrics for all open positions.
+        Returns: {total_risk_dollars, total_risk_pct, positions: [{ticker, risk}]}
+        """
+        open_trades = self.get_open_trades()
+        positions = []
+        total_risk = 0
+
+        for trade in open_trades:
+            entry = float(trade.get('entry_price', 0))
+            stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+            shares = float(trade.get('shares', 0))
+
+            risk = 0
+            if entry > 0 and stop > 0 and shares > 0:
+                risk = shares * (entry - stop)
+
+            total_risk += max(0, risk)
+            positions.append({
+                'ticker': trade['ticker'],
+                'risk_dollars': round(max(0, risk), 2),
+                'entry': entry,
+                'stop': stop,
+                'shares': shares,
+            })
+
+        return {
+            'total_risk_dollars': round(total_risk, 2),
+            'positions': positions,
+        }
 
     def get_sector_exposure(self, ticker_sectors: Dict[str, str]) -> Dict[str, int]:
         """
