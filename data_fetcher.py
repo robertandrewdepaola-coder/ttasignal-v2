@@ -472,8 +472,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     Returns dict keyed by ticker:
         {ticker: {next_earnings: date_str, days_until: int, within_window: bool}}
 
-    Uses ThreadPoolExecutor to fetch in parallel (10 workers) instead of
-    sequential calls that would take 200+ seconds for 200 tickers.
+    Uses ThreadPoolExecutor with 5 workers to balance speed vs rate-limiting.
+    Three strategies per ticker: info dict → calendar → earnings_dates.
     """
     cache_key = "BATCH_EARNINGS_FLAGS"
     cached = _cache.get(cache_key)
@@ -485,35 +485,66 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     today = datetime.now().date()
 
     def _fetch_one_earnings(ticker: str):
-        """Fetch earnings date for a single ticker. Returns (ticker, result_dict) or (ticker, None)."""
+        """Fetch earnings date for a single ticker with 3 fallback strategies."""
         try:
             stock = yf.Ticker(ticker)
             earn_dt = None
 
-            # Strategy 1: calendar (fast path)
+            # Strategy 1: info dict (often has earningsTimestamp — fast, same API call)
             try:
-                cal = stock.calendar
-                if cal is not None:
-                    raw_date = None
-                    if isinstance(cal, dict):
-                        raw_date = cal.get('Earnings Date')
-                        if isinstance(raw_date, list) and raw_date:
-                            raw_date = raw_date[0]
-                    elif isinstance(cal, pd.DataFrame) and not cal.empty:
-                        try:
-                            raw_date = cal.iloc[0].get('Earnings Date')
-                        except Exception:
-                            pass
-
-                    if raw_date is not None:
-                        if hasattr(raw_date, 'date') and callable(getattr(raw_date, 'date', None)):
-                            earn_dt = raw_date.date()
-                        elif isinstance(raw_date, str) and len(raw_date) >= 10:
-                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                info = stock.info
+                if info:
+                    # Try multiple possible keys
+                    for key in ('earningsTimestamp', 'earningsTimestampStart', 'mostRecentQuarter'):
+                        ts = info.get(key)
+                        if ts and isinstance(ts, (int, float)) and ts > 0:
+                            from datetime import timezone
+                            candidate = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                            # earningsTimestamp is usually future; mostRecentQuarter is past
+                            if key == 'mostRecentQuarter':
+                                continue  # Skip past dates from this key
+                            if (candidate - today).days >= -7:
+                                earn_dt = candidate
+                                break
+                    # Also check string date format
+                    if earn_dt is None:
+                        for key in ('earningsDate',):
+                            val = info.get(key)
+                            if val:
+                                if isinstance(val, list) and val:
+                                    val = val[0]
+                                if hasattr(val, 'date') and callable(getattr(val, 'date', None)):
+                                    candidate = val.date()
+                                    if (candidate - today).days >= -7:
+                                        earn_dt = candidate
             except Exception:
                 pass
 
-            # Strategy 2: earnings_dates (fallback)
+            # Strategy 2: calendar property
+            if earn_dt is None:
+                try:
+                    cal = stock.calendar
+                    if cal is not None:
+                        raw_date = None
+                        if isinstance(cal, dict):
+                            raw_date = cal.get('Earnings Date')
+                            if isinstance(raw_date, list) and raw_date:
+                                raw_date = raw_date[0]
+                        elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                            try:
+                                raw_date = cal.iloc[0].get('Earnings Date')
+                            except Exception:
+                                pass
+
+                        if raw_date is not None:
+                            if hasattr(raw_date, 'date') and callable(getattr(raw_date, 'date', None)):
+                                earn_dt = raw_date.date()
+                            elif isinstance(raw_date, str) and len(raw_date) >= 10:
+                                earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                except Exception:
+                    pass
+
+            # Strategy 3: earnings_dates (most reliable but slowest)
             if earn_dt is None:
                 try:
                     edates = stock.earnings_dates
@@ -546,22 +577,24 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
             pass
         return (ticker, None)
 
-    # Run in parallel — 10 workers, 3s timeout per ticker
+    # Run in parallel — 5 workers (gentle on yfinance rate limiter), 8s per ticker
     flags = {}
     try:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(_fetch_one_earnings, t): t for t in tickers}
-            for future in as_completed(futures, timeout=45):
+            for future in as_completed(futures, timeout=90):
                 try:
-                    ticker, result = future.result(timeout=3)
+                    ticker, result = future.result(timeout=8)
                     if result:
                         flags[ticker] = result
                 except Exception:
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[data_fetcher] Batch earnings error: {e}")
 
-    _cache.set(cache_key, flags)
+    # Only cache if we got meaningful results (don't cache empty on failure)
+    if flags:
+        _cache.set(cache_key, flags)
     return flags
 
 
