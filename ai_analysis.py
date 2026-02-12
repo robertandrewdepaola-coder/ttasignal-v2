@@ -1259,3 +1259,324 @@ def _infer_regime(data: Dict) -> str:
     elif score <= -1:
         return 'Caution'
     return 'Neutral'
+
+
+# =============================================================================
+# DEEP MARKET STRUCTURE ANALYSIS — "Juan's Market Filter" style
+# =============================================================================
+
+def generate_deep_market_analysis(macro_data: Dict,
+                                   market_filter: Dict = None,
+                                   sector_rotation: Dict = None,
+                                   gemini_model=None,
+                                   openai_client=None) -> Dict[str, Any]:
+    """
+    Generate a deep, interpretive market structure analysis.
+    
+    Unlike the morning briefing (factual summary), this provides:
+    - WHY markets are moving
+    - Institutional flow interpretation
+    - Sector leadership/laggard dynamics
+    - Actionable stock selection guidance
+    - Juan Maldonado-style 5-factor scoring
+    
+    Returns: {analysis: str, score: int, score_label: str, factors: dict,
+              provider: str, success: bool}
+    """
+    result = {
+        'analysis': '',
+        'score': 0,
+        'score_label': '',
+        'factors': {},
+        'provider': None,
+        'success': False,
+        'error': None,
+    }
+
+    prompt = _build_deep_analysis_prompt(macro_data, market_filter, sector_rotation)
+
+    raw_text = None
+
+    # Try Groq first
+    if openai_client is not None:
+        try:
+            response = openai_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system",
+                     "content": (
+                         "You are an elite institutional macro strategist who interprets market structure, "
+                         "institutional flows, and inter-market relationships. You think like a hedge fund "
+                         "portfolio manager explaining the WHY behind market moves. You score the market "
+                         "environment on a -5 to +5 scale like Juan Maldonado's 5-Factor Institutional Flow model. "
+                         "Be direct, opinionated, and actionable. No hedging language."
+                     )},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.6
+            )
+            raw_text = response.choices[0].message.content
+            result['provider'] = 'groq'
+        except Exception as e:
+            result['groq_error'] = str(e)[:200]
+
+    # Gemini fallback
+    if raw_text is None and gemini_model is not None:
+        try:
+            response = gemini_model.generate_content(prompt)
+            raw_text = response.text
+            result['provider'] = 'gemini'
+        except Exception:
+            pass
+
+    if raw_text:
+        result['analysis'] = raw_text.strip()
+        result['success'] = True
+        # Parse structured fields
+        parsed = _parse_deep_analysis(raw_text)
+        result.update(parsed)
+    else:
+        # System fallback
+        result.update(_generate_system_deep_analysis(macro_data, market_filter))
+        result['provider'] = 'system'
+        result['success'] = True
+
+    return result
+
+
+def _build_deep_analysis_prompt(macro_data: Dict,
+                                 market_filter: Dict = None,
+                                 sector_rotation: Dict = None) -> str:
+    """Build the deep analysis prompt with all available market context."""
+    
+    parts = ["""MARKET STRUCTURE ANALYSIS — Deep Institutional Interpretation
+
+You are scoring the market environment using a 5-Factor Institutional Flow model.
+Analyze each factor, assign a score, and provide an overall market read.
+
+CURRENT MARKET DATA:
+"""]
+
+    # Factor 1: S&P 500 Trend
+    indices = macro_data.get('indices', {})
+    spy = indices.get('S&P 500', {})
+    if spy:
+        parts.append(f"FACTOR 1 — S&P 500 TREND:")
+        parts.append(f"  Price: ${spy.get('price', '?')} | 1d: {spy.get('1d', 0):+.1f}% | 5d: {spy.get('5d', 0):+.1f}% | 20d: {spy.get('20d', 0):+.1f}%")
+    if market_filter:
+        sma200 = market_filter.get('spy_sma200', '?')
+        above = market_filter.get('spy_above_200', True)
+        parts.append(f"  200 SMA: ${sma200} — Price {'ABOVE' if above else 'BELOW'} 200 SMA")
+        parts.append(f"  50 SMA status: {'Above' if market_filter.get('spy_above_50', True) else 'Below'}")
+
+    # Factor 2: VIX / Volatility / Commercials
+    vix = macro_data.get('vix', {})
+    if vix:
+        parts.append(f"\nFACTOR 2 — VIX / VOLATILITY:")
+        parts.append(f"  VIX: {vix.get('level', '?')} (5d change: {vix.get('change_5d', 0):+.1f})")
+        parts.append(f"  Regime: {vix.get('regime', '?')}")
+        # Interpretation hint
+        if vix.get('level', 20) < 15:
+            parts.append(f"  Note: VIX below 15 = complacency, commercials may be selling protection")
+        elif vix.get('level', 20) > 25:
+            parts.append(f"  Note: VIX above 25 = institutional hedging, commercials buying protection")
+
+    # Factor 3: US Dollar (risk-on/risk-off gauge)
+    macro = macro_data.get('macro', {})
+    dollar = macro.get('Dollar', {})
+    if dollar:
+        parts.append(f"\nFACTOR 3 — US DOLLAR (risk-on/risk-off proxy):")
+        parts.append(f"  UUP: ${dollar.get('price', '?')} | 20d: {dollar.get('20d', 0):+.1f}%")
+        parts.append(f"  Strong dollar = risk-off / headwind for multinationals and commodities")
+
+    # Factor 4: Cost of Money (bonds/yields)
+    bonds = macro.get('20Y Bond', {})
+    if bonds:
+        parts.append(f"\nFACTOR 4 — COST OF MONEY (interest rates):")
+        parts.append(f"  TLT (20Y Bond): ${bonds.get('price', '?')} | 20d: {bonds.get('20d', 0):+.1f}%")
+        parts.append(f"  TLT falling = yields rising = cost of money increasing = headwind for growth stocks")
+
+    # Factor 5: Sector Rotation / Breadth
+    sectors = macro_data.get('sectors', {})
+    breadth = macro_data.get('breadth', {})
+    if sectors:
+        parts.append(f"\nFACTOR 5 — SECTOR ROTATION & BREADTH:")
+        parts.append(f"  Offensive sectors (XLK/XLY/XLC) avg 20d: {sectors.get('offensive_avg_20d', '?')}%")
+        parts.append(f"  Defensive sectors (XLU/XLP/XLV) avg 20d: {sectors.get('defensive_avg_20d', '?')}%")
+        parts.append(f"  Spread: {sectors.get('spread', 0):+.1f}% → {sectors.get('regime', '?')}")
+    if breadth:
+        parts.append(f"  Breadth: RSP vs SPY spread: {breadth.get('spread', 0):+.1f}% → {breadth.get('regime', '?')}")
+
+    # Sector rotation detail
+    if sector_rotation:
+        leading = [f"{v.get('short_name', k)} ({v.get('perf_20d', 0):+.1f}%)"
+                   for k, v in sector_rotation.items() if v.get('status') == 'leading']
+        lagging = [f"{v.get('short_name', k)} ({v.get('perf_20d', 0):+.1f}%)"
+                   for k, v in sector_rotation.items() if v.get('status') == 'lagging']
+        if leading:
+            parts.append(f"  Leading: {', '.join(leading)}")
+        if lagging:
+            parts.append(f"  Lagging: {', '.join(lagging)}")
+
+    # Additional indices context
+    qqq = indices.get('Nasdaq 100', {})
+    iwm = indices.get('Russell 2000', {})
+    if qqq:
+        parts.append(f"\nADDITIONAL CONTEXT:")
+        parts.append(f"  QQQ: ${qqq.get('price', '?')} (20d: {qqq.get('20d', 0):+.1f}%)")
+    if iwm:
+        parts.append(f"  IWM: ${iwm.get('price', '?')} (20d: {iwm.get('20d', 0):+.1f}%)")
+        if spy and iwm:
+            iwm_vs_spy = (iwm.get('20d', 0) or 0) - (spy.get('20d', 0) or 0)
+            parts.append(f"  Small vs Large cap spread: {iwm_vs_spy:+.1f}% ({'small caps leading' if iwm_vs_spy > 0 else 'large caps leading'})")
+
+    parts.append("""
+
+YOUR TASK: Provide a structured market analysis in EXACTLY this format:
+
+SCORE: [integer from -5 to +5]
+LABEL: [e.g. "BEARISH ENVIRONMENT" or "BULLISH WITH CAUTION" or "RISK-ON"]
+
+FACTOR SCORES:
+S&P 500: [🟢 or 🔴] [one-line assessment, e.g. "Above 50MA, momentum positive"]
+VIX/Commercials: [🟢 or 🔴] [one-line, e.g. "Selling protection (VIX=17.6)"]
+US Dollar: [🟢 or 🔴] [one-line, e.g. "Strong (Risk-Off)"]
+Cost of Money: [🟢 or 🔴] [one-line, e.g. "Rising rates, headwind"]
+Inflation/Rotation: [🟢 or 🔴] [one-line, e.g. "Defensive sectors leading"]
+
+STRUCTURAL READ:
+[2-3 sentences: Explain the WHY behind the current market structure. What are institutions doing?
+What's driving the moves? Are there divergences to watch? Be opinionated.]
+
+ACTIONABLE GUIDANCE:
+[2-3 sentences: What sectors/stocks should a swing trader target RIGHT NOW and WHY?
+What to avoid? Any inflection points approaching? End with a clear directional bias.]
+""")
+
+    return "\n".join(parts)
+
+
+def _parse_deep_analysis(text: str) -> Dict:
+    """Parse structured fields from deep analysis response."""
+    result = {
+        'score': 0,
+        'score_label': '',
+        'factors': {},
+    }
+
+    lines = text.strip().split('\n')
+    current_section = None
+
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+
+        # Parse SCORE
+        if line_stripped.upper().startswith('SCORE:'):
+            try:
+                score_text = line_stripped.split(':', 1)[1].strip()
+                # Handle formats like "-3/5", "-3", "+2/5"
+                score_num = score_text.split('/')[0].strip()
+                result['score'] = max(-5, min(5, int(score_num)))
+            except Exception:
+                pass
+
+        # Parse LABEL
+        elif line_stripped.upper().startswith('LABEL:'):
+            result['score_label'] = line_stripped.split(':', 1)[1].strip().strip('"\'')
+
+        # Parse factor scores
+        elif 'S&P 500:' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+            result['factors']['sp500'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
+        elif 'VIX' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+            result['factors']['vix'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
+        elif 'Dollar' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+            result['factors']['dollar'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
+        elif 'Cost' in line_stripped and 'Money' in line_stripped and ('🟢' in line_stripped or '🔴' in line_stripped):
+            result['factors']['cost_of_money'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
+        elif ('Inflation' in line_stripped or 'Rotation' in line_stripped) and ('🟢' in line_stripped or '🔴' in line_stripped):
+            result['factors']['rotation'] = line_stripped.split(':', 1)[1].strip() if ':' in line_stripped else line_stripped
+
+    return result
+
+
+def _generate_system_deep_analysis(macro_data: Dict,
+                                    market_filter: Dict = None) -> Dict:
+    """Fallback deep analysis when AI is unavailable."""
+    score = 0
+    factors = {}
+
+    # Factor 1: S&P
+    indices = macro_data.get('indices', {})
+    spy = indices.get('S&P 500', {})
+    spy_above = market_filter.get('spy_above_200', True) if market_filter else True
+    if spy_above and spy.get('20d', 0) > 0:
+        factors['sp500'] = f"🟢 Above 200MA, 20d momentum: {spy.get('20d', 0):+.1f}%"
+        score += 1
+    else:
+        factors['sp500'] = f"🔴 {'Below 200MA' if not spy_above else 'Negative momentum'}"
+        score -= 1
+
+    # Factor 2: VIX
+    vix = macro_data.get('vix', {})
+    if vix.get('level', 20) < 20:
+        factors['vix'] = f"🟢 Low fear (VIX={vix.get('level', '?')})"
+        score += 1
+    else:
+        factors['vix'] = f"🔴 Elevated (VIX={vix.get('level', '?')})"
+        score -= 1
+
+    # Factor 3: Dollar
+    macro = macro_data.get('macro', {})
+    dollar = macro.get('Dollar', {})
+    if dollar.get('20d', 0) < 0:
+        factors['dollar'] = f"🟢 Weakening ({dollar.get('20d', 0):+.1f}% 20d) — risk-on"
+        score += 1
+    else:
+        factors['dollar'] = f"🔴 Strong ({dollar.get('20d', 0):+.1f}% 20d) — risk-off"
+        score -= 1
+
+    # Factor 4: Cost of money
+    bonds = macro.get('20Y Bond', {})
+    if bonds.get('20d', 0) > 0:
+        factors['cost_of_money'] = f"🟢 Yields falling (TLT +{bonds.get('20d', 0):.1f}%)"
+        score += 1
+    else:
+        factors['cost_of_money'] = f"🔴 Yields rising (TLT {bonds.get('20d', 0):+.1f}%)"
+        score -= 1
+
+    # Factor 5: Rotation
+    sectors = macro_data.get('sectors', {})
+    if sectors.get('regime') == 'Risk-On':
+        factors['rotation'] = f"🟢 Offensive leading (spread: {sectors.get('spread', 0):+.1f}%)"
+        score += 1
+    elif sectors.get('regime') == 'Risk-Off':
+        factors['rotation'] = f"🔴 Defensive leading (spread: {sectors.get('spread', 0):+.1f}%)"
+        score -= 1
+    else:
+        factors['rotation'] = f"🟡 Balanced rotation"
+
+    # Label
+    if score >= 3:
+        label = "BULLISH ENVIRONMENT"
+    elif score >= 1:
+        label = "CAUTIOUSLY BULLISH"
+    elif score <= -3:
+        label = "BEARISH ENVIRONMENT"
+    elif score <= -1:
+        label = "CAUTION — HEADWINDS"
+    else:
+        label = "MIXED / NEUTRAL"
+
+    analysis = (f"{score}/5 {label}. "
+                f"System analysis: {sum(1 for f in factors.values() if '🟢' in f)}/5 factors positive. "
+                f"AI unavailable for deep interpretation — refresh when online.")
+
+    return {
+        'analysis': analysis,
+        'score': score,
+        'score_label': label,
+        'factors': factors,
+    }
