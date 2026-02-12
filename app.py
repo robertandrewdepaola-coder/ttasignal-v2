@@ -85,13 +85,12 @@ def get_journal() -> JournalManager:
 def _render_morning_briefing():
     """
     DUAL ANALYSIS SYSTEM:
-    Part A — Factual Market Brief (replaces old green market health rectangle)
-    Part B — Deep Structural Analysis (Juan's Market Filter style)
+    Part B — Deep Structural Analysis with Sector ETF Rotation ("Juan's Market Filter")
     """
     today = datetime.now().strftime('%Y-%m-%d')
 
     # ══════════════════════════════════════════════════════════════════
-    # PART B: DEEP STRUCTURAL ANALYSIS — "Juan's Market Filter"
+    # DEEP STRUCTURAL ANALYSIS — Sector Rotation + 5-Factor Score
     # ══════════════════════════════════════════════════════════════════
     deep_data = st.session_state.get('deep_market_analysis')
     deep_date = st.session_state.get('deep_analysis_date', '')
@@ -101,8 +100,9 @@ def _render_morning_briefing():
             score = deep_data.get('score', 0)
             label = deep_data.get('score_label', 'Neutral')
             factors = deep_data.get('factors', {})
+            phases = deep_data.get('sectors_by_phase', {})
 
-            # Score with color
+            # ── Score Banner ──────────────────────────────────────────
             if score >= 2:
                 st.success(f"**{score:+d}/5 {label}**")
             elif score <= -2:
@@ -114,7 +114,7 @@ def _render_morning_briefing():
             else:
                 st.info(f"**{score:+d}/5 {label}**")
 
-            # 5-Factor Scores — compact display
+            # ── 5-Factor Scores (compact) ─────────────────────────────
             factor_labels = {
                 'sp500': 'S&P 500',
                 'vix': 'VIX/Commercials',
@@ -127,25 +127,65 @@ def _render_morning_briefing():
                 if val:
                     st.markdown(f"**{display_name}:** {val}")
 
-            # Deep narrative in sub-expander
+            # ── Sector ETF Rotation Table ─────────────────────────────
+            st.divider()
+            st.markdown("**📊 Sector ETF Rotation**")
+
+            def _show_phase(emoji, phase_name, items):
+                if items:
+                    for s in sorted(items, key=lambda x: x.get('vs_spy_20d', 0), reverse=True):
+                        vs5 = s.get('vs_spy_5d', 0)
+                        vs20 = s.get('vs_spy_20d', 0)
+                        st.caption(
+                            f"{emoji} **{s['etf']}** {s['short']}  "
+                            f"5d:{vs5:+.1f}% 20d:{vs20:+.1f}%"
+                        )
+
+            leading = phases.get('LEADING', [])
+            emerging = phases.get('EMERGING', [])
+            fading = phases.get('FADING', [])
+            lagging = phases.get('LAGGING', [])
+
+            if leading:
+                st.markdown("🟢 **Leading** — trade these")
+                _show_phase("🟢", "LEADING", leading)
+            if emerging:
+                st.markdown("🔵 **Emerging** — watch for entries")
+                _show_phase("🔵", "EMERGING", emerging)
+            if fading:
+                st.markdown("🟡 **Fading** — tighten stops")
+                _show_phase("🟡", "FADING", fading)
+            if lagging:
+                st.markdown("🔴 **Lagging** — avoid")
+                _show_phase("🔴", "LAGGING", lagging)
+
+            # ── AI Narrative (expandable) ─────────────────────────────
             analysis_text = deep_data.get('analysis', '')
             if analysis_text:
-                # Extract just the structural read and actionable parts
-                st.divider()
-                # Show condensed version — skip the factor list already displayed
-                for section in ['STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:']:
-                    if section in analysis_text:
-                        idx = analysis_text.index(section)
-                        # Find end of section (next section header or end)
-                        remaining = analysis_text[idx + len(section):]
-                        # Take until next all-caps header or end
-                        end = len(remaining)
-                        for marker in ['FACTOR SCORES:', 'STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:', 'SCORE:', 'LABEL:']:
-                            if marker in remaining and remaining.index(marker) > 0:
-                                end = min(end, remaining.index(marker))
-                        st.caption(remaining[:end].strip())
+                with st.expander("📝 Full Analysis"):
+                    # Extract narrative sections
+                    for section_header in ['SECTOR ROTATION NARRATIVE:', 'WHAT TO TRADE:', 'WHAT TO AVOID:',
+                                           'STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:']:
+                        if section_header in analysis_text:
+                            idx = analysis_text.index(section_header)
+                            remaining = analysis_text[idx + len(section_header):]
+                            # Find end of section
+                            end = len(remaining)
+                            for marker in ['FACTOR SCORES:', 'SECTOR ROTATION NARRATIVE:',
+                                           'WHAT TO TRADE:', 'WHAT TO AVOID:', 'STRUCTURAL READ:',
+                                           'ACTIONABLE GUIDANCE:', 'SCORE:', 'LABEL:']:
+                                if marker in remaining and remaining.index(marker) > 0:
+                                    end = min(end, remaining.index(marker))
+                            section_text = remaining[:end].strip()
+                            if section_text:
+                                st.markdown(f"**{section_header.replace(':', '')}**")
+                                st.caption(section_text)
+
+                    # Provider info
+                    provider = deep_data.get('provider', '?')
+                    st.caption(f"_via {provider}_")
         else:
-            st.caption("Click refresh to generate market structure analysis")
+            st.caption("Click refresh to generate sector rotation analysis")
 
         # Refresh button
         if st.button("🔄 Refresh Analysis", use_container_width=True,
@@ -154,15 +194,15 @@ def _render_morning_briefing():
 
 
 def _run_deep_analysis():
-    """Run the deep structural market analysis."""
-    with st.spinner("Analyzing market structure..."):
+    """Run the deep structural market analysis with sector ETF rotation."""
+    with st.spinner("Analyzing market structure & sector rotation..."):
         try:
-            from data_fetcher import fetch_macro_narrative_data, fetch_market_filter
+            from data_fetcher import fetch_macro_narrative_data, fetch_market_filter, fetch_sector_rotation
             from ai_analysis import generate_deep_market_analysis
 
             macro_data = fetch_macro_narrative_data()
             market_filter = fetch_market_filter()
-            sector_rotation = st.session_state.get('sector_rotation', {})
+            sector_rotation = fetch_sector_rotation()
 
             gemini_model = st.session_state.get('gemini_model')
             openai_client = st.session_state.get('openai_client')
