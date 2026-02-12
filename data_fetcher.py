@@ -467,28 +467,30 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
 
 def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str, Dict]:
     """
-    Check earnings dates for a batch of tickers.
+    Check earnings dates for a batch of tickers using parallel threading.
 
     Returns dict keyed by ticker:
         {ticker: {next_earnings: date_str, days_until: int, within_window: bool}}
 
-    Returns ALL tickers with known upcoming earnings (not just within window).
-    within_window flag indicates if earnings are within days_ahead days.
+    Uses ThreadPoolExecutor to fetch in parallel (10 workers) instead of
+    sequential calls that would take 200+ seconds for 200 tickers.
     """
-    cache_key = f"BATCH_EARN_{hash(tuple(sorted(tickers)))}"
+    cache_key = "BATCH_EARNINGS_FLAGS"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
 
-    flags = {}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     today = datetime.now().date()
 
-    for ticker in tickers:
+    def _fetch_one_earnings(ticker: str):
+        """Fetch earnings date for a single ticker. Returns (ticker, result_dict) or (ticker, None)."""
         try:
             stock = yf.Ticker(ticker)
             earn_dt = None
 
-            # Strategy 1: Try calendar first (fastest)
+            # Strategy 1: calendar (fast path)
             try:
                 cal = stock.calendar
                 if cal is not None:
@@ -504,19 +506,18 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                             pass
 
                     if raw_date is not None:
-                        if hasattr(raw_date, 'date'):
-                            earn_dt = raw_date.date() if callable(getattr(raw_date, 'date', None)) else raw_date
+                        if hasattr(raw_date, 'date') and callable(getattr(raw_date, 'date', None)):
+                            earn_dt = raw_date.date()
                         elif isinstance(raw_date, str) and len(raw_date) >= 10:
                             earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
             except Exception:
                 pass
 
-            # Strategy 2: Try earnings_dates (more reliable for many tickers)
+            # Strategy 2: earnings_dates (fallback)
             if earn_dt is None:
                 try:
                     edates = stock.earnings_dates
                     if edates is not None and len(edates) > 0:
-                        # earnings_dates index is datetime — find next upcoming
                         for dt_idx in sorted(edates.index):
                             try:
                                 if hasattr(dt_idx, 'date') and callable(getattr(dt_idx, 'date')):
@@ -525,8 +526,7 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                                     d = dt_idx.to_pydatetime().date()
                                 else:
                                     continue
-                                days_diff = (d - today).days
-                                if days_diff >= -7:  # Accept recent past + future
+                                if (d - today).days >= -7:
                                     earn_dt = d
                                     break
                             except Exception:
@@ -536,19 +536,32 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
             if earn_dt is not None:
                 days_until = (earn_dt - today).days
-                # Include future earnings and recently reported (up to 7 days past)
                 if days_until >= -7:
-                    flags[ticker] = {
+                    return (ticker, {
                         'next_earnings': earn_dt.strftime('%Y-%m-%d'),
                         'days_until': days_until,
                         'within_window': 0 <= days_until <= days_ahead,
-                    }
-
+                    })
         except Exception:
             pass
+        return (ticker, None)
 
-    if flags:  # Only cache if we got results
-        _cache.set(cache_key, flags)
+    # Run in parallel — 10 workers, 3s timeout per ticker
+    flags = {}
+    try:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_fetch_one_earnings, t): t for t in tickers}
+            for future in as_completed(futures, timeout=45):
+                try:
+                    ticker, result = future.result(timeout=3)
+                    if result:
+                        flags[ticker] = result
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    _cache.set(cache_key, flags)
     return flags
 
 
