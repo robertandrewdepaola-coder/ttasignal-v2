@@ -407,7 +407,7 @@ def _load_ticker_for_view(ticker: str):
         if r.ticker == ticker:
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
-            st.session_state['_scroll_to_detail'] = True
+            st.session_state['scroll_to_detail'] = True
             st.rerun()
             return
 
@@ -418,7 +418,7 @@ def _load_ticker_for_view(ticker: str):
             analysis = analyze_ticker(data)
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = analysis
-            st.session_state['_scroll_to_detail'] = True
+            st.session_state['scroll_to_detail'] = True
             # Cache the data
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
@@ -1289,7 +1289,7 @@ def render_detail_view():
     st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
 
     # Auto-scroll JavaScript — fires once when a new ticker is selected
-    if st.session_state.get('_scroll_to_detail'):
+    if st.session_state.pop('scroll_to_detail', False):
         import streamlit.components.v1 as components
         components.html(
             """<script>
@@ -1298,7 +1298,6 @@ def render_detail_view():
             </script>""",
             height=0,
         )
-        st.session_state['_scroll_to_detail'] = False
 
     # Header with scroll-to-top button
     hdr_col1, hdr_col2 = st.columns([8, 1])
@@ -3188,24 +3187,6 @@ def main():
 
         if st.session_state.get('selected_analysis'):
             st.divider()
-
-            # Auto-scroll to detail view when ticker clicked
-            if st.session_state.pop('scroll_to_detail', False):
-                st.components.v1.html(
-                    '<script>window.parent.document.querySelector("[data-testid=stVerticalBlock]'
-                    ' [data-testid=stVerticalBlock]").scrollIntoView({behavior:"smooth"});</script>',
-                    height=0
-                )
-
-            # Scroll to Top button
-            top_col1, top_col2 = st.columns([4, 1])
-            with top_col2:
-                if st.button("⬆️ Top", key="scroll_top"):
-                    st.components.v1.html(
-                        '<script>window.parent.document.querySelector("header").scrollIntoView({behavior:"smooth"});</script>',
-                        height=0
-                    )
-
             render_detail_view()
 
     with tab_alerts:
