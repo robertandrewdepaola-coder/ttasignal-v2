@@ -473,6 +473,187 @@ def get_ticker_sector(ticker: str) -> Optional[str]:
 
 
 # =============================================================================
+# MACRO NARRATIVE DATA — Morning Briefing
+# =============================================================================
+
+def fetch_macro_narrative_data() -> Dict[str, Any]:
+    """
+    Fetch broad market data for AI-generated morning narrative.
+
+    Returns dict with:
+    - indices: SPY, QQQ, IWM performance (1d, 5d, 20d)
+    - breadth: RSP vs SPY (equal-weight vs cap-weight)
+    - vix: level, 5-day change, regime
+    - sectors: offensive vs defensive rotation
+    - macro: 10Y yield proxy (TLT), dollar index (UUP)
+    """
+    cache_key = "MACRO_NARRATIVE"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    result = {
+        'indices': {},
+        'breadth': {},
+        'vix': {},
+        'sectors': {},
+        'macro': {},
+        'timestamp': datetime.now().isoformat(),
+    }
+
+    def _perf(df, periods):
+        """Calculate returns for multiple periods."""
+        if df is None or df.empty:
+            return {}
+        close = df['Close']
+        out = {'price': round(float(close.iloc[-1]), 2)}
+        for label, n in periods:
+            if len(close) >= n:
+                out[label] = round((close.iloc[-1] / close.iloc[-n] - 1) * 100, 2)
+        return out
+
+    periods = [('1d', 2), ('5d', 5), ('20d', 20)]
+
+    # ── Major Indices ─────────────────────────────────────────────────
+    for sym, name in [('SPY', 'S&P 500'), ('QQQ', 'Nasdaq 100'), ('IWM', 'Russell 2000')]:
+        try:
+            df = fetch_daily(sym, period='3mo')
+            result['indices'][name] = _perf(df, periods)
+        except Exception:
+            pass
+
+    # ── Market Breadth: RSP (equal weight S&P) vs SPY ─────────────────
+    try:
+        rsp_df = fetch_daily('RSP', period='3mo')
+        spy_df = fetch_daily('SPY', period='3mo')
+        if rsp_df is not None and spy_df is not None and len(rsp_df) >= 20:
+            rsp_20d = (rsp_df['Close'].iloc[-1] / rsp_df['Close'].iloc[-20] - 1) * 100
+            spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+            spread = rsp_20d - spy_20d
+            result['breadth'] = {
+                'rsp_20d': round(rsp_20d, 2),
+                'spy_20d': round(spy_20d, 2),
+                'spread': round(spread, 2),
+                'regime': 'Broad participation' if spread > 1 else (
+                    'Narrow leadership' if spread < -1 else 'Neutral'),
+            }
+    except Exception:
+        pass
+
+    # ── VIX ───────────────────────────────────────────────────────────
+    try:
+        vix_df = fetch_daily('^VIX', period='1mo')
+        if vix_df is not None and len(vix_df) >= 5:
+            vix_now = float(vix_df['Close'].iloc[-1])
+            vix_5d_ago = float(vix_df['Close'].iloc[-5])
+            vix_chg = vix_now - vix_5d_ago
+
+            if vix_now < 15:
+                regime = 'Low volatility (complacency)'
+            elif vix_now < 20:
+                regime = 'Normal'
+            elif vix_now < 25:
+                regime = 'Elevated'
+            elif vix_now < 30:
+                regime = 'High fear'
+            else:
+                regime = 'Extreme fear'
+
+            result['vix'] = {
+                'level': round(vix_now, 2),
+                'change_5d': round(vix_chg, 2),
+                'regime': regime,
+            }
+    except Exception:
+        pass
+
+    # ── Sector Rotation: Offensive vs Defensive ───────────────────────
+    try:
+        offensive = ['XLK', 'XLY', 'XLC']  # Tech, Consumer Disc, Comm
+        defensive = ['XLU', 'XLP', 'XLV']  # Utilities, Staples, Healthcare
+
+        off_perf = []
+        def_perf = []
+
+        for etf in offensive:
+            df = fetch_daily(etf, period='3mo')
+            if df is not None and len(df) >= 20:
+                p = (df['Close'].iloc[-1] / df['Close'].iloc[-20] - 1) * 100
+                off_perf.append(p)
+
+        for etf in defensive:
+            df = fetch_daily(etf, period='3mo')
+            if df is not None and len(df) >= 20:
+                p = (df['Close'].iloc[-1] / df['Close'].iloc[-20] - 1) * 100
+                def_perf.append(p)
+
+        if off_perf and def_perf:
+            avg_off = sum(off_perf) / len(off_perf)
+            avg_def = sum(def_perf) / len(def_perf)
+            spread = avg_off - avg_def
+
+            result['sectors'] = {
+                'offensive_avg_20d': round(avg_off, 2),
+                'defensive_avg_20d': round(avg_def, 2),
+                'spread': round(spread, 2),
+                'regime': 'Risk-On' if spread > 2 else (
+                    'Risk-Off' if spread < -2 else 'Balanced'),
+            }
+    except Exception:
+        pass
+
+    # ── Macro Gauges: Bond proxy (TLT) and Dollar (UUP) ──────────────
+    try:
+        for sym, name in [('TLT', '20Y Bond'), ('UUP', 'Dollar')]:
+            df = fetch_daily(sym, period='3mo')
+            if df is not None and len(df) >= 20:
+                result['macro'][name] = _perf(df, periods)
+    except Exception:
+        pass
+
+    _cache.set(cache_key, result)
+    return result
+
+
+def fetch_signal_for_exit(ticker: str) -> Optional[Dict]:
+    """
+    Fetch minimal signal data for exit advisor.
+    Returns dict with macd, ao, weekly, monthly state.
+    """
+    try:
+        daily = fetch_daily(ticker)
+        weekly = fetch_weekly(ticker)
+        monthly = fetch_monthly(ticker)
+
+        if daily is None or len(daily) < 50:
+            return None
+
+        # Import signal engine functions
+        from signal_engine import detect_macd_cross, detect_ao_state
+
+        macd_state = detect_macd_cross(daily)
+        ao_state = detect_ao_state(daily)
+
+        weekly_state = {}
+        if weekly is not None and len(weekly) >= 26:
+            weekly_state = detect_macd_cross(weekly)
+
+        monthly_state = {}
+        if monthly is not None and len(monthly) >= 26:
+            monthly_state = detect_macd_cross(monthly)
+
+        return {
+            'macd': macd_state,
+            'ao': ao_state,
+            'weekly': weekly_state,
+            'monthly': monthly_state,
+        }
+    except Exception as e:
+        print(f"[data_fetcher] Signal for exit error ({ticker}): {e}")
+        return None
+
+
+# =============================================================================
 # FUNDAMENTAL DATA — Ticker info, sector, earnings
 # =============================================================================
 
