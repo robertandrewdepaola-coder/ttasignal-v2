@@ -83,14 +83,143 @@ def get_journal() -> JournalManager:
 # =============================================================================
 
 def _render_morning_briefing():
-    """Render daily market narrative in sidebar. Cached once per session."""
-    # Check if already generated today
-    narrative_data = st.session_state.get('morning_narrative')
-    narrative_date = st.session_state.get('morning_narrative_date', '')
+    """
+    DUAL ANALYSIS SYSTEM:
+    Part A — Factual Market Brief (replaces old green market health rectangle)
+    Part B — Deep Structural Analysis (Juan's Market Filter style)
+    """
     today = datetime.now().strftime('%Y-%m-%d')
 
+    # ══════════════════════════════════════════════════════════════════
+    # PART B: DEEP STRUCTURAL ANALYSIS — "Juan's Market Filter"
+    # ══════════════════════════════════════════════════════════════════
+    deep_data = st.session_state.get('deep_market_analysis')
+    deep_date = st.session_state.get('deep_analysis_date', '')
+
+    with st.sidebar.expander("🏛️ Market Structure", expanded=True):
+        if deep_data and deep_date == today:
+            score = deep_data.get('score', 0)
+            label = deep_data.get('score_label', 'Neutral')
+            factors = deep_data.get('factors', {})
+
+            # Score with color
+            if score >= 2:
+                st.success(f"**{score:+d}/5 {label}**")
+            elif score <= -2:
+                st.error(f"**{score:+d}/5 {label}**")
+            elif score >= 1:
+                st.info(f"**{score:+d}/5 {label}**")
+            elif score <= -1:
+                st.warning(f"**{score:+d}/5 {label}**")
+            else:
+                st.info(f"**{score:+d}/5 {label}**")
+
+            # 5-Factor Scores — compact display
+            factor_labels = {
+                'sp500': 'S&P 500',
+                'vix': 'VIX/Commercials',
+                'dollar': 'US Dollar',
+                'cost_of_money': 'Cost of Money',
+                'rotation': 'Rotation/Breadth',
+            }
+            for key, display_name in factor_labels.items():
+                val = factors.get(key, '')
+                if val:
+                    st.markdown(f"**{display_name}:** {val}")
+
+            # Deep narrative in sub-expander
+            analysis_text = deep_data.get('analysis', '')
+            if analysis_text:
+                # Extract just the structural read and actionable parts
+                st.divider()
+                # Show condensed version — skip the factor list already displayed
+                for section in ['STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:']:
+                    if section in analysis_text:
+                        idx = analysis_text.index(section)
+                        # Find end of section (next section header or end)
+                        remaining = analysis_text[idx + len(section):]
+                        # Take until next all-caps header or end
+                        end = len(remaining)
+                        for marker in ['FACTOR SCORES:', 'STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:', 'SCORE:', 'LABEL:']:
+                            if marker in remaining and remaining.index(marker) > 0:
+                                end = min(end, remaining.index(marker))
+                        st.caption(remaining[:end].strip())
+        else:
+            st.caption("Click refresh to generate market structure analysis")
+
+        # Refresh button
+        if st.button("🔄 Refresh Analysis", use_container_width=True,
+                     key="refresh_deep_analysis"):
+            _run_deep_analysis()
+
+
+def _run_deep_analysis():
+    """Run the deep structural market analysis."""
+    with st.spinner("Analyzing market structure..."):
+        try:
+            from data_fetcher import fetch_macro_narrative_data, fetch_market_filter
+            from ai_analysis import generate_deep_market_analysis
+
+            macro_data = fetch_macro_narrative_data()
+            market_filter = fetch_market_filter()
+            sector_rotation = st.session_state.get('sector_rotation', {})
+
+            gemini_model = st.session_state.get('gemini_model')
+            openai_client = st.session_state.get('openai_client')
+
+            result = generate_deep_market_analysis(
+                macro_data,
+                market_filter=market_filter,
+                sector_rotation=sector_rotation,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+            )
+
+            result['macro_data'] = macro_data
+            st.session_state['deep_market_analysis'] = result
+            st.session_state['deep_analysis_date'] = datetime.now().strftime('%Y-%m-%d')
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Analysis error: {e}")
+
+
+def _render_factual_market_brief():
+    """
+    PART A: Factual market brief — replaces the old green/yellow/red market health rectangle.
+    Shows indices, VIX, breadth data + AI narrative summary.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+    mkt = fetch_market_filter()
+    spy_ok = mkt.get('spy_above_200', True)
+    vix_close = mkt.get('vix_close', 0) or 0
+
+    # ── Market Status Line (compact) ──────────────────────────────────
+    spy_str = f"SPY {'✅' if spy_ok else '❌'} ${mkt.get('spy_close', '?')}"
+
+    if vix_close < 15:
+        vix_icon = "🟢"
+    elif vix_close < 20:
+        vix_icon = "🟡"
+    elif vix_close < 25:
+        vix_icon = "🟠"
+    elif vix_close < 30:
+        vix_icon = "🔴"
+    else:
+        vix_icon = "🔴🔴"
+    vix_str = f"VIX {vix_icon} {vix_close}"
+
+    if spy_ok and vix_close < 20:
+        st.sidebar.success(f"**{spy_str} | {vix_str}**")
+    elif spy_ok and vix_close < 30:
+        st.sidebar.warning(f"**{spy_str} | {vix_str}**")
+    else:
+        st.sidebar.error(f"**{spy_str} | {vix_str}**")
+
+    # ── AI Narrative (if generated) ───────────────────────────────────
+    narrative_data = st.session_state.get('morning_narrative')
+    narrative_date = st.session_state.get('morning_narrative_date', '')
+
     if narrative_data and narrative_date == today:
-        # Display cached narrative
         regime = narrative_data.get('regime', 'Neutral')
         regime_colors = {
             'Risk-On': '🟢', 'Bullish': '🟢', 'Cautiously Bullish': '🟢',
@@ -100,51 +229,61 @@ def _render_morning_briefing():
         }
         icon = regime_colors.get(regime, '🟡')
 
-        st.sidebar.markdown(f"### {icon} {regime}")
-        st.sidebar.caption(narrative_data.get('narrative', '')[:300])
+        with st.sidebar.expander(f"{icon} Market Brief — {regime}"):
+            st.caption(narrative_data.get('narrative', '')[:400])
 
-        with st.sidebar.expander("📊 Raw Data"):
+            # Raw data
             macro = narrative_data.get('macro_data', {})
-            # Indices
-            for name, info in macro.get('indices', {}).items():
-                d20 = info.get('20d', 0)
-                icon_i = '🟢' if d20 > 0 else '🔴'
-                st.caption(f"{icon_i} {name}: ${info.get('price', '?')} ({d20:+.1f}%)")
-            # VIX
-            vix = macro.get('vix', {})
-            if vix:
-                st.caption(f"VIX: {vix.get('level', '?')} ({vix.get('regime', '')})")
-            # Sectors
-            sectors = macro.get('sectors', {})
-            if sectors:
-                st.caption(f"Sectors: {sectors.get('regime', '')} (spread: {sectors.get('spread', 0):+.1f}%)")
+            if macro:
+                st.divider()
+                for name, info in macro.get('indices', {}).items():
+                    d20 = info.get('20d', 0)
+                    ic = '🟢' if d20 > 0 else '🔴'
+                    st.caption(f"{ic} {name}: ${info.get('price', '?')} ({d20:+.1f}%)")
 
-    # Refresh button
-    if st.sidebar.button("🔄 Refresh Briefing", use_container_width=True,
-                         key="refresh_narrative"):
-        with st.spinner("Generating market briefing..."):
-            try:
-                from data_fetcher import fetch_macro_narrative_data
-                from ai_analysis import generate_market_narrative
+                vix_data = macro.get('vix', {})
+                if vix_data:
+                    st.caption(f"VIX: {vix_data.get('level', '?')} ({vix_data.get('regime', '')})")
 
-                macro_data = fetch_macro_narrative_data()
+                sectors = macro.get('sectors', {})
+                if sectors:
+                    st.caption(f"Sectors: {sectors.get('regime', '')} (spread: {sectors.get('spread', 0):+.1f}%)")
 
-                # Get AI clients
-                gemini_model = st.session_state.get('gemini_model')
-                openai_client = st.session_state.get('openai_client')
+                breadth = macro.get('breadth', {})
+                if breadth:
+                    st.caption(f"Breadth: {breadth.get('regime', '')} (RSP-SPY: {breadth.get('spread', 0):+.1f}%)")
 
-                narrative_result = generate_market_narrative(
-                    macro_data,
-                    gemini_model=gemini_model,
-                    openai_client=openai_client,
-                )
+        # Refresh button
+        if st.sidebar.button("🔄 Refresh Brief", use_container_width=True, key="refresh_brief"):
+            _run_factual_brief()
+    else:
+        if st.sidebar.button("📊 Generate Market Brief", use_container_width=True, key="gen_brief"):
+            _run_factual_brief()
 
-                narrative_result['macro_data'] = macro_data
-                st.session_state['morning_narrative'] = narrative_result
-                st.session_state['morning_narrative_date'] = today
-                st.rerun()
-            except Exception as e:
-                st.sidebar.error(f"Briefing error: {e}")
+
+def _run_factual_brief():
+    """Generate the factual morning brief."""
+    with st.spinner("Generating market brief..."):
+        try:
+            from data_fetcher import fetch_macro_narrative_data
+            from ai_analysis import generate_market_narrative
+
+            macro_data = fetch_macro_narrative_data()
+            gemini_model = st.session_state.get('gemini_model')
+            openai_client = st.session_state.get('openai_client')
+
+            narrative_result = generate_market_narrative(
+                macro_data,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+            )
+
+            narrative_result['macro_data'] = macro_data
+            st.session_state['morning_narrative'] = narrative_result
+            st.session_state['morning_narrative_date'] = datetime.now().strftime('%Y-%m-%d')
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Brief error: {e}")
 
 
 # =============================================================================
@@ -158,7 +297,7 @@ def render_sidebar():
     st.sidebar.caption("Technical Trading Assistant")
 
     # ══════════════════════════════════════════════════════════════════
-    # MORNING BRIEFING — AI Market Narrative
+    # PART B: Deep Structural Analysis ("Juan's Market Filter")
     # ══════════════════════════════════════════════════════════════════
     _render_morning_briefing()
 
@@ -226,37 +365,9 @@ def render_sidebar():
                     jm.remove_conditional(ticker)
                     st.rerun()
 
-    # ── Market Filter ─────────────────────────────────────────────────
+    # ── Market Brief (replaces old green/yellow/red rectangle) ──────
     st.sidebar.divider()
-    mkt = fetch_market_filter()
-    spy_ok = mkt.get('spy_above_200', True)
-    vix_close = mkt.get('vix_close', 0) or 0
-    vix_ok = mkt.get('vix_below_30', True)
-
-    # SPY color
-    spy_str = f"SPY {'✅' if spy_ok else '❌'} ${mkt.get('spy_close', '?')}"
-
-    # VIX color — graduated risk
-    if vix_close < 15:
-        vix_icon = "🟢"  # Low fear
-    elif vix_close < 20:
-        vix_icon = "🟡"  # Elevated
-    elif vix_close < 25:
-        vix_icon = "🟠"  # High
-    elif vix_close < 30:
-        vix_icon = "🔴"  # Very high
-    else:
-        vix_icon = "🔴🔴"  # Extreme
-
-    vix_str = f"VIX {vix_icon} {vix_close}"
-
-    # Overall market health
-    if spy_ok and vix_close < 20:
-        st.sidebar.success(f"**Market:** {spy_str} | {vix_str}")
-    elif spy_ok and vix_close < 30:
-        st.sidebar.warning(f"**Market:** {spy_str} | {vix_str}")
-    else:
-        st.sidebar.error(f"**Market:** {spy_str} | {vix_str}")
+    _render_factual_market_brief()
 
 
 def _load_ticker_for_view(ticker: str):
@@ -454,6 +565,10 @@ def render_scanner_table():
     watchlist_tickers = jm.get_watchlist_tickers()
     favorite_tickers = set(jm.get_favorite_tickers())
 
+    # Watchlist version counter — used to force text_area reset when watchlist changes
+    if 'wl_version' not in st.session_state:
+        st.session_state['wl_version'] = 0
+
     with st.expander(f"📋 Watchlist ({len(watchlist_tickers)} tickers) — click to edit",
                      expanded=(len(watchlist_tickers) == 0)):
 
@@ -468,15 +583,35 @@ def render_scanner_table():
                     ticker_clean = new_ticker.strip().upper()
                     if ticker_clean and ticker_clean not in watchlist_tickers:
                         jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                        st.session_state['wl_version'] += 1  # Force text_area refresh
                         st.rerun()
+
+        # ── Sort Controls ─────────────────────────────────────────────
+        if watchlist_tickers:
+            sort_col1, sort_col2 = st.columns([1, 1])
+            with sort_col1:
+                wl_sort = st.selectbox(
+                    "Sort", ["⭐ Favorites first", "A-Z", "Z-A", "Date added"],
+                    key="wl_sort", label_visibility="collapsed",
+                )
+            with sort_col2:
+                st.caption(f"{len(watchlist_tickers)} tickers"
+                           + (f" | ⭐{len(favorite_tickers)}" if favorite_tickers else ""))
 
         # ── Interactive List with Favorite/Delete ─────────────────────
         if watchlist_tickers:
-            # Sort favorites to top
-            sorted_tickers = sorted(
-                watchlist_tickers,
-                key=lambda t: (0 if t in favorite_tickers else 1, t)
-            )
+            # Apply sort
+            if wl_sort == "A-Z":
+                sorted_tickers = sorted(watchlist_tickers)
+            elif wl_sort == "Z-A":
+                sorted_tickers = sorted(watchlist_tickers, reverse=True)
+            elif wl_sort == "Date added":
+                sorted_tickers = list(watchlist_tickers)  # Original order = date added
+            else:  # Favorites first (default)
+                sorted_tickers = sorted(
+                    watchlist_tickers,
+                    key=lambda t: (0 if t in favorite_tickers else 1, t)
+                )
 
             # Show in compact rows
             for t in sorted_tickers:
@@ -500,6 +635,7 @@ def render_scanner_table():
                     if st.button("🗑️", key=f"del_{t}",
                                  help="Delete"):
                         jm.delete_single_ticker(t)
+                        st.session_state['wl_version'] += 1  # Force text_area refresh
                         # Also remove from scan results
                         if 'scan_results' in st.session_state:
                             st.session_state['scan_results'] = [
@@ -516,13 +652,17 @@ def render_scanner_table():
         # ── Bulk Editor (for pasting 200 tickers) ─────────────────────
         with st.expander("📝 Bulk Edit (paste tickers)"):
             st.caption("Paste tickers separated by commas, spaces, or new lines.")
-            default_text = ", ".join(watchlist_tickers) if watchlist_tickers else ""
+
+            # PERSISTENCE FIX: Use dynamic key that resets when watchlist changes
+            # This prevents stale text_area values from overwriting new additions
+            wl_ver = st.session_state.get('wl_version', 0)
+            default_text = ", ".join(sorted(watchlist_tickers)) if watchlist_tickers else ""
             new_text = st.text_area(
                 "Tickers",
                 value=default_text,
                 height=100 if len(watchlist_tickers) > 20 else 68,
                 label_visibility="collapsed",
-                key="watchlist_editor",
+                key=f"watchlist_editor_v{wl_ver}",  # Dynamic key forces fresh value
             )
 
             wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
@@ -538,13 +678,23 @@ def render_scanner_table():
                         if t not in seen:
                             seen.add(t)
                             unique.append(t)
+
+                    # Preserve favorites across bulk save
+                    old_favorites = set(jm.get_favorite_tickers())
                     jm.clear_watchlist()
                     jm.set_watchlist_tickers(unique)
+                    # Re-apply favorites
+                    for fav in old_favorites:
+                        if fav in unique:
+                            jm.toggle_favorite(fav)
+
+                    st.session_state['wl_version'] += 1
                     st.success(f"✅ Saved {len(unique)} tickers")
                     st.rerun()
             with wl_col2:
                 if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
                     jm.clear_watchlist()
+                    st.session_state['wl_version'] += 1
                     st.session_state.pop('scan_results', None)
                     st.session_state.pop('scan_results_summary', None)
                     st.session_state.pop('ticker_data_cache', None)
