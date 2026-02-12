@@ -84,6 +84,7 @@ class WatchlistItem:
     stop_price: float = 0
     notes: str = ''
     is_favorite: bool = False
+    focus_label: str = ''  # '', 'green', 'yellow', 'red', 'blue'
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -254,6 +255,29 @@ class JournalManager:
     def get_favorite_tickers(self) -> List[str]:
         """Get list of favorited tickers."""
         return [w['ticker'] for w in self.watchlist if w.get('is_favorite', False)]
+
+    def set_focus_label(self, ticker: str, label: str) -> str:
+        """Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                w['focus_label'] = label
+                self._save(self.watchlist_file, self.watchlist)
+                return label
+        return ''
+
+    def get_focus_label(self, ticker: str) -> str:
+        """Get focus label for a ticker."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                return w.get('focus_label', '')
+        return ''
+
+    def get_focus_labels(self) -> Dict[str, str]:
+        """Get all focus labels as {ticker: label} for non-empty labels."""
+        return {w['ticker']: w['focus_label'] for w in self.watchlist
+                if w.get('focus_label', '')}
 
     def delete_single_ticker(self, ticker: str) -> str:
         """Delete a single ticker from watchlist with immediate persistence."""
