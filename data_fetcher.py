@@ -577,10 +577,10 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
             pass
         return (ticker, None)
 
-    # Run in parallel — 5 workers (gentle on yfinance rate limiter), 8s per ticker
+    # Run in parallel — 3 workers (reduced to avoid rate limiting), 8s per ticker
     flags = {}
     try:
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {executor.submit(_fetch_one_earnings, t): t for t in tickers}
             for future in as_completed(futures, timeout=90):
                 try:
@@ -592,6 +592,20 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     except Exception as e:
         print(f"[data_fetcher] Batch earnings error: {e}")
 
+    # If batch got very few results (possible rate-limiting), retry missing ones sequentially
+    if len(flags) < len(tickers) * 0.3 and len(tickers) > 1:
+        import time
+        time.sleep(2)  # Back off before retry
+        missing = [t for t in tickers if t not in flags]
+        for t in missing[:10]:  # Cap at 10 retries
+            try:
+                _, result = _fetch_one_earnings(t)
+                if result:
+                    flags[t] = result
+                time.sleep(0.5)  # Stagger
+            except Exception:
+                pass
+
     # Only cache if we got meaningful results (don't cache empty on failure)
     if flags:
         _cache.set(cache_key, flags)
@@ -599,9 +613,90 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
 
 def get_ticker_sector(ticker: str) -> Optional[str]:
-    """Get sector for a ticker from cached info."""
+    """Get sector for a ticker — with static fallback when yfinance is rate-limited."""
+    # Try yfinance first
     info = fetch_ticker_info(ticker)
-    return info.get('sector')
+    sector = info.get('sector')
+    if sector:
+        return sector
+
+    # Fallback: static sector map for common tickers
+    return _SECTOR_FALLBACK.get(ticker.upper())
+
+
+# Static sector map — covers top ~150 most traded US tickers
+# Used when yfinance is rate-limited or returns no data
+_SECTOR_FALLBACK = {
+    # Technology
+    'AAPL': 'Technology', 'MSFT': 'Technology', 'NVDA': 'Technology', 'GOOGL': 'Technology',
+    'GOOG': 'Technology', 'META': 'Technology', 'AVGO': 'Technology', 'ORCL': 'Technology',
+    'CRM': 'Technology', 'ADBE': 'Technology', 'AMD': 'Technology', 'INTC': 'Technology',
+    'CSCO': 'Technology', 'QCOM': 'Technology', 'TXN': 'Technology', 'AMAT': 'Technology',
+    'LRCX': 'Technology', 'KLAC': 'Technology', 'MU': 'Technology', 'MRVL': 'Technology',
+    'ADI': 'Technology', 'SNPS': 'Technology', 'CDNS': 'Technology', 'NXPI': 'Technology',
+    'MCHP': 'Technology', 'ON': 'Technology', 'SWKS': 'Technology', 'MPWR': 'Technology',
+    'NOW': 'Technology', 'PANW': 'Technology', 'CRWD': 'Technology', 'SNOW': 'Technology',
+    'PLTR': 'Technology', 'NET': 'Technology', 'DDOG': 'Technology', 'ZS': 'Technology',
+    'FTNT': 'Technology', 'WDAY': 'Technology', 'TEAM': 'Technology', 'HUBS': 'Technology',
+    'SHOP': 'Technology', 'SQ': 'Technology', 'UBER': 'Technology', 'DASH': 'Technology',
+    'COIN': 'Technology', 'MSTR': 'Technology', 'DELL': 'Technology', 'HPE': 'Technology',
+    'IBM': 'Technology', 'SMCI': 'Technology', 'ARM': 'Technology', 'TSM': 'Technology',
+    'ASML': 'Technology', 'SAP': 'Technology',
+    # Communication Services
+    'NFLX': 'Communication Services', 'DIS': 'Communication Services',
+    'CMCSA': 'Communication Services', 'T': 'Communication Services',
+    'VZ': 'Communication Services', 'TMUS': 'Communication Services',
+    'SPOT': 'Communication Services', 'ROKU': 'Communication Services',
+    'SNAP': 'Communication Services', 'PINS': 'Communication Services',
+    'RBLX': 'Communication Services', 'TTWO': 'Communication Services',
+    'EA': 'Communication Services', 'WBD': 'Communication Services',
+    # Consumer Discretionary
+    'AMZN': 'Consumer Cyclical', 'TSLA': 'Consumer Cyclical', 'HD': 'Consumer Cyclical',
+    'MCD': 'Consumer Cyclical', 'NKE': 'Consumer Cyclical', 'SBUX': 'Consumer Cyclical',
+    'LOW': 'Consumer Cyclical', 'TJX': 'Consumer Cyclical', 'BKNG': 'Consumer Cyclical',
+    'CMG': 'Consumer Cyclical', 'ABNB': 'Consumer Cyclical', 'RCL': 'Consumer Cyclical',
+    'GM': 'Consumer Cyclical', 'F': 'Consumer Cyclical', 'RIVN': 'Consumer Cyclical',
+    'LCID': 'Consumer Cyclical', 'LULU': 'Consumer Cyclical', 'ROST': 'Consumer Cyclical',
+    # Consumer Staples
+    'WMT': 'Consumer Defensive', 'PG': 'Consumer Defensive', 'COST': 'Consumer Defensive',
+    'KO': 'Consumer Defensive', 'PEP': 'Consumer Defensive', 'PM': 'Consumer Defensive',
+    'MO': 'Consumer Defensive', 'CL': 'Consumer Defensive', 'KMB': 'Consumer Defensive',
+    'MDLZ': 'Consumer Defensive', 'GIS': 'Consumer Defensive', 'KHC': 'Consumer Defensive',
+    # Healthcare
+    'UNH': 'Healthcare', 'JNJ': 'Healthcare', 'LLY': 'Healthcare', 'ABBV': 'Healthcare',
+    'MRK': 'Healthcare', 'PFE': 'Healthcare', 'TMO': 'Healthcare', 'ABT': 'Healthcare',
+    'DHR': 'Healthcare', 'AMGN': 'Healthcare', 'GILD': 'Healthcare', 'ISRG': 'Healthcare',
+    'VRTX': 'Healthcare', 'BMY': 'Healthcare', 'MDT': 'Healthcare', 'SYK': 'Healthcare',
+    'REGN': 'Healthcare', 'ZTS': 'Healthcare', 'MRNA': 'Healthcare', 'BIIB': 'Healthcare',
+    # Financials
+    'BRK.B': 'Financial Services', 'JPM': 'Financial Services', 'V': 'Financial Services',
+    'MA': 'Financial Services', 'BAC': 'Financial Services', 'WFC': 'Financial Services',
+    'GS': 'Financial Services', 'MS': 'Financial Services', 'BLK': 'Financial Services',
+    'SCHW': 'Financial Services', 'AXP': 'Financial Services', 'C': 'Financial Services',
+    'USB': 'Financial Services', 'PNC': 'Financial Services', 'PYPL': 'Financial Services',
+    'SOFI': 'Financial Services', 'HOOD': 'Financial Services',
+    # Energy
+    'XOM': 'Energy', 'CVX': 'Energy', 'COP': 'Energy', 'EOG': 'Energy',
+    'SLB': 'Energy', 'MPC': 'Energy', 'PSX': 'Energy', 'VLO': 'Energy',
+    'OXY': 'Energy', 'DVN': 'Energy', 'HAL': 'Energy', 'FANG': 'Energy',
+    # Industrials
+    'GE': 'Industrials', 'CAT': 'Industrials', 'RTX': 'Industrials', 'HON': 'Industrials',
+    'UNP': 'Industrials', 'BA': 'Industrials', 'DE': 'Industrials', 'LMT': 'Industrials',
+    'GD': 'Industrials', 'NOC': 'Industrials', 'MMM': 'Industrials', 'WM': 'Industrials',
+    'UPS': 'Industrials', 'FDX': 'Industrials', 'STRL': 'Industrials',
+    # Materials
+    'LIN': 'Basic Materials', 'APD': 'Basic Materials', 'SHW': 'Basic Materials',
+    'FCX': 'Basic Materials', 'NEM': 'Basic Materials', 'NUE': 'Basic Materials',
+    'GOLD': 'Basic Materials', 'X': 'Basic Materials', 'CLF': 'Basic Materials',
+    # Utilities
+    'NEE': 'Utilities', 'DUK': 'Utilities', 'SO': 'Utilities', 'D': 'Utilities',
+    'AEP': 'Utilities', 'SRE': 'Utilities', 'EXC': 'Utilities', 'XEL': 'Utilities',
+    'CEG': 'Utilities', 'VST': 'Utilities',
+    # Real Estate
+    'AMT': 'Real Estate', 'PLD': 'Real Estate', 'CCI': 'Real Estate',
+    'EQIX': 'Real Estate', 'SPG': 'Real Estate', 'O': 'Real Estate',
+    'PSA': 'Real Estate', 'DLR': 'Real Estate',
+}
 
 
 # =============================================================================
@@ -817,7 +912,22 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
     
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
+        info = None
+        
+        # Try up to 2 times with delay if rate-limited
+        for _attempt in range(2):
+            try:
+                info = stock.info
+                if info and info.get('sector'):
+                    break  # Got real data
+                if _attempt == 0:
+                    import time
+                    time.sleep(1.5)
+            except Exception:
+                if _attempt == 0:
+                    import time
+                    time.sleep(1.5)
+                break
         
         if info:
             result['sector'] = info.get('sector')
@@ -989,6 +1099,7 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     Method 3: stock.earnings_dates (sorted, find next upcoming)
     Method 4: Historical pattern estimation (last earnings + ~90 days)
     
+    Includes retry with delay for yfinance rate limiting.
     Returns dict with next_earnings, days_until_earnings, confidence, source.
     """
     cache_key = f"{ticker}:calendar"
@@ -1008,142 +1119,167 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     
     today = datetime.now().date()
     
-    try:
-        stock = yf.Ticker(ticker)
-        
-        # ── METHOD 1: stock.calendar ──────────────────────────────
+    # Try up to 2 attempts (initial + 1 retry after delay if rate-limited)
+    for attempt in range(2):
         try:
-            cal = stock.calendar
-            if cal is not None:
-                raw_date = None
-                if isinstance(cal, dict):
-                    raw_date = cal.get('Earnings Date')
-                    if isinstance(raw_date, list) and len(raw_date) > 0:
-                        raw_date = raw_date[0]
-                elif isinstance(cal, pd.DataFrame) and 'Earnings Date' in cal.columns:
-                    raw_date = cal['Earnings Date'].iloc[0]
-                
-                if raw_date is not None:
-                    earn_dt = None
-                    if hasattr(raw_date, 'date'):
-                        earn_dt = raw_date.date() if callable(getattr(raw_date, 'date', None)) else raw_date
-                    elif hasattr(raw_date, 'strftime'):
-                        earn_dt = raw_date
-                    elif isinstance(raw_date, str) and len(raw_date) >= 10:
-                        try:
-                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
-                        except ValueError:
-                            pass
-                    
-                    if earn_dt:
-                        days = (earn_dt - today).days
-                        if days >= -7:  # Accept recent past (just reported)
-                            result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
-                            result['days_until_earnings'] = max(0, days)
-                            result['confidence'] = 'HIGH'
-                            result['source'] = 'Yahoo (.calendar)'
-        except Exception:
-            pass
-        
-        # ── METHOD 2: stock.info timestamps ───────────────────────
-        if not result['next_earnings']:
+            stock = yf.Ticker(ticker)
+            
+            # ── METHOD 1: stock.calendar ──────────────────────────────
             try:
-                info = stock.info or {}
-                for ts_key in ('earningsTimestamp', 'earningsTimestampStart',
-                               'mostRecentQuarter'):
-                    ts = info.get(ts_key)
-                    if ts and isinstance(ts, (int, float)) and ts > 0:
-                        from datetime import timezone
-                        earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-                        days = (earn_dt - today).days
-                        if days >= -7:
-                            result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
-                            result['days_until_earnings'] = max(0, days)
-                            result['confidence'] = 'MEDIUM-HIGH'
-                            result['source'] = f'Yahoo (.info:{ts_key})'
-                            break
+                cal = stock.calendar
+                if cal is not None:
+                    raw_date = None
+                    if isinstance(cal, dict):
+                        raw_date = cal.get('Earnings Date')
+                        if isinstance(raw_date, list) and len(raw_date) > 0:
+                            raw_date = raw_date[0]
+                    elif isinstance(cal, pd.DataFrame) and 'Earnings Date' in cal.columns:
+                        raw_date = cal['Earnings Date'].iloc[0]
+                    
+                    if raw_date is not None:
+                        earn_dt = None
+                        if hasattr(raw_date, 'date'):
+                            earn_dt = raw_date.date() if callable(getattr(raw_date, 'date', None)) else raw_date
+                        elif hasattr(raw_date, 'strftime'):
+                            earn_dt = raw_date
+                        elif isinstance(raw_date, str) and len(raw_date) >= 10:
+                            try:
+                                earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                            except ValueError:
+                                pass
+                        
+                        if earn_dt:
+                            days = (earn_dt - today).days
+                            if days >= -7:  # Accept recent past (just reported)
+                                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                                result['days_until_earnings'] = max(0, days)
+                                result['confidence'] = 'HIGH'
+                                result['source'] = 'Yahoo (.calendar)'
             except Exception:
                 pass
-        
-        # ── METHOD 3: stock.earnings_dates (most reliable for upcoming) ──
-        if not result['next_earnings']:
-            try:
-                edates = stock.earnings_dates
-                if edates is not None and len(edates) > 0:
-                    # Sort and find the next date >= today - 7
-                    for dt_idx in sorted(edates.index):
-                        try:
-                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                            days = (d - today).days
+            
+            # ── METHOD 2: stock.info timestamps ───────────────────────
+            if not result['next_earnings']:
+                try:
+                    info = stock.info or {}
+                    for ts_key in ('earningsTimestamp', 'earningsTimestampStart',
+                                   'mostRecentQuarter'):
+                        ts = info.get(ts_key)
+                        if ts and isinstance(ts, (int, float)) and ts > 0:
+                            from datetime import timezone
+                            earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                            days = (earn_dt - today).days
                             if days >= -7:
-                                result['next_earnings'] = d.strftime('%Y-%m-%d')
+                                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
                                 result['days_until_earnings'] = max(0, days)
                                 result['confidence'] = 'MEDIUM-HIGH'
-                                result['source'] = 'Yahoo (.earnings_dates)'
-                                # Grab EPS estimate if available
-                                row = edates.loc[dt_idx]
-                                eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
-                                if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
-                                    result['next_eps_estimate'] = float(eps_est)
+                                result['source'] = f'Yahoo (.info:{ts_key})'
                                 break
-                        except Exception:
-                            continue
-                    
-                    # Also grab last earnings date (most recent past)
-                    for dt_idx in sorted(edates.index, reverse=True):
-                        try:
-                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                            days = (d - today).days
-                            if days < -7:
-                                result['last_earnings'] = d.strftime('%Y-%m-%d')
-                                break
-                        except Exception:
-                            continue
-            except Exception:
-                pass
-        
-        # ── METHOD 4: Historical pattern estimation ───────────────
-        if not result['next_earnings'] and result.get('last_earnings'):
-            # Estimate next based on ~90 day quarterly cycle
-            try:
-                last_dt = datetime.strptime(result['last_earnings'], '%Y-%m-%d').date()
-                estimated = last_dt + timedelta(days=91)
-                # If estimated date is in the past, add another quarter
-                while (estimated - today).days < -7:
-                    estimated += timedelta(days=91)
-                result['next_earnings'] = estimated.strftime('%Y-%m-%d')
-                result['days_until_earnings'] = max(0, (estimated - today).days)
-                result['confidence'] = 'LOW'
-                result['source'] = 'Estimated (last + 91d pattern)'
-            except Exception:
-                pass
-        
-        # ── METHOD 4b: If no last_earnings either, try earnings_dates for any past date ──
-        if not result['next_earnings'] and not result.get('last_earnings'):
-            try:
-                edates = stock.earnings_dates
-                if edates is not None and len(edates) > 0:
-                    # Get any past date as anchor
-                    for dt_idx in sorted(edates.index, reverse=True):
-                        try:
-                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                            result['last_earnings'] = d.strftime('%Y-%m-%d')
-                            # Project forward
-                            estimated = d + timedelta(days=91)
-                            while (estimated - today).days < -7:
-                                estimated += timedelta(days=91)
-                            result['next_earnings'] = estimated.strftime('%Y-%m-%d')
-                            result['days_until_earnings'] = max(0, (estimated - today).days)
-                            result['confidence'] = 'LOW'
-                            result['source'] = 'Estimated (historical + 91d)'
-                            break
-                        except Exception:
-                            continue
-            except Exception:
-                pass
+                except Exception:
+                    pass
+            
+            # ── METHOD 3: stock.earnings_dates (most reliable for upcoming) ──
+            if not result['next_earnings']:
+                try:
+                    edates = stock.earnings_dates
+                    if edates is not None and len(edates) > 0:
+                        # Sort and find the next date >= today - 7
+                        for dt_idx in sorted(edates.index):
+                            try:
+                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                                days = (d - today).days
+                                if days >= -7:
+                                    result['next_earnings'] = d.strftime('%Y-%m-%d')
+                                    result['days_until_earnings'] = max(0, days)
+                                    result['confidence'] = 'MEDIUM-HIGH'
+                                    result['source'] = 'Yahoo (.earnings_dates)'
+                                    # Grab EPS estimate if available
+                                    row = edates.loc[dt_idx]
+                                    eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
+                                    if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
+                                        result['next_eps_estimate'] = float(eps_est)
+                                    break
+                            except Exception:
+                                continue
+                        
+                        # Also grab last earnings date (most recent past)
+                        for dt_idx in sorted(edates.index, reverse=True):
+                            try:
+                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                                days = (d - today).days
+                                if days < -7:
+                                    result['last_earnings'] = d.strftime('%Y-%m-%d')
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+            
+            # If we got a result from any method, break out of retry loop
+            if result['next_earnings']:
+                break
+            
+            # If first attempt got nothing, check if rate-limited and retry
+            if attempt == 0:
+                # If stock.info returned empty/error, likely rate-limited
+                try:
+                    _test = stock.info
+                    if not _test or _test.get('trailingPegRatio') is None:
+                        # Possibly rate-limited — wait and retry
+                        import time
+                        time.sleep(2)
+                        continue
+                except Exception:
+                    import time
+                    time.sleep(2)
+                    continue
+                break  # Not rate-limited, just no data available
+            
+        except Exception as e:
+            err_str = str(e).lower()
+            if attempt == 0 and ('429' in err_str or 'rate' in err_str or 'too many' in err_str):
+                import time
+                time.sleep(2)
+                continue
+            result['error'] = str(e)[:200]
+            break
     
-    except Exception as e:
-        result['error'] = str(e)[:200]
+    # ── METHOD 4: Historical pattern estimation ───────────────
+    if not result['next_earnings'] and result.get('last_earnings'):
+        try:
+            last_dt = datetime.strptime(result['last_earnings'], '%Y-%m-%d').date()
+            estimated = last_dt + timedelta(days=91)
+            while (estimated - today).days < -7:
+                estimated += timedelta(days=91)
+            result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+            result['days_until_earnings'] = max(0, (estimated - today).days)
+            result['confidence'] = 'LOW'
+            result['source'] = 'Estimated (last + 91d pattern)'
+        except Exception:
+            pass
+    
+    # ── METHOD 4b: If no last_earnings either, try earnings_dates for any past date ──
+    if not result['next_earnings'] and not result.get('last_earnings'):
+        try:
+            stock = yf.Ticker(ticker)
+            edates = stock.earnings_dates
+            if edates is not None and len(edates) > 0:
+                for dt_idx in sorted(edates.index, reverse=True):
+                    try:
+                        d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                        result['last_earnings'] = d.strftime('%Y-%m-%d')
+                        estimated = d + timedelta(days=91)
+                        while (estimated - today).days < -7:
+                            estimated += timedelta(days=91)
+                        result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+                        result['days_until_earnings'] = max(0, (estimated - today).days)
+                        result['confidence'] = 'LOW'
+                        result['source'] = 'Estimated (historical + 91d)'
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
     
     _cache.set(cache_key, result)
     return result
