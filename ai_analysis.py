@@ -647,11 +647,13 @@ Keep total response under 300 words. No fluff. Be specific with prices and perce
 
 def call_ai(prompt: str,
             gemini_model=None,
-            openai_client=None) -> Dict[str, Any]:
+            openai_client=None,
+            ai_model: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
     """
     Send prompt to AI and parse response.
 
-    Tries Gemini first (preferred), falls back to OpenAI.
+    Tries OpenAI-compatible endpoint first (Groq or xAI), falls back to Gemini.
+    ai_model: model name to use (auto-detected from key prefix in app.py).
     Returns raw text and parsed fields.
     """
     result = {
@@ -668,11 +670,11 @@ def call_ai(prompt: str,
 
     narrative = None
 
-    # Try Groq/OpenAI first (primary — free, fast, generous limits)
+    # Try primary AI provider (Groq or xAI — auto-detected)
     if openai_client is not None:
         try:
             response = openai_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=ai_model,
                 messages=[
                     {"role": "system",
                      "content": "You are a senior technical analyst. Be concise, honest, actionable."},
@@ -682,7 +684,7 @@ def call_ai(prompt: str,
                 temperature=0.5
             )
             narrative = response.choices[0].message.content
-            result['provider'] = 'groq'
+            result['provider'] = ai_model
         except Exception as e:
             result['groq_error'] = str(e)[:200]
 
@@ -1041,7 +1043,8 @@ def analyze(ticker: str,
             news_data: Dict = None,
             market_intel: Dict = None,
             gemini_model=None,
-            openai_client=None) -> Dict[str, Any]:
+            openai_client=None,
+            ai_model: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
     """
     Run enhanced AI analysis on a ticker.
     """
@@ -1052,7 +1055,8 @@ def analyze(ticker: str,
 
     # Try AI first
     if gemini_model is not None or openai_client is not None:
-        result = call_ai(prompt, gemini_model=gemini_model, openai_client=openai_client)
+        result = call_ai(prompt, gemini_model=gemini_model, openai_client=openai_client,
+                         ai_model=ai_model)
 
         # If AI failed, use system fallback but preserve error info
         if not result['success']:
@@ -1089,7 +1093,8 @@ def analyze(ticker: str,
 
 def generate_market_narrative(macro_data: Dict,
                               gemini_model=None,
-                              openai_client=None) -> Dict[str, Any]:
+                              openai_client=None,
+                              ai_model: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
     """
     Generate a concise market narrative from macro data.
 
@@ -1112,7 +1117,7 @@ def generate_market_narrative(macro_data: Dict,
     if openai_client is not None:
         try:
             response = openai_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=ai_model,
                 messages=[
                     {"role": "system",
                      "content": "You are a senior macro strategist giving a morning briefing to a swing trader."},
@@ -1122,7 +1127,7 @@ def generate_market_narrative(macro_data: Dict,
                 temperature=0.5
             )
             narrative_text = response.choices[0].message.content
-            result['provider'] = 'groq'
+            result['provider'] = ai_model
         except Exception as e:
             result['groq_error'] = str(e)[:200]
 
@@ -1284,7 +1289,8 @@ def generate_deep_market_analysis(macro_data: Dict,
                                    market_filter: Dict = None,
                                    sector_rotation: Dict = None,
                                    gemini_model=None,
-                                   openai_client=None) -> Dict[str, Any]:
+                                   openai_client=None,
+                                   ai_model: str = "llama-3.3-70b-versatile") -> Dict[str, Any]:
     """
     Generate a deep, interpretive market structure analysis centered on
     sector ETF rotation — which sectors are LEADING, EMERGING, FADING, LAGGING,
@@ -1330,11 +1336,11 @@ def generate_deep_market_analysis(macro_data: Dict,
 
     raw_text = None
 
-    # Try Groq first
+    # Try primary AI provider
     if openai_client is not None:
         try:
             response = openai_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=ai_model,
                 messages=[
                     {"role": "system",
                      "content": (
@@ -1351,7 +1357,7 @@ def generate_deep_market_analysis(macro_data: Dict,
                 temperature=0.6
             )
             raw_text = response.choices[0].message.content
-            result['provider'] = 'groq'
+            result['provider'] = ai_model
         except Exception as e:
             result['groq_error'] = str(e)[:200]
 
