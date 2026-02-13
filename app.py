@@ -41,9 +41,10 @@ from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 # =============================================================================
 
 def clean_ai_formatting(text: str) -> str:
-    """Fix common AI output formatting issues with currency, percentages, and spacing.
+    """Fix common AI output formatting issues with currency, percentages, spacing, and markdown.
     
     Handles:
+    - Markdown bold/italic stripping (***text***, **text**, *text* → text with proper spacing)
     - Missing spaces after dollar amounts ($184.54Buy → $184.54 Buy)
     - Missing spaces before dollar amounts (target$210 → target $210)
     - Letter-number concatenation (gained27% → gained 27%)
@@ -55,6 +56,21 @@ def clean_ai_formatting(text: str) -> str:
     """
     if not text:
         return text
+
+    # ── Strip markdown bold/italic markers with space preservation ──
+    # Handle ***bold italic*** first (most greedy)
+    text = re.sub(r'(\w)\*{3}(\w)', r'\1 \2', text)   # word***word → word word
+    text = re.sub(r'\*{3}', '', text)                    # remaining ***
+
+    # Handle **bold**
+    text = re.sub(r'(\w)\*{2}(\w)', r'\1 \2', text)    # word**word → word word
+    text = re.sub(r'\*{2}', '', text)                    # remaining **
+
+    # Handle *italic* — careful not to hit multiplication
+    # Pattern: *word(s)* where content has letters
+    text = re.sub(r'(\w)\*([a-zA-Z])', r'\1 \2', text)  # word*text → word text
+    text = re.sub(r'([a-zA-Z])\*(\w)', r'\1 \2', text)  # text*word → text word
+    text = re.sub(r'(?<!\*)\*(?!\*)', '', text)          # remaining lone *
 
     # Fix dollar amounts followed by words: $184.54Buy → $184.54 Buy
     text = re.sub(r'(\$\d+[\d,.]*[KMBkmb]?)([A-Z][a-z])', r'\1 \2', text)
@@ -73,6 +89,10 @@ def clean_ai_formatting(text: str) -> str:
     text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
     text = re.sub(r'([,;:])([a-zA-Z])', r'\1 \2', text)
 
+    # Fix camelCase word boundaries from AI word-smashing (e.g. "dataWithout" → "data Without")
+    # But preserve intentional camelCase (single uppercase after lowercase is a word boundary)
+    text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', text)
+
     # Fix em-dash spacing
     text = re.sub(r'([a-zA-Z])—([a-zA-Z])', r'\1 — \2', text)
 
@@ -84,6 +104,8 @@ def clean_ai_formatting(text: str) -> str:
     text = re.sub(r'(\d+) ([KMBkmb])\b', r'\1\2', text)   # $15.2K, $3.2B
     text = re.sub(r'(\d) (st|nd|rd|th)\b', r'\1\2', text)  # 1st, 2nd, 3rd
     text = re.sub(r'\bQ (\d)\b', r'Q\1', text)             # Q1, Q2, Q3, Q4
+    text = re.sub(r'\bR: R\b', r'R:R', text)               # R:R ratio
+    text = re.sub(r'(\d) : (\d)', r'\1:\2', text)          # 5.9:1
 
     # Clean multiple spaces (preserve markdown indentation)
     text = re.sub(r'(?<!\n) {2,}', ' ', text)
@@ -3945,6 +3967,7 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
         external_research = st.session_state.get(research_key, "External research not yet loaded.")
 
         return f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant).
+CRITICAL FORMATTING RULE: NEVER use markdown formatting in your response — no *italic*, **bold**, or ***bold italic*** markers. Use PLAIN TEXT only with proper spacing between ALL words. Section headers should be plain numbered labels like "1. MARKET & SECTOR CONTEXT".
 
 ═══ YOUR DATA SOURCES ═══
 
@@ -4014,6 +4037,7 @@ If earnings are 60+ days away, skip this section.
 - Do NOT say "Based on the app data..." or list signals back — INTERPRET them
 - ALWAYS calculate and state the risk/reward ratio — never present a trade plan without it
 - Keep under 600 words. Be decisive, not exhaustive. Every sentence must add value.
+- FORMATTING: Do NOT use markdown formatting in your response body — no *italic*, **bold**, or ***bold italic*** markers anywhere. Use PLAIN TEXT with proper spacing between all words. Section headers should be plain numbered labels (e.g., "1. MARKET & SECTOR CONTEXT") without markdown.
 
 ═══ FOR FOLLOW-UP QUESTIONS (CONVERSATIONAL Q&A MODE) ═══
 
