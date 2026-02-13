@@ -181,6 +181,16 @@ if 'sector_rotation' not in st.session_state:
     except Exception:
         st.session_state['sector_rotation'] = {}
 
+# Pre-fetch SPY/VIX for APEX chart signals (avoids mid-render fetch on chart tab)
+if 'apex_spy_data' not in st.session_state:
+    try:
+        from data_fetcher import fetch_daily
+        st.session_state['apex_spy_data'] = fetch_daily("SPY")
+        st.session_state['apex_vix_data'] = fetch_daily("^VIX")
+    except Exception:
+        st.session_state['apex_spy_data'] = None
+        st.session_state['apex_vix_data'] = None
+
 if 'selected_ticker' not in st.session_state:
     st.session_state['selected_ticker'] = None
 
@@ -582,6 +592,11 @@ def render_sidebar():
                 st.session_state.pop('_research_market_cache_ts', None)
                 st.session_state.pop('_position_prices', None)
                 st.session_state.pop('_position_prices_ts', None)
+                # Clear APEX caches (SPY/VIX data + per-ticker detection)
+                st.session_state.pop('apex_spy_data', None)
+                st.session_state.pop('apex_vix_data', None)
+                for k in [k for k in st.session_state if k.startswith('_apex_cache_')]:
+                    st.session_state.pop(k, None)
                 st.toast("✅ Market data will refresh on next load.")
 
         # Key diagnostic
@@ -635,6 +650,8 @@ def _load_ticker_for_view(ticker: str):
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
             st.session_state['ticker_data_cache'] = cache
+            # Clear stale APEX cache (new data = needs re-detection)
+            st.session_state.pop(f'_apex_cache_{ticker}', None)
             # No rerun — current pass will render detail view
         else:
             st.sidebar.error(f"No data for {ticker}")
@@ -1813,41 +1830,48 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
     weekly = ticker_data.get('weekly')
     monthly = ticker_data.get('monthly')
 
-    # ── APEX Signal Detection ─────────────────────────────────────
+    # ── APEX Signal Detection (cached per ticker) ──────────────────
     show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{ticker}")
 
     apex_markers = []
     apex_signals_list = []
     apex_summary = {}
 
+    _apex_cache_key = f'_apex_cache_{ticker}'
+
     if show_apex and weekly is not None and monthly is not None:
-        try:
-            # Fetch SPY/VIX for bear filter (cache across tickers)
-            if 'apex_spy_data' not in st.session_state:
-                from data_fetcher import fetch_daily
-                st.session_state['apex_spy_data'] = fetch_daily("SPY")
-                st.session_state['apex_vix_data'] = fetch_daily("^VIX")
+        # Use cached APEX results if available
+        _cached_apex = st.session_state.get(_apex_cache_key)
+        if _cached_apex:
+            apex_signals_list = _cached_apex['signals']
+            apex_markers = _cached_apex['markers']
+            apex_summary = _cached_apex['summary']
+        else:
+            try:
+                spy_df = st.session_state.get('apex_spy_data')
+                vix_df = st.session_state.get('apex_vix_data')
 
-            spy_df = st.session_state.get('apex_spy_data')
-            vix_df = st.session_state.get('apex_vix_data')
+                apex_signals_list = detect_apex_signals(
+                    ticker=ticker,
+                    daily_data=daily,
+                    weekly_data=weekly,
+                    monthly_data=monthly,
+                    spy_data=spy_df,
+                    vix_data=vix_df,
+                )
 
-            apex_signals_list = detect_apex_signals(
-                ticker=ticker,
-                daily_data=daily,
-                weekly_data=weekly,
-                monthly_data=monthly,
-                spy_data=spy_df,
-                vix_data=vix_df,
-            )
+                apex_markers = get_apex_markers(apex_signals_list)
+                apex_summary = get_apex_summary(apex_signals_list)
 
-            apex_markers = get_apex_markers(apex_signals_list)
-            apex_summary = get_apex_summary(apex_signals_list)
+                # Cache for subsequent reruns (avoids re-detection on tab switches)
+                st.session_state[_apex_cache_key] = {
+                    'signals': apex_signals_list,
+                    'markers': apex_markers,
+                    'summary': apex_summary,
+                }
 
-            # Store for trade tab health monitoring
-            st.session_state[f'apex_signals_{ticker}'] = apex_signals_list
-
-        except Exception as e:
-            st.warning(f"APEX detection error: {e}")
+            except Exception as e:
+                st.warning(f"APEX detection error: {e}")
 
     # ── Render Chart ──────────────────────────────────────────────
     render_tv_chart(daily, ticker, signal=signal, height=750,
@@ -4690,10 +4714,10 @@ def _render_position_management(ticker: str, jm: JournalManager):
     )
 
     # ── APEX Signal Context ───────────────────────────────────────
-    # Check if APEX signals are available in session state
-    apex_signals_key = f'apex_signals_{ticker}'
-    if apex_signals_key in st.session_state:
-        apex_sigs = st.session_state[apex_signals_key]
+    # Check if APEX signals are available in session state (from chart tab cache)
+    _apex_cache = st.session_state.get(f'_apex_cache_{ticker}', {})
+    apex_sigs = _apex_cache.get('signals', []) if _apex_cache else []
+    if apex_sigs:
         active_apex = [s for s in apex_sigs if s.is_active]
         if active_apex:
             a = active_apex[-1]
@@ -4704,7 +4728,7 @@ def _render_position_management(ticker: str, jm: JournalManager):
                 f"Stop: {a.stop_level}% | {trail_status} | "
                 f"Highest: ${a.highest_price:.2f}"
             )
-        elif apex_sigs:
+        elif apex_sigs:  # signals exist but none active
             last = apex_sigs[-1]
             st.warning(
                 f"📡 **Last APEX signal closed** — {last.exit_reason} on "
