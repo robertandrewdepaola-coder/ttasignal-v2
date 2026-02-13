@@ -2939,6 +2939,12 @@ def _fetch_external_research(ticker: str) -> str:
                 if val:
                     lines.append(f"  {label}: {val}")
 
+            # Business description (critical for sector misclassification detection)
+            biz_summary = info.get('longBusinessSummary', '')
+            if biz_summary:
+                # First 400 chars is enough to identify actual business
+                lines.append(f"  Business: {biz_summary[:400]}")
+
             # Valuation
             lines.append(f"  --- Valuation ---")
             mc = info.get('marketCap')
@@ -3176,8 +3182,9 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
 
 **1. MARKET & SECTOR CONTEXT** (ALWAYS INCLUDE FIRST)
 - Current overall equity market conditions (use SPY, VIX, breadth data provided)
-- Identify the stock's sector by name
-- Is that sector in rotation vs S&P 500? LEADING, LAGGING, or WEAKENING?
+- Identify the stock's SECTOR and INDUSTRY by name
+- SECTOR CLASSIFICATION CHECK: Read the company's Business description. Does the Yahoo-assigned sector accurately reflect what this company actually does? Many companies are misclassified (e.g., crypto miners in "Financial Services", SaaS companies in "Industrials", EV companies in "Consumer Cyclical"). If the actual business doesn't match the assigned sector, SAY SO and explain which sector's rotation data is more relevant. Example: "WULF is classified as Financial Services but is actually a Bitcoin mining company — crypto/tech sector rotation is more relevant than traditional financials."
+- Is the RELEVANT sector in rotation vs S&P 500? LEADING, LAGGING, or WEAKENING?
 - Cite current sector performance data (20d vs SPY)
 - If sector rotation data unavailable, explicitly state this limitation
 
@@ -3206,9 +3213,17 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
 - Entry price or zone (if BUY)
 - Stop loss level (MUST include)
 - Target price with upside %
+- **RISK/REWARD RATIO** (MUST calculate explicitly): Upside % to target ÷ Downside % to stop. State the ratio (e.g., "1.75:1"). Assess whether it's adequate given the setup: 2:1+ is standard for swing trades; earnings plays with high short interest need 2.5:1+ to justify the binary risk. If R:R is below 1.5:1, flag it as inadequate.
 - Hold duration — MUST be appropriate to earnings calendar
 - Position sizing: Full (100%) / Reduced (75%) / Small (50%) / Skip — with reason
-- Key risks and any conflicting signals
+
+**6. POST-EARNINGS SCENARIOS** (REQUIRED if earnings are within 30 days)
+If the next earnings report falls within the recommended hold period OR within 30 days, you MUST provide:
+- **If earnings BEAT and stock gaps up:** Take profits at what level? Or reassess for a longer hold? What would confirm a continuation vs a "sell the news" fade?
+- **If earnings MISS and stock gaps down:** Exit immediately regardless of stop loss? Or is there a lower support level worth holding to?
+- **Recommended exit strategy:** Should this be a day-after-earnings exit regardless of direction? Or hold through? What's the plan for a flat/neutral reaction?
+- **Pre-earnings positioning:** Should the full position be entered now, or scale in? Should part be hedged with options?
+If earnings are 60+ days away, skip this section.
 
 ═══ CRITICAL RULES ═══
 - Never recommend a multi-month hold if earnings are <30 days away without explicitly acknowledging the risk
@@ -3216,7 +3231,8 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
 - When discussing insider activity, ONLY report actual BUY/SELL transactions — ownership % is NOT selling
 - Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
 - Do NOT say "Based on the app data..." or list signals back — INTERPRET them
-- Keep under 400 words. Be decisive, not exhaustive. Every sentence must add value.
+- ALWAYS calculate and state the risk/reward ratio — never present a trade plan without it
+- Keep under 500 words. Be decisive, not exhaustive. Every sentence must add value.
 
 ═══ FOR FOLLOW-UP QUESTIONS ═══
 - Be direct and specific — cite prices, percentages, dates
@@ -3259,7 +3275,7 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
                 response = openai_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=messages,
-                    max_tokens=1200,
+                    max_tokens=1600,
                     temperature=0.3,
                 )
                 reply = response.choices[0].message.content
@@ -3270,7 +3286,7 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
                 response = openai_client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=messages,
-                    max_tokens=1000,
+                    max_tokens=1200,
                     temperature=0.3,
                 )
                 reply = response.choices[0].message.content
