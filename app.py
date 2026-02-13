@@ -2275,16 +2275,20 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     _weinstein = signal.weinstein if signal else {}
     _ws_stage = _weinstein.get('stage', 0) if _weinstein else 0
 
-    # Daily: MACD bullish cross or bullish momentum
-    _daily_signal = _macd.get('signal_type', '') if _macd else ''
-    _daily_bullish = 'bullish' in str(_daily_signal).lower()
+    # Daily: MACD above signal line = bullish
+    _daily_bullish = _macd.get('bullish', False) if _macd else False
+    _daily_weakening = _macd.get('weakening', False) if _macd else False
+    _daily_cross_recent = _macd.get('cross_recent', False) if _macd else False
+    _daily_hist = _macd.get('histogram', 0) if _macd else 0
 
     # Weekly: Weinstein Stage 2 (advancing) = bullish structure
     _weekly_bullish = _ws_stage == 2
 
-    # Momentum: AO green = bullish momentum confirmation
-    _ao_color = _ao.get('current_color', '') if _ao else ''
-    _momentum_bullish = _ao_color == 'green'
+    # Momentum: AO positive = bullish momentum (trend adds nuance)
+    _ao_positive = _ao.get('positive', False) if _ao else False
+    _ao_trend = _ao.get('trend', 'flat') if _ao else 'flat'
+    _ao_value = _ao.get('value', 0) if _ao else 0
+    _momentum_bullish = _ao_positive
 
     _aligned_count = sum([_daily_bullish, _weekly_bullish, _momentum_bullish])
     _confluence_score = _aligned_count / 3.0
@@ -2292,8 +2296,13 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     st.markdown("---")
     tf1, tf2, tf3 = st.columns(3)
     with tf1:
-        _d_icon = "✅ Bullish" if _daily_bullish else "❌ Bearish"
-        _d_detail = str(_daily_signal)[:20] if _daily_signal else "No signal"
+        if _daily_bullish:
+            _d_icon = "✅ Bullish"
+            if _daily_weakening:
+                _d_icon = "⚠️ Weakening"
+        else:
+            _d_icon = "❌ Bearish"
+        _d_detail = f"Hist: {_daily_hist:+.2f}" + (" | Recent cross" if _daily_cross_recent else "")
         st.metric("Daily (MACD)", _d_icon)
         st.caption(_d_detail)
     with tf2:
@@ -2302,9 +2311,12 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.metric("Weekly (Weinstein)", _w_icon)
         st.caption(_w_label if _w_label else "Structure")
     with tf3:
-        _m_icon = "✅ Green" if _momentum_bullish else ("❌ Red" if _ao_color == 'red' else "⚠️ Mixed")
+        if _ao_positive:
+            _m_icon = "✅ Positive" if _ao_trend != 'falling' else "⚠️ Fading"
+        else:
+            _m_icon = "❌ Negative"
         st.metric("Momentum (AO)", _m_icon)
-        st.caption(f"{'Bullish' if _momentum_bullish else 'Bearish'} momentum")
+        st.caption(f"AO: {_ao_value:+.1f} ({_ao_trend})")
 
     # Confluence bar + sector-adjusted guidance
     _required = 3 if _phase == 'LAGGING' else (3 if _phase == 'EMERGING' else 2)
@@ -2386,13 +2398,28 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         _tech_rows.append(("Weinstein Stage", f"Stage {_ws_stage}" + (f" — {_ts_label}" if _ts_label else ""), _ts_icon))
 
         # MACD Signal
-        _ms = _macd.get('signal_type', '') if _macd else ''
-        _ms_icon = "✅" if 'bullish' in str(_ms).lower() else ("❌" if 'bearish' in str(_ms).lower() else "⚠️")
-        _tech_rows.append(("MACD Signal", str(_ms)[:30] if _ms else "N/A", _ms_icon))
+        _macd_bullish = _macd.get('bullish', False) if _macd else False
+        _macd_weak = _macd.get('weakening', False) if _macd else False
+        _macd_hist = _macd.get('histogram', 0) if _macd else 0
+        if _macd_bullish:
+            _ms_label = "Bullish" + (" (weakening)" if _macd_weak else "")
+            _ms_icon = "⚠️" if _macd_weak else "✅"
+        else:
+            _ms_label = "Bearish"
+            _ms_icon = "❌"
+        _tech_rows.append(("MACD Signal", f"{_ms_label} (Hist: {_macd_hist:+.2f})", _ms_icon))
 
         # AO Momentum
-        _tech_rows.append(("AO Momentum", _ao_color.title() if _ao_color else "N/A",
-                           "✅" if _ao_color == 'green' else ("❌" if _ao_color == 'red' else "⚠️")))
+        _ao_pos = _ao.get('positive', False) if _ao else False
+        _ao_trn = _ao.get('trend', 'flat') if _ao else 'flat'
+        _ao_val = _ao.get('value', 0) if _ao else 0
+        if _ao_pos:
+            _ao_label = f"Positive ({_ao_trn})"
+            _ao_icon = "✅" if _ao_trn != 'falling' else "⚠️"
+        else:
+            _ao_label = f"Negative ({_ao_trn})"
+            _ao_icon = "❌"
+        _tech_rows.append(("AO Momentum", f"{_ao_label} ({_ao_val:+.1f})", _ao_icon))
 
         # Volume vs Average
         if _vol_ratio:
