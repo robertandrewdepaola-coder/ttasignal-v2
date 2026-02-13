@@ -45,6 +45,60 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# =============================================================================
+# AI PROVIDER AUTO-DETECTION — supports Groq (gsk_) and xAI/Grok (xai-)
+# =============================================================================
+
+def _detect_ai_provider(api_key: str) -> Dict:
+    """
+    Auto-detect AI provider from API key prefix.
+    Returns config dict with base_url, models, and provider name.
+    
+    Supported:
+      - Groq (groq.com): keys start with 'gsk_', endpoint api.groq.com
+      - xAI/Grok (x.ai): keys start with 'xai-', endpoint api.x.ai
+    """
+    key = (api_key or "").strip().strip('"').strip("'").strip()
+    
+    if key.startswith("gsk_"):
+        return {
+            'provider': 'groq',
+            'base_url': 'https://api.groq.com/openai/v1',
+            'model': 'llama-3.3-70b-versatile',
+            'fallback_model': 'llama-3.1-8b-instant',
+            'key': key,
+            'display': f'Groq (gsk_...{key[-4:]})',
+        }
+    elif key.startswith("xai-") or key.startswith("xai_"):
+        return {
+            'provider': 'xai',
+            'base_url': 'https://api.x.ai/v1',
+            'model': 'grok-3-mini-fast',
+            'fallback_model': 'grok-3-mini-fast',
+            'key': key,
+            'display': f'xAI/Grok (xai-...{key[-4:]})',
+        }
+    elif key:
+        # Unknown prefix — try Groq format as default
+        return {
+            'provider': 'unknown',
+            'base_url': 'https://api.groq.com/openai/v1',
+            'model': 'llama-3.3-70b-versatile',
+            'fallback_model': 'llama-3.1-8b-instant',
+            'key': key,
+            'display': f'Unknown ({key[:6]}...{key[-4:]})',
+        }
+    else:
+        return {
+            'provider': 'none',
+            'base_url': '',
+            'model': '',
+            'fallback_model': '',
+            'key': '',
+            'display': 'Not configured',
+        }
+
 # Initialize journal
 if 'journal' not in st.session_state:
     st.session_state['journal'] = JournalManager(data_dir=".")
@@ -221,6 +275,7 @@ def _run_deep_analysis():
                 sector_rotation=sector_rotation,
                 gemini_model=gemini_model,
                 openai_client=openai_client,
+                ai_model=st.session_state.get('_ai_config', {}).get('model', 'llama-3.3-70b-versatile'),
             )
 
             result['macro_data'] = macro_data
@@ -363,6 +418,7 @@ def _run_factual_brief():
                 macro_data,
                 gemini_model=gemini_model,
                 openai_client=openai_client,
+                ai_model=st.session_state.get('_ai_config', {}).get('model', 'llama-3.3-70b-versatile'),
             )
 
             narrative_result['macro_data'] = macro_data
@@ -456,17 +512,18 @@ def render_sidebar():
         try:
             _diag_key = st.secrets.get("GROQ_API_KEY", "")
             if _diag_key:
-                _diag_key = _diag_key.strip().strip('"').strip("'").strip()
-                _status = st.session_state.get('_groq_key_status', 'unknown')
-                st.caption(f"🔑 Groq key: `{_diag_key[:8]}...{_diag_key[-4:]}` ({len(_diag_key)} chars) | Status: {_status}")
-                if not _diag_key.startswith("gsk_"):
-                    st.error("⚠️ Key should start with `gsk_` — check you copied the right key from console.groq.com")
-                if len(_diag_key) < 40:
-                    st.error(f"⚠️ Key looks too short ({len(_diag_key)} chars) — Groq keys are typically 56+ characters")
+                _diag_cfg = _detect_ai_provider(_diag_key)
+                _status = st.session_state.get('_groq_key_status', 'not tested')
+                st.caption(f"🔑 API key: `{_diag_cfg['key'][:8]}...{_diag_cfg['key'][-4:]}` "
+                           f"({len(_diag_cfg['key'])} chars)")
+                st.caption(f"   Provider: **{_diag_cfg['provider'].upper()}** → {_diag_cfg['base_url']} | "
+                           f"Model: {_diag_cfg['model']} | Status: {_status}")
+                if _diag_cfg['provider'] == 'unknown':
+                    st.warning("⚠️ Key prefix not recognized. Expected `gsk_` (Groq) or `xai-` (xAI/Grok).")
             else:
-                st.caption("🔑 Groq key: **not set**")
+                st.caption("🔑 API key: **not set** — add GROQ_API_KEY to secrets")
             _gem_key = st.secrets.get("GEMINI_API_KEY", "")
-            st.caption(f"🤖 Gemini key: {'set (' + _gem_key[:6] + '...)' if _gem_key else '**not set**'}")
+            st.caption(f"🤖 Gemini key: {'set (' + _gem_key[:6] + '...)' if _gem_key else '**not set** (optional fallback)'}")
         except Exception:
             st.caption("🔑 Could not read secrets")
 
@@ -1817,54 +1874,61 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     quality = analysis.quality or {}
     jm = get_journal()
 
-    # Check for AI providers: Groq (primary) → Gemini (fallback)
+    # Check for AI providers: auto-detect Groq vs xAI/Grok from key prefix
     gemini = None
-    openai_client = None  # Used for Groq (same API format)
+    openai_client = None
+    ai_config = {'model': '', 'fallback_model': '', 'provider': 'none'}
 
-    # Groq — primary (free, fast, generous limits)
-    groq_error = None
+    # Primary provider — auto-detect from GROQ_API_KEY (supports Groq gsk_ and xAI xai-)
+    primary_error = None
     try:
-        groq_key = st.secrets.get("GROQ_API_KEY", "")
-        # Sanitize — strip whitespace and stray quotes
-        if groq_key:
-            groq_key = groq_key.strip().strip('"').strip("'").strip()
-        if groq_key:
-            # Check if we already know this key is bad (cached validation)
-            cached_groq_status = st.session_state.get('_groq_key_status')
-            cached_groq_key = st.session_state.get('_groq_key_cached', '')
-            if cached_groq_status == 'invalid' and cached_groq_key == groq_key:
-                groq_error = "API key previously failed (401 Invalid). Click 🔑 Reset API in sidebar after updating secrets."
+        raw_key = st.secrets.get("GROQ_API_KEY", "")
+        ai_config = _detect_ai_provider(raw_key)
+        api_key = ai_config['key']
+
+        if api_key and ai_config['provider'] != 'none':
+            # Check cached validation
+            cached_status = st.session_state.get('_groq_key_status')
+            cached_key = st.session_state.get('_groq_key_cached', '')
+            if cached_status == 'invalid' and cached_key == api_key:
+                primary_error = f"Key previously failed (401). Click 🔑 Reset API after updating. [{ai_config['display']}]"
             else:
                 from openai import OpenAI
                 openai_client = OpenAI(
-                    api_key=groq_key,
-                    base_url="https://api.groq.com/openai/v1",
+                    api_key=api_key,
+                    base_url=ai_config['base_url'],
                 )
-                # Pre-flight validation: quick test call to catch 401 immediately
-                if f'_groq_validated_{groq_key[:8]}' not in st.session_state:
+                # Store config in session for other tabs
+                st.session_state['_ai_config'] = ai_config
+                # Pre-flight validation (once per key)
+                if f'_ai_validated_{api_key[:8]}' not in st.session_state:
                     try:
                         _test = openai_client.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
+                            model=ai_config['model'],
                             messages=[{"role": "user", "content": "hi"}],
                             max_tokens=1,
                         )
-                        st.session_state[f'_groq_validated_{groq_key[:8]}'] = True
+                        st.session_state[f'_ai_validated_{api_key[:8]}'] = True
                     except Exception as val_err:
                         val_str = str(val_err)
-                        if 'Invalid API Key' in val_str or '401' in val_str:
+                        if 'Invalid API Key' in val_str or '401' in val_str or 'Unauthorized' in val_str:
                             st.session_state['_groq_key_status'] = 'invalid'
-                            st.session_state['_groq_key_cached'] = groq_key
+                            st.session_state['_groq_key_cached'] = api_key
                             openai_client = None
-                            groq_error = f"Key validation failed (401). Key starts with: {groq_key[:8]}..."
+                            primary_error = f"Key validation failed (401). {ai_config['display']}"
                         else:
-                            # Non-auth error (rate limit etc) — key itself is probably fine
-                            st.session_state[f'_groq_validated_{groq_key[:8]}'] = True
+                            # Non-auth error (rate limit etc) — key itself probably fine
+                            st.session_state[f'_ai_validated_{api_key[:8]}'] = True
         else:
-            groq_error = "No GROQ_API_KEY in secrets"
+            primary_error = "No GROQ_API_KEY in secrets (supports Groq gsk_ or xAI xai- keys)"
     except ImportError:
-        groq_error = "openai package not installed — add to requirements.txt"
+        primary_error = "openai package not installed — add to requirements.txt"
     except Exception as e:
-        groq_error = str(e)[:200]
+        primary_error = str(e)[:200]
+
+    # Show provider info
+    if openai_client:
+        st.caption(f"Provider: {ai_config['display']} | Model: {ai_config['model']}")
 
     # Gemini — fallback
     gemini_error = None
@@ -1883,12 +1947,12 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
 
     if not openai_client and not gemini:
         errors = []
-        if groq_error:
-            errors.append(f"Groq: {groq_error}")
+        if primary_error:
+            errors.append(primary_error)
         if gemini_error:
             errors.append(f"Gemini: {gemini_error}")
         st.warning(f"⚠️ AI providers unavailable: {' | '.join(errors)}")
-        st.caption("💡 After updating API keys in Streamlit secrets, **restart the app** (not just refresh) for changes to take effect.")
+        st.caption("💡 After updating API keys, click 🔑 **Reset API** in ⚙️ Settings sidebar.")
 
     # Auto-run on first view for this ticker, or manual re-run
     has_cached = st.session_state.get(f'ai_result_{ticker}') is not None
@@ -1987,6 +2051,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
                     market_intel=market_intel,
                     gemini_model=gemini,
                     openai_client=openai_client,
+                    ai_model=ai_config.get('model', 'llama-3.3-70b-versatile'),
                 )
             else:
                 # No AI provider — build result from data only
@@ -2014,39 +2079,27 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     provider = ai_result.get('provider', 'unknown')
     st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
 
-    # Show AI errors if present — cache key validation failures
+    # Show AI errors if present
     groq_err = ai_result.get('groq_error', '')
     gemini_err = ai_result.get('gemini_error', '')
+    _cfg = st.session_state.get('_ai_config', {})
+    _provider_name = _cfg.get('display', 'AI provider')
 
     if groq_err:
-        if 'Invalid API Key' in groq_err or '401' in groq_err or 'validation failed' in groq_err:
-            # Cache this key as bad so we don't keep retrying
-            try:
-                _bad_key = st.secrets.get("GROQ_API_KEY", "").strip().strip('"').strip("'").strip()
-                st.session_state['_groq_key_status'] = 'invalid'
-                st.session_state['_groq_key_cached'] = _bad_key
-                _key_info = f"Key being used: `{_bad_key[:8]}...{_bad_key[-4:]}` ({len(_bad_key)} chars)"
-                if not _bad_key.startswith("gsk_"):
-                    _key_info += " ⚠️ **Does NOT start with `gsk_`!**"
-            except Exception:
-                _key_info = ""
-            st.error(f"🔑 **Groq API key is invalid (401).** {_key_info}")
-            st.caption("**To fix:** 1) Go to [console.groq.com/keys](https://console.groq.com/keys) → Create API Key "
-                       "2) Copy the key (starts with `gsk_`, ~56 chars) "
-                       "3) In Streamlit: Settings → Secrets → set `GROQ_API_KEY = \"gsk_your_key_here\"` "
-                       "4) **Stop & restart** the app. Then click 🔑 **Reset API** in ⚙️ Settings sidebar.")
+        if 'Invalid API Key' in groq_err or '401' in groq_err or 'Unauthorized' in groq_err:
+            st.error(f"🔑 **{_provider_name}: API key invalid (401).** Click 🔑 Reset API in ⚙️ Settings sidebar after fixing.")
         else:
-            st.warning(f"⚠️ Groq error: {groq_err}")
+            st.warning(f"⚠️ {_provider_name} error: {groq_err}")
     if gemini_err:
         if '429' in gemini_err or 'quota' in gemini_err.lower():
-            st.warning("⚠️ Gemini fallback: quota exceeded (free tier limit). Fix your Groq key to avoid this.")
+            st.warning("⚠️ Gemini fallback: quota exceeded. Fix your primary API key to avoid this.")
         else:
             st.warning(f"⚠️ Gemini error: {gemini_err}")
     if ai_result.get('openai_error'):
-        st.warning(f"⚠️ OpenAI error: {ai_result['openai_error']}")
+        st.warning(f"⚠️ API error: {ai_result['openai_error']}")
     if ai_result.get('error'):
         if 'All AI providers failed' in str(ai_result.get('error', '')):
-            st.error("❌ All AI providers failed. **Fix your GROQ_API_KEY** in secrets, then restart the app.")
+            st.error(f"❌ All AI providers failed. Check your API key in secrets, then click 🔑 Reset API.")
         else:
             st.warning(f"⚠️ Error: {ai_result['error']}")
 
@@ -3390,36 +3443,40 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
                      analysis: TickerAnalysis):
     """AI Research Analyst — auto-runs external research + interactive follow-up chat."""
 
-    # ── Initialize Groq client ────────────────────────────────────────
+    # ── Initialize AI client (auto-detect Groq vs xAI/Grok) ─────────
     openai_client = None
-    groq_key = ""
-    try:
+    ai_config = st.session_state.get('_ai_config')  # From AI Intel pre-flight
+
+    if not ai_config:
+        # First time — detect from key
         try:
-            groq_key = st.secrets.get("GROQ_API_KEY", "")
+            raw_key = st.secrets.get("GROQ_API_KEY", "")
+            ai_config = _detect_ai_provider(raw_key)
+            st.session_state['_ai_config'] = ai_config
         except Exception:
-            pass
-        # Sanitize
-        if groq_key:
-            groq_key = groq_key.strip().strip('"').strip("'").strip()
-        if groq_key:
-            # Check cached validation (from AI Intel pre-flight or prior 401)
-            cached_status = st.session_state.get('_groq_key_status')
-            cached_key = st.session_state.get('_groq_key_cached', '')
-            if cached_status == 'invalid' and cached_key == groq_key:
-                groq_key = ""  # Skip — known bad key
-            else:
+            ai_config = {'provider': 'none', 'key': '', 'model': '', 'fallback_model': '', 'base_url': '', 'display': 'Error'}
+
+    if ai_config['key'] and ai_config['provider'] != 'none':
+        # Check cached validation
+        cached_status = st.session_state.get('_groq_key_status')
+        cached_key = st.session_state.get('_groq_key_cached', '')
+        if cached_status == 'invalid' and cached_key == ai_config['key']:
+            pass  # Skip — known bad key
+        else:
+            try:
                 from openai import OpenAI
                 openai_client = OpenAI(
-                    api_key=groq_key,
-                    base_url="https://api.groq.com/openai/v1",
+                    api_key=ai_config['key'],
+                    base_url=ai_config['base_url'],
                 )
-    except Exception:
-        pass
+            except Exception:
+                pass
 
     if not openai_client:
-        st.warning("🔑 **GROQ_API_KEY is missing or invalid.** "
-                   "Go to Settings → Secrets, add a valid key, then **restart the app** (Stop → Run).")
-        st.caption("Get a free API key at [console.groq.com](https://console.groq.com)")
+        st.warning(f"🔑 **API key missing or invalid.** Current: {ai_config.get('display', 'none')}")
+        st.caption("Add your API key in Settings → Secrets as `GROQ_API_KEY`. "
+                   "Supports **Groq** (`gsk_...`) or **xAI/Grok** (`xai-...`) keys. "
+                   "After updating, click 🔑 **Reset API** in ⚙️ Settings sidebar.")
         return
 
     # ── Chat state management (per ticker) ────────────────────────────
@@ -3557,7 +3614,7 @@ If earnings are 60+ days away, skip this section.
         try:
             with st.spinner(f"🧠 Analyzing {ticker} — synthesizing signals + research..."):
                 response = openai_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model=ai_config['model'],
                     messages=messages,
                     max_tokens=1800,
                     temperature=0.3,
@@ -3567,19 +3624,19 @@ If earnings are 60+ days away, skip this section.
         except Exception as e:
             err_str = str(e)
             # Cache 401 invalid key so we don't keep retrying
-            if 'Invalid API Key' in err_str or '401' in err_str:
+            if 'Invalid API Key' in err_str or '401' in err_str or 'Unauthorized' in err_str:
                 try:
                     st.session_state['_groq_key_status'] = 'invalid'
-                    st.session_state['_groq_key_cached'] = st.secrets.get("GROQ_API_KEY", "")
+                    st.session_state['_groq_key_cached'] = ai_config.get('key', '')
                 except Exception:
                     pass
                 history.append({'role': 'assistant',
-                                'content': "🔑 **Groq API key is invalid.** Go to Settings → Secrets, update GROQ_API_KEY, then **restart the app** (Stop → Run).\n\nGet a free key at [console.groq.com](https://console.groq.com)"})
+                                'content': f"🔑 **API key invalid ({ai_config.get('display', 'unknown')}).** Update GROQ_API_KEY in secrets, then click 🔑 Reset API in sidebar."})
             else:
                 # Fallback model
                 try:
                     response = openai_client.chat.completions.create(
-                        model="llama-3.1-8b-instant",
+                        model=ai_config['fallback_model'],
                         messages=messages,
                         max_tokens=1400,
                         temperature=0.3,
@@ -3588,14 +3645,14 @@ If earnings are 60+ days away, skip this section.
                     history.append({'role': 'assistant', 'content': reply})
                 except Exception as e2:
                     err2_str = str(e2)
-                    if 'Invalid API Key' in err2_str or '401' in err2_str:
+                    if 'Invalid API Key' in err2_str or '401' in err2_str or 'Unauthorized' in err2_str:
                         try:
                             st.session_state['_groq_key_status'] = 'invalid'
-                            st.session_state['_groq_key_cached'] = st.secrets.get("GROQ_API_KEY", "")
+                            st.session_state['_groq_key_cached'] = ai_config.get('key', '')
                         except Exception:
                             pass
                         history.append({'role': 'assistant',
-                                        'content': "🔑 **Groq API key is invalid.** Update GROQ_API_KEY in secrets, then restart the app."})
+                                        'content': f"🔑 **API key invalid.** Update GROQ_API_KEY in secrets, then click 🔑 Reset API."})
                     else:
                         history.append({'role': 'assistant',
                                         'content': f"⚠️ Analysis failed: {err_str[:200]}\nFallback: {err2_str[:200]}"})
@@ -3635,7 +3692,7 @@ If earnings are 60+ days away, skip this section.
             try:
                 with st.spinner("Thinking..."):
                     response = openai_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model=ai_config['model'],
                         messages=messages,
                         max_tokens=1000,
                         temperature=0.4,
@@ -3652,7 +3709,7 @@ If earnings are 60+ days away, skip this section.
                 try:
                     with st.spinner("Retrying..."):
                         response = openai_client.chat.completions.create(
-                            model="llama-3.1-8b-instant",
+                            model=ai_config['fallback_model'],
                             messages=messages,
                             max_tokens=800,
                             temperature=0.4,
