@@ -2566,142 +2566,99 @@ def _render_fundamental_snapshot(fp: Dict):
 
 
 # =============================================================================
-# ASK AI CHAT — Interactive conversation about the stock
+# ASK AI — Research Analyst + Interactive Chat
 # =============================================================================
 
-def _build_stock_context(ticker: str, signal: EntrySignal, rec: Dict,
-                         analysis: TickerAnalysis) -> str:
-    """Build comprehensive stock context string for AI chat system prompt."""
-    lines = [f"═══ FULL DATA CONTEXT FOR {ticker} ═══\n"]
+def _build_internal_context(ticker: str, signal: EntrySignal, rec: Dict,
+                            analysis: TickerAnalysis) -> str:
+    """Build internal app data context — signals, quality, AI results.
+    This is what the AI can SEE from the app. It should interpret, not repeat."""
+    lines = [f"═══ IN-APP DATA FOR {ticker} (visible to user — DO NOT repeat, only interpret) ═══\n"]
 
-    # Current price & recommendation
+    # Price & recommendation
     if analysis.current_price:
-        lines.append(f"CURRENT PRICE: ${analysis.current_price:.2f}")
-    lines.append(f"RECOMMENDATION: {rec.get('recommendation', 'N/A')} (Conviction: {rec.get('conviction', 0)}/10)")
-    lines.append(f"SUMMARY: {rec.get('summary', 'N/A')}")
+        lines.append(f"PRICE: ${analysis.current_price:.2f}")
+    lines.append(f"APP RECOMMENDATION: {rec.get('recommendation', 'N/A')} | Conviction: {rec.get('conviction', 0)}/10")
 
     # Quality
     q = analysis.quality or {}
     if q:
-        lines.append(f"\nQUALITY GRADE: {q.get('quality_grade', '?')}")
-        for factor in ['trend_alignment', 'volume_confirmation', 'momentum_health',
-                       'multi_timeframe', 'risk_reward']:
-            val = q.get(factor)
-            if val is not None:
-                lines.append(f"  {factor}: {val}")
+        lines.append(f"QUALITY GRADE: {q.get('quality_grade', '?')}")
 
-    # Signal data
+    # Signals
     if signal:
-        lines.append(f"\n── DAILY SIGNALS ──")
         m = signal.macd
-        lines.append(f"  MACD: {'Bullish' if m.get('bullish') else 'Bearish'} | Hist: {m.get('histogram', 0):+.4f}")
-        if m.get('near_cross'):
-            lines.append(f"  ⚠ MACD near crossover")
-        if m.get('weakening'):
-            lines.append(f"  ⚠ MACD histogram weakening")
-
         ao = signal.ao
-        lines.append(f"  AO: {'Positive' if ao.get('positive') else 'Negative'} | Value: {ao.get('value', 0):+.4f}")
-        if ao.get('saucer'):
-            lines.append(f"  🟢 AO Saucer (bullish acceleration)")
-
-        lines.append(f"\n── WEEKLY ──")
         wm = signal.weekly_macd
-        lines.append(f"  Weekly MACD: {'Bullish' if wm.get('bullish') else 'Bearish'}")
-
-        lines.append(f"\n── MONTHLY ──")
         mm = signal.monthly_macd
+        lines.append(f"\nTECHNICAL SIGNALS (user can see these on Signal tab):")
+        lines.append(f"  Daily MACD: {'Bullish' if m.get('bullish') else 'Bearish'} | Hist: {m.get('histogram', 0):+.4f}"
+                     f"{' | NEAR CROSS' if m.get('near_cross') else ''}"
+                     f"{' | WEAKENING' if m.get('weakening') else ''}")
+        lines.append(f"  AO: {'Positive' if ao.get('positive') else 'Negative'} | {ao.get('value', 0):+.4f}"
+                     f"{' | SAUCER' if ao.get('saucer') else ''}")
+        lines.append(f"  Weekly MACD: {'Bullish' if wm.get('bullish') else 'Bearish'}")
         lines.append(f"  Monthly MACD: {'Bullish' if mm.get('bullish') else 'Bearish'}")
 
-        # Volume
         if analysis.volume_ratio:
-            lines.append(f"\n  Volume Ratio: {analysis.volume_ratio:.1f}x average")
+            lines.append(f"  Volume: {analysis.volume_ratio:.1f}x average")
 
-    # Re-entry / Late entry
+    # Special signals
     if analysis.reentry and analysis.reentry.get('is_valid'):
         re = analysis.reentry
-        lines.append(f"\n── RE-ENTRY SIGNAL ──")
-        lines.append(f"  MACD cross {re.get('macd_cross_bars_ago', '?')} bars ago")
-        lines.append(f"  AO confirmation: {re.get('ao_confirmed', False)}")
-
-    # Apex
+        lines.append(f"  RE-ENTRY: MACD cross {re.get('macd_cross_bars_ago', '?')} bars ago, AO confirm: {re.get('ao_confirmed')}")
     if analysis.apex_buy:
-        lines.append(f"\n🎯 APEX BUY SIGNAL ACTIVE")
-
-    # AO Divergence
+        lines.append(f"  🎯 APEX BUY SIGNAL ACTIVE")
     if analysis.ao_divergence_active:
-        lines.append(f"\n⚡ AO DIVERGENCE DETECTED (bullish divergence)")
+        lines.append(f"  ⚡ AO BULLISH DIVERGENCE DETECTED")
 
-    # AI Analysis results (if already run)
+    # Previous AI analysis
     ai_result = st.session_state.get(f'ai_result_{ticker}')
     if ai_result:
-        lines.append(f"\n── AI ANALYSIS (previous run) ──")
+        lines.append(f"\nPREVIOUS AI ANALYSIS (AI Intel tab):")
         for key in ['action', 'conviction', 'resistance_verdict', 'why_moving',
                      'fundamental_quality', 'smart_money', 'bull_case', 'bear_case',
                      'red_flags', 'position_sizing']:
             val = ai_result.get(key)
             if val:
-                lines.append(f"  {key.upper().replace('_', ' ')}: {val}")
+                lines.append(f"  {key.replace('_', ' ').title()}: {val}")
 
-        # Market intelligence
+        # Market intel summary
         mi = ai_result.get('market_intel', {})
         if mi:
-            lines.append(f"\n── MARKET INTELLIGENCE ──")
-            # Analysts
             ac = mi.get('analyst_consensus')
             if ac:
                 lines.append(f"  Analyst Consensus: {ac} ({mi.get('analyst_count', 0)} analysts)")
             target = mi.get('target_mean')
             if target:
-                upside = mi.get('target_upside_pct', 0)
-                lines.append(f"  Price Target: ${target:.2f} ({upside:+.1f}% upside)")
-            # Insiders
+                lines.append(f"  Mean Price Target: ${target:.2f} ({mi.get('target_upside_pct', 0):+.1f}%)")
             buys = mi.get('insider_buys_90d', 0)
             sells = mi.get('insider_sells_90d', 0)
             if buys > 0 or sells > 0:
                 lines.append(f"  Insider Transactions: {buys} buys, {sells} sells (90d)")
             else:
-                lines.append(f"  Insider Transactions: None found in last 90 days")
-            # Social
-            social = mi.get('social_score')
-            if social:
-                lines.append(f"  Social Sentiment: {social} (source: {mi.get('social_source', '?')})")
-            # Recent changes
-            changes = mi.get('recent_changes', [])
-            if changes:
-                lines.append(f"  Recent Upgrades/Downgrades:")
-                for c in changes[:3]:
-                    lines.append(f"    {c.get('date', '?')} — {c.get('firm', '?')}: {c.get('action', '?')} → {c.get('to_grade', '?')}")
+                lines.append(f"  Insider Transactions: None in 90 days")
 
-        # Fundamental profile
-        fp = ai_result.get('fundamental_profile') or st.session_state.get(f'fund_profile_{ticker}', {})
-        if not fp:
-            # Try to get from fundamentals
-            pass
-
-    # Sector
+    # Sector & earnings
     sector = st.session_state.get('ticker_sectors', {}).get(ticker)
     if sector:
         rotation = st.session_state.get('sector_rotation', {}).get(sector, {})
         if rotation:
-            lines.append(f"\n── SECTOR ──")
-            lines.append(f"  Sector: {sector} ({rotation.get('phase', '?')})")
-            lines.append(f"  Vs SPY (20d): {rotation.get('vs_spy_20d', 0):+.1f}%")
+            lines.append(f"\n  Sector: {sector} | Phase: {rotation.get('phase', '?')} | vs SPY: {rotation.get('vs_spy_20d', 0):+.1f}%")
 
-    # Earnings
     earn = st.session_state.get('earnings_flags', {}).get(ticker)
     if earn:
-        lines.append(f"\n── EARNINGS ──")
-        lines.append(f"  Next: {earn.get('next_earnings', '?')} ({earn.get('days_until', '?')} days)")
+        lines.append(f"  Next Earnings: {earn.get('next_earnings', '?')} ({earn.get('days_until', '?')} days)")
 
     return "\n".join(lines)
 
 
-def _fetch_web_context(ticker: str) -> str:
-    """Fetch additional web context (news, Yahoo data) for the chat."""
-    lines = [f"\n═══ ADDITIONAL WEB DATA FOR {ticker} (just fetched) ═══\n"]
+def _fetch_external_research(ticker: str) -> str:
+    """Fetch comprehensive external data — this is the AI's UNIQUE VALUE.
+    News, social proxy, Yahoo fundamentals, analyst data — things NOT in the app."""
+    lines = [f"\n═══ EXTERNAL RESEARCH FOR {ticker} (freshly fetched) ═══\n"]
 
-    # Finnhub news
+    # ── Finnhub News ──────────────────────────────────────────────────
     try:
         finnhub_key = ""
         try:
@@ -2713,8 +2670,8 @@ def _fetch_web_context(ticker: str) -> str:
             from data_fetcher import fetch_finnhub_news
             news = fetch_finnhub_news(ticker, api_key=finnhub_key)
             if news and news.get('articles'):
-                lines.append("RECENT NEWS (Finnhub):")
-                for article in news['articles'][:8]:
+                lines.append("📰 RECENT NEWS (last 7 days):")
+                for article in news['articles'][:10]:
                     headline = article.get('headline', article.get('title', '?'))
                     source = article.get('source', '?')
                     date = article.get('datetime', '')
@@ -2724,71 +2681,209 @@ def _fetch_web_context(ticker: str) -> str:
                             date = dt.fromtimestamp(date).strftime('%Y-%m-%d')
                         except Exception:
                             date = ''
-                    summary = article.get('summary', '')[:200]
-                    lines.append(f"  [{date}] {headline} ({source})")
+                    summary = article.get('summary', '')[:300]
+                    lines.append(f"  [{date}] {headline} — {source}")
                     if summary:
-                        lines.append(f"    {summary}")
+                        lines.append(f"    Summary: {summary}")
             else:
-                lines.append("NEWS: No recent articles found on Finnhub")
+                lines.append("📰 NEWS: No articles found on Finnhub for last 7 days")
         else:
-            lines.append("NEWS: No Finnhub API key configured")
+            lines.append("📰 NEWS: No Finnhub API key — limited news data")
     except Exception as e:
-        lines.append(f"NEWS: Error fetching — {str(e)[:100]}")
+        lines.append(f"📰 NEWS ERROR: {str(e)[:100]}")
 
-    # Yahoo Finance info (quick fundamental snapshot)
+    # ── Yahoo Finance comprehensive snapshot ──────────────────────────
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
         info = stock.info or {}
+
         if info:
-            lines.append(f"\nYAHOO FINANCE SNAPSHOT:")
+            lines.append(f"\n📊 YAHOO FINANCE DATA:")
+            # Company basics
             for key, label in [
-                ('shortName', 'Company'), ('industry', 'Industry'),
-                ('marketCap', 'Market Cap'), ('trailingPE', 'P/E'),
-                ('forwardPE', 'Forward P/E'), ('revenueGrowth', 'Revenue Growth'),
-                ('recommendationKey', 'Yahoo Recommendation'),
-                ('targetMeanPrice', 'Target Price'),
-                ('shortPercentOfFloat', 'Short % Float'),
-                ('fiftyTwoWeekHigh', '52w High'), ('fiftyTwoWeekLow', '52w Low'),
+                ('shortName', 'Company'), ('industry', 'Industry'), ('sector', 'Sector'),
+            ]:
+                val = info.get(key)
+                if val:
+                    lines.append(f"  {label}: {val}")
+
+            # Valuation
+            lines.append(f"  --- Valuation ---")
+            mc = info.get('marketCap')
+            if mc:
+                if mc >= 1e12: mc_str = f"${mc/1e12:.1f}T"
+                elif mc >= 1e9: mc_str = f"${mc/1e9:.1f}B"
+                else: mc_str = f"${mc/1e6:.0f}M"
+                lines.append(f"  Market Cap: {mc_str}")
+            for key, label in [
+                ('trailingPE', 'Trailing P/E'), ('forwardPE', 'Forward P/E'),
+                ('priceToBook', 'P/B'), ('enterpriseToRevenue', 'EV/Revenue'),
+                ('trailingEps', 'EPS'), ('dividendYield', 'Dividend Yield'),
             ]:
                 val = info.get(key)
                 if val is not None:
-                    if key == 'marketCap' and isinstance(val, (int, float)):
-                        if val >= 1e12:
-                            val = f"${val/1e12:.1f}T"
-                        elif val >= 1e9:
-                            val = f"${val/1e9:.1f}B"
-                        elif val >= 1e6:
-                            val = f"${val/1e6:.0f}M"
-                    elif key in ('revenueGrowth', 'shortPercentOfFloat') and isinstance(val, (int, float)):
-                        val = f"{val*100:.1f}%"
-                    lines.append(f"  {label}: {val}")
+                    if 'Yield' in label:
+                        lines.append(f"  {label}: {val*100:.2f}%")
+                    else:
+                        lines.append(f"  {label}: {val:.2f}")
 
-            # Recent news from Yahoo
-            try:
-                news_items = stock.news
-                if news_items:
-                    lines.append(f"\nYAHOO NEWS:")
-                    for item in news_items[:5]:
-                        title = item.get('title', '?')
-                        publisher = item.get('publisher', '?')
-                        lines.append(f"  • {title} ({publisher})")
-            except Exception:
-                pass
+            # Growth & profitability
+            lines.append(f"  --- Growth & Profitability ---")
+            for key, label in [
+                ('revenueGrowth', 'Revenue Growth'), ('earningsGrowth', 'Earnings Growth'),
+                ('profitMargins', 'Profit Margin'), ('grossMargins', 'Gross Margin'),
+                ('operatingMargins', 'Operating Margin'), ('returnOnEquity', 'ROE'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    lines.append(f"  {label}: {val*100:.1f}%")
+
+            # Analyst data
+            lines.append(f"  --- Analyst Consensus ---")
+            rec_key = info.get('recommendationKey', '')
+            rec_mean = info.get('recommendationMean')
+            target_mean = info.get('targetMeanPrice')
+            target_high = info.get('targetHighPrice')
+            target_low = info.get('targetLowPrice')
+            num_analysts = info.get('numberOfAnalystOpinions')
+            current = info.get('currentPrice') or info.get('regularMarketPrice')
+
+            if rec_key:
+                lines.append(f"  Yahoo Recommendation: {rec_key.upper()}")
+            if rec_mean:
+                lines.append(f"  Recommendation Score: {rec_mean:.1f} (1=Strong Buy, 5=Strong Sell)")
+            if target_mean and current:
+                upside = (target_mean - current) / current * 100
+                lines.append(f"  Target: ${target_low:.2f} — ${target_mean:.2f} — ${target_high:.2f} ({upside:+.1f}% to mean)")
+            if num_analysts:
+                lines.append(f"  Analysts Covering: {num_analysts}")
+
+            # Short interest
+            lines.append(f"  --- Short Interest & Risk ---")
+            for key, label in [
+                ('shortPercentOfFloat', 'Short % of Float'),
+                ('shortRatio', 'Short Ratio (days to cover)'),
+                ('beta', 'Beta'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    if 'Percent' in label:
+                        lines.append(f"  {label}: {val*100:.1f}%")
+                    else:
+                        lines.append(f"  {label}: {val:.2f}")
+
+            # 52-week range
+            high52 = info.get('fiftyTwoWeekHigh')
+            low52 = info.get('fiftyTwoWeekLow')
+            if high52 and low52 and current:
+                range_pct = (current - low52) / (high52 - low52) * 100 if high52 != low52 else 50
+                lines.append(f"  52-Week: ${low52:.2f} — ${high52:.2f} (currently at {range_pct:.0f}% of range)")
+
+            # Ownership
+            insider_pct = info.get('heldPercentInsiders')
+            inst_pct = info.get('heldPercentInstitutions')
+            if insider_pct is not None:
+                lines.append(f"  Insider Ownership: {insider_pct*100:.1f}% (static stake, NOT selling)")
+            if inst_pct is not None:
+                lines.append(f"  Institutional Ownership: {inst_pct*100:.1f}%")
+
+        # Yahoo news
+        try:
+            news_items = stock.news
+            if news_items:
+                lines.append(f"\n📰 YAHOO NEWS:")
+                for item in news_items[:8]:
+                    title = item.get('title', '?')
+                    publisher = item.get('publisher', '?')
+                    lines.append(f"  • {title} ({publisher})")
+        except Exception:
+            pass
+
     except Exception as e:
-        lines.append(f"YAHOO: Error — {str(e)[:100]}")
+        lines.append(f"YAHOO ERROR: {str(e)[:100]}")
+
+    # ── Social Sentiment Proxy (volume-based) ─────────────────────────
+    try:
+        from data_fetcher import fetch_daily
+        daily = fetch_daily(ticker, period='3mo')
+        if daily is not None and len(daily) >= 20 and 'Volume' in daily.columns:
+            recent_vol = float(daily['Volume'].iloc[-5:].mean())
+            avg_vol = float(daily['Volume'].tail(50).mean())
+            vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1.0
+
+            lines.append(f"\n📱 SOCIAL/VOLUME SENTIMENT PROXY:")
+            lines.append(f"  5-day avg volume vs 50-day avg: {vol_ratio:.1f}x")
+            if vol_ratio >= 3.0:
+                lines.append(f"  Signal: 🔥 EXTREME volume surge — major institutional activity or news-driven")
+            elif vol_ratio >= 2.0:
+                lines.append(f"  Signal: 📈 ELEVATED volume — increased interest, possible accumulation")
+            elif vol_ratio >= 1.5:
+                lines.append(f"  Signal: 📊 Above average — moderate interest")
+            elif vol_ratio <= 0.5:
+                lines.append(f"  Signal: 😴 Very LOW volume — lack of interest, thin liquidity risk")
+            else:
+                lines.append(f"  Signal: Normal trading volume")
+
+            # Recent price action context
+            if len(daily) >= 5:
+                last_5_return = (daily['Close'].iloc[-1] / daily['Close'].iloc[-5] - 1) * 100
+                last_20_return = (daily['Close'].iloc[-1] / daily['Close'].iloc[-20] - 1) * 100 if len(daily) >= 20 else None
+                lines.append(f"  5-day return: {last_5_return:+.1f}%")
+                if last_20_return is not None:
+                    lines.append(f"  20-day return: {last_20_return:+.1f}%")
+    except Exception:
+        pass
+
+    # ── Finnhub Social Sentiment (if premium key) ─────────────────────
+    try:
+        finnhub_key = ""
+        try:
+            finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+        except Exception:
+            pass
+
+        if finnhub_key:
+            import requests as req
+            import pandas as pd
+            from_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from={from_date}&token={finnhub_key}"
+            resp = req.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                reddit = data.get('reddit', [])
+                twitter = data.get('twitter', [])
+                if reddit or twitter:
+                    r_mentions = sum(r.get('mention', 0) for r in reddit[-7:]) if reddit else 0
+                    t_mentions = sum(t.get('mention', 0) for t in twitter[-7:]) if twitter else 0
+                    lines.append(f"\n📱 FINNHUB SOCIAL SENTIMENT (7 days):")
+                    lines.append(f"  Reddit mentions: {r_mentions}")
+                    lines.append(f"  Twitter mentions: {t_mentions}")
+                    total = r_mentions + t_mentions
+                    if total > 100:
+                        lines.append(f"  Assessment: HIGH social buzz — stock is being actively discussed")
+                    elif total > 20:
+                        lines.append(f"  Assessment: Moderate social interest")
+                    elif total > 0:
+                        lines.append(f"  Assessment: Low social mentions")
+                    else:
+                        lines.append(f"  Assessment: Minimal social presence")
+            elif resp.status_code in (401, 403):
+                lines.append(f"\n📱 FINNHUB SOCIAL: Premium subscription required for social sentiment data")
+    except Exception:
+        pass
 
     return "\n".join(lines)
 
 
 def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
                      analysis: TickerAnalysis):
-    """Interactive AI chat about the stock with full data context."""
+    """AI Research Analyst — auto-runs external research + interactive follow-up chat."""
 
     # ── Initialize Groq client ────────────────────────────────────────
     openai_client = None
+    groq_key = ""
     try:
-        groq_key = ""
         try:
             groq_key = st.secrets.get("GROQ_API_KEY", "")
         except Exception:
@@ -2803,106 +2898,162 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
         pass
 
     if not openai_client:
-        st.info("💬 Configure GROQ_API_KEY in secrets to enable the AI chat. "
-                "This feature lets you have a conversation with AI about this stock.")
+        st.info("💬 Configure GROQ_API_KEY in secrets to enable the AI Research Analyst. "
+                "This feature auto-researches news, sentiment, and analyst data, then synthesizes "
+                "a recommendation with the app's technical signals.")
         return
 
-    # ── Chat history management (per ticker) ──────────────────────────
+    # ── Chat state management (per ticker) ────────────────────────────
     chat_key = f'chat_history_{ticker}'
-    if chat_key not in st.session_state:
-        st.session_state[chat_key] = []
+    research_key = f'chat_research_{ticker}'
+    autorun_key = f'chat_autorun_{ticker}'
 
-    # Reset chat when switching tickers
+    # Reset when switching tickers
     if st.session_state.get('chat_active_ticker') != ticker:
         st.session_state[chat_key] = []
         st.session_state['chat_active_ticker'] = ticker
-        st.session_state.pop('chat_web_context', None)
+        st.session_state.pop(research_key, None)
+        st.session_state.pop(autorun_key, None)
+
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    # ── System prompt — the research analyst role ─────────────────────
+    internal_context = _build_internal_context(ticker, signal, rec, analysis)
+
+    # Fetch external research (cached per ticker within session)
+    if research_key not in st.session_state:
+        with st.spinner(f"🔍 Researching {ticker} — fetching news, analyst data, sentiment..."):
+            external_research = _fetch_external_research(ticker)
+            st.session_state[research_key] = external_research
+    external_research = st.session_state[research_key]
+
+    system_prompt = f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant). You have TWO data sources:
+
+1. IN-APP DATA (the user can already see this on their screen — DO NOT list it back):
+{internal_context}
+
+2. EXTERNAL RESEARCH (you just gathered this — this is YOUR unique value):
+{external_research}
+
+═══ YOUR ROLE AND RULES ═══
+
+WHAT YOU MUST DO:
+• SYNTHESIZE the technical picture (from the app) with external intelligence (news, analysts, sentiment) 
+• INTERPRET what the signals mean collectively — identify the most critical patterns and conflicts
+• Reference specific data points to support your analysis, but DON'T just list what's on screen
+• When discussing insider activity, ONLY report actual BUY/SELL transactions — ownership % is NOT selling
+• Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
+
+WHAT YOU MUST NOT DO:
+• Do NOT repeat technical indicators the user can already see — they have MACD, AO, weekly/monthly signals on screen
+• Do NOT say "Based on the app data..." or list signals back — INTERPRET them
+• Do NOT hallucinate news or analyst ratings — only cite what's in your external research data above
+
+RESPONSE FORMAT (for initial analysis):
+• Lead with clear BUY / HOLD / PASS recommendation and confidence (High/Medium/Low)
+• Key supporting signals (max 3 bullets — synthesized, not listed)
+• Key risks/conflicts (max 3 bullets)
+• If BUY: entry zone, stop loss, target, and hold duration
+• If HOLD: what triggers a buy or sell
+• If PASS: specific reasons risk outweighs reward
+• Flag any major contradictions between technical and fundamental picture
+• Keep under 400 words — be decisive, not exhaustive
+
+FOR FOLLOW-UP QUESTIONS:
+• Be direct and specific — cite prices, percentages, dates
+• If asked about something not in your data, say so honestly
+• You can discuss entry strategy, position sizing, risk management, catalysts, sector trends
+• If asked to find more info, explain what you'd look for and what your current data shows"""
 
     # ── Header with controls ──────────────────────────────────────────
-    ctrl1, ctrl2, ctrl3 = st.columns([4, 2, 2])
-    with ctrl1:
-        st.markdown(f"**💬 Ask anything about {ticker}** — AI sees all signals, fundamentals & market intel")
-    with ctrl2:
-        if st.button("🔍 Fetch Latest News", key="chat_fetch_news",
-                     help="Pull fresh news & Yahoo data into the conversation"):
-            with st.spinner("Searching for latest info..."):
-                web_context = _fetch_web_context(ticker)
-                st.session_state['chat_web_context'] = web_context
-                # Add as system context message
-                st.session_state[chat_key].append({
-                    'role': 'assistant',
-                    'content': f"📡 I've just fetched the latest news and data for {ticker}. Ask me anything about what I found!"
-                })
-                st.session_state[f'chat_web_fetched_{ticker}'] = True
-                st.rerun()
-    with ctrl3:
-        if st.button("🗑️ Clear Chat", key="chat_clear"):
+    hdr1, hdr2, hdr3 = st.columns([5, 2, 1])
+    with hdr1:
+        st.markdown(f"**🔬 AI Research Analyst — {ticker}**")
+    with hdr2:
+        if st.button("🔄 Refresh Research", key="chat_refresh_research",
+                     help="Re-fetch latest news, analyst data & sentiment"):
+            st.session_state.pop(research_key, None)
+            st.session_state.pop(autorun_key, None)
             st.session_state[chat_key] = []
-            st.session_state.pop('chat_web_context', None)
-            st.session_state.pop(f'chat_web_fetched_{ticker}', None)
+            st.rerun()
+    with hdr3:
+        if st.button("🗑️", key="chat_clear", help="Clear conversation"):
+            st.session_state[chat_key] = []
+            st.session_state.pop(autorun_key, None)
             st.rerun()
 
-    # Show web context status
-    if st.session_state.get(f'chat_web_fetched_{ticker}'):
-        st.caption("✅ Latest news loaded — ask about recent developments, catalysts, or sentiment")
-
-    # ── Display conversation history ──────────────────────────────────
+    # ── Auto-run initial analysis ─────────────────────────────────────
     history = st.session_state[chat_key]
 
-    if not history:
-        st.caption("💡 Try asking: *\"What are the key risks?\"* · *\"Is this a good entry point?\"* · "
-                   "*\"What do the insiders think?\"* · *\"Compare the bull and bear case\"* · "
-                   "*\"What would make you change your mind?\"*")
+    if not st.session_state.get(autorun_key):
+        # Auto-populate and send the initial analysis request
+        initial_query = f"Analyze {ticker} and provide a BUY/HOLD/PASS recommendation."
 
+        history.append({'role': 'user', 'content': initial_query})
+
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': initial_query},
+        ]
+
+        try:
+            with st.spinner(f"🧠 Analyzing {ticker} — synthesizing signals + research..."):
+                response = openai_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    max_tokens=1200,
+                    temperature=0.3,
+                )
+                reply = response.choices[0].message.content
+                history.append({'role': 'assistant', 'content': reply})
+        except Exception as e:
+            # Fallback model
+            try:
+                response = openai_client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=messages,
+                    max_tokens=1000,
+                    temperature=0.3,
+                )
+                reply = response.choices[0].message.content
+                history.append({'role': 'assistant', 'content': reply})
+            except Exception as e2:
+                history.append({'role': 'assistant',
+                                'content': f"⚠️ Analysis failed: {str(e)[:200]}\nFallback: {str(e2)[:200]}"})
+
+        st.session_state[chat_key] = history
+        st.session_state[autorun_key] = True
+
+    # ── Display conversation ──────────────────────────────────────────
     for msg in history:
-        with st.chat_message(msg['role']):
+        with st.chat_message(msg['role'], avatar="🧑‍💼" if msg['role'] == 'user' else "🔬"):
             st.markdown(msg['content'])
 
-    # ── Chat input ────────────────────────────────────────────────────
+    # ── Suggested follow-ups (after initial analysis) ─────────────────
+    if len(history) == 2:  # Just the auto-run Q&A
+        st.caption("💡 **Ask follow-ups:** *\"What's the biggest risk here?\"* · "
+                   "*\"Where exactly should I enter?\"* · "
+                   "*\"What catalyst could move this 20%?\"* · "
+                   "*\"Is smart money buying or selling?\"* · "
+                   "*\"Compare bull and bear case\"* · "
+                   "*\"How does this sector look right now?\"*")
+
+    # ── Chat input for follow-ups ─────────────────────────────────────
     user_input = st.chat_input(f"Ask about {ticker}...", key=f"chat_input_{ticker}")
 
     if user_input:
-        # Add user message to history
         history.append({'role': 'user', 'content': user_input})
 
-        # Display user message immediately
-        with st.chat_message('user'):
+        with st.chat_message('user', avatar="🧑‍💼"):
             st.markdown(user_input)
 
-        # Build system prompt with full stock context
-        stock_context = _build_stock_context(ticker, signal, rec, analysis)
-
-        # Add web context if fetched
-        web_context = st.session_state.get('chat_web_context', '')
-
-        system_prompt = f"""You are an expert stock analyst assistant embedded in a trading application called TTA (Technical Trading Assistant).
-You have access to ALL the data this app has collected about {ticker}.
-
-YOUR DATA CONTEXT:
-{stock_context}
-{web_context}
-
-BEHAVIOR RULES:
-- Reference specific data points from the context above (prices, signals, analyst targets, etc.)
-- Be direct and actionable — this user is a swing/position trader
-- If asked about something not in your data, say what you'd need to check and suggest clicking "Fetch Latest News"
-- Use the signal data to support your analysis (MACD, AO, weekly/monthly alignment)
-- When discussing risk, reference specific price levels
-- If insider data shows "None found", do NOT claim there is insider selling — ownership % is NOT the same as selling
-- Keep responses focused and under 250 words unless the question warrants more detail
-- You can discuss entry points, stop losses, targets, position sizing, catalysts, risks
-- If the user asks you to search for something, recommend they click the "🔍 Fetch Latest News" button for the most current data"""
-
-        # Build messages for API call
+        # Build full message chain (system + last 20 messages)
         messages = [{'role': 'system', 'content': system_prompt}]
-
-        # Add conversation history (limit to last 10 exchanges to stay within context)
-        recent_history = history[-20:]  # Last 20 messages (10 exchanges)
-        for msg in recent_history:
+        for msg in history[-20:]:
             messages.append({'role': msg['role'], 'content': msg['content']})
 
-        # Call Groq
-        with st.chat_message('assistant'):
+        with st.chat_message('assistant', avatar="🔬"):
             try:
                 with st.spinner("Thinking..."):
                     response = openai_client.chat.completions.create(
@@ -2914,17 +3065,14 @@ BEHAVIOR RULES:
                     reply = response.choices[0].message.content
 
                 st.markdown(reply)
-
-                # Save assistant response to history
                 history.append({'role': 'assistant', 'content': reply})
                 st.session_state[chat_key] = history
 
             except Exception as e:
                 error_msg = str(e)[:300]
                 st.error(f"AI Error: {error_msg}")
-                # Try fallback model
                 try:
-                    with st.spinner("Retrying with fallback model..."):
+                    with st.spinner("Retrying..."):
                         response = openai_client.chat.completions.create(
                             model="llama-3.1-8b-instant",
                             messages=messages,
@@ -2936,7 +3084,7 @@ BEHAVIOR RULES:
                     history.append({'role': 'assistant', 'content': reply})
                     st.session_state[chat_key] = history
                 except Exception as e2:
-                    st.error(f"Fallback also failed: {str(e2)[:200]}")
+                    st.error(f"Fallback failed: {str(e2)[:200]}")
 
 
 def _render_trade_tab(ticker: str, signal: EntrySignal,
