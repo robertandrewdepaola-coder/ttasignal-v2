@@ -982,9 +982,14 @@ def fetch_fundamental_profile(ticker: str) -> Dict[str, Any]:
 
 def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     """
-    Fetch next earnings date and related calendar info.
+    Fetch next earnings date using 4-method cascade for maximum reliability.
     
-    Returns dict with next_earnings, days_until_earnings.
+    Method 1: stock.calendar (dict or DataFrame)
+    Method 2: stock.info timestamps (earningsTimestamp, earningsTimestampStart)
+    Method 3: stock.earnings_dates (sorted, find next upcoming)
+    Method 4: Historical pattern estimation (last earnings + ~90 days)
+    
+    Returns dict with next_earnings, days_until_earnings, confidence, source.
     """
     cache_key = f"{ticker}:calendar"
     cached = _cache.get(cache_key)
@@ -994,41 +999,151 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     result = {
         'next_earnings': None,
         'days_until_earnings': None,
+        'last_earnings': None,
+        'next_eps_estimate': None,
+        'confidence': None,        # HIGH / MEDIUM / LOW
+        'source': None,
         'error': None,
     }
     
+    today = datetime.now().date()
+    
     try:
         stock = yf.Ticker(ticker)
-        cal = stock.calendar
         
-        if cal is not None:
-            # calendar can be a dict or DataFrame depending on yfinance version
-            if isinstance(cal, dict):
-                earnings = cal.get('Earnings Date')
-                if earnings:
-                    # Can be a list of dates
-                    if isinstance(earnings, list) and len(earnings) > 0:
-                        next_date = earnings[0]
-                    else:
-                        next_date = earnings
+        # ── METHOD 1: stock.calendar ──────────────────────────────
+        try:
+            cal = stock.calendar
+            if cal is not None:
+                raw_date = None
+                if isinstance(cal, dict):
+                    raw_date = cal.get('Earnings Date')
+                    if isinstance(raw_date, list) and len(raw_date) > 0:
+                        raw_date = raw_date[0]
+                elif isinstance(cal, pd.DataFrame) and 'Earnings Date' in cal.columns:
+                    raw_date = cal['Earnings Date'].iloc[0]
+                
+                if raw_date is not None:
+                    earn_dt = None
+                    if hasattr(raw_date, 'date'):
+                        earn_dt = raw_date.date() if callable(getattr(raw_date, 'date', None)) else raw_date
+                    elif hasattr(raw_date, 'strftime'):
+                        earn_dt = raw_date
+                    elif isinstance(raw_date, str) and len(raw_date) >= 10:
+                        try:
+                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                        except ValueError:
+                            pass
                     
-                    if hasattr(next_date, 'strftime'):
-                        result['next_earnings'] = next_date.strftime('%Y-%m-%d')
-                        delta = (next_date - datetime.now()).days
-                        result['days_until_earnings'] = max(0, delta)
-                    elif isinstance(next_date, str):
-                        result['next_earnings'] = next_date
-                        
-            elif isinstance(cal, pd.DataFrame):
-                if 'Earnings Date' in cal.columns:
-                    next_date = cal['Earnings Date'].iloc[0]
-                    if hasattr(next_date, 'strftime'):
-                        result['next_earnings'] = next_date.strftime('%Y-%m-%d')
-                        delta = (next_date - datetime.now()).days
-                        result['days_until_earnings'] = max(0, delta)
+                    if earn_dt:
+                        days = (earn_dt - today).days
+                        if days >= -7:  # Accept recent past (just reported)
+                            result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                            result['days_until_earnings'] = max(0, days)
+                            result['confidence'] = 'HIGH'
+                            result['source'] = 'Yahoo (.calendar)'
+        except Exception:
+            pass
+        
+        # ── METHOD 2: stock.info timestamps ───────────────────────
+        if not result['next_earnings']:
+            try:
+                info = stock.info or {}
+                for ts_key in ('earningsTimestamp', 'earningsTimestampStart',
+                               'mostRecentQuarter'):
+                    ts = info.get(ts_key)
+                    if ts and isinstance(ts, (int, float)) and ts > 0:
+                        from datetime import timezone
+                        earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                        days = (earn_dt - today).days
+                        if days >= -7:
+                            result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                            result['days_until_earnings'] = max(0, days)
+                            result['confidence'] = 'MEDIUM-HIGH'
+                            result['source'] = f'Yahoo (.info:{ts_key})'
+                            break
+            except Exception:
+                pass
+        
+        # ── METHOD 3: stock.earnings_dates (most reliable for upcoming) ──
+        if not result['next_earnings']:
+            try:
+                edates = stock.earnings_dates
+                if edates is not None and len(edates) > 0:
+                    # Sort and find the next date >= today - 7
+                    for dt_idx in sorted(edates.index):
+                        try:
+                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                            days = (d - today).days
+                            if days >= -7:
+                                result['next_earnings'] = d.strftime('%Y-%m-%d')
+                                result['days_until_earnings'] = max(0, days)
+                                result['confidence'] = 'MEDIUM-HIGH'
+                                result['source'] = 'Yahoo (.earnings_dates)'
+                                # Grab EPS estimate if available
+                                row = edates.loc[dt_idx]
+                                eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
+                                if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
+                                    result['next_eps_estimate'] = float(eps_est)
+                                break
+                        except Exception:
+                            continue
+                    
+                    # Also grab last earnings date (most recent past)
+                    for dt_idx in sorted(edates.index, reverse=True):
+                        try:
+                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                            days = (d - today).days
+                            if days < -7:
+                                result['last_earnings'] = d.strftime('%Y-%m-%d')
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+        
+        # ── METHOD 4: Historical pattern estimation ───────────────
+        if not result['next_earnings'] and result.get('last_earnings'):
+            # Estimate next based on ~90 day quarterly cycle
+            try:
+                last_dt = datetime.strptime(result['last_earnings'], '%Y-%m-%d').date()
+                estimated = last_dt + timedelta(days=91)
+                # If estimated date is in the past, add another quarter
+                while (estimated - today).days < -7:
+                    estimated += timedelta(days=91)
+                result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (estimated - today).days)
+                result['confidence'] = 'LOW'
+                result['source'] = 'Estimated (last + 91d pattern)'
+            except Exception:
+                pass
+        
+        # ── METHOD 4b: If no last_earnings either, try earnings_dates for any past date ──
+        if not result['next_earnings'] and not result.get('last_earnings'):
+            try:
+                edates = stock.earnings_dates
+                if edates is not None and len(edates) > 0:
+                    # Get any past date as anchor
+                    for dt_idx in sorted(edates.index, reverse=True):
+                        try:
+                            d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                            result['last_earnings'] = d.strftime('%Y-%m-%d')
+                            # Project forward
+                            estimated = d + timedelta(days=91)
+                            while (estimated - today).days < -7:
+                                estimated += timedelta(days=91)
+                            result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+                            result['days_until_earnings'] = max(0, (estimated - today).days)
+                            result['confidence'] = 'LOW'
+                            result['source'] = 'Estimated (historical + 91d)'
+                            break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
     
     except Exception as e:
-        result['error'] = str(e)
+        result['error'] = str(e)[:200]
     
     _cache.set(cache_key, result)
     return result
@@ -1057,26 +1172,16 @@ def fetch_earnings_history(ticker: str) -> Dict[str, Any]:
     try:
         stock = yf.Ticker(ticker)
 
-        # Next earnings date
+        # Next earnings date — use the robust 4-method cascade
         try:
-            cal = stock.calendar
-            if cal is not None:
-                if isinstance(cal, dict):
-                    ed = cal.get('Earnings Date')
-                    if ed:
-                        next_date = ed[0] if isinstance(ed, list) and len(ed) > 0 else ed
-                        if hasattr(next_date, 'strftime'):
-                            result['next_earnings'] = next_date.strftime('%Y-%m-%d')
-                            delta = (next_date - datetime.now()).days
-                            result['days_until_earnings'] = max(0, delta)
-                        elif isinstance(next_date, str):
-                            result['next_earnings'] = str(next_date)
-                elif isinstance(cal, pd.DataFrame) and 'Earnings Date' in cal.columns:
-                    next_date = cal['Earnings Date'].iloc[0]
-                    if hasattr(next_date, 'strftime'):
-                        result['next_earnings'] = next_date.strftime('%Y-%m-%d')
-                        delta = (next_date - datetime.now()).days
-                        result['days_until_earnings'] = max(0, delta)
+            earn_date_result = fetch_earnings_date(ticker)
+            if earn_date_result.get('next_earnings'):
+                result['next_earnings'] = earn_date_result['next_earnings']
+                result['days_until_earnings'] = earn_date_result.get('days_until_earnings')
+                result['next_eps_estimate'] = earn_date_result.get('next_eps_estimate')
+                result['last_earnings'] = earn_date_result.get('last_earnings')
+                result['confidence'] = earn_date_result.get('confidence', 'MEDIUM')
+                result['source'] = earn_date_result.get('source', '?')
         except Exception:
             pass
 
