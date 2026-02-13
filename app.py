@@ -529,10 +529,26 @@ def render_sidebar():
     if open_trades:
         st.sidebar.divider()
         st.sidebar.subheader(f"📈 Open ({len(open_trades)})")
+
+        # Cache position prices — refresh every 60 seconds, not every rerun
+        _pos_cache = st.session_state.get('_position_prices', {})
+        _pos_ts = st.session_state.get('_position_prices_ts', 0)
+        _now_ts = datetime.now().timestamp()
+        _stale = (_now_ts - _pos_ts) > 60  # 60-second TTL
+
+        if _stale:
+            _new_prices = {}
+            for trade in open_trades:
+                t = trade['ticker']
+                _new_prices[t] = fetch_current_price(t) or trade.get('entry_price', 0)
+            st.session_state['_position_prices'] = _new_prices
+            st.session_state['_position_prices_ts'] = _now_ts
+            _pos_cache = _new_prices
+
         for trade in open_trades:
             ticker = trade['ticker']
             entry = trade.get('entry_price', 0)
-            current = fetch_current_price(ticker) or entry
+            current = _pos_cache.get(ticker, entry)
             pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
             icon = "🟢" if pnl_pct >= 0 else "🔴"
 
@@ -562,6 +578,10 @@ def render_sidebar():
                          help="Re-fetch SPY, VIX, sector rotation"):
                 st.session_state.pop('market_filter_data', None)
                 st.session_state.pop('sector_rotation', None)
+                st.session_state.pop('_research_market_cache', None)
+                st.session_state.pop('_research_market_cache_ts', None)
+                st.session_state.pop('_position_prices', None)
+                st.session_state.pop('_position_prices_ts', None)
                 st.toast("✅ Market data will refresh on next load.")
 
         # Key diagnostic
@@ -2020,8 +2040,10 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         if st.button("🔄 Re-run AI Analysis", type="secondary"):
             should_run = True
     elif keys_available:
-        # Auto-run only if we have working AI providers
-        should_run = True
+        # Show prominent run button — don't auto-fire (saves ~10 API calls per ticker switch)
+        st.info("🤖 **AI analysis ready.** Click below to fetch fundamentals, market intel & AI recommendation.")
+        if st.button("▶️ Run AI Analysis", type="primary", use_container_width=True):
+            should_run = True
     else:
         # No providers + no cached results — show manual button (to fetch data at least)
         st.caption("AI providers unavailable. Data-only analysis available.")
@@ -3170,93 +3192,106 @@ def _fetch_external_research(ticker: str) -> str:
     lines = [f"\n═══ EXTERNAL RESEARCH FOR {ticker} (freshly fetched) ═══\n"]
 
     # ══════════════════════════════════════════════════════════════════
-    # SECTION 1: OVERALL MARKET CONDITIONS (MANDATORY)
+    # SECTIONS 1 & 2: MARKET CONDITIONS + SECTOR ROTATION
+    # These are TICKER-INDEPENDENT — cache in session state (5-min TTL)
     # ══════════════════════════════════════════════════════════════════
-    lines.append("🌍 OVERALL MARKET CONDITIONS:")
-    try:
-        from data_fetcher import fetch_daily, fetch_market_filter
-        market = fetch_market_filter()
+    _mkt_cache = st.session_state.get('_research_market_cache', '')
+    _mkt_ts = st.session_state.get('_research_market_cache_ts', 0)
+    _now = datetime.now().timestamp()
 
-        spy_close = market.get('spy_close')
-        spy_sma200 = market.get('spy_sma200')
-        spy_above = market.get('spy_above_200', True)
-        vix_close = market.get('vix_close')
-        vix_below = market.get('vix_below_30', True)
+    if _mkt_cache and (_now - _mkt_ts) < 300:
+        # Use cached market context (same for all tickers)
+        lines.append(_mkt_cache)
+    else:
+        # Build fresh market context
+        _mkt_lines = []
+        _mkt_lines.append("🌍 OVERALL MARKET CONDITIONS:")
+        try:
+            from data_fetcher import fetch_daily, fetch_market_filter
+            market = fetch_market_filter()
 
-        if spy_close:
-            lines.append(f"  SPY: ${spy_close:.2f} | 200-day SMA: ${spy_sma200:.2f} | {'ABOVE ✅' if spy_above else 'BELOW ❌'}")
-        if vix_close:
-            lines.append(f"  VIX: {vix_close:.1f} | {'LOW fear ✅' if vix_close < 20 else 'ELEVATED ⚠️' if vix_close < 30 else 'HIGH FEAR ❌'}")
+            spy_close = market.get('spy_close')
+            spy_sma200 = market.get('spy_sma200')
+            spy_above = market.get('spy_above_200', True)
+            vix_close = market.get('vix_close')
+            vix_below = market.get('vix_below_30', True)
 
-        # SPY recent performance (risk-on vs risk-off)
-        spy_df = fetch_daily("SPY")
-        if spy_df is not None and len(spy_df) >= 50:
-            spy_5d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
-            spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
-            spy_50d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-50] - 1) * 100
-            spy_sma50 = float(spy_df['Close'].rolling(50).mean().iloc[-1])
-            spy_high52 = float(spy_df['Close'].tail(252).max()) if len(spy_df) >= 252 else float(spy_df['Close'].max())
-            pct_from_high = (spy_df['Close'].iloc[-1] / spy_high52 - 1) * 100
+            if spy_close:
+                _mkt_lines.append(f"  SPY: ${spy_close:.2f} | 200-day SMA: ${spy_sma200:.2f} | {'ABOVE ✅' if spy_above else 'BELOW ❌'}")
+            if vix_close:
+                _mkt_lines.append(f"  VIX: {vix_close:.1f} | {'LOW fear ✅' if vix_close < 20 else 'ELEVATED ⚠️' if vix_close < 30 else 'HIGH FEAR ❌'}")
 
-            lines.append(f"  SPY Returns: 5d {spy_5d:+.1f}% | 20d {spy_20d:+.1f}% | 50d {spy_50d:+.1f}%")
-            lines.append(f"  SPY 50-day SMA: ${spy_sma50:.2f} | {'Above' if spy_df['Close'].iloc[-1] > spy_sma50 else 'Below'}")
-            lines.append(f"  SPY vs 52-week high: {pct_from_high:+.1f}%")
+            # SPY recent performance (risk-on vs risk-off)
+            spy_df = fetch_daily("SPY")
+            if spy_df is not None and len(spy_df) >= 50:
+                spy_5d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
+                spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+                spy_50d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-50] - 1) * 100
+                spy_sma50 = float(spy_df['Close'].rolling(50).mean().iloc[-1])
+                spy_high52 = float(spy_df['Close'].tail(252).max()) if len(spy_df) >= 252 else float(spy_df['Close'].max())
+                pct_from_high = (spy_df['Close'].iloc[-1] / spy_high52 - 1) * 100
 
-            # Overall market assessment
-            if spy_above and vix_close and vix_close < 20 and spy_5d > 0:
-                lines.append(f"  ASSESSMENT: RISK-ON environment — market bullish, low fear, new positions supported")
-            elif spy_above and vix_close and vix_close < 25:
-                lines.append(f"  ASSESSMENT: CAUTIOUSLY BULLISH — market above key support, moderate fear")
-            elif not spy_above:
-                lines.append(f"  ASSESSMENT: RISK-OFF — SPY below 200-day SMA, defensive posture recommended")
-            elif vix_close and vix_close >= 30:
-                lines.append(f"  ASSESSMENT: HIGH VOLATILITY — elevated VIX, reduce position sizes")
+                _mkt_lines.append(f"  SPY Returns: 5d {spy_5d:+.1f}% | 20d {spy_20d:+.1f}% | 50d {spy_50d:+.1f}%")
+                _mkt_lines.append(f"  SPY 50-day SMA: ${spy_sma50:.2f} | {'Above' if spy_df['Close'].iloc[-1] > spy_sma50 else 'Below'}")
+                _mkt_lines.append(f"  SPY vs 52-week high: {pct_from_high:+.1f}%")
+
+                # Overall market assessment
+                if spy_above and vix_close and vix_close < 20 and spy_5d > 0:
+                    _mkt_lines.append(f"  ASSESSMENT: RISK-ON environment — market bullish, low fear, new positions supported")
+                elif spy_above and vix_close and vix_close < 25:
+                    _mkt_lines.append(f"  ASSESSMENT: CAUTIOUSLY BULLISH — market above key support, moderate fear")
+                elif not spy_above:
+                    _mkt_lines.append(f"  ASSESSMENT: RISK-OFF — SPY below 200-day SMA, defensive posture recommended")
+                elif vix_close and vix_close >= 30:
+                    _mkt_lines.append(f"  ASSESSMENT: HIGH VOLATILITY — elevated VIX, reduce position sizes")
+                else:
+                    _mkt_lines.append(f"  ASSESSMENT: NEUTRAL — mixed signals, selective stock-picking environment")
+
+                # Breadth proxy: RSP (equal-weight SPY) vs SPY
+                try:
+                    rsp_df = fetch_daily("RSP")
+                    if rsp_df is not None and len(rsp_df) >= 20:
+                        rsp_20d = (rsp_df['Close'].iloc[-1] / rsp_df['Close'].iloc[-20] - 1) * 100
+                        spread = rsp_20d - spy_20d
+                        if spread > 1.0:
+                            breadth = "BROAD — equal-weight outperforming (healthy breadth)"
+                        elif spread < -1.0:
+                            breadth = "NARROW — cap-weighted leading (top-heavy, fragile)"
+                        else:
+                            breadth = "BALANCED — similar performance"
+                        _mkt_lines.append(f"  Market Breadth: RSP 20d {rsp_20d:+.1f}% vs SPY {spy_20d:+.1f}% → {breadth}")
+                except Exception:
+                    pass
+        except Exception as e:
+            _mkt_lines.append(f"  Error fetching market data: {str(e)[:100]}")
+
+        # Sector rotation (already cached in session state from startup)
+        _mkt_lines.append(f"\n📊 SECTOR ROTATION (all sectors vs SPY):")
+        try:
+            all_sectors = st.session_state.get('sector_rotation')
+            if not all_sectors:
+                from data_fetcher import fetch_sector_rotation
+                all_sectors = fetch_sector_rotation()
+            if all_sectors:
+                sorted_sectors = sorted(all_sectors.items(),
+                                        key=lambda x: x[1].get('vs_spy_20d', 0), reverse=True)
+                for sector_name, data in sorted_sectors:
+                    phase = data.get('phase', '?')
+                    vs_spy = data.get('vs_spy_20d', 0)
+                    perf_20d = data.get('perf_20d', 0)
+                    etf = data.get('etf', '?')
+                    icon = "🟢" if phase == 'LEADING' else "🟡" if phase == 'WEAKENING' else "🔴" if phase == 'LAGGING' else "⚪"
+                    _mkt_lines.append(f"  {icon} {sector_name} ({etf}): {phase} | 20d: {perf_20d:+.1f}% | vs SPY: {vs_spy:+.1f}%")
             else:
-                lines.append(f"  ASSESSMENT: NEUTRAL — mixed signals, selective stock-picking environment")
+                _mkt_lines.append(f"  Sector data unavailable")
+        except Exception as e:
+            _mkt_lines.append(f"  Error: {str(e)[:100]}")
 
-            # Breadth proxy: RSP (equal-weight SPY) vs SPY
-            try:
-                rsp_df = fetch_daily("RSP")
-                if rsp_df is not None and len(rsp_df) >= 20:
-                    rsp_20d = (rsp_df['Close'].iloc[-1] / rsp_df['Close'].iloc[-20] - 1) * 100
-                    spread = rsp_20d - spy_20d
-                    if spread > 1.0:
-                        breadth = "BROAD — equal-weight outperforming (healthy breadth)"
-                    elif spread < -1.0:
-                        breadth = "NARROW — cap-weighted leading (top-heavy, fragile)"
-                    else:
-                        breadth = "BALANCED — similar performance"
-                    lines.append(f"  Market Breadth: RSP 20d {rsp_20d:+.1f}% vs SPY {spy_20d:+.1f}% → {breadth}")
-            except Exception:
-                pass
-    except Exception as e:
-        lines.append(f"  Error fetching market data: {str(e)[:100]}")
-
-    # ══════════════════════════════════════════════════════════════════
-    # SECTION 2: SECTOR ROTATION MAP (MANDATORY)
-    # ══════════════════════════════════════════════════════════════════
-    lines.append(f"\n📊 SECTOR ROTATION (all sectors vs SPY):")
-    try:
-        # Use session_state cache first (already fetched at startup), fallback to fresh fetch
-        all_sectors = st.session_state.get('sector_rotation')
-        if not all_sectors:
-            from data_fetcher import fetch_sector_rotation
-            all_sectors = fetch_sector_rotation()
-        if all_sectors:
-            # Sort by performance vs SPY
-            sorted_sectors = sorted(all_sectors.items(),
-                                    key=lambda x: x[1].get('vs_spy_20d', 0), reverse=True)
-            for sector_name, data in sorted_sectors:
-                phase = data.get('phase', '?')
-                vs_spy = data.get('vs_spy_20d', 0)
-                perf_20d = data.get('perf_20d', 0)
-                etf = data.get('etf', '?')
-                icon = "🟢" if phase == 'LEADING' else "🟡" if phase == 'WEAKENING' else "🔴" if phase == 'LAGGING' else "⚪"
-                lines.append(f"  {icon} {sector_name} ({etf}): {phase} | 20d: {perf_20d:+.1f}% | vs SPY: {vs_spy:+.1f}%")
-        else:
-            lines.append(f"  Sector data unavailable")
-    except Exception as e:
-        lines.append(f"  Error: {str(e)[:100]}")
+        # Cache the combined market context
+        _mkt_text = "\n".join(_mkt_lines)
+        st.session_state['_research_market_cache'] = _mkt_text
+        st.session_state['_research_market_cache_ts'] = _now
+        lines.append(_mkt_text)
 
     # ══════════════════════════════════════════════════════════════════
     # SECTION 3: EARNINGS DATE (MANDATORY — try multiple sources)
@@ -3973,6 +4008,26 @@ Q: "Why PASS when analysts say $23?"
     history = st.session_state[chat_key]
 
     if not st.session_state.get(autorun_key):
+        if not history:
+            # Show run button — don't auto-fire (saves ~15 API calls per ticker switch)
+            st.info("💬 **AI Research Analyst ready.** Click below to fetch research data & generate analysis.")
+            if st.button("▶️ Run Research Analysis", type="primary", use_container_width=True,
+                         key=f"chat_run_{ticker}"):
+                pass  # Fall through to run the analysis below
+            else:
+                # Show data sources info even before running
+                with st.expander("ℹ️ About Data Sources", expanded=False):
+                    st.markdown("""**Available in this analysis:**
+✅ Technical indicators (MACD, AO, Weinstein stages, volume, support/resistance)
+✅ Yahoo Finance (fundamentals, analyst ratings, insider transactions, earnings)
+✅ Finnhub (news, company profile, social sentiment proxy)
+✅ Market context (SPY, VIX, sector rotation, breadth)
+✅ Correlated assets (BTC for crypto miners, oil for E&P, gold for miners)
+
+**Not available (will suggest alternatives):**
+❌ Real-time social media (Twitter/X, Reddit) · ❌ Elliott Wave · ❌ Level 2 / dark pool · ❌ Advanced options flow""")
+                return  # Don't run yet
+
         # Auto-populate and send the initial analysis request
         initial_query = f"Analyze {ticker} and provide a BUY/HOLD/PASS recommendation."
 
