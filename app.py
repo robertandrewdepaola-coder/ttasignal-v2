@@ -706,7 +706,7 @@ def _run_scan(mode='all'):
         try:
             from data_fetcher import fetch_batch_earnings_flags
             all_scan_tickers = [r.ticker for r in new_results]
-            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=14)
+            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=60)
             if earnings_flags:  # Only update if we got results
                 if mode == 'new_only':
                     existing_flags = st.session_state.get('earnings_flags', {})
@@ -1448,7 +1448,18 @@ def _build_rows_from_analysis(results, jm) -> list:
 
         # Earnings flag
         earn = earnings_flags.get(r.ticker)
-        earn_flag = f"⚡{earn['days_until']}d" if earn else ""
+        if earn:
+            _ed = earn['days_until']
+            if _ed <= 7:
+                earn_flag = f"⚡{_ed}d"
+            elif _ed <= 14:
+                earn_flag = f"⏰{_ed}d"
+            elif _ed <= 30:
+                earn_flag = f"📅{_ed}d"
+            else:
+                earn_flag = f"{_ed}d"
+        else:
+            earn_flag = ""
 
         # Volume
         vol = r.volume or 0
@@ -2170,6 +2181,8 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
             # Attach extra data for UI display
             result['earnings_history'] = earnings_history
             result['market_intel'] = market_intel
+            result['fundamentals'] = fundamentals  # For earnings fallback in risk assessment
+            result['fundamental_profile'] = fundamental_profile
 
             st.session_state[f'ai_result_{ticker}'] = result
 
@@ -2234,6 +2247,39 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         grade = fq[0] if fq and fq[0] in 'ABCD' else '?'
         grade_icon = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴'}.get(grade, '⚪')
         st.metric("Business Quality", f"{grade_icon} {grade}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # EARNINGS DATE BANNER (always visible — multiple source fallback)
+    # ═══════════════════════════════════════════════════════════════
+    _earn_hist = ai_result.get('earnings_history', {})
+    _earn_cal = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+
+    # Try earnings_history first (has quarters + streak), then calendar fallback
+    _e_date = _earn_hist.get('next_earnings') or _earn_cal.get('next_earnings')
+    _e_days = _earn_hist.get('days_until_earnings') or _earn_cal.get('days_until_earnings')
+    _e_eps = _earn_hist.get('next_eps_estimate') or _earn_cal.get('next_eps_estimate')
+    _e_conf = _earn_hist.get('confidence') or _earn_cal.get('confidence', '')
+    _e_src = _earn_hist.get('source') or _earn_cal.get('source', '')
+    _e_streak = _earn_hist.get('streak', 0)
+    _e_last = _earn_hist.get('last_earnings') or _earn_cal.get('last_earnings', '')
+
+    if _e_date:
+        _eps_str = f" | EPS Est: ${_e_eps:.2f}" if _e_eps else ""
+        _streak_str = f" | {'🔥' if _e_streak > 0 else '📉'} {abs(_e_streak)} {'beat' if _e_streak > 0 else 'miss'}{'s' if abs(_e_streak) > 1 else ''}" if _e_streak != 0 else ""
+        _conf_str = f" ({_e_conf})" if _e_conf else ""
+
+        if _e_days is not None and _e_days <= 7:
+            st.error(f"⚡ **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str} — Binary event imminent{_conf_str}")
+        elif _e_days is not None and _e_days <= 14:
+            st.warning(f"⏰ **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str} — Plan exit strategy{_conf_str}")
+        elif _e_days is not None and _e_days <= 30:
+            st.info(f"📅 **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str}{_conf_str}")
+        else:
+            _days_str = f" ({_e_days}d)" if _e_days else ""
+            st.caption(f"📅 Next Earnings: {_e_date}{_days_str}{_eps_str}{_streak_str}{_conf_str}")
+    elif _e_last:
+        st.caption(f"📅 Earnings: Not yet announced (Last: {_e_last})")
+    # If no earnings data at all, don't clutter the header
 
     # ═══════════════════════════════════════════════════════════════
     # TRADE LEVELS (Entry / Target / Stop / R:R)
@@ -2355,10 +2401,22 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # ═══════════════════════════════════════════════════════════════
     resistance = ai_result.get('resistance_verdict', '')  # Used here and in resistance section below
 
+    # Earnings date — try earnings_history first, then fundamentals.earnings as fallback
     _earnings_data = ai_result.get('earnings_history', {})
-    _next_earnings = _earnings_data.get('next_date') if _earnings_data else None
-    _days_to_earn = None
-    if _next_earnings:
+    _next_earnings = _earnings_data.get('next_earnings') if _earnings_data else None
+    _days_to_earn = _earnings_data.get('days_until_earnings') if _earnings_data else None
+    _earn_confidence = _earnings_data.get('confidence', '') if _earnings_data else ''
+
+    # Fallback: fetch_earnings_date result (stored in fundamentals dict during AI Intel)
+    if not _next_earnings:
+        _fund_earnings = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+        if _fund_earnings:
+            _next_earnings = _fund_earnings.get('next_earnings')
+            _days_to_earn = _fund_earnings.get('days_until_earnings')
+            _earn_confidence = _fund_earnings.get('confidence', '')
+
+    # Parse days if we have a date string but no days count
+    if _next_earnings and _days_to_earn is None:
         try:
             _earn_dt = datetime.strptime(str(_next_earnings), '%Y-%m-%d')
             _days_to_earn = (_earn_dt - datetime.now()).days
@@ -2582,8 +2640,20 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # ═══════════════════════════════════════════════════════════════
     # EARNINGS SECTION
     # ═══════════════════════════════════════════════════════════════
-    earnings = ai_result.get('earnings_history', {})
-    if earnings and not earnings.get('error'):
+    earnings = ai_result.get('earnings_history', {}) or {}
+
+    # Merge in fallback date from fetch_earnings_date() if history didn't get it
+    if not earnings.get('next_earnings'):
+        _fallback_earn = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+        if _fallback_earn and _fallback_earn.get('next_earnings'):
+            earnings['next_earnings'] = _fallback_earn['next_earnings']
+            earnings['days_until_earnings'] = _fallback_earn.get('days_until_earnings')
+            if not earnings.get('next_eps_estimate'):
+                earnings['next_eps_estimate'] = _fallback_earn.get('next_eps_estimate')
+            earnings['confidence'] = _fallback_earn.get('confidence', '')
+            earnings['source'] = _fallback_earn.get('source', '')
+
+    if earnings and (earnings.get('next_earnings') or earnings.get('quarters')):
         _render_earnings_section(earnings)
 
     # ═══════════════════════════════════════════════════════════════
@@ -2889,6 +2959,8 @@ def _render_earnings_section(earnings: Dict):
     days_until = earnings.get('days_until_earnings')
     quarters = earnings.get('quarters', [])
     streak = earnings.get('streak', 0)
+    confidence = earnings.get('confidence', '')
+    source = earnings.get('source', '')
 
     if not next_date and not quarters:
         return
@@ -2898,19 +2970,20 @@ def _render_earnings_section(earnings: Dict):
     # ── Next Earnings Banner ──────────────────────────────────────
     if next_date:
         next_eps = earnings.get('next_eps_estimate')
+        conf_str = f" [{confidence}]" if confidence and confidence != 'HIGH' else ""
 
         if days_until is not None and days_until <= 14:
             # Imminent — warning
             eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
-            st.error(f"⚠️ **Next Earnings: {next_date} ({days_until} days)**{eps_str} — "
+            st.error(f"⚠️ **Next Earnings: {next_date} ({days_until} days)**{eps_str}{conf_str} — "
                      f"Consider waiting or reducing size")
         elif days_until is not None and days_until <= 30:
             eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
-            st.warning(f"📅 **Next Earnings: {next_date} ({days_until} days)**{eps_str}")
+            st.warning(f"📅 **Next Earnings: {next_date} ({days_until} days)**{eps_str}{conf_str}")
         else:
             eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
             st.info(f"📅 **Next Earnings: {next_date}"
-                    f"{f' ({days_until} days)' if days_until else ''}**{eps_str}")
+                    f"{f' ({days_until} days)' if days_until else ''}**{eps_str}{conf_str}")
 
     # ── Streak + Summary ──────────────────────────────────────────
     if quarters:
@@ -3345,14 +3418,14 @@ def _fetch_external_research(ticker: str) -> str:
         lines.append(_mkt_text)
 
     # ══════════════════════════════════════════════════════════════════
-    # SECTION 3: EARNINGS DATE (MANDATORY — try multiple sources)
+    # SECTION 3: EARNINGS DATE (MANDATORY — 4-method cascade via fetch_earnings_date)
     # ══════════════════════════════════════════════════════════════════
     lines.append(f"\n📅 EARNINGS DATE (MANDATORY — you MUST state this):")
     earnings_found = False
     earnings_date_str = None
     earnings_days = None
 
-    # Source 1: App session (batch scanner)
+    # Source 1: App session (batch scanner — instant, no API call)
     earn_flag = st.session_state.get('earnings_flags', {}).get(ticker)
     if earn_flag:
         earnings_date_str = earn_flag.get('next_earnings')
@@ -3362,85 +3435,31 @@ def _fetch_external_research(ticker: str) -> str:
         lines.append(f"  Next Earnings: {earnings_date_str}")
         lines.append(f"  Days Until: {earnings_days}")
 
-    # Source 2: yfinance (fresh fetch if scanner didn't have it)
+    # Source 2: fetch_earnings_date() — 4-method cascade (calendar → info → earnings_dates → pattern)
     if not earnings_found:
         try:
-            import yfinance as yf
-            stock = yf.Ticker(ticker)
-
-            # Try .calendar
-            try:
-                cal = stock.calendar
-                if cal is not None:
-                    raw_date = None
-                    if isinstance(cal, dict):
-                        raw_date = cal.get('Earnings Date')
-                        if isinstance(raw_date, list) and raw_date:
-                            raw_date = raw_date[0]
-                    if raw_date is not None:
-                        if hasattr(raw_date, 'date'):
-                            earn_dt = raw_date.date()
-                        elif isinstance(raw_date, str):
-                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
-                        else:
-                            earn_dt = None
-                        if earn_dt:
-                            earnings_days = (earn_dt - datetime.now().date()).days
-                            earnings_date_str = earn_dt.strftime('%Y-%m-%d')
-                            earnings_found = True
-                            lines.append(f"  Source: Yahoo Finance (.calendar)")
-                            lines.append(f"  Next Earnings: {earnings_date_str}")
-                            lines.append(f"  Days Until: {earnings_days}")
-            except Exception:
-                pass
-
-            # Try info dict
-            if not earnings_found:
-                try:
-                    info = stock.info or {}
-                    for key in ('earningsTimestamp', 'earningsTimestampStart'):
-                        ts = info.get(key)
-                        if ts and isinstance(ts, (int, float)) and ts > 0:
-                            from datetime import timezone
-                            earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
-                            earnings_days = (earn_dt - datetime.now().date()).days
-                            if earnings_days >= -7:
-                                earnings_date_str = earn_dt.strftime('%Y-%m-%d')
-                                earnings_found = True
-                                lines.append(f"  Source: Yahoo Finance (info)")
-                                lines.append(f"  Next Earnings: {earnings_date_str}")
-                                lines.append(f"  Days Until: {earnings_days}")
-                                break
-                except Exception:
-                    pass
-
-            # Try .earnings_dates
-            if not earnings_found:
-                try:
-                    edates = stock.earnings_dates
-                    if edates is not None and len(edates) > 0:
-                        today = datetime.now().date()
-                        for dt_idx in sorted(edates.index):
-                            try:
-                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                                if (d - today).days >= -7:
-                                    earnings_date_str = d.strftime('%Y-%m-%d')
-                                    earnings_days = (d - today).days
-                                    earnings_found = True
-                                    lines.append(f"  Source: Yahoo Finance (.earnings_dates)")
-                                    lines.append(f"  Next Earnings: {earnings_date_str}")
-                                    lines.append(f"  Days Until: {earnings_days}")
-                                    break
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
+            from data_fetcher import fetch_earnings_date
+            earn_result = fetch_earnings_date(ticker)
+            if earn_result.get('next_earnings'):
+                earnings_date_str = earn_result['next_earnings']
+                earnings_days = earn_result.get('days_until_earnings')
+                earnings_found = True
+                _src = earn_result.get('source', 'Yahoo Finance')
+                _conf = earn_result.get('confidence', 'MEDIUM')
+                lines.append(f"  Source: {_src} (confidence: {_conf})")
+                lines.append(f"  Next Earnings: {earnings_date_str}")
+                lines.append(f"  Days Until: {earnings_days}")
+                if earn_result.get('next_eps_estimate'):
+                    lines.append(f"  EPS Estimate: ${earn_result['next_eps_estimate']:.2f}")
+                if earn_result.get('last_earnings'):
+                    lines.append(f"  Last Earnings: {earn_result['last_earnings']}")
         except Exception as e:
-            lines.append(f"  Yahoo earnings fetch error: {str(e)[:100]}")
+            lines.append(f"  Earnings fetch error: {str(e)[:100]}")
 
     if not earnings_found:
-        lines.append(f"  ⚠️ EARNINGS DATE NOT FOUND — tell user this could not be determined")
-        lines.append(f"  (Some stocks, especially small-caps or foreign ADRs, may not have scheduled dates)")
+        lines.append(f"  ⚠️ EARNINGS DATE NOT FOUND after 4-method cascade")
+        lines.append(f"  → Tell user: 'Earnings date could not be determined from available sources'")
+        lines.append(f"  → Still provide risk framework based on typical quarterly patterns")
 
     # Earnings risk assessment
     if earnings_found and earnings_days is not None:
