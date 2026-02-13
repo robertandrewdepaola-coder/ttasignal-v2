@@ -636,7 +636,8 @@ RED FLAGS: [1-3 specific concerns, or "None" if clean. CRITICAL: Do NOT flag "in
 
 POSITION SIZING: [Full (100%) / Reduced (75%) / Small (50%) / Skip — with 1 reason]
 
-Keep total response under 300 words. No fluff. Be specific with prices and percentages."""
+Keep total response under 300 words. No fluff. Be specific with prices and percentages.
+CRITICAL: Do NOT use markdown formatting (no *italic*, **bold**, or ***bold italic***). Write plain text only. Spaces between all words."""
 
     return prompt
 
@@ -677,7 +678,7 @@ def call_ai(prompt: str,
                 model=ai_model,
                 messages=[
                     {"role": "system",
-                     "content": "You are a senior technical analyst. Be concise, honest, actionable."},
+                     "content": "You are a senior technical analyst. Be concise, honest, actionable. NEVER use markdown formatting (*italic*, **bold**) — plain text only with proper spacing."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=800,
