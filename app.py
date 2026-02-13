@@ -237,7 +237,11 @@ def _render_factual_market_brief():
     Shows indices, VIX, breadth data + AI narrative summary.
     """
     today = datetime.now().strftime('%Y-%m-%d')
-    mkt = fetch_market_filter()
+
+    # Cache market filter in session_state (survives reruns, refreshes via data_fetcher's 5min TTL)
+    if 'market_filter_data' not in st.session_state:
+        st.session_state['market_filter_data'] = fetch_market_filter()
+    mkt = st.session_state['market_filter_data']
     spy_ok = mkt.get('spy_above_200', True)
     vix_close = mkt.get('vix_close', 0) or 0
 
@@ -430,6 +434,27 @@ def render_sidebar():
     # ── Market Brief (replaces old green/yellow/red rectangle) ──────
     st.sidebar.divider()
     _render_factual_market_brief()
+
+    # ── Settings (bottom of sidebar) ──────────────────────────────────
+    with st.sidebar.expander("⚙️ Settings", expanded=False):
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("🔑 Reset API", key="reset_api_cache",
+                         help="Clear cached API key status after updating secrets"):
+                for k in ['_groq_key_status', '_groq_key_cached']:
+                    st.session_state.pop(k, None)
+                # Also clear cached AI results that have errors
+                keys_to_clear = [k for k in st.session_state
+                                 if k.startswith('ai_result_') or k.startswith('chat_')]
+                for k in keys_to_clear:
+                    st.session_state.pop(k, None)
+                st.toast("✅ API cache cleared. Re-run analysis.")
+        with s2:
+            if st.button("📊 Refresh Mkt", key="refresh_market_data",
+                         help="Re-fetch SPY, VIX, sector rotation"):
+                st.session_state.pop('market_filter_data', None)
+                st.session_state.pop('sector_rotation', None)
+                st.toast("✅ Market data will refresh on next load.")
 
 
 def _load_ticker_for_view(ticker: str):
@@ -1787,11 +1812,17 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     try:
         groq_key = st.secrets.get("GROQ_API_KEY", "")
         if groq_key:
-            from openai import OpenAI
-            openai_client = OpenAI(
-                api_key=groq_key,
-                base_url="https://api.groq.com/openai/v1",
-            )
+            # Check if we already know this key is bad (cached validation)
+            cached_groq_status = st.session_state.get('_groq_key_status')
+            cached_groq_key = st.session_state.get('_groq_key_cached', '')
+            if cached_groq_status == 'invalid' and cached_groq_key == groq_key:
+                groq_error = "API key previously failed (401 Invalid). Restart app after updating secrets."
+            else:
+                from openai import OpenAI
+                openai_client = OpenAI(
+                    api_key=groq_key,
+                    base_url="https://api.groq.com/openai/v1",
+                )
         else:
             groq_error = "No GROQ_API_KEY in secrets"
     except ImportError:
@@ -1820,19 +1851,26 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
             errors.append(f"Groq: {groq_error}")
         if gemini_error:
             errors.append(f"Gemini: {gemini_error}")
-        st.caption(f"⚠️ {' | '.join(errors)}")
+        st.warning(f"⚠️ AI providers unavailable: {' | '.join(errors)}")
+        st.caption("💡 After updating API keys in Streamlit secrets, **restart the app** (not just refresh) for changes to take effect.")
 
     # Auto-run on first view for this ticker, or manual re-run
     has_cached = st.session_state.get(f'ai_result_{ticker}') is not None
     should_run = False
+    keys_available = bool(openai_client or gemini)
 
     if has_cached:
         # Show refresh button only if already have results
         if st.button("🔄 Re-run AI Analysis", type="secondary"):
             should_run = True
-    else:
-        # Always run data fetch; AI generation only if provider available
+    elif keys_available:
+        # Auto-run only if we have working AI providers
         should_run = True
+    else:
+        # No providers + no cached results — show manual button (to fetch data at least)
+        st.caption("AI providers unavailable. Data-only analysis available.")
+        if st.button("📊 Fetch Fundamentals (data only)", type="secondary"):
+            should_run = True
 
     if should_run:
         with st.spinner("Fetching fundamentals, market intel & analyzing..."):
@@ -1940,15 +1978,33 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     provider = ai_result.get('provider', 'unknown')
     st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
 
-    # Show AI errors if present
-    if ai_result.get('groq_error'):
-        st.warning(f"⚠️ Groq error: {ai_result['groq_error']}")
-    if ai_result.get('gemini_error'):
-        st.warning(f"⚠️ Gemini error: {ai_result['gemini_error']}")
+    # Show AI errors if present — cache key validation failures
+    groq_err = ai_result.get('groq_error', '')
+    gemini_err = ai_result.get('gemini_error', '')
+
+    if groq_err:
+        if 'Invalid API Key' in groq_err or '401' in groq_err:
+            # Cache this key as bad so we don't keep retrying
+            try:
+                st.session_state['_groq_key_status'] = 'invalid'
+                st.session_state['_groq_key_cached'] = st.secrets.get("GROQ_API_KEY", "")
+            except Exception:
+                pass
+            st.error("🔑 **Groq API key is invalid.** Go to Settings → Secrets, paste a valid GROQ_API_KEY, then **restart the app** (Stop → Run).")
+        else:
+            st.warning(f"⚠️ Groq error: {groq_err}")
+    if gemini_err:
+        if '429' in gemini_err or 'quota' in gemini_err.lower():
+            st.warning("⚠️ Gemini fallback: quota exceeded (free tier limit). Fix your Groq key to avoid this.")
+        else:
+            st.warning(f"⚠️ Gemini error: {gemini_err}")
     if ai_result.get('openai_error'):
         st.warning(f"⚠️ OpenAI error: {ai_result['openai_error']}")
     if ai_result.get('error'):
-        st.warning(f"⚠️ Error: {ai_result['error']}")
+        if 'All AI providers failed' in str(ai_result.get('error', '')):
+            st.error("❌ All AI providers failed. **Fix your GROQ_API_KEY** in secrets, then restart the app.")
+        else:
+            st.warning(f"⚠️ Error: {ai_result['error']}")
 
     # ═══════════════════════════════════════════════════════════════
     # TOP ROW: Action + Conviction + Sizing
@@ -2751,8 +2807,11 @@ def _fetch_external_research(ticker: str) -> str:
     # ══════════════════════════════════════════════════════════════════
     lines.append(f"\n📊 SECTOR ROTATION (all sectors vs SPY):")
     try:
-        from data_fetcher import fetch_sector_rotation
-        all_sectors = fetch_sector_rotation()
+        # Use session_state cache first (already fetched at startup), fallback to fresh fetch
+        all_sectors = st.session_state.get('sector_rotation')
+        if not all_sectors:
+            from data_fetcher import fetch_sector_rotation
+            all_sectors = fetch_sector_rotation()
         if all_sectors:
             # Sort by performance vs SPY
             sorted_sectors = sorted(all_sectors.items(),
@@ -3296,18 +3355,24 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
         except Exception:
             pass
         if groq_key:
-            from openai import OpenAI
-            openai_client = OpenAI(
-                api_key=groq_key,
-                base_url="https://api.groq.com/openai/v1",
-            )
+            # Check cached validation
+            cached_status = st.session_state.get('_groq_key_status')
+            cached_key = st.session_state.get('_groq_key_cached', '')
+            if cached_status == 'invalid' and cached_key == groq_key:
+                groq_key = ""  # Skip — known bad key
+            else:
+                from openai import OpenAI
+                openai_client = OpenAI(
+                    api_key=groq_key,
+                    base_url="https://api.groq.com/openai/v1",
+                )
     except Exception:
         pass
 
     if not openai_client:
-        st.info("💬 Configure GROQ_API_KEY in secrets to enable the AI Research Analyst. "
-                "This feature auto-researches news, sentiment, and analyst data, then synthesizes "
-                "a recommendation with the app's technical signals.")
+        st.warning("🔑 **GROQ_API_KEY is missing or invalid.** "
+                   "Go to Settings → Secrets, add a valid key, then **restart the app** (Stop → Run).")
+        st.caption("Get a free API key at [console.groq.com](https://console.groq.com)")
         return
 
     # ── Chat state management (per ticker) ────────────────────────────
@@ -3325,17 +3390,19 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
     if chat_key not in st.session_state:
         st.session_state[chat_key] = []
 
-    # ── System prompt — the research analyst role ─────────────────────
-    internal_context = _build_internal_context(ticker, signal, rec, analysis)
+    # ── Build context lazily (only when needed for API calls) ─────────
+    def _get_system_prompt():
+        """Build system prompt on demand — avoids fetching external research on every render."""
+        internal_context = _build_internal_context(ticker, signal, rec, analysis)
 
-    # Fetch external research (cached per ticker within session)
-    if research_key not in st.session_state:
-        with st.spinner(f"🔍 Researching {ticker} — fetching news, analyst data, sentiment..."):
-            external_research = _fetch_external_research(ticker)
-            st.session_state[research_key] = external_research
-    external_research = st.session_state[research_key]
+        # Fetch external research (cached per ticker within session)
+        if research_key not in st.session_state:
+            with st.spinner(f"🔍 Researching {ticker} — fetching news, analyst data, sentiment..."):
+                external_research = _fetch_external_research(ticker)
+                st.session_state[research_key] = external_research
+        external_research = st.session_state.get(research_key, "External research not yet loaded.")
 
-    system_prompt = f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant).
+        return f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant).
 
 ═══ YOUR DATA SOURCES ═══
 
@@ -3436,7 +3503,7 @@ If earnings are 60+ days away, skip this section.
         history.append({'role': 'user', 'content': initial_query})
 
         messages = [
-            {'role': 'system', 'content': system_prompt},
+            {'role': 'system', 'content': _get_system_prompt()},
             {'role': 'user', 'content': initial_query},
         ]
 
@@ -3451,19 +3518,40 @@ If earnings are 60+ days away, skip this section.
                 reply = response.choices[0].message.content
                 history.append({'role': 'assistant', 'content': reply})
         except Exception as e:
-            # Fallback model
-            try:
-                response = openai_client.chat.completions.create(
-                    model="llama-3.1-8b-instant",
-                    messages=messages,
-                    max_tokens=1400,
-                    temperature=0.3,
-                )
-                reply = response.choices[0].message.content
-                history.append({'role': 'assistant', 'content': reply})
-            except Exception as e2:
+            err_str = str(e)
+            # Cache 401 invalid key so we don't keep retrying
+            if 'Invalid API Key' in err_str or '401' in err_str:
+                try:
+                    st.session_state['_groq_key_status'] = 'invalid'
+                    st.session_state['_groq_key_cached'] = st.secrets.get("GROQ_API_KEY", "")
+                except Exception:
+                    pass
                 history.append({'role': 'assistant',
-                                'content': f"⚠️ Analysis failed: {str(e)[:200]}\nFallback: {str(e2)[:200]}"})
+                                'content': "🔑 **Groq API key is invalid.** Go to Settings → Secrets, update GROQ_API_KEY, then **restart the app** (Stop → Run).\n\nGet a free key at [console.groq.com](https://console.groq.com)"})
+            else:
+                # Fallback model
+                try:
+                    response = openai_client.chat.completions.create(
+                        model="llama-3.1-8b-instant",
+                        messages=messages,
+                        max_tokens=1400,
+                        temperature=0.3,
+                    )
+                    reply = response.choices[0].message.content
+                    history.append({'role': 'assistant', 'content': reply})
+                except Exception as e2:
+                    err2_str = str(e2)
+                    if 'Invalid API Key' in err2_str or '401' in err2_str:
+                        try:
+                            st.session_state['_groq_key_status'] = 'invalid'
+                            st.session_state['_groq_key_cached'] = st.secrets.get("GROQ_API_KEY", "")
+                        except Exception:
+                            pass
+                        history.append({'role': 'assistant',
+                                        'content': "🔑 **Groq API key is invalid.** Update GROQ_API_KEY in secrets, then restart the app."})
+                    else:
+                        history.append({'role': 'assistant',
+                                        'content': f"⚠️ Analysis failed: {err_str[:200]}\nFallback: {err2_str[:200]}"})
 
         st.session_state[chat_key] = history
         st.session_state[autorun_key] = True
@@ -3492,7 +3580,7 @@ If earnings are 60+ days away, skip this section.
             st.markdown(user_input)
 
         # Build full message chain (system + last 20 messages)
-        messages = [{'role': 'system', 'content': system_prompt}]
+        messages = [{'role': 'system', 'content': _get_system_prompt()}]
         for msg in history[-20:]:
             messages.append({'role': msg['role'], 'content': msg['content']})
 
