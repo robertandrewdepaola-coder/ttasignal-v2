@@ -3112,6 +3112,174 @@ def _fetch_external_research(ticker: str) -> str:
     except Exception:
         pass
 
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 7: CORRELATED ASSET PRICE ACTION
+    # (Auto-detects crypto miners, oil/gas, gold miners, etc.)
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        # Re-use Yahoo info if available, otherwise fetch
+        try:
+            _yf_info = stock.info if 'stock' in dir() else yf.Ticker(ticker).info
+        except Exception:
+            import yfinance as yf
+            _yf_info = yf.Ticker(ticker).info or {}
+
+        biz = (_yf_info.get('longBusinessSummary', '') + ' ' +
+               _yf_info.get('industry', '') + ' ' +
+               _yf_info.get('sector', '')).lower()
+
+        # Map business keywords to correlated assets
+        CORRELATED_ASSETS = {
+            'BTC-USD': {
+                'name': 'Bitcoin',
+                'keywords': ['bitcoin', 'crypto', 'blockchain', 'mining', 'btc',
+                             'digital asset', 'digital currency', 'hash rate'],
+            },
+            'CL=F': {
+                'name': 'Crude Oil (WTI)',
+                'keywords': ['oil', 'petroleum', 'crude', 'drilling', 'upstream',
+                             'exploration and production', 'e&p'],
+            },
+            'GC=F': {
+                'name': 'Gold',
+                'keywords': ['gold mining', 'gold miner', 'precious metal',
+                             'gold exploration', 'gold production'],
+            },
+            'SI=F': {
+                'name': 'Silver',
+                'keywords': ['silver mining', 'silver miner'],
+            },
+            'NG=F': {
+                'name': 'Natural Gas',
+                'keywords': ['natural gas', 'lng', 'gas producer'],
+            },
+            'ETH-USD': {
+                'name': 'Ethereum',
+                'keywords': ['ethereum', 'defi', 'smart contract', 'eth'],
+            },
+        }
+
+        matched_assets = []
+        for asset_ticker, asset_info in CORRELATED_ASSETS.items():
+            if any(kw in biz for kw in asset_info['keywords']):
+                matched_assets.append((asset_ticker, asset_info['name']))
+
+        if matched_assets:
+            from data_fetcher import fetch_daily
+            lines.append(f"\n🔗 CORRELATED ASSET PRICE ACTION:")
+            for asset_ticker, asset_name in matched_assets:
+                try:
+                    asset_df = fetch_daily(asset_ticker, period='3mo')
+                    if asset_df is not None and len(asset_df) >= 20:
+                        current = float(asset_df['Close'].iloc[-1])
+                        ret_5d = (asset_df['Close'].iloc[-1] / asset_df['Close'].iloc[-5] - 1) * 100
+                        ret_20d = (asset_df['Close'].iloc[-1] / asset_df['Close'].iloc[-20] - 1) * 100
+                        high_3mo = float(asset_df['Close'].max())
+                        low_3mo = float(asset_df['Close'].min())
+                        pct_from_high = (current / high_3mo - 1) * 100
+
+                        # Format price based on asset
+                        if current >= 1000:
+                            price_str = f"${current:,.0f}"
+                        elif current >= 1:
+                            price_str = f"${current:,.2f}"
+                        else:
+                            price_str = f"${current:.4f}"
+
+                        lines.append(f"  {asset_name} ({asset_ticker}): {price_str}")
+                        lines.append(f"    5d: {ret_5d:+.1f}% | 20d: {ret_20d:+.1f}% | vs 3mo high: {pct_from_high:+.1f}%")
+                        lines.append(f"    3mo range: ${low_3mo:,.0f} — ${high_3mo:,.0f}")
+
+                        # Directional assessment
+                        if ret_5d > 3 and ret_20d > 5:
+                            lines.append(f"    → {asset_name} in STRONG UPTREND — supports bullish thesis")
+                        elif ret_5d > 0 and ret_20d > 0:
+                            lines.append(f"    → {asset_name} trending UP — mildly supportive")
+                        elif ret_5d < -3 and ret_20d < -5:
+                            lines.append(f"    → {asset_name} in DOWNTREND — HEADWIND for {ticker}")
+                        elif ret_5d < 0:
+                            lines.append(f"    → {asset_name} pulling back — near-term caution")
+                        else:
+                            lines.append(f"    → {asset_name} FLAT — neutral for {ticker}")
+                except Exception:
+                    lines.append(f"  {asset_name}: Data unavailable")
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 8: EARNINGS VOLATILITY ESTIMATE
+    # (For stocks with imminent earnings + high short interest)
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        # Only generate if earnings within 30 days
+        if earnings_found and earnings_days is not None and earnings_days <= 30:
+            try:
+                _yf_info2 = stock.info if 'stock' in dir() else {}
+            except Exception:
+                _yf_info2 = {}
+
+            short_pct = _yf_info2.get('shortPercentOfFloat', 0) or 0
+            beta_val = _yf_info2.get('beta', 1.0) or 1.0
+
+            # Historical earnings moves (from earnings_dates if available)
+            hist_moves = []
+            try:
+                import yfinance as yf
+                _stock = yf.Ticker(ticker)
+                edates = _stock.earnings_dates
+                if edates is not None and len(edates) >= 2:
+                    from data_fetcher import fetch_daily
+                    hist_df = fetch_daily(ticker, period='2y')
+                    if hist_df is not None and len(hist_df) > 50:
+                        for dt_idx in edates.index:
+                            try:
+                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                                # Find the trading day before and after earnings
+                                mask_before = hist_df.index.date <= d
+                                mask_after = hist_df.index.date >= d
+                                if mask_before.any() and mask_after.any():
+                                    close_before = float(hist_df.loc[mask_before, 'Close'].iloc[-1])
+                                    # Day after (or same day if reported pre-market)
+                                    after_df = hist_df.loc[mask_after]
+                                    if len(after_df) >= 2:
+                                        close_after = float(after_df['Close'].iloc[1])
+                                        move_pct = (close_after / close_before - 1) * 100
+                                        hist_moves.append(round(move_pct, 1))
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+
+            lines.append(f"\n📊 EARNINGS VOLATILITY ESTIMATE:")
+            lines.append(f"  Days to earnings: {earnings_days}")
+            lines.append(f"  Short % of float: {short_pct*100:.1f}%" if short_pct else "  Short %: N/A")
+            lines.append(f"  Beta: {beta_val:.2f}")
+
+            if hist_moves and len(hist_moves) >= 2:
+                avg_move = sum(abs(m) for m in hist_moves) / len(hist_moves)
+                max_move = max(abs(m) for m in hist_moves)
+                lines.append(f"  Historical earnings moves (last {len(hist_moves)}): {', '.join(f'{m:+.1f}%' for m in hist_moves[:6])}")
+                lines.append(f"  Average absolute move: ±{avg_move:.1f}%")
+                lines.append(f"  Largest move: ±{max_move:.1f}%")
+            else:
+                # Estimate from beta and short interest
+                base_move = 8.0  # Average S&P stock earnings move
+                beta_adj = base_move * beta_val
+                short_adj = beta_adj * (1 + short_pct * 2) if short_pct else beta_adj
+                lines.append(f"  No historical earnings data — estimating from beta + short interest:")
+                lines.append(f"  Estimated earnings move: ±{short_adj:.0f}–{short_adj*1.5:.0f}%")
+
+            # Short squeeze potential
+            if short_pct and short_pct > 0.15:
+                lines.append(f"  ⚠️ SHORT SQUEEZE RISK: {short_pct*100:.1f}% short interest")
+                lines.append(f"  → If earnings beat: potential for {short_pct*100:.0f}–{short_pct*200:.0f}%+ upside squeeze")
+                lines.append(f"  → If earnings miss: shorts will pile on, amplifying downside")
+                lines.append(f"  → Standard stop losses may be INEFFECTIVE on gap moves — stock could gap past your stop")
+            elif short_pct and short_pct > 0.10:
+                lines.append(f"  ℹ️ Elevated short interest ({short_pct*100:.1f}%) — earnings moves likely amplified")
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 
@@ -3186,11 +3354,13 @@ Your response MUST include ALL sections below in this order. Omitting any sectio
 - SECTOR CLASSIFICATION CHECK: Read the company's Business description. Does the Yahoo-assigned sector accurately reflect what this company actually does? Many companies are misclassified (e.g., crypto miners in "Financial Services", SaaS companies in "Industrials", EV companies in "Consumer Cyclical"). If the actual business doesn't match the assigned sector, SAY SO and explain which sector's rotation data is more relevant. Example: "WULF is classified as Financial Services but is actually a Bitcoin mining company — crypto/tech sector rotation is more relevant than traditional financials."
 - Is the RELEVANT sector in rotation vs S&P 500? LEADING, LAGGING, or WEAKENING?
 - Cite current sector performance data (20d vs SPY)
+- CORRELATED ASSET: If your research data includes a "CORRELATED ASSET PRICE ACTION" section (e.g., Bitcoin for crypto miners, oil for E&P companies, gold for gold miners), you MUST mention it. State the correlated asset's current trend and whether it supports or contradicts the bullish thesis. This is critical context — a Bitcoin miner in a BTC downtrend faces a massive headwind regardless of its own technicals.
 - If sector rotation data unavailable, explicitly state this limitation
 
 **2. EARNINGS & TRADE TIMING** (CRITICAL — ALWAYS INCLUDE)
 - State the next earnings date and exact days remaining
 - If earnings <30 days away: flag as HIGH RISK and assess viability
+- VOLATILITY ESTIMATE: If your research data includes an "EARNINGS VOLATILITY ESTIMATE" section, you MUST reference it. State the estimated or historical earnings move range (e.g., "±15-25%"). If short interest is >15%, explicitly warn that a gap move could blow past any stop loss — the stock could open 20-30% lower/higher than the prior close. This affects whether a stop loss is even a viable risk management tool.
 - Is there a viable trade window before the next binary event?
 - Note any other upcoming catalysts from news data
 - If earnings date is missing, state: "Unable to fully assess trade timing — earnings date not found"
@@ -3232,7 +3402,7 @@ If earnings are 60+ days away, skip this section.
 - Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
 - Do NOT say "Based on the app data..." or list signals back — INTERPRET them
 - ALWAYS calculate and state the risk/reward ratio — never present a trade plan without it
-- Keep under 500 words. Be decisive, not exhaustive. Every sentence must add value.
+- Keep under 600 words. Be decisive, not exhaustive. Every sentence must add value.
 
 ═══ FOR FOLLOW-UP QUESTIONS ═══
 - Be direct and specific — cite prices, percentages, dates
@@ -3275,7 +3445,7 @@ If earnings are 60+ days away, skip this section.
                 response = openai_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=messages,
-                    max_tokens=1600,
+                    max_tokens=1800,
                     temperature=0.3,
                 )
                 reply = response.choices[0].message.content
@@ -3286,7 +3456,7 @@ If earnings are 60+ days away, skip this section.
                 response = openai_client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=messages,
-                    max_tokens=1200,
+                    max_tokens=1400,
                     temperature=0.3,
                 )
                 reply = response.choices[0].message.content
