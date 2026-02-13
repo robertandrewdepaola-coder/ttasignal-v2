@@ -74,7 +74,7 @@ def _detect_ai_provider(api_key: str) -> Dict:
         return {
             'provider': 'xai',
             'base_url': 'https://api.x.ai/v1',
-            'model': 'grok-3-mini-fast',
+            'model': 'grok-3-fast',
             'fallback_model': 'grok-3-mini-fast',
             'key': key,
             'display': f'xAI/Grok (xai-...{key[-4:]})',
@@ -3575,10 +3575,47 @@ If earnings are 60+ days away, skip this section.
 - ALWAYS calculate and state the risk/reward ratio — never present a trade plan without it
 - Keep under 600 words. Be decisive, not exhaustive. Every sentence must add value.
 
-═══ FOR FOLLOW-UP QUESTIONS ═══
-- Be direct and specific — cite prices, percentages, dates
+═══ FOR FOLLOW-UP QUESTIONS (CONVERSATIONAL Q&A MODE) ═══
+
+When the user asks follow-up questions, switch to conversational mode:
+
+YOUR AVAILABLE DATA SOURCES:
+✅ In-app technical indicators (MACD, AO, RSI, volume, moving averages, Weinstein stages)
+✅ Yahoo Finance (fundamentals, analyst ratings, insider transactions, earnings dates, options)
+✅ Finnhub basic tier (news, company profile, social sentiment proxy)
+✅ Market conditions (SPY, VIX, sector rotation, breadth)
+✅ Correlated asset data (BTC, oil, gold for relevant stocks)
+✅ Your previous analysis in this conversation — reference it freely
+
+NOT AVAILABLE (be transparent):
+❌ Real-time social media (Twitter/X, Reddit, StockTwits) — requires premium subscription
+❌ Elliott Wave analysis — not in the system, suggest TradingView
+❌ Level 2 / order book data — not available
+❌ Advanced options flow (unusual activity) — only basic Yahoo options chain
+❌ Dark pool / institutional flow data — not available
+❌ Proprietary scoring models — only what's in the app
+
+RESPONSE GUIDELINES:
+- Be conversational, helpful, and direct — cite specific prices, percentages, dates
+- Reference your previous analysis sections when relevant ("As I noted in Section 2...")
+- When users ask about unavailable data:
+  * Explain what you DO have access to as an alternative
+  * Suggest external tools when appropriate (TradingView, Finviz, Unusual Whales, etc.)
+  * Offer to analyze available proxy data instead
+- When asked "why did you recommend X?": Give detailed reasoning referencing specific data points
+- When asked hypotheticals ("what if BTC drops?"): Use available data to model scenarios
 - If asked about something not in your data, say so honestly and suggest clicking "Refresh Research"
-- You can discuss entry strategy, position sizing, risk management, catalysts, sector trends"""
+- You can discuss entry strategy, position sizing, risk management, catalysts, sector trends
+
+EXAMPLE RESPONSES:
+Q: "What's the sentiment on Twitter?"
+→ "I don't have real-time Twitter/X access. However, I can see that [institutional ownership, insider activity, analyst consensus, social mention counts from Finnhub] — these 'smart money' signals often matter more than social buzz."
+
+Q: "Can you do Elliott Wave?"
+→ "Elliott Wave isn't part of my analysis tools. I work with MACD, AO, Weinstein stages, and support/resistance. For EW, try TradingView. I can help with trend structure using multi-timeframe momentum — want me to break that down?"
+
+Q: "Why PASS when analysts say $23?"
+→ [Reference specific sections from initial analysis with data points]"""
 
     # ── Header with controls ──────────────────────────────────────────
     hdr1, hdr2, hdr3 = st.columns([5, 2, 1])
@@ -3673,6 +3710,26 @@ If earnings are 60+ days away, skip this section.
                    "*\"Is smart money buying or selling?\"* · "
                    "*\"Compare bull and bear case\"* · "
                    "*\"How does this sector look right now?\"*")
+
+    # ── Data sources transparency ─────────────────────────────────────
+    with st.expander("ℹ️ About Data Sources", expanded=False):
+        st.markdown("""
+**Available in this analysis:**
+- ✅ Technical indicators — MACD, AO, RSI, volume, moving averages, Weinstein stages
+- ✅ Yahoo Finance — fundamentals, analyst ratings, insider transactions, earnings dates
+- ✅ Finnhub (basic) — news, company profile, social mention counts
+- ✅ Market context — SPY/VIX, sector rotation (all 11 GICS sectors), breadth
+- ✅ Correlated assets — BTC, oil, gold (auto-detected for relevant stocks)
+- ✅ Earnings volatility — historical moves, short squeeze risk assessment
+
+**Not available (ask the AI for workarounds):**
+- ❌ Real-time social media (Twitter/X, Reddit) — premium subscription required
+- ❌ Elliott Wave analysis — use TradingView for this
+- ❌ Level 2 / order book / dark pool data
+- ❌ Advanced options flow (unusual activity beyond Yahoo chain)
+
+The AI is transparent about limitations and will suggest alternatives using available data.
+""")
 
     # ── Chat input for follow-ups ─────────────────────────────────────
     user_input = st.chat_input(f"Ask about {ticker}...", key=f"chat_input_{ticker}")
