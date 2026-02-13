@@ -18,6 +18,7 @@ Version: 2.0.0 (2026-02-08)
 
 import streamlit as st
 import pandas as pd
+import re
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -33,6 +34,61 @@ from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
 from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
+
+
+# =============================================================================
+# AI TEXT CLEANUP — fix garbled formatting from LLM outputs
+# =============================================================================
+
+def clean_ai_formatting(text: str) -> str:
+    """Fix common AI output formatting issues with currency, percentages, and spacing.
+    
+    Handles:
+    - Missing spaces after dollar amounts ($184.54Buy → $184.54 Buy)
+    - Missing spaces before dollar amounts (target$210 → target $210)
+    - Letter-number concatenation (gained27% → gained 27%)
+    - Percentage concatenation (27%gains → 27% gains)
+    - Punctuation spacing (end.Start → end. Start)
+    - Em-dash spacing (word—word → word — word)
+    - Number-letter concatenation (27times → 27 times)
+    - Preserves: 200d, 50d, 1x, $15.2K, $3.2B, Q3, 1st/2nd/3rd
+    """
+    if not text:
+        return text
+
+    # Fix dollar amounts followed by words: $184.54Buy → $184.54 Buy
+    text = re.sub(r'(\$\d+[\d,.]*[KMBkmb]?)([A-Z][a-z])', r'\1 \2', text)
+    text = re.sub(r'(\$\d+\.?\d{2})([a-z])', r'\1 \2', text)
+
+    # Fix missing spaces before dollar amounts
+    text = re.sub(r'([a-zA-Z])(\$\d)', r'\1 \2', text)
+
+    # Fix letter-number concatenation (gained27 → gained 27)
+    text = re.sub(r'([a-z])(\d)', r'\1 \2', text)
+
+    # Fix percentage spacing
+    text = re.sub(r'(\d+\.?\d*)%([a-zA-Z])', r'\1% \2', text)
+
+    # Fix missing spaces after sentence-ending punctuation
+    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'([,;:])([a-zA-Z])', r'\1 \2', text)
+
+    # Fix em-dash spacing
+    text = re.sub(r'([a-zA-Z])—([a-zA-Z])', r'\1 — \2', text)
+
+    # Fix number-letter concatenation (27times → 27 times)
+    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
+
+    # Restore common abbreviations that should NOT have spaces
+    text = re.sub(r'(\d+) ([dxwDXW])\b', r'\1\2', text)   # 200d, 2.5x, 52w
+    text = re.sub(r'(\d+) ([KMBkmb])\b', r'\1\2', text)   # $15.2K, $3.2B
+    text = re.sub(r'(\d) (st|nd|rd|th)\b', r'\1\2', text)  # 1st, 2nd, 3rd
+    text = re.sub(r'\bQ (\d)\b', r'Q\1', text)             # Q1, Q2, Q3, Q4
+
+    # Clean multiple spaces (preserve markdown indentation)
+    text = re.sub(r'(?<!\n) {2,}', ' ', text)
+
+    return text.strip()
 
 # =============================================================================
 # CONFIG
@@ -2134,9 +2190,224 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.metric("Business Quality", f"{grade_icon} {grade}")
 
     # ═══════════════════════════════════════════════════════════════
+    # TRADE LEVELS (Entry / Target / Stop / R:R)
+    # ═══════════════════════════════════════════════════════════════
+    stops = signal.stops if signal else {}
+    _entry = stops.get('entry', 0)
+    _stop = stops.get('stop', 0)
+    _target = stops.get('target', 0)
+    _price = analysis.current_price if analysis else 0
+
+    if _entry and _stop and _target and _entry > _stop:
+        risk = _entry - _stop
+        reward = _target - _entry
+        rr_ratio = reward / risk if risk > 0 else 0
+
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            st.metric("Entry", f"${_entry:.2f}")
+        with t2:
+            pct_target = ((_target - _entry) / _entry * 100) if _entry else 0
+            st.metric("Target", f"${_target:.2f}", delta=f"+{pct_target:.1f}%")
+        with t3:
+            pct_stop = ((_stop - _entry) / _entry * 100) if _entry else 0
+            st.metric("Stop Loss", f"${_stop:.2f}", delta=f"{pct_stop:.1f}%")
+        with t4:
+            rr_icon = "🟢" if rr_ratio >= 2.5 else ("🟡" if rr_ratio >= 2.0 else "🔴")
+            st.metric("R:R Ratio", f"{rr_icon} {rr_ratio:.1f}:1")
+
+    # ═══════════════════════════════════════════════════════════════
+    # SECTOR ROTATION POSITION
+    # ═══════════════════════════════════════════════════════════════
+    _rotation = st.session_state.get('sector_rotation', {})
+    _fp = ai_result.get('fundamental_profile', {})
+    _stock_sector = _fp.get('sector', '') if _fp else ''
+    _phase = ''  # Initialize — may be set below
+    _vs_spy = 0
+
+    if _rotation and _stock_sector:
+        _sector_info = _rotation.get(_stock_sector, {})
+        _phase = _sector_info.get('phase', '')
+        _vs_spy = _sector_info.get('vs_spy_20d', 0)
+        _etf = _sector_info.get('etf', '')
+        _perf_20d = _sector_info.get('perf_20d', 0)
+
+        if _phase == 'LEADING':
+            st.success(f"🚀 **MOMENTUM TAILWIND** — {_stock_sector} ({_etf}) is **LEADING** the market ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** 2 of 3 timeframes aligned = valid setup. Sector momentum supports the trade.")
+        elif _phase == 'EMERGING':
+            st.info(f"📈 **REQUIRES STRONGER CONFLUENCE** — {_stock_sector} ({_etf}) is **EMERGING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** All 3 timeframes must align. Sector is building momentum but not yet confirmed.")
+        elif _phase == 'FADING':
+            st.warning(f"⚠️ **TIGHTEN STOPS** — {_stock_sector} ({_etf}) is **FADING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** Consider taking profits, reduce position size. Watch for sector breakdown.")
+        elif _phase == 'LAGGING':
+            st.error(f"🔴 **SECTOR HEADWIND** — {_stock_sector} ({_etf}) is **LAGGING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** Perfect confluence + volume surge required. Sector is working against you.")
+
+    # ═══════════════════════════════════════════════════════════════
+    # MULTI-TIMEFRAME CONFLUENCE
+    # ═══════════════════════════════════════════════════════════════
+    _macd = signal.macd if signal else {}
+    _ao = signal.ao if signal else {}
+    _weinstein = signal.weinstein if signal else {}
+    _ws_stage = _weinstein.get('stage', 0) if _weinstein else 0
+
+    # Daily: MACD bullish cross or bullish momentum
+    _daily_signal = _macd.get('signal_type', '') if _macd else ''
+    _daily_bullish = 'bullish' in str(_daily_signal).lower()
+
+    # Weekly: Weinstein Stage 2 (advancing) = bullish structure
+    _weekly_bullish = _ws_stage == 2
+
+    # Momentum: AO green = bullish momentum confirmation
+    _ao_color = _ao.get('current_color', '') if _ao else ''
+    _momentum_bullish = _ao_color == 'green'
+
+    _aligned_count = sum([_daily_bullish, _weekly_bullish, _momentum_bullish])
+    _confluence_score = _aligned_count / 3.0
+
+    st.markdown("---")
+    tf1, tf2, tf3 = st.columns(3)
+    with tf1:
+        _d_icon = "✅ Bullish" if _daily_bullish else "❌ Bearish"
+        _d_detail = str(_daily_signal)[:20] if _daily_signal else "No signal"
+        st.metric("Daily (MACD)", _d_icon)
+        st.caption(_d_detail)
+    with tf2:
+        _w_icon = "✅ Stage 2" if _weekly_bullish else ("⚠️ Stage " + str(_ws_stage) if _ws_stage else "❌ N/A")
+        _w_label = _weinstein.get('label', '')[:25] if _weinstein else ''
+        st.metric("Weekly (Weinstein)", _w_icon)
+        st.caption(_w_label if _w_label else "Structure")
+    with tf3:
+        _m_icon = "✅ Green" if _momentum_bullish else ("❌ Red" if _ao_color == 'red' else "⚠️ Mixed")
+        st.metric("Momentum (AO)", _m_icon)
+        st.caption(f"{'Bullish' if _momentum_bullish else 'Bearish'} momentum")
+
+    # Confluence bar + sector-adjusted guidance
+    _required = 3 if _phase == 'LAGGING' else (3 if _phase == 'EMERGING' else 2)
+    _meets_req = _aligned_count >= _required
+    _bar_text = f"Confluence: {_aligned_count}/3 aligned"
+    if _phase:
+        _bar_text += f" ({'✅ meets' if _meets_req else '❌ below'} {_phase.lower()} sector requirement of {_required}/3)"
+    st.progress(_confluence_score, text=_bar_text)
+
+    # ═══════════════════════════════════════════════════════════════
+    # RISK ASSESSMENT (earnings proximity + volatility)
+    # ═══════════════════════════════════════════════════════════════
+    resistance = ai_result.get('resistance_verdict', '')  # Used here and in resistance section below
+
+    _earnings_data = ai_result.get('earnings_history', {})
+    _next_earnings = _earnings_data.get('next_date') if _earnings_data else None
+    _days_to_earn = None
+    if _next_earnings:
+        try:
+            _earn_dt = datetime.strptime(str(_next_earnings), '%Y-%m-%d')
+            _days_to_earn = (_earn_dt - datetime.now()).days
+        except Exception:
+            pass
+
+    _risk_factors = []
+    _risk_score = 0
+
+    # Earnings risk
+    if _days_to_earn is not None and _days_to_earn <= 30:
+        _risk_score += 40 if _days_to_earn <= 7 else (30 if _days_to_earn <= 14 else 20)
+        _risk_factors.append(f"Earnings in {_days_to_earn}d")
+
+    # Sector headwind
+    if _phase in ('LAGGING', 'FADING'):
+        _risk_score += 20
+        _risk_factors.append(f"Sector {_phase.lower()}")
+
+    # Low conviction
+    if conv <= 3:
+        _risk_score += 20
+        _risk_factors.append("Low conviction")
+
+    # Resistance overhead
+    if resistance and any(w in resistance.lower() for w in ['wait', 'stall', 'failed']):
+        _risk_score += 15
+        _risk_factors.append("Resistance overhead")
+
+    # Low confluence
+    if _aligned_count <= 1:
+        _risk_score += 15
+        _risk_factors.append(f"Low confluence ({_aligned_count}/3)")
+
+    _risk_score = min(_risk_score, 100)
+
+    if _risk_score > 0:
+        r1, r2 = st.columns([3, 1])
+        with r1:
+            _risk_label = "LOW" if _risk_score < 30 else ("MODERATE" if _risk_score < 50 else ("HIGH" if _risk_score < 75 else "EXTREME"))
+            _risk_color = "success" if _risk_score < 30 else ("info" if _risk_score < 50 else ("warning" if _risk_score < 75 else "error"))
+            getattr(st, _risk_color)(f"⚠️ **Risk: {_risk_label}** ({_risk_score}/100) — {', '.join(_risk_factors)}")
+        with r2:
+            st.progress(_risk_score / 100, text=f"{_risk_score}%")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TECHNICAL SNAPSHOT TABLE (reuses _macd, _ao, _weinstein from confluence)
+    # ═══════════════════════════════════════════════════════════════
+    if signal and _price:
+        _vol_ratio = analysis.volume_ratio if analysis else 0
+        _ores = signal.overhead_resistance if signal else {}
+
+        _tech_rows = []
+
+        # Price
+        _tech_rows.append(("Price", f"${_price:.2f}", "—"))
+
+        # Weinstein Stage
+        _ts_icon = "✅" if _ws_stage == 2 else ("⚠️" if _ws_stage in (1, 3) else "❌")
+        _ts_label = _weinstein.get('label', '')[:30] if _weinstein else ''
+        _tech_rows.append(("Weinstein Stage", f"Stage {_ws_stage}" + (f" — {_ts_label}" if _ts_label else ""), _ts_icon))
+
+        # MACD Signal
+        _ms = _macd.get('signal_type', '') if _macd else ''
+        _ms_icon = "✅" if 'bullish' in str(_ms).lower() else ("❌" if 'bearish' in str(_ms).lower() else "⚠️")
+        _tech_rows.append(("MACD Signal", str(_ms)[:30] if _ms else "N/A", _ms_icon))
+
+        # AO Momentum
+        _tech_rows.append(("AO Momentum", _ao_color.title() if _ao_color else "N/A",
+                           "✅" if _ao_color == 'green' else ("❌" if _ao_color == 'red' else "⚠️")))
+
+        # Volume vs Average
+        if _vol_ratio:
+            _vol_status = "✅ High" if _vol_ratio >= 1.5 else ("⚠️ Normal" if _vol_ratio >= 0.8 else "❌ Low")
+            _tech_rows.append(("Volume vs Avg", f"{_vol_ratio:.1f}x", _vol_status))
+
+        # Risk per Share
+        if _entry and _stop:
+            _risk_pct = abs((_entry - _stop) / _entry * 100) if _entry else 0
+            _tech_rows.append(("Risk per Share", f"${abs(_entry - _stop):.2f}", f"{_risk_pct:.1f}%"))
+
+        # Overhead Resistance Density
+        if _ores:
+            _density = _ores.get('density_pct', 0) if isinstance(_ores, dict) else 0
+            _crit = _ores.get('critical_level', {}) if isinstance(_ores, dict) else {}
+            _crit_price = _crit.get('price', 0) if isinstance(_crit, dict) else 0
+            _ores_val = f"{_density:.0f}%" + (f" (critical: ${_crit_price:.2f})" if _crit_price else "")
+            _ores_icon = "✅ Clear" if _density < 15 else ("⚠️ Moderate" if _density < 40 else "❌ Heavy")
+            _tech_rows.append(("Overhead Resistance", _ores_val, _ores_icon))
+
+        # Distance to 200 SMA
+        _sma200 = _weinstein.get('sma_200', 0) if _weinstein else 0
+        if not _sma200:
+            _sma200 = _weinstein.get('ma_200', 0) if _weinstein else 0
+        if _sma200 and _price:
+            _dist_200 = ((_price / _sma200) - 1) * 100
+            _dist_icon = "✅ Above" if _dist_200 > 0 else "❌ Below"
+            _tech_rows.append(("Distance to 200 SMA", f"{_dist_200:+.1f}%" + (f" (${_sma200:.2f})" if _sma200 else ""), _dist_icon))
+
+        if _tech_rows:
+            with st.expander("📈 Technical Snapshot", expanded=False):
+                _df = pd.DataFrame(_tech_rows, columns=["Metric", "Value", "Status"])
+                st.dataframe(_df, hide_index=True, use_container_width=True)
+
+    # ═══════════════════════════════════════════════════════════════
     # RESISTANCE VERDICT + BREAKOUT ALERT BUTTON
     # ═══════════════════════════════════════════════════════════════
-    resistance = ai_result.get('resistance_verdict', '')
     if resistance:
         is_wait = any(w in resistance.lower() for w in ['wait', 'breakout', 'stall', 'failed'])
         if is_wait:
@@ -2191,23 +2462,23 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         why = ai_result.get('why_moving', '')
         if why:
             st.markdown(f"**📰 Why it's moving:**")
-            st.info(why)
+            st.info(clean_ai_formatting(why))
 
         fq_detail = ai_result.get('fundamental_quality', '')
         if fq_detail:
             st.markdown(f"**💼 Fundamental quality:**")
-            st.info(fq_detail)
+            st.info(clean_ai_formatting(fq_detail))
 
     with col_r:
         bull = ai_result.get('bull_case', '')
         if bull:
             st.markdown("**🐂 Bull case:**")
-            st.success(bull)
+            st.success(clean_ai_formatting(bull))
 
         bear = ai_result.get('bear_case', '')
         if bear:
             st.markdown("**🐻 Bear case:**")
-            st.error(bear)
+            st.error(clean_ai_formatting(bear))
 
     # ═══════════════════════════════════════════════════════════════
     # SMART MONEY (AI-synthesized analyst + insider view)
@@ -2215,14 +2486,14 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     smart = ai_result.get('smart_money', '')
     if smart:
         st.markdown("**🏦 Smart Money:**")
-        st.info(smart)
+        st.info(clean_ai_formatting(smart))
 
     # ═══════════════════════════════════════════════════════════════
     # RED FLAGS
     # ═══════════════════════════════════════════════════════════════
     flags = ai_result.get('red_flags', '')
     if flags and flags.lower() != 'none':
-        st.warning(f"🚩 **Red flags:** {flags}")
+        st.warning(f"🚩 **Red flags:** {clean_ai_formatting(flags)}")
     else:
         st.success("🚩 **Red flags:** None — clean setup")
 
@@ -2270,7 +2541,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     # FULL AI RESPONSE
     # ═══════════════════════════════════════════════════════════════
     with st.expander("📝 Full AI Response"):
-        st.text(ai_result.get('raw_text', ''))
+        st.markdown(clean_ai_formatting(ai_result.get('raw_text', '')))
 
 
 def _render_market_intelligence(intel: Dict):
@@ -2721,6 +2992,68 @@ def _render_fundamental_snapshot(fp: Dict):
 # =============================================================================
 # ASK AI — Research Analyst + Interactive Chat
 # =============================================================================
+
+def _build_sector_rotation_context() -> str:
+    """
+    Build dynamic sector rotation context from live cached data.
+    Pulls from session state (populated by fetch_sector_rotation at startup).
+    Returns formatted text for injection into the AI system prompt.
+    """
+    rotation = st.session_state.get('sector_rotation')
+    if not rotation:
+        return "SECTOR ROTATION: Data not yet loaded. Ask user to refresh market data."
+
+    # Group sectors by phase
+    phases = {'LEADING': [], 'EMERGING': [], 'FADING': [], 'LAGGING': []}
+    seen_etfs = set()
+    for sector, info in rotation.items():
+        etf = info.get('etf', '')
+        if etf in seen_etfs:
+            continue
+        seen_etfs.add(etf)
+        phase = info.get('phase', 'LAGGING')
+        vs_spy = info.get('vs_spy_20d', 0)
+        perf = info.get('perf_20d', 0)
+        short_name = info.get('short_name', sector[:4])
+        phases[phase].append({
+            'name': sector,
+            'short': short_name,
+            'etf': etf,
+            'perf_20d': perf,
+            'vs_spy_20d': vs_spy,
+        })
+
+    lines = [f"═══ CURRENT SECTOR ROTATION STATUS (Updated: {datetime.now().strftime('%Y-%m-%d')}) ═══\n"]
+
+    def _fmt_sector_list(sectors):
+        if not sectors:
+            return "  (none currently)"
+        return "\n".join(f"  - {s['name']} ({s['etf']}): {s['perf_20d']:+.1f}% (vs SPY: {s['vs_spy_20d']:+.1f}%)"
+                         for s in sorted(sectors, key=lambda x: x['vs_spy_20d'], reverse=True))
+
+    lines.append("LEADING Sectors (momentum tailwind — 2 of 3 timeframes aligned = valid setup):")
+    lines.append(_fmt_sector_list(phases['LEADING']))
+    lines.append("")
+    lines.append("EMERGING Sectors (building momentum — all 3 timeframes must align):")
+    lines.append(_fmt_sector_list(phases['EMERGING']))
+    lines.append("")
+    lines.append("FADING Sectors (losing momentum — tighten stops, reduce position size):")
+    lines.append(_fmt_sector_list(phases['FADING']))
+    lines.append("")
+    lines.append("LAGGING Sectors (headwind — perfect confluence + volume breakout required):")
+    lines.append(_fmt_sector_list(phases['LAGGING']))
+    lines.append("")
+    lines.append("""MOMENTUM TRADING GUIDANCE:
+- Stocks in LEADING sectors: 2 of 3 timeframes aligned = valid setup. Sector is a tailwind.
+- Stocks in EMERGING sectors: All 3 timeframes must align. Sector is neutral-to-positive.
+- Stocks in FADING sectors: Tighten stops, reduce sizing. Sector momentum is weakening.
+- Stocks in LAGGING sectors: Perfect confluence + volume breakout required. Sector is a headwind.
+- ALWAYS state which sector rotation category the ticker belongs to in your analysis.
+- Adjust conviction level up/down based on whether sector has momentum tailwinds or headwinds.
+- If the stock's actual business doesn't match its assigned sector, note which sector's data is more relevant.""")
+
+    return "\n".join(lines)
+
 
 def _build_internal_context(ticker: str, signal: EntrySignal, rec: Dict,
                             analysis: TickerAnalysis) -> str:
@@ -3516,6 +3849,8 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
 2. EXTERNAL RESEARCH (you just gathered this — this is YOUR unique value):
 {external_research}
 
+3. {_build_sector_rotation_context()}
+
 ═══ MANDATORY ANALYSIS STRUCTURE ═══
 Your response MUST include ALL sections below in this order. Omitting any section is a FAILURE.
 
@@ -3700,7 +4035,7 @@ Q: "Why PASS when analysts say $23?"
     # ── Display conversation ──────────────────────────────────────────
     for msg in history:
         with st.chat_message(msg['role'], avatar="🧑‍💼" if msg['role'] == 'user' else "🔬"):
-            st.markdown(msg['content'])
+            st.markdown(clean_ai_formatting(msg['content']) if msg['role'] == 'assistant' else msg['content'])
 
     # ── Suggested follow-ups (after initial analysis) ─────────────────
     if len(history) == 2:  # Just the auto-run Q&A
@@ -3756,7 +4091,7 @@ The AI is transparent about limitations and will suggest alternatives using avai
                     )
                     reply = response.choices[0].message.content
 
-                st.markdown(reply)
+                st.markdown(clean_ai_formatting(reply))
                 history.append({'role': 'assistant', 'content': reply})
                 st.session_state[chat_key] = history
 
@@ -3772,7 +4107,7 @@ The AI is transparent about limitations and will suggest alternatives using avai
                             temperature=0.4,
                         )
                         reply = response.choices[0].message.content
-                    st.markdown(reply)
+                    st.markdown(clean_ai_formatting(reply))
                     history.append({'role': 'assistant', 'content': reply})
                     st.session_state[chat_key] = history
                 except Exception as e2:
