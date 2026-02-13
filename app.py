@@ -2639,26 +2639,255 @@ def _build_internal_context(ticker: str, signal: EntrySignal, rec: Dict,
             else:
                 lines.append(f"  Insider Transactions: None in 90 days")
 
-    # Sector & earnings
+    # ═══ SECTOR (from app session — MANDATORY for AI to discuss) ═══
     sector = st.session_state.get('ticker_sectors', {}).get(ticker)
     if sector:
         rotation = st.session_state.get('sector_rotation', {}).get(sector, {})
         if rotation:
-            lines.append(f"\n  Sector: {sector} | Phase: {rotation.get('phase', '?')} | vs SPY: {rotation.get('vs_spy_20d', 0):+.1f}%")
+            lines.append(f"\n═══ SECTOR CONTEXT (MANDATORY — you MUST discuss this) ═══")
+            lines.append(f"  Sector: {sector}")
+            lines.append(f"  Sector ETF: {rotation.get('etf', '?')}")
+            lines.append(f"  Phase: {rotation.get('phase', '?')}")
+            lines.append(f"  Sector vs SPY (20-day): {rotation.get('vs_spy_20d', 0):+.1f}%")
+            lines.append(f"  Sector vs SPY (5-day): {rotation.get('vs_spy_5d', 0):+.1f}%")
+            lines.append(f"  Sector 5d perf: {rotation.get('perf_5d', 0):+.1f}%")
+            lines.append(f"  Sector 20d perf: {rotation.get('perf_20d', 0):+.1f}%")
+        else:
+            lines.append(f"\n═══ SECTOR: {sector} (no rotation data — check external research) ═══")
+    else:
+        lines.append(f"\n═══ SECTOR: Unknown (check Yahoo data in external research for sector) ═══")
 
+    # ═══ EARNINGS (from app session — MANDATORY for AI to discuss) ═══
     earn = st.session_state.get('earnings_flags', {}).get(ticker)
     if earn:
-        lines.append(f"  Next Earnings: {earn.get('next_earnings', '?')} ({earn.get('days_until', '?')} days)")
+        days = earn.get('days_until', 999)
+        lines.append(f"\n═══ EARNINGS (MANDATORY — you MUST address this in your analysis) ═══")
+        lines.append(f"  Next Earnings Date: {earn.get('next_earnings', '?')}")
+        lines.append(f"  Days Until: {days}")
+        if days <= 7:
+            lines.append(f"  ⚠️ CRITICAL: EARNINGS IN {days} DAYS — EXTREME RISK")
+        elif days <= 14:
+            lines.append(f"  ⚠️ WARNING: EARNINGS IN {days} DAYS — HIGH RISK, limited trading window")
+        elif days <= 30:
+            lines.append(f"  ⚠️ CAUTION: EARNINGS WITHIN 30 DAYS — affects hold duration")
+        else:
+            lines.append(f"  ✅ Clear runway: {days} days before earnings")
+    else:
+        lines.append(f"\n═══ EARNINGS: Date not available from app — CHECK Yahoo data in external research ═══")
 
     return "\n".join(lines)
 
 
 def _fetch_external_research(ticker: str) -> str:
     """Fetch comprehensive external data — this is the AI's UNIQUE VALUE.
-    News, social proxy, Yahoo fundamentals, analyst data — things NOT in the app."""
+    Includes: market conditions, sector rotation, earnings, news, fundamentals, social."""
     lines = [f"\n═══ EXTERNAL RESEARCH FOR {ticker} (freshly fetched) ═══\n"]
 
-    # ── Finnhub News ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 1: OVERALL MARKET CONDITIONS (MANDATORY)
+    # ══════════════════════════════════════════════════════════════════
+    lines.append("🌍 OVERALL MARKET CONDITIONS:")
+    try:
+        from data_fetcher import fetch_daily, fetch_market_filter
+        market = fetch_market_filter()
+
+        spy_close = market.get('spy_close')
+        spy_sma200 = market.get('spy_sma200')
+        spy_above = market.get('spy_above_200', True)
+        vix_close = market.get('vix_close')
+        vix_below = market.get('vix_below_30', True)
+
+        if spy_close:
+            lines.append(f"  SPY: ${spy_close:.2f} | 200-day SMA: ${spy_sma200:.2f} | {'ABOVE ✅' if spy_above else 'BELOW ❌'}")
+        if vix_close:
+            lines.append(f"  VIX: {vix_close:.1f} | {'LOW fear ✅' if vix_close < 20 else 'ELEVATED ⚠️' if vix_close < 30 else 'HIGH FEAR ❌'}")
+
+        # SPY recent performance (risk-on vs risk-off)
+        spy_df = fetch_daily("SPY")
+        if spy_df is not None and len(spy_df) >= 50:
+            spy_5d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
+            spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+            spy_50d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-50] - 1) * 100
+            spy_sma50 = float(spy_df['Close'].rolling(50).mean().iloc[-1])
+            spy_high52 = float(spy_df['Close'].tail(252).max()) if len(spy_df) >= 252 else float(spy_df['Close'].max())
+            pct_from_high = (spy_df['Close'].iloc[-1] / spy_high52 - 1) * 100
+
+            lines.append(f"  SPY Returns: 5d {spy_5d:+.1f}% | 20d {spy_20d:+.1f}% | 50d {spy_50d:+.1f}%")
+            lines.append(f"  SPY 50-day SMA: ${spy_sma50:.2f} | {'Above' if spy_df['Close'].iloc[-1] > spy_sma50 else 'Below'}")
+            lines.append(f"  SPY vs 52-week high: {pct_from_high:+.1f}%")
+
+            # Overall market assessment
+            if spy_above and vix_close and vix_close < 20 and spy_5d > 0:
+                lines.append(f"  ASSESSMENT: RISK-ON environment — market bullish, low fear, new positions supported")
+            elif spy_above and vix_close and vix_close < 25:
+                lines.append(f"  ASSESSMENT: CAUTIOUSLY BULLISH — market above key support, moderate fear")
+            elif not spy_above:
+                lines.append(f"  ASSESSMENT: RISK-OFF — SPY below 200-day SMA, defensive posture recommended")
+            elif vix_close and vix_close >= 30:
+                lines.append(f"  ASSESSMENT: HIGH VOLATILITY — elevated VIX, reduce position sizes")
+            else:
+                lines.append(f"  ASSESSMENT: NEUTRAL — mixed signals, selective stock-picking environment")
+
+            # Breadth proxy: RSP (equal-weight SPY) vs SPY
+            try:
+                rsp_df = fetch_daily("RSP")
+                if rsp_df is not None and len(rsp_df) >= 20:
+                    rsp_20d = (rsp_df['Close'].iloc[-1] / rsp_df['Close'].iloc[-20] - 1) * 100
+                    spread = rsp_20d - spy_20d
+                    if spread > 1.0:
+                        breadth = "BROAD — equal-weight outperforming (healthy breadth)"
+                    elif spread < -1.0:
+                        breadth = "NARROW — cap-weighted leading (top-heavy, fragile)"
+                    else:
+                        breadth = "BALANCED — similar performance"
+                    lines.append(f"  Market Breadth: RSP 20d {rsp_20d:+.1f}% vs SPY {spy_20d:+.1f}% → {breadth}")
+            except Exception:
+                pass
+    except Exception as e:
+        lines.append(f"  Error fetching market data: {str(e)[:100]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 2: SECTOR ROTATION MAP (MANDATORY)
+    # ══════════════════════════════════════════════════════════════════
+    lines.append(f"\n📊 SECTOR ROTATION (all sectors vs SPY):")
+    try:
+        from data_fetcher import fetch_sector_rotation
+        all_sectors = fetch_sector_rotation()
+        if all_sectors:
+            # Sort by performance vs SPY
+            sorted_sectors = sorted(all_sectors.items(),
+                                    key=lambda x: x[1].get('vs_spy_20d', 0), reverse=True)
+            for sector_name, data in sorted_sectors:
+                phase = data.get('phase', '?')
+                vs_spy = data.get('vs_spy_20d', 0)
+                perf_20d = data.get('perf_20d', 0)
+                etf = data.get('etf', '?')
+                icon = "🟢" if phase == 'LEADING' else "🟡" if phase == 'WEAKENING' else "🔴" if phase == 'LAGGING' else "⚪"
+                lines.append(f"  {icon} {sector_name} ({etf}): {phase} | 20d: {perf_20d:+.1f}% | vs SPY: {vs_spy:+.1f}%")
+        else:
+            lines.append(f"  Sector data unavailable")
+    except Exception as e:
+        lines.append(f"  Error: {str(e)[:100]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 3: EARNINGS DATE (MANDATORY — try multiple sources)
+    # ══════════════════════════════════════════════════════════════════
+    lines.append(f"\n📅 EARNINGS DATE (MANDATORY — you MUST state this):")
+    earnings_found = False
+    earnings_date_str = None
+    earnings_days = None
+
+    # Source 1: App session (batch scanner)
+    earn_flag = st.session_state.get('earnings_flags', {}).get(ticker)
+    if earn_flag:
+        earnings_date_str = earn_flag.get('next_earnings')
+        earnings_days = earn_flag.get('days_until')
+        earnings_found = True
+        lines.append(f"  Source: TTA Scanner")
+        lines.append(f"  Next Earnings: {earnings_date_str}")
+        lines.append(f"  Days Until: {earnings_days}")
+
+    # Source 2: yfinance (fresh fetch if scanner didn't have it)
+    if not earnings_found:
+        try:
+            import yfinance as yf
+            stock = yf.Ticker(ticker)
+
+            # Try .calendar
+            try:
+                cal = stock.calendar
+                if cal is not None:
+                    raw_date = None
+                    if isinstance(cal, dict):
+                        raw_date = cal.get('Earnings Date')
+                        if isinstance(raw_date, list) and raw_date:
+                            raw_date = raw_date[0]
+                    if raw_date is not None:
+                        if hasattr(raw_date, 'date'):
+                            earn_dt = raw_date.date()
+                        elif isinstance(raw_date, str):
+                            earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                        else:
+                            earn_dt = None
+                        if earn_dt:
+                            earnings_days = (earn_dt - datetime.now().date()).days
+                            earnings_date_str = earn_dt.strftime('%Y-%m-%d')
+                            earnings_found = True
+                            lines.append(f"  Source: Yahoo Finance (.calendar)")
+                            lines.append(f"  Next Earnings: {earnings_date_str}")
+                            lines.append(f"  Days Until: {earnings_days}")
+            except Exception:
+                pass
+
+            # Try info dict
+            if not earnings_found:
+                try:
+                    info = stock.info or {}
+                    for key in ('earningsTimestamp', 'earningsTimestampStart'):
+                        ts = info.get(key)
+                        if ts and isinstance(ts, (int, float)) and ts > 0:
+                            from datetime import timezone
+                            earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+                            earnings_days = (earn_dt - datetime.now().date()).days
+                            if earnings_days >= -7:
+                                earnings_date_str = earn_dt.strftime('%Y-%m-%d')
+                                earnings_found = True
+                                lines.append(f"  Source: Yahoo Finance (info)")
+                                lines.append(f"  Next Earnings: {earnings_date_str}")
+                                lines.append(f"  Days Until: {earnings_days}")
+                                break
+                except Exception:
+                    pass
+
+            # Try .earnings_dates
+            if not earnings_found:
+                try:
+                    edates = stock.earnings_dates
+                    if edates is not None and len(edates) > 0:
+                        today = datetime.now().date()
+                        for dt_idx in sorted(edates.index):
+                            try:
+                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                                if (d - today).days >= -7:
+                                    earnings_date_str = d.strftime('%Y-%m-%d')
+                                    earnings_days = (d - today).days
+                                    earnings_found = True
+                                    lines.append(f"  Source: Yahoo Finance (.earnings_dates)")
+                                    lines.append(f"  Next Earnings: {earnings_date_str}")
+                                    lines.append(f"  Days Until: {earnings_days}")
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+        except Exception as e:
+            lines.append(f"  Yahoo earnings fetch error: {str(e)[:100]}")
+
+    if not earnings_found:
+        lines.append(f"  ⚠️ EARNINGS DATE NOT FOUND — tell user this could not be determined")
+        lines.append(f"  (Some stocks, especially small-caps or foreign ADRs, may not have scheduled dates)")
+
+    # Earnings risk assessment
+    if earnings_found and earnings_days is not None:
+        if earnings_days <= 7:
+            lines.append(f"  🚨 CRITICAL RISK: Earnings in {earnings_days} days — binary event imminent")
+            lines.append(f"  → Any position recommendation MUST account for earnings gap risk")
+            lines.append(f"  → Consider: wait until after earnings, or use options to define risk")
+        elif earnings_days <= 14:
+            lines.append(f"  ⚠️ HIGH RISK: Earnings in {earnings_days} days — limited trading window")
+            lines.append(f"  → A 3-6 month hold recommendation does NOT make sense here")
+            lines.append(f"  → Must be an earnings play or wait until after report")
+        elif earnings_days <= 30:
+            lines.append(f"  ⚠️ CAUTION: Earnings within 30 days — adjust hold duration")
+            lines.append(f"  → Any swing trade must have exit plan BEFORE earnings")
+        elif earnings_days <= 60:
+            lines.append(f"  ℹ️ Earnings approaching in {earnings_days} days — factor into hold duration")
+        else:
+            lines.append(f"  ✅ Clear runway: {earnings_days} days before next earnings report")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 4: NEWS
+    # ══════════════════════════════════════════════════════════════════
     try:
         finnhub_key = ""
         try:
@@ -2670,7 +2899,7 @@ def _fetch_external_research(ticker: str) -> str:
             from data_fetcher import fetch_finnhub_news
             news = fetch_finnhub_news(ticker, api_key=finnhub_key)
             if news and news.get('articles'):
-                lines.append("📰 RECENT NEWS (last 7 days):")
+                lines.append(f"\n📰 RECENT NEWS (last 7 days):")
                 for article in news['articles'][:10]:
                     headline = article.get('headline', article.get('title', '?'))
                     source = article.get('source', '?')
@@ -2686,13 +2915,15 @@ def _fetch_external_research(ticker: str) -> str:
                     if summary:
                         lines.append(f"    Summary: {summary}")
             else:
-                lines.append("📰 NEWS: No articles found on Finnhub for last 7 days")
+                lines.append(f"\n📰 NEWS: No articles found on Finnhub for last 7 days")
         else:
-            lines.append("📰 NEWS: No Finnhub API key — limited news data")
+            lines.append(f"\n📰 NEWS: No Finnhub API key — limited news data")
     except Exception as e:
-        lines.append(f"📰 NEWS ERROR: {str(e)[:100]}")
+        lines.append(f"\n📰 NEWS ERROR: {str(e)[:100]}")
 
-    # ── Yahoo Finance comprehensive snapshot ──────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 5: YAHOO FINANCE FUNDAMENTALS + ANALYST DATA
+    # ══════════════════════════════════════════════════════════════════
     try:
         import yfinance as yf
         stock = yf.Ticker(ticker)
@@ -2801,9 +3032,11 @@ def _fetch_external_research(ticker: str) -> str:
             pass
 
     except Exception as e:
-        lines.append(f"YAHOO ERROR: {str(e)[:100]}")
+        lines.append(f"\nYAHOO ERROR: {str(e)[:100]}")
 
-    # ── Social Sentiment Proxy (volume-based) ─────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 6: SOCIAL / VOLUME SENTIMENT
+    # ══════════════════════════════════════════════════════════════════
     try:
         from data_fetcher import fetch_daily
         daily = fetch_daily(ticker, period='3mo')
@@ -2835,7 +3068,7 @@ def _fetch_external_research(ticker: str) -> str:
     except Exception:
         pass
 
-    # ── Finnhub Social Sentiment (if premium key) ─────────────────────
+    # Finnhub Social Sentiment (if premium key)
     try:
         finnhub_key = ""
         try:
@@ -2928,7 +3161,9 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
             st.session_state[research_key] = external_research
     external_research = st.session_state[research_key]
 
-    system_prompt = f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant). You have TWO data sources:
+    system_prompt = f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant).
+
+═══ YOUR DATA SOURCES ═══
 
 1. IN-APP DATA (the user can already see this on their screen — DO NOT list it back):
 {internal_context}
@@ -2936,35 +3171,57 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
 2. EXTERNAL RESEARCH (you just gathered this — this is YOUR unique value):
 {external_research}
 
-═══ YOUR ROLE AND RULES ═══
+═══ MANDATORY ANALYSIS STRUCTURE ═══
+Your response MUST include ALL sections below in this order. Omitting any section is a FAILURE.
 
-WHAT YOU MUST DO:
-• SYNTHESIZE the technical picture (from the app) with external intelligence (news, analysts, sentiment) 
-• INTERPRET what the signals mean collectively — identify the most critical patterns and conflicts
-• Reference specific data points to support your analysis, but DON'T just list what's on screen
-• When discussing insider activity, ONLY report actual BUY/SELL transactions — ownership % is NOT selling
-• Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
+**1. MARKET & SECTOR CONTEXT** (ALWAYS INCLUDE FIRST)
+- Current overall equity market conditions (use SPY, VIX, breadth data provided)
+- Identify the stock's sector by name
+- Is that sector in rotation vs S&P 500? LEADING, LAGGING, or WEAKENING?
+- Cite current sector performance data (20d vs SPY)
+- If sector rotation data unavailable, explicitly state this limitation
 
-WHAT YOU MUST NOT DO:
-• Do NOT repeat technical indicators the user can already see — they have MACD, AO, weekly/monthly signals on screen
-• Do NOT say "Based on the app data..." or list signals back — INTERPRET them
-• Do NOT hallucinate news or analyst ratings — only cite what's in your external research data above
+**2. EARNINGS & TRADE TIMING** (CRITICAL — ALWAYS INCLUDE)
+- State the next earnings date and exact days remaining
+- If earnings <30 days away: flag as HIGH RISK and assess viability
+- Is there a viable trade window before the next binary event?
+- Note any other upcoming catalysts from news data
+- If earnings date is missing, state: "Unable to fully assess trade timing — earnings date not found"
 
-RESPONSE FORMAT (for initial analysis):
-• Lead with clear BUY / HOLD / PASS recommendation and confidence (High/Medium/Low)
-• Key supporting signals (max 3 bullets — synthesized, not listed)
-• Key risks/conflicts (max 3 bullets)
-• If BUY: entry zone, stop loss, target, and hold duration
-• If HOLD: what triggers a buy or sell
-• If PASS: specific reasons risk outweighs reward
-• Flag any major contradictions between technical and fundamental picture
-• Keep under 400 words — be decisive, not exhaustive
+**3. TECHNICAL INTERPRETATION** (from in-app data)
+- Reference but DO NOT LIST the technical indicators the user can already see on screen
+- INTERPRET what the signals mean collectively — what's the story?
+- Identify the most critical patterns, levels, and momentum state
+- Volume and momentum assessment in context
 
-FOR FOLLOW-UP QUESTIONS:
-• Be direct and specific — cite prices, percentages, dates
-• If asked about something not in your data, say so honestly
-• You can discuss entry strategy, position sizing, risk management, catalysts, sector trends
-• If asked to find more info, explain what you'd look for and what your current data shows"""
+**4. EXTERNAL INTELLIGENCE** (from your research data above)
+- Latest analyst ratings, price targets, and any recent changes
+- Social media / volume sentiment assessment
+- Recent news highlights (past 7 days) — only material items
+- Institutional/insider transaction activity (ownership % is NOT selling)
+- Only cite data actually present in your research — do NOT hallucinate
+
+**5. SYNTHESIZED RECOMMENDATION**
+- **BUY / HOLD / PASS** with confidence level (High/Medium/Low)
+- Entry price or zone (if BUY)
+- Stop loss level (MUST include)
+- Target price with upside %
+- Hold duration — MUST be appropriate to earnings calendar
+- Position sizing: Full (100%) / Reduced (75%) / Small (50%) / Skip — with reason
+- Key risks and any conflicting signals
+
+═══ CRITICAL RULES ═══
+- Never recommend a multi-month hold if earnings are <30 days away without explicitly acknowledging the risk
+- Your value is SYNTHESIS + EXTERNAL CONTEXT, not repeating in-app data
+- When discussing insider activity, ONLY report actual BUY/SELL transactions — ownership % is NOT selling
+- Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
+- Do NOT say "Based on the app data..." or list signals back — INTERPRET them
+- Keep under 400 words. Be decisive, not exhaustive. Every sentence must add value.
+
+═══ FOR FOLLOW-UP QUESTIONS ═══
+- Be direct and specific — cite prices, percentages, dates
+- If asked about something not in your data, say so honestly and suggest clicking "Refresh Research"
+- You can discuss entry strategy, position sizing, risk management, catalysts, sector trends"""
 
     # ── Header with controls ──────────────────────────────────────────
     hdr1, hdr2, hdr3 = st.columns([5, 2, 1])
