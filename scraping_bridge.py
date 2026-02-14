@@ -30,8 +30,8 @@ import requests
 ETF_CSV_URLS = {
     "arkk": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_INNOVATION_ETF_ARKK_HOLDINGS.csv",
     "arkw": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_NEXT_GENERATION_INTERNET_ETF_ARKW_HOLDINGS.csv",
-    "arkg": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_GENOMIC_REVOLUTION_MULTISECTOR_ETF_ARKG_HOLDINGS.csv",
-    "arkq": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_AUTONOMOUS_TECHNOLOGY_&_ROBOTICS_ETF_ARKQ_HOLDINGS.csv",
+    "arkg": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_GENOMIC_REVOLUTION_ETF_ARKG_HOLDINGS.csv",
+    "arkq": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_AUTONOMOUS_TECH._&_ROBOTICS_ETF_ARKQ_HOLDINGS.csv",
     "arkf": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_FINTECH_INNOVATION_ETF_ARKF_HOLDINGS.csv",
     "arkx": "https://assets.ark-funds.com/fund-documents/funds-etf-csv/ARK_SPACE_EXPLORATION_&_INNOVATION_ETF_ARKX_HOLDINGS.csv",
 }
@@ -93,6 +93,7 @@ class ScrapingBridge:
         Fetch tickers based on watchlist configuration.
 
         Routes to the appropriate provider based on watchlist['source_type'].
+        If watchlist has 'url_override', uses that URL instead of the default.
 
         Args:
             watchlist: Dict with at minimum 'source_type' and 'source' keys.
@@ -102,6 +103,11 @@ class ScrapingBridge:
         """
         source_type = watchlist.get("source_type", "")
         source = watchlist.get("source", "")
+
+        # Check for user-provided URL override
+        url_override = watchlist.get("url_override", "")
+        if url_override:
+            return self._fetch_csv_from_url(url_override, f"Custom URL override")
 
         try:
             if source_type == "etf_shortcut":
@@ -122,6 +128,42 @@ class ScrapingBridge:
         except Exception as e:
             return False, f"Fetch error: {str(e)[:200]}", []
 
+    def fetch_from_csv_content(self, csv_content) -> Tuple[bool, str, List[str]]:
+        """
+        Parse tickers from raw CSV content (from file_uploader).
+
+        Public method for sidebar CSV upload fallback.
+        """
+        return self._fetch_tradingview_csv(csv_content)
+
+    def validate_url(self, url: str) -> Tuple[bool, str, int]:
+        """
+        Lightweight URL check via HEAD request before downloading.
+
+        Returns:
+            (reachable, message, status_code)
+        """
+        try:
+            resp = self._session.head(url, timeout=10, allow_redirects=True)
+            if resp.status_code == 200:
+                return True, "OK", 200
+            elif resp.status_code == 404:
+                return False, f"URL not found (404) — ARK may have renamed this file", 404
+            elif resp.status_code == 403:
+                return False, f"Access denied (403) — site may be blocking requests", 403
+            else:
+                return False, f"HTTP {resp.status_code}", resp.status_code
+        except requests.exceptions.Timeout:
+            return False, "URL timed out — server not responding", 0
+        except requests.exceptions.ConnectionError:
+            return False, "Connection failed — check internet or URL domain", 0
+        except Exception as e:
+            return False, f"URL check failed: {str(e)[:100]}", 0
+
+    def get_etf_url(self, identifier: str) -> Optional[str]:
+        """Get the configured CSV URL for an ETF shortcut (for display/debugging)."""
+        return ETF_CSV_URLS.get(identifier.lower().strip())
+
     # --- ETF Shortcut (ARK CSV downloads) ------------------------------------
 
     def _fetch_etf_shortcut(self, identifier: str) -> Tuple[bool, str, List[str]]:
@@ -129,7 +171,7 @@ class ScrapingBridge:
         Fetch tickers from a pre-configured ETF CSV URL.
 
         ARK Invest publishes daily holdings as CSV files.
-        This is the most reliable source — no scraping, no API key.
+        Validates URL reachability before attempting download.
         """
         identifier = identifier.lower().strip()
         url = ETF_CSV_URLS.get(identifier)
@@ -137,6 +179,15 @@ class ScrapingBridge:
         if not url:
             available = ", ".join(sorted(ETF_CSV_URLS.keys()))
             return False, f"Unknown ETF shortcut: '{identifier}'. Available: {available}", []
+
+        # Pre-validate URL before downloading
+        reachable, check_msg, status = self.validate_url(url)
+        if not reachable:
+            return False, (
+                f"URL unreachable for {identifier.upper()}: {check_msg}\n"
+                f"URL: {url}\n"
+                f"Fix: Update the URL below or upload a CSV file."
+            ), []
 
         return self._fetch_csv_from_url(url, f"ETF shortcut '{identifier.upper()}'")
 
