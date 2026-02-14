@@ -177,6 +177,102 @@ def _detect_ai_provider(api_key: str) -> Dict:
             'display': 'Not configured',
         }
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# CENTRALIZED AI CLIENT — initialized once, cached in session_state
+# Eliminates ~500ms of repeated imports + client creation on every rerun
+# ═══════════════════════════════════════════════════════════════════════
+
+def _get_ai_clients() -> Dict:
+    """
+    Get cached AI clients (OpenAI-compatible + Gemini).
+    Creates clients once per session, validates once per key.
+    Returns dict: {openai_client, gemini, ai_config, primary_error, gemini_error}
+    """
+    # Return cached if available and key hasn't changed and not invalidated
+    cached = st.session_state.get('_ai_clients_cache')
+    if cached:
+        # Check if key changed (user updated secrets) or key was invalidated
+        current_key = ""
+        try:
+            current_key = st.secrets.get("GROQ_API_KEY", "")
+        except Exception:
+            pass
+        key_invalidated = st.session_state.get('_groq_key_status') == 'invalid'
+        if cached.get('_raw_key') == current_key and not key_invalidated:
+            return cached
+
+    result = {
+        'openai_client': None,
+        'gemini': None,
+        'ai_config': {'model': '', 'fallback_model': '', 'provider': 'none', 'display': 'Not configured'},
+        'primary_error': None,
+        'gemini_error': None,
+        '_raw_key': '',
+    }
+
+    # ── Primary provider (OpenAI-compatible: Groq or xAI) ─────────────
+    try:
+        raw_key = st.secrets.get("GROQ_API_KEY", "")
+        result['_raw_key'] = raw_key
+        ai_config = _detect_ai_provider(raw_key)
+        result['ai_config'] = ai_config
+        api_key = ai_config['key']
+
+        if api_key and ai_config['provider'] != 'none':
+            cached_status = st.session_state.get('_groq_key_status')
+            cached_key_val = st.session_state.get('_groq_key_cached', '')
+            if cached_status == 'invalid' and cached_key_val == api_key:
+                result['primary_error'] = f"Key previously failed (401). Click 🔑 Reset API after updating. [{ai_config['display']}]"
+            else:
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key, base_url=ai_config['base_url'])
+                # Pre-flight validation (once per key)
+                validation_key = f'_ai_validated_{api_key[:8]}'
+                if validation_key not in st.session_state:
+                    try:
+                        client.chat.completions.create(
+                            model=ai_config['model'],
+                            messages=[{"role": "user", "content": "hi"}],
+                            max_tokens=1,
+                        )
+                        st.session_state[validation_key] = True
+                    except Exception as val_err:
+                        val_str = str(val_err)
+                        if 'Invalid API Key' in val_str or '401' in val_str or 'Unauthorized' in val_str:
+                            st.session_state['_groq_key_status'] = 'invalid'
+                            st.session_state['_groq_key_cached'] = api_key
+                            client = None
+                            result['primary_error'] = f"Key validation failed (401). {ai_config['display']}"
+                        else:
+                            st.session_state[validation_key] = True
+                result['openai_client'] = client
+                st.session_state['_ai_config'] = ai_config
+        else:
+            result['primary_error'] = "No GROQ_API_KEY in secrets (supports Groq gsk_ or xAI xai- keys)"
+    except ImportError:
+        result['primary_error'] = "openai package not installed — add to requirements.txt"
+    except Exception as e:
+        result['primary_error'] = str(e)[:200]
+
+    # ── Gemini fallback ───────────────────────────────────────────────
+    try:
+        import google.generativeai as genai
+        gkey = st.secrets.get("GEMINI_API_KEY", "")
+        if gkey:
+            genai.configure(api_key=gkey)
+            result['gemini'] = genai.GenerativeModel('gemini-2.0-flash')
+        else:
+            result['gemini_error'] = "No GEMINI_API_KEY in secrets"
+    except ImportError:
+        result['gemini_error'] = "google-generativeai not installed"
+    except Exception as e:
+        result['gemini_error'] = str(e)[:200]
+
+    # Cache for all subsequent reruns
+    st.session_state['_ai_clients_cache'] = result
+    return result
+
 # Initialize journal
 if 'journal' not in st.session_state:
     st.session_state['journal'] = JournalManager(data_dir=".")
@@ -602,8 +698,10 @@ def render_sidebar():
             if st.button("🔑 Reset API", key="reset_api_cache",
                          help="Clear cached API key status after updating secrets"):
                 for k in list(st.session_state.keys()):
-                    if k.startswith(('_groq_key', '_groq_validated', 'ai_result_', 'chat_')):
+                    if k.startswith(('_groq_key', '_groq_validated', '_ai_validated', '_ai_clients',
+                                     'ai_result_', 'chat_')):
                         st.session_state.pop(k, None)
+                st.session_state.pop('_ai_config', None)
                 st.toast("✅ API cache cleared. Click a ticker to re-run.")
         with s2:
             if st.button("📊 Refresh Mkt", key="refresh_market_data",
@@ -1694,8 +1792,14 @@ def _render_quick_alert_form(ticker: str, jm: JournalManager):
 # DETAIL VIEW — Tabbed analysis for selected ticker
 # =============================================================================
 
+@st.fragment
 def render_detail_view():
-    """Render detailed analysis for selected ticker."""
+    """Render detailed analysis for selected ticker.
+    
+    Decorated with @st.fragment — interactions within this view (button clicks,
+    tab switches, checkbox toggles) only re-render this fragment, NOT the entire
+    scanner table + sidebar. This eliminates ~1-2s of lag on every interaction.
+    """
     analysis: TickerAnalysis = st.session_state.get('selected_analysis')
     if not analysis:
         return
@@ -2007,76 +2111,17 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     quality = analysis.quality or {}
     jm = get_journal()
 
-    # Check for AI providers: auto-detect Groq vs xAI/Grok from key prefix
-    gemini = None
-    openai_client = None
-    ai_config = {'model': '', 'fallback_model': '', 'provider': 'none'}
-
-    # Primary provider — auto-detect from GROQ_API_KEY (supports Groq gsk_ and xAI xai-)
-    primary_error = None
-    try:
-        raw_key = st.secrets.get("GROQ_API_KEY", "")
-        ai_config = _detect_ai_provider(raw_key)
-        api_key = ai_config['key']
-
-        if api_key and ai_config['provider'] != 'none':
-            # Check cached validation
-            cached_status = st.session_state.get('_groq_key_status')
-            cached_key = st.session_state.get('_groq_key_cached', '')
-            if cached_status == 'invalid' and cached_key == api_key:
-                primary_error = f"Key previously failed (401). Click 🔑 Reset API after updating. [{ai_config['display']}]"
-            else:
-                from openai import OpenAI
-                openai_client = OpenAI(
-                    api_key=api_key,
-                    base_url=ai_config['base_url'],
-                )
-                # Store config in session for other tabs
-                st.session_state['_ai_config'] = ai_config
-                # Pre-flight validation (once per key)
-                if f'_ai_validated_{api_key[:8]}' not in st.session_state:
-                    try:
-                        _test = openai_client.chat.completions.create(
-                            model=ai_config['model'],
-                            messages=[{"role": "user", "content": "hi"}],
-                            max_tokens=1,
-                        )
-                        st.session_state[f'_ai_validated_{api_key[:8]}'] = True
-                    except Exception as val_err:
-                        val_str = str(val_err)
-                        if 'Invalid API Key' in val_str or '401' in val_str or 'Unauthorized' in val_str:
-                            st.session_state['_groq_key_status'] = 'invalid'
-                            st.session_state['_groq_key_cached'] = api_key
-                            openai_client = None
-                            primary_error = f"Key validation failed (401). {ai_config['display']}"
-                        else:
-                            # Non-auth error (rate limit etc) — key itself probably fine
-                            st.session_state[f'_ai_validated_{api_key[:8]}'] = True
-        else:
-            primary_error = "No GROQ_API_KEY in secrets (supports Groq gsk_ or xAI xai- keys)"
-    except ImportError:
-        primary_error = "openai package not installed — add to requirements.txt"
-    except Exception as e:
-        primary_error = str(e)[:200]
+    # ── Get cached AI clients (no re-import/re-create on every rerun) ──
+    ai_clients = _get_ai_clients()
+    openai_client = ai_clients['openai_client']
+    gemini = ai_clients['gemini']
+    ai_config = ai_clients['ai_config']
+    primary_error = ai_clients['primary_error']
+    gemini_error = ai_clients['gemini_error']
 
     # Show provider info
     if openai_client:
         st.caption(f"Provider: {ai_config['display']} | Model: {ai_config['model']}")
-
-    # Gemini — fallback
-    gemini_error = None
-    try:
-        import google.generativeai as genai
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
-        if api_key:
-            genai.configure(api_key=api_key)
-            gemini = genai.GenerativeModel('gemini-2.0-flash')
-        else:
-            gemini_error = "No GEMINI_API_KEY in secrets"
-    except ImportError:
-        gemini_error = "google-generativeai not installed"
-    except Exception as e:
-        gemini_error = str(e)[:200]
 
     if not openai_client and not gemini:
         errors = []
@@ -2556,7 +2601,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         if _tech_rows:
             with st.expander("📈 Technical Snapshot", expanded=False):
                 _df = pd.DataFrame(_tech_rows, columns=["Metric", "Value", "Status"])
-                st.dataframe(_df, hide_index=True, use_container_width=True)
+                st.dataframe(_df, hide_index=True, width='stretch')
 
     # ═══════════════════════════════════════════════════════════════
     # RESISTANCE VERDICT + BREAKOUT ALERT BUTTON
@@ -2787,7 +2832,7 @@ def _render_market_intelligence(intel: Dict):
                 })
 
             import pandas as pd
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
     # ── Insider Activity + Social ─────────────────────────────────
     col_insider, col_social = st.columns(2)
@@ -2822,7 +2867,7 @@ def _render_market_intelligence(intel: Dict):
                             'Value': val_str,
                         })
                     import pandas as pd
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
         else:
             st.caption("No insider transactions found in last 90 days")
 
@@ -3058,7 +3103,7 @@ def _render_earnings_section(earnings: Dict):
 
         import pandas as pd
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True,
+        st.dataframe(df, width='stretch', hide_index=True,
                       column_config={
                           'Date': st.column_config.TextColumn(width="medium"),
                           'EPS Est': st.column_config.TextColumn("Estimate", width="small"),
@@ -3903,34 +3948,10 @@ def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
                      analysis: TickerAnalysis):
     """AI Research Analyst — auto-runs external research + interactive follow-up chat."""
 
-    # ── Initialize AI client (auto-detect Groq vs xAI/Grok) ─────────
-    openai_client = None
-    ai_config = st.session_state.get('_ai_config')  # From AI Intel pre-flight
-
-    if not ai_config:
-        # First time — detect from key
-        try:
-            raw_key = st.secrets.get("GROQ_API_KEY", "")
-            ai_config = _detect_ai_provider(raw_key)
-            st.session_state['_ai_config'] = ai_config
-        except Exception:
-            ai_config = {'provider': 'none', 'key': '', 'model': '', 'fallback_model': '', 'base_url': '', 'display': 'Error'}
-
-    if ai_config['key'] and ai_config['provider'] != 'none':
-        # Check cached validation
-        cached_status = st.session_state.get('_groq_key_status')
-        cached_key = st.session_state.get('_groq_key_cached', '')
-        if cached_status == 'invalid' and cached_key == ai_config['key']:
-            pass  # Skip — known bad key
-        else:
-            try:
-                from openai import OpenAI
-                openai_client = OpenAI(
-                    api_key=ai_config['key'],
-                    base_url=ai_config['base_url'],
-                )
-            except Exception:
-                pass
+    # ── Get cached AI client (no re-import/re-create on every rerun) ──
+    ai_clients = _get_ai_clients()
+    openai_client = ai_clients['openai_client']
+    ai_config = ai_clients['ai_config']
 
     if not openai_client:
         st.warning(f"🔑 **API key missing or invalid.** Current: {ai_config.get('display', 'none')}")
@@ -4914,7 +4935,7 @@ def render_performance():
                 'Reason': t.get('exit_reason', '?'),
                 'Signal': t.get('signal_type', '?'),
             })
-        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
 
 # =============================================================================
