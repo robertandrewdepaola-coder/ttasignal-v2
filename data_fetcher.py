@@ -89,6 +89,111 @@ def get_cache_stats() -> Dict[str, int]:
 
 
 # =============================================================================
+# YFINANCE SESSION HEALTH — Detect & recover from crumb/auth failures
+# =============================================================================
+
+# Track crumb failure state to avoid hammering Yahoo with stale sessions
+_crumb_failure_count = 0
+_last_crumb_reset = 0.0
+_CRUMB_RESET_COOLDOWN = 30  # seconds between forced resets
+
+
+def _is_crumb_or_auth_error(error: Exception) -> bool:
+    """Check if an exception is a yfinance crumb/auth error (401).
+    
+    Also catches 'NoneType not subscriptable' which is how yfinance
+    internally manifests stale crumbs — it tries to parse a None response.
+    """
+    err_str = str(error).lower()
+    return any(marker in err_str for marker in [
+        'invalid crumb',
+        'unauthorized',
+        '401',
+        'unable to access this feature',
+        "'nonetype' object is not subscriptable",
+    ])
+
+
+def _force_yfinance_session_reset():
+    """
+    Force yfinance to obtain a fresh crumb/cookie.
+    
+    yfinance caches its session (cookies + crumb) at module level.
+    When Yahoo invalidates the crumb server-side, ALL requests fail
+    with 401 until the session is refreshed. This happens frequently
+    on Streamlit Cloud's shared IPs.
+    """
+    global _crumb_failure_count, _last_crumb_reset
+    
+    now = time.time()
+    if now - _last_crumb_reset < _CRUMB_RESET_COOLDOWN:
+        return  # Don't reset more than once per cooldown period
+    
+    _last_crumb_reset = now
+    _crumb_failure_count = 0
+    
+    try:
+        # Clear yfinance's internal cache (crumb, cookies, session)
+        if hasattr(yf, 'cache'):
+            # yfinance >= 0.2.x
+            try:
+                yf.cache.clear()
+            except Exception:
+                pass
+        
+        # Force new session by clearing shared data module
+        if hasattr(yf, 'shared') and hasattr(yf.shared, '_CACHE'):
+            try:
+                yf.shared._CACHE = {}
+            except Exception:
+                pass
+        
+        # yfinance 0.2.x+ stores sessions differently
+        if hasattr(yf, 'utils') and hasattr(yf.utils, 'get_json'):
+            # Clear any module-level session
+            pass
+        
+        # Nuclear option: reimport to reset all module state
+        import importlib
+        importlib.reload(yf)
+        
+        # Re-import normalize_columns since signal_engine uses yfinance indirectly
+        print(f"[data_fetcher] Forced yfinance session reset (crumb expired)")
+        
+    except Exception as e:
+        print(f"[data_fetcher] Session reset error (non-fatal): {e}")
+
+
+def _fetch_with_crumb_retry(fetch_fn, *args, **kwargs):
+    """
+    Wrapper that retries a fetch function after resetting the yfinance
+    session if a crumb/auth error is detected.
+    
+    This is the core fix for the 883 'Invalid Crumb' errors seen in production.
+    """
+    global _crumb_failure_count
+    
+    for attempt in range(2):
+        try:
+            result = fetch_fn(*args, **kwargs)
+            if attempt == 1 and result is not None:
+                print(f"[data_fetcher] Crumb retry succeeded")
+            return result
+        except Exception as e:
+            if _is_crumb_or_auth_error(e) and attempt == 0:
+                _crumb_failure_count += 1
+                if _crumb_failure_count >= 2:
+                    # Multiple crumb failures = session is definitely stale
+                    _force_yfinance_session_reset()
+                    time.sleep(1)  # Brief pause after reset
+                    continue  # Retry with fresh session
+                else:
+                    time.sleep(0.5)
+                    continue
+            raise  # Non-crumb error or second attempt — propagate
+
+
+# =============================================================================
 # CORE PRICE DATA — Daily, Weekly, Monthly
 # =============================================================================
 
@@ -99,73 +204,88 @@ def fetch_daily(ticker: str, period: str = DAILY_PERIOD) -> Optional[pd.DataFram
     Returns normalized DataFrame with columns:
     Open, High, Low, Close, Volume
     
-    Returns None on error.
+    Returns None on error. Auto-retries on crumb/auth failures.
     """
     cache_key = f"{ticker}:daily:{period}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period, interval='1d')
-        
-        if df is None or df.empty:
+    for attempt in range(2):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval='1d')
+            
+            if df is None or df.empty:
+                return None
+            
+            df = normalize_columns(df)
+            _cache.set(cache_key, df)
+            return df
+            
+        except Exception as e:
+            if _is_crumb_or_auth_error(e) and attempt == 0:
+                _force_yfinance_session_reset()
+                time.sleep(1)
+                continue
+            print(f"[data_fetcher] Error fetching daily {ticker}: {e}")
             return None
-        
-        df = normalize_columns(df)
-        _cache.set(cache_key, df)
-        return df
-        
-    except Exception as e:
-        print(f"[data_fetcher] Error fetching daily {ticker}: {e}")
-        return None
 
 
 def fetch_weekly(ticker: str, period: str = WEEKLY_PERIOD) -> Optional[pd.DataFrame]:
-    """Fetch weekly OHLCV data."""
+    """Fetch weekly OHLCV data. Auto-retries on crumb/auth failures."""
     cache_key = f"{ticker}:weekly:{period}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period, interval='1wk')
-        
-        if df is None or df.empty:
+    for attempt in range(2):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval='1wk')
+            
+            if df is None or df.empty:
+                return None
+            
+            df = normalize_columns(df)
+            _cache.set(cache_key, df)
+            return df
+            
+        except Exception as e:
+            if _is_crumb_or_auth_error(e) and attempt == 0:
+                _force_yfinance_session_reset()
+                time.sleep(1)
+                continue
+            print(f"[data_fetcher] Error fetching weekly {ticker}: {e}")
             return None
-        
-        df = normalize_columns(df)
-        _cache.set(cache_key, df)
-        return df
-        
-    except Exception as e:
-        print(f"[data_fetcher] Error fetching weekly {ticker}: {e}")
-        return None
 
 
 def fetch_monthly(ticker: str, period: str = MONTHLY_PERIOD) -> Optional[pd.DataFrame]:
-    """Fetch monthly OHLCV data."""
+    """Fetch monthly OHLCV data. Auto-retries on crumb/auth failures."""
     cache_key = f"{ticker}:monthly:{period}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
     
-    try:
-        stock = yf.Ticker(ticker)
-        df = stock.history(period=period, interval='1mo')
-        
-        if df is None or df.empty:
+    for attempt in range(2):
+        try:
+            stock = yf.Ticker(ticker)
+            df = stock.history(period=period, interval='1mo')
+            
+            if df is None or df.empty:
+                return None
+            
+            df = normalize_columns(df)
+            _cache.set(cache_key, df)
+            return df
+            
+        except Exception as e:
+            if _is_crumb_or_auth_error(e) and attempt == 0:
+                _force_yfinance_session_reset()
+                time.sleep(1)
+                continue
+            print(f"[data_fetcher] Error fetching monthly {ticker}: {e}")
             return None
-        
-        df = normalize_columns(df)
-        _cache.set(cache_key, df)
-        return df
-        
-    except Exception as e:
-        print(f"[data_fetcher] Error fetching monthly {ticker}: {e}")
-        return None
 
 
 def fetch_intraday(ticker: str, interval: str = '1h',
@@ -914,19 +1034,22 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
         stock = yf.Ticker(ticker)
         info = None
         
-        # Try up to 2 times with delay if rate-limited
+        # Try up to 2 times — reset session on crumb/auth errors
         for _attempt in range(2):
             try:
                 info = stock.info
                 if info and info.get('sector'):
                     break  # Got real data
                 if _attempt == 0:
-                    import time
-                    time.sleep(1.5)
-            except Exception:
+                    time.sleep(1)
+            except Exception as _e:
+                if _is_crumb_or_auth_error(_e) and _attempt == 0:
+                    _force_yfinance_session_reset()
+                    stock = yf.Ticker(ticker)  # Fresh ticker object
+                    time.sleep(1)
+                    continue
                 if _attempt == 0:
-                    import time
-                    time.sleep(1.5)
+                    time.sleep(1)
                 break
         
         if info:
@@ -1219,26 +1342,26 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
             if result['next_earnings']:
                 break
             
-            # If first attempt got nothing, check if rate-limited and retry
+            # If first attempt got nothing, check if rate-limited/crumb-expired and retry
             if attempt == 0:
-                # If stock.info returned empty/error, likely rate-limited
                 try:
                     _test = stock.info
                     if not _test or _test.get('trailingPegRatio') is None:
-                        # Possibly rate-limited — wait and retry
-                        import time
                         time.sleep(2)
                         continue
-                except Exception:
-                    import time
+                except Exception as _te:
+                    if _is_crumb_or_auth_error(_te):
+                        _force_yfinance_session_reset()
                     time.sleep(2)
                     continue
                 break  # Not rate-limited, just no data available
             
         except Exception as e:
             err_str = str(e).lower()
-            if attempt == 0 and ('429' in err_str or 'rate' in err_str or 'too many' in err_str):
-                import time
+            if attempt == 0 and (_is_crumb_or_auth_error(e) or
+                                 '429' in err_str or 'rate' in err_str or 'too many' in err_str):
+                if _is_crumb_or_auth_error(e):
+                    _force_yfinance_session_reset()
                 time.sleep(2)
                 continue
             result['error'] = str(e)[:200]
