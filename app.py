@@ -824,18 +824,23 @@ def render_sidebar():
 
     # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
     if active_wl.get("type") == "auto":
-        from scraping_bridge import ScrapingBridge
+        from scraping_bridge import ScrapingBridge, ETF_CSV_URLS
 
         # Show source info
         src = active_wl.get("source", "")
+        url_override = active_wl.get("url_override", "")
         if active_wl.get("source_type") == "etf_shortcut" and src:
+            configured_url = ETF_CSV_URLS.get(src.lower(), "")
+            display_url = url_override or configured_url
             st.sidebar.caption(f"Source: ARK ETF `{src.upper()}` (auto-populated)")
+            if url_override:
+                st.sidebar.caption(f"🔗 Using custom URL override")
 
         # Show last error if any
         stats = active_wl.get("scraping_stats", {})
         last_error = stats.get("last_error")
         if last_error:
-            st.sidebar.warning(f"⚠️ Last fetch: {last_error[:100]}")
+            st.sidebar.warning(f"⚠️ Last fetch: {last_error[:120]}")
 
         # Skip cooldown if last attempt failed (let user retry immediately)
         can_refresh, remaining = _wm.can_refresh_auto(active_wl["id"])
@@ -851,7 +856,7 @@ def render_sidebar():
                         _bridge_scraper = ScrapingBridge()
                         st.session_state['scraping_bridge'] = _bridge_scraper
                     with st.sidebar:
-                        with st.spinner("Fetching tickers from source..."):
+                        with st.spinner("Validating URL and fetching tickers..."):
                             success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
                     if success and tickers:
                         ok, update_msg, cleaned = _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
@@ -870,6 +875,78 @@ def render_sidebar():
                 st.rerun()
         else:
             st.sidebar.caption(f"⏳ Retry in {remaining}s")
+
+        # ── URL Fix / CSV Upload Fallback (shown when last fetch failed) ──
+        if last_error and ("URL" in last_error or "404" in last_error or "403" in last_error
+                          or "unreachable" in last_error or "timed out" in last_error):
+            with st.sidebar.expander("🔧 Fix Source", expanded=True):
+                st.caption("The auto-fetch URL may have changed. Choose a fix:")
+
+                # Show current URL for reference
+                _src_key = active_wl.get("source", "").lower()
+                _current_url = url_override or ETF_CSV_URLS.get(_src_key, "unknown")
+                st.code(_current_url, language=None)
+
+                # Option 1: Custom URL override
+                st.markdown("**Option 1: Paste corrected URL**")
+                new_url = st.text_input(
+                    "CSV URL", value=url_override or "",
+                    placeholder="https://assets.ark-funds.com/...",
+                    key="url_override_input", label_visibility="collapsed",
+                )
+                if new_url and new_url.strip() != url_override:
+                    if st.button("✅ Save URL & Fetch", key="save_url_override"):
+                        _bridge_scraper = st.session_state.get('scraping_bridge')
+                        if not _bridge_scraper:
+                            _bridge_scraper = ScrapingBridge()
+                            st.session_state['scraping_bridge'] = _bridge_scraper
+                        # Validate first
+                        ok, check_msg, status = _bridge_scraper.validate_url(new_url.strip())
+                        if ok:
+                            _wm.update_watchlist_metadata(active_wl["id"], url_override=new_url.strip())
+                            # Fetch with override
+                            active_wl["url_override"] = new_url.strip()
+                            success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
+                            if success and tickers:
+                                _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                                _wm.record_refresh_success(active_wl["id"])
+                                st.toast(f"✅ Fetched {len(tickers)} tickers from new URL")
+                            else:
+                                st.error(f"URL reachable but no tickers found: {msg}")
+                        else:
+                            st.error(f"❌ {check_msg}")
+                        st.rerun()
+
+                # Clear override if one exists
+                if url_override:
+                    if st.button("🔄 Reset to default URL", key="clear_url_override"):
+                        _wm.update_watchlist_metadata(active_wl["id"], url_override="")
+                        st.toast("Reset to default URL")
+                        st.rerun()
+
+                st.divider()
+
+                # Option 2: Upload CSV file
+                st.markdown("**Option 2: Upload CSV file**")
+                st.caption("Download holdings CSV from ark-funds.com, then upload here.")
+                csv_file = st.file_uploader(
+                    "Upload CSV", type=["csv"], key="csv_fallback_upload",
+                    label_visibility="collapsed",
+                )
+                if csv_file is not None:
+                    _bridge_scraper = st.session_state.get('scraping_bridge')
+                    if not _bridge_scraper:
+                        _bridge_scraper = ScrapingBridge()
+                        st.session_state['scraping_bridge'] = _bridge_scraper
+                    csv_bytes = csv_file.read()
+                    success, msg, tickers = _bridge_scraper.fetch_from_csv_content(csv_bytes)
+                    if success and tickers:
+                        _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                        _wm.record_refresh_success(active_wl["id"])
+                        st.toast(f"✅ Loaded {len(tickers)} tickers from CSV")
+                        st.rerun()
+                    else:
+                        st.error(f"CSV parse failed: {msg}")
 
         # Rollback option
         backup = active_wl.get("last_backup")
