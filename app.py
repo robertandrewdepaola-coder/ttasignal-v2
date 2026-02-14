@@ -645,6 +645,136 @@ def render_sidebar():
 
     st.sidebar.divider()
 
+    # ── Watchlist Selector ─────────────────────────────────────────────
+    _wm = st.session_state['watchlist_bridge'].manager
+    all_wls = _wm.get_all_watchlists()
+    active_wl = _wm.get_active_watchlist()
+
+    if len(all_wls) > 1:
+        # Multiple watchlists — show selector
+        wl_labels = []
+        wl_id_map = {}
+        for wl in all_wls:
+            icon = "🔒" if wl.get("is_system") else ("🔄" if wl.get("type") == "auto" else "✏️")
+            label = f"{icon} {wl['name']} ({len(wl.get('tickers', []))})"
+            wl_labels.append(label)
+            wl_id_map[label] = wl["id"]
+
+        active_label = None
+        for label, wl_id in wl_id_map.items():
+            if wl_id == active_wl["id"]:
+                active_label = label
+                break
+        current_idx = wl_labels.index(active_label) if active_label in wl_labels else 0
+
+        sel_col1, sel_col2 = st.sidebar.columns([4, 1])
+        with sel_col1:
+            selected = st.selectbox(
+                "Watchlist", wl_labels, index=current_idx,
+                key="sidebar_wl_selector", label_visibility="collapsed",
+            )
+        with sel_col2:
+            if st.button("➕", key="sidebar_wl_create", help="Create new watchlist"):
+                st.session_state['show_wl_create'] = True
+                st.rerun()
+
+        selected_id = wl_id_map.get(selected)
+        if selected_id and selected_id != active_wl["id"]:
+            _wm.set_active_watchlist(selected_id)
+            st.session_state.pop('scan_results', None)
+            st.session_state.pop('scan_results_summary', None)
+            st.session_state.pop('ticker_data_cache', None)
+            st.rerun()
+    else:
+        # Single watchlist — just show create button
+        wl_col1, wl_col2 = st.sidebar.columns([3, 1])
+        with wl_col1:
+            st.sidebar.caption(f"📋 {active_wl['name']}")
+        with wl_col2:
+            if st.button("➕", key="sidebar_wl_create", help="Create new watchlist"):
+                st.session_state['show_wl_create'] = True
+                st.rerun()
+
+    # ── Create Watchlist Dialog (inline sidebar) ───────────────────────
+    if st.session_state.get('show_wl_create'):
+        from scraping_bridge import ETF_SHORTCUTS
+        with st.sidebar.form("sidebar_create_wl", clear_on_submit=True):
+            st.markdown("**New Watchlist**")
+            wl_name = st.text_input("Name", placeholder="e.g. ARKK Holdings")
+            wl_type = st.radio("Type", ["Manual", "Auto (ETF)"], horizontal=True, key="create_wl_type")
+
+            source_type = None
+            source = None
+            if wl_type == "Auto (ETF)":
+                shortcuts = list(ETF_SHORTCUTS.keys())
+                choice = st.selectbox("ETF", shortcuts, key="create_wl_etf")
+                source_type = "etf_shortcut"
+                source = ETF_SHORTCUTS.get(choice, "")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                submitted = st.form_submit_button("Create", type="primary")
+            with c2:
+                cancelled = st.form_submit_button("Cancel")
+
+            if cancelled:
+                st.session_state['show_wl_create'] = False
+                st.rerun()
+            if submitted and wl_name and wl_name.strip():
+                try:
+                    actual_type = "manual" if wl_type == "Manual" else "auto"
+                    new_id = _wm.create_watchlist(
+                        name=wl_name.strip(), wl_type=actual_type,
+                        source_type=source_type, source=source,
+                    )
+                    if new_id:
+                        _wm.set_active_watchlist(new_id)
+                        st.session_state['show_wl_create'] = False
+                        st.session_state.pop('scan_results', None)
+                        st.session_state.pop('scan_results_summary', None)
+                        st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
+
+    # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
+    if active_wl.get("type") == "auto":
+        from scraping_bridge import ScrapingBridge
+        can_refresh, remaining = _wm.can_refresh_auto(active_wl["id"])
+
+        if can_refresh:
+            if st.sidebar.button("🔄 Refresh Tickers", key="sidebar_refresh_wl"):
+                _wm.record_refresh_request(active_wl["id"])
+                try:
+                    _bridge_scraper = st.session_state.get('scraping_bridge')
+                    if not _bridge_scraper:
+                        _bridge_scraper = ScrapingBridge()
+                        st.session_state['scraping_bridge'] = _bridge_scraper
+                    success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
+                    if success and tickers:
+                        ok, update_msg, cleaned = _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                        if ok:
+                            _wm.record_refresh_success(active_wl["id"])
+                            st.sidebar.success(f"✓ {update_msg}")
+                        else:
+                            _wm.record_refresh_failure(active_wl["id"], update_msg)
+                            st.sidebar.error(update_msg)
+                    else:
+                        _wm.record_refresh_failure(active_wl["id"], msg)
+                        st.sidebar.error(f"✗ {msg}")
+                except Exception as e:
+                    _wm.record_refresh_failure(active_wl["id"], str(e))
+                    st.sidebar.error(f"Refresh failed: {str(e)[:100]}")
+                st.rerun()
+        else:
+            st.sidebar.caption(f"🔄 Refresh cooldown: {remaining}s")
+
+        # Rollback option
+        backup = active_wl.get("last_backup")
+        if backup and backup.get("tickers"):
+            if st.sidebar.button(f"↩️ Rollback ({len(backup['tickers'])} tickers)", key="sidebar_rollback_wl"):
+                _wm.rollback_tickers(active_wl["id"])
+                st.rerun()
+
     # ── Scan Controls ─────────────────────────────────────────────────
     watchlist_tickers = bridge.get_watchlist_tickers()
     ticker_count = len(watchlist_tickers)
@@ -1175,8 +1305,22 @@ def render_scanner_table():
                     st.session_state.pop('ticker_data_cache', None)
                     st.rerun()
             with wl_col3:
-                st.caption(f"{len(watchlist_tickers)} saved"
-                           + (f" | ⭐ {len(favorite_tickers)} favorites" if favorite_tickers else ""))
+                _active_wl = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+                if not _active_wl.get("is_system"):
+                    st.caption(f"{len(watchlist_tickers)} saved | [{_active_wl['name']}]")
+                    if st.button("🗑️ Delete Watchlist", key="wl_delete_active",
+                                 help=f"Delete '{_active_wl['name']}' and switch to Master"):
+                        _wm = st.session_state['watchlist_bridge'].manager
+                        ok, msg = _wm.delete_watchlist(_active_wl["id"])
+                        if ok:
+                            st.session_state.pop('scan_results', None)
+                            st.session_state.pop('scan_results_summary', None)
+                            st.session_state.pop('ticker_data_cache', None)
+                            st.toast(f"✅ {msg}")
+                            st.rerun()
+                else:
+                    st.caption(f"{len(watchlist_tickers)} saved"
+                               + (f" | ⭐ {len(favorite_tickers)} favorites" if favorite_tickers else ""))
 
     # ══════════════════════════════════════════════════════════════════
     # SCAN RESULTS
