@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # CONSTANTS
 # =============================================================================
 
-REFRESH_COOLDOWN = 60       # seconds between auto-refreshes
+REFRESH_COOLDOWN = 10        # seconds between auto-refreshes
 MIN_TICKERS = 5             # warning threshold (still saves)
 MAX_TICKERS = 500           # warning threshold (still saves)
 
