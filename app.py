@@ -257,7 +257,11 @@ def _get_ai_clients() -> Dict:
 
     # ── Gemini fallback ───────────────────────────────────────────────
     try:
-        import google.generativeai as genai
+        import warnings
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning,
+                                     module="google.generativeai")
+            import google.generativeai as genai
         gkey = st.secrets.get("GEMINI_API_KEY", "")
         if gkey:
             genai.configure(api_key=gkey)
@@ -715,7 +719,7 @@ def render_sidebar():
                 # Clear APEX caches (SPY/VIX data + per-ticker detection)
                 st.session_state.pop('apex_spy_data', None)
                 st.session_state.pop('apex_vix_data', None)
-                for k in [k for k in st.session_state if k.startswith('_apex_cache_')]:
+                for k in [k for k in list(st.session_state.keys()) if k.startswith('_apex_cache_')]:
                     st.session_state.pop(k, None)
                 st.toast("✅ Market data will refresh on next load.")
 
@@ -794,6 +798,20 @@ def _run_scan(mode='all'):
     open_tickers = jm.get_open_tickers()
 
     full_list = list(set(all_watchlist + conditional_tickers + open_tickers))
+    
+    # ── Validate tickers — reject corrupt entries before they hit yfinance ──
+    import re as _re
+    valid_list = []
+    rejected = []
+    for t in full_list:
+        # Valid ticker: 1-5 uppercase alpha, or known indices (^VIX, ^GSPC)
+        if _re.match(r'^[A-Z]{1,5}$', t) or t.startswith('^'):
+            valid_list.append(t)
+        else:
+            rejected.append(t)
+    if rejected:
+        print(f"[scan] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
+    full_list = valid_list
 
     if not full_list:
         st.sidebar.warning("Add tickers to watchlist first")
@@ -1006,11 +1024,18 @@ def render_scanner_table():
         with qa2:
             if st.button("➕ Add", key="wl_add_btn", use_container_width=True):
                 if new_ticker:
+                    import re as _re
                     ticker_clean = new_ticker.strip().upper()
-                    if ticker_clean and ticker_clean not in watchlist_tickers:
-                        jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
-                        st.session_state['wl_version'] += 1  # Force text_area refresh
-                        st.rerun()
+                    # Validate: 1-5 uppercase alpha chars only
+                    if ticker_clean and _re.match(r'^[A-Z]{1,5}$', ticker_clean):
+                        if ticker_clean not in watchlist_tickers:
+                            jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                            st.session_state['wl_version'] += 1
+                            st.rerun()
+                        else:
+                            st.toast(f"⚠️ {ticker_clean} already in watchlist")
+                    else:
+                        st.toast(f"⚠️ Invalid ticker: {ticker_clean[:20]}")
 
         # ── Sort Controls ─────────────────────────────────────────────
         if watchlist_tickers:
@@ -1098,12 +1123,20 @@ def render_scanner_table():
                     import re
                     raw = re.split(r'[,\s\n\t]+', new_text)
                     tickers = [t.strip().upper() for t in raw if t.strip()]
+                    
+                    # Validate: real tickers are 1-5 uppercase alpha chars
+                    # Reject comma-strings, numbers-only, special chars
                     seen = set()
                     unique = []
+                    rejected = []
                     for t in tickers:
-                        if t not in seen:
-                            seen.add(t)
-                            unique.append(t)
+                        if t in seen:
+                            continue
+                        if not re.match(r'^[A-Z]{1,5}$', t):
+                            rejected.append(t)
+                            continue
+                        seen.add(t)
+                        unique.append(t)
 
                     # Preserve favorites across bulk save
                     old_favorites = set(jm.get_favorite_tickers())
@@ -1115,7 +1148,10 @@ def render_scanner_table():
                             jm.toggle_favorite(fav)
 
                     st.session_state['wl_version'] += 1
-                    st.success(f"✅ Saved {len(unique)} tickers")
+                    msg = f"✅ Saved {len(unique)} tickers"
+                    if rejected:
+                        msg += f" | ⚠️ Rejected {len(rejected)}: {', '.join(rejected[:5])}"
+                    st.success(msg)
                     st.rerun()
             with wl_col2:
                 if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
@@ -1748,7 +1784,7 @@ def _render_quick_alert_form(ticker: str, jm: JournalManager):
                                   key=f"alert_type_{ticker}")
     with ca2:
         # Default trigger: overhead resistance if available, else current + 3%
-        default_trigger = current * 1.03 if current > 0 else 0
+        default_trigger = float(current * 1.03) if current > 0 else 0.0
         # Try to get resistance from analysis
         analysis = st.session_state.get('selected_analysis')
         if analysis and analysis.signal and analysis.signal.overhead_resistance:
@@ -4490,12 +4526,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     """
     from position_sizer import calculate_position_size
 
-    current_price = analysis.current_price or 0
-    entry_default = float(stops.get('entry', current_price or 0))
-    stop_default = float(stops.get('stop', 0))
-    target_default = float(stops.get('target', 0))
+    current_price = float(analysis.current_price or 0.0)
+    entry_default = float(stops.get('entry', current_price or 0.0))
+    stop_default = float(stops.get('stop', 0.0))
+    target_default = float(stops.get('target', 0.0))
 
-    account_size = st.session_state.get('account_size', 100000.0)
+    account_size = float(st.session_state.get('account_size', 100000.0))
     open_trades = jm.get_open_trades()
 
     # Get performance context
@@ -4511,20 +4547,22 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.warning(f"⚠️ Recent win rate: {win_rate:.0%} — consider reducing exposure")
 
     # ── Input Row ─────────────────────────────────────────────────────
+    # All values MUST be float to avoid StreamlitMixedNumericTypesError
+    _entry_val = float(entry_default if entry_default > 0 else current_price)
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         entry_price = st.number_input("Entry Price",
-                                       value=entry_default if entry_default > 0 else current_price,
+                                       value=_entry_val,
                                        step=0.01, format="%.2f",
                                        key=f"sizer_entry_{ticker}")
     with col2:
         stop_price = st.number_input("Stop Loss",
-                                      value=stop_default,
+                                      value=float(stop_default),
                                       step=0.01, format="%.2f",
                                       key=f"sizer_stop_{ticker}")
     with col3:
         target_price = st.number_input("Target",
-                                        value=target_default,
+                                        value=float(target_default),
                                         step=0.01, format="%.2f",
                                         key=f"sizer_target_{ticker}")
     with col4:
