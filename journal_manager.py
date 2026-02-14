@@ -157,6 +157,10 @@ class JournalManager:
         self.scan_results_file = self.data_dir / "v2_last_scan.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
+        # Clean corrupt entries (strings instead of dicts from old comma-paste bug)
+        if self.watchlist and any(not isinstance(w, dict) for w in self.watchlist):
+            self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]
+            self._save(self.watchlist_file, self.watchlist)
         self.open_trades: List[Dict] = self._load(self.open_trades_file, [])
         self.trade_history: List[Dict] = self._load(self.history_file, [])
         self.conditionals: List[Dict] = self._load(self.conditionals_file, [])
@@ -257,13 +261,25 @@ class JournalManager:
         return [w['ticker'] for w in self.watchlist if w.get('is_favorite', False)]
 
     def set_focus_label(self, ticker: str, label: str) -> str:
-        """Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'."""
+        """Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'.
+        Auto-adds ticker to watchlist if not already present."""
         ticker = ticker.upper().strip()
         for w in self.watchlist:
             if w['ticker'] == ticker:
                 w['focus_label'] = label
                 self._save(self.watchlist_file, self.watchlist)
                 return label
+
+        # Ticker not in watchlist — auto-add with label
+        if label:  # Only auto-add if setting a non-empty label
+            new_item = WatchlistItem(
+                ticker=ticker,
+                added_date=datetime.now().strftime('%Y-%m-%d'),
+                focus_label=label,
+            )
+            self.watchlist.append(new_item.to_dict())
+            self._save(self.watchlist_file, self.watchlist)
+            return label
         return ''
 
     def get_focus_label(self, ticker: str) -> str:
@@ -277,7 +293,7 @@ class JournalManager:
     def get_focus_labels(self) -> Dict[str, str]:
         """Get all focus labels as {ticker: label} for non-empty labels."""
         return {w['ticker']: w['focus_label'] for w in self.watchlist
-                if w.get('focus_label', '')}
+                if isinstance(w, dict) and w.get('focus_label', '')}
 
     def delete_single_ticker(self, ticker: str) -> str:
         """Delete a single ticker from watchlist with immediate persistence."""
