@@ -33,6 +33,8 @@ from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
 from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry
+from watchlist_manager import WatchlistManager
+from watchlist_bridge import WatchlistBridge
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 
 
@@ -281,6 +283,11 @@ def _get_ai_clients() -> Dict:
 if 'journal' not in st.session_state:
     st.session_state['journal'] = JournalManager(data_dir=".")
 
+# Initialize watchlist bridge (routes jm.get_watchlist_tickers() → new JSON system)
+if 'watchlist_bridge' not in st.session_state:
+    _wm = WatchlistManager()
+    st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, st.session_state['journal'])
+
 # Initialize scan results — restore from disk if available
 if 'scan_results' not in st.session_state:
     jm_init = st.session_state['journal']
@@ -325,6 +332,9 @@ if 'ticker_data_cache' not in st.session_state:
 
 def get_journal() -> JournalManager:
     return st.session_state['journal']
+
+def get_bridge() -> WatchlistBridge:
+    return st.session_state['watchlist_bridge']
 
 
 # =============================================================================
@@ -623,6 +633,7 @@ def _run_factual_brief():
 
 def render_sidebar():
     jm = get_journal()
+    bridge = get_bridge()
 
     st.sidebar.title("📊 TTA v2")
     st.sidebar.caption("Technical Trading Assistant")
@@ -635,7 +646,7 @@ def render_sidebar():
     st.sidebar.divider()
 
     # ── Scan Controls ─────────────────────────────────────────────────
-    watchlist_tickers = jm.get_watchlist_tickers()
+    watchlist_tickers = bridge.get_watchlist_tickers()
     ticker_count = len(watchlist_tickers)
 
     # Count unscanned
@@ -791,7 +802,8 @@ def _run_scan(mode='all'):
     mode='new_only': Only scan tickers not in current results
     """
     jm = get_journal()
-    all_watchlist = jm.get_watchlist_tickers()
+    bridge = get_bridge()
+    all_watchlist = bridge.get_watchlist_tickers()
 
     # Also include conditional alert tickers and open positions
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
@@ -988,6 +1000,7 @@ def render_scanner_table():
     summary = st.session_state.get('scan_results_summary', [])
     timestamp = st.session_state.get('scan_timestamp', '')
     jm = get_journal()
+    bridge = get_bridge()
 
     # ══════════════════════════════════════════════════════════════════
     # TRIGGERED ALERTS BANNER
@@ -1006,8 +1019,8 @@ def render_scanner_table():
     # ══════════════════════════════════════════════════════════════════
     # WATCHLIST EDITOR (collapsible)
     # ══════════════════════════════════════════════════════════════════
-    watchlist_tickers = jm.get_watchlist_tickers()
-    favorite_tickers = set(jm.get_favorite_tickers())
+    watchlist_tickers = bridge.get_watchlist_tickers()
+    favorite_tickers = set(bridge.get_favorite_tickers())
 
     # Watchlist version counter — used to force text_area reset when watchlist changes
     if 'wl_version' not in st.session_state:
@@ -1029,7 +1042,7 @@ def render_scanner_table():
                     # Validate: 1-5 uppercase alpha chars only
                     if ticker_clean and _re.match(r'^[A-Z]{1,5}$', ticker_clean):
                         if ticker_clean not in watchlist_tickers:
-                            jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                            bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
                             st.session_state['wl_version'] += 1
                             st.rerun()
                         else:
@@ -1073,7 +1086,7 @@ def render_scanner_table():
                 with tc1:
                     if st.button(fav_icon, key=f"fav_{t}",
                                  help="Toggle favorite"):
-                        jm.toggle_favorite(t)
+                        bridge.toggle_favorite(t)
                         st.rerun()
                 with tc2:
                     st.caption(f"{'⭐ ' if is_fav else ''}{t}")
@@ -1139,13 +1152,13 @@ def render_scanner_table():
                         unique.append(t)
 
                     # Preserve favorites across bulk save
-                    old_favorites = set(jm.get_favorite_tickers())
-                    jm.clear_watchlist()
-                    jm.set_watchlist_tickers(unique)
+                    old_favorites = set(bridge.get_favorite_tickers())
+                    bridge.clear_watchlist()
+                    bridge.set_watchlist_tickers(unique)
                     # Re-apply favorites
                     for fav in old_favorites:
                         if fav in unique:
-                            jm.toggle_favorite(fav)
+                            bridge.toggle_favorite(fav)
 
                     st.session_state['wl_version'] += 1
                     msg = f"✅ Saved {len(unique)} tickers"
@@ -1155,7 +1168,7 @@ def render_scanner_table():
                     st.rerun()
             with wl_col2:
                 if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
-                    jm.clear_watchlist()
+                    bridge.clear_watchlist()
                     st.session_state['wl_version'] += 1
                     st.session_state.pop('scan_results', None)
                     st.session_state.pop('scan_results_summary', None)
@@ -1308,7 +1321,7 @@ def render_scanner_table():
             filtered = [r for r in filtered if r.get('SectorPhase', '') == target_phase]
 
     # Always sort favorites to top first
-    fav_tickers = set(jm.get_favorite_tickers())
+    fav_tickers = set(bridge.get_favorite_tickers())
 
     # Signal strength hierarchy for sorting (handles both old and new names)
     _rec_rank = {
@@ -1551,9 +1564,9 @@ def render_scanner_table():
         if st.button("➕ Add & Scan", use_container_width=True):
             if quick_ticker:
                 ticker_clean = quick_ticker.strip().upper()
-                wl = jm.get_watchlist_tickers()
+                wl = bridge.get_watchlist_tickers()
                 if ticker_clean not in wl:
-                    jm.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                    bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
                 _load_ticker_for_view(ticker_clean)
 
     # Alert form (if requested from detail view)
