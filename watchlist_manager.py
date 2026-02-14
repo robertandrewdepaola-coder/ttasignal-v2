@@ -243,7 +243,7 @@ class WatchlistManager:
         if not wl:
             return False, "Watchlist not found"
 
-        allowed = {"name", "source", "source_type", "provider", "refresh_schedule"}
+        allowed = {"name", "source", "source_type", "provider", "refresh_schedule", "url_override"}
         for key, val in kwargs.items():
             if key in allowed:
                 wl[key] = val
