@@ -698,43 +698,43 @@ def render_sidebar():
     # ── Create Watchlist Dialog (inline sidebar) ───────────────────────
     if st.session_state.get('show_wl_create'):
         from scraping_bridge import ETF_SHORTCUTS
-        with st.sidebar.form("sidebar_create_wl", clear_on_submit=True):
+        with st.sidebar.container(border=True):
             st.markdown("**New Watchlist**")
-            wl_name = st.text_input("Name", placeholder="e.g. ARKK Holdings")
+            wl_name = st.text_input("Name", placeholder="e.g. ARKK Holdings", key="create_wl_name")
             wl_type = st.radio("Type", ["Manual", "Auto (ETF)"], horizontal=True, key="create_wl_type")
 
             source_type = None
             source = None
             if wl_type == "Auto (ETF)":
                 shortcuts = list(ETF_SHORTCUTS.keys())
-                choice = st.selectbox("ETF", shortcuts, key="create_wl_etf")
+                choice = st.selectbox("Select ETF", shortcuts, key="create_wl_etf")
                 source_type = "etf_shortcut"
                 source = ETF_SHORTCUTS.get(choice, "")
 
             c1, c2 = st.columns(2)
             with c1:
-                submitted = st.form_submit_button("Create", type="primary")
+                if st.button("Create", type="primary", key="create_wl_submit", use_container_width=True):
+                    if wl_name and wl_name.strip():
+                        try:
+                            actual_type = "manual" if wl_type == "Manual" else "auto"
+                            new_id = _wm.create_watchlist(
+                                name=wl_name.strip(), wl_type=actual_type,
+                                source_type=source_type, source=source,
+                            )
+                            if new_id:
+                                _wm.set_active_watchlist(new_id)
+                                st.session_state['show_wl_create'] = False
+                                st.session_state.pop('scan_results', None)
+                                st.session_state.pop('scan_results_summary', None)
+                                st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+                    else:
+                        st.error("Enter a name")
             with c2:
-                cancelled = st.form_submit_button("Cancel")
-
-            if cancelled:
-                st.session_state['show_wl_create'] = False
-                st.rerun()
-            if submitted and wl_name and wl_name.strip():
-                try:
-                    actual_type = "manual" if wl_type == "Manual" else "auto"
-                    new_id = _wm.create_watchlist(
-                        name=wl_name.strip(), wl_type=actual_type,
-                        source_type=source_type, source=source,
-                    )
-                    if new_id:
-                        _wm.set_active_watchlist(new_id)
-                        st.session_state['show_wl_create'] = False
-                        st.session_state.pop('scan_results', None)
-                        st.session_state.pop('scan_results_summary', None)
-                        st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
+                if st.button("Cancel", key="create_wl_cancel", use_container_width=True):
+                    st.session_state['show_wl_create'] = False
+                    st.rerun()
 
     # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
     if active_wl.get("type") == "auto":
