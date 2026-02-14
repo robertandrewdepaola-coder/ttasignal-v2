@@ -3,7 +3,7 @@ TTA v2 Watchlist Manager — Multi-Watchlist System
 ===================================================
 
 Core CRUD operations for managing multiple watchlists.
-Stores data in v2_watchlist.json with atomic writes.
+Stores data in v2_multi_watchlist.json with atomic writes.
 
 Features:
 - Multiple named watchlists (manual + auto-populated)
@@ -81,7 +81,7 @@ class WatchlistManager:
     The system Master watchlist cannot be deleted.
     """
 
-    def __init__(self, json_path: str = "v2_watchlist.json"):
+    def __init__(self, json_path: str = "v2_multi_watchlist.json"):
         """Load watchlist data from JSON, or create fresh if missing/corrupted."""
         self.json_path = json_path
         self.data = self._load_or_create()
