@@ -682,9 +682,11 @@ def render_sidebar():
         selected_id = wl_id_map.get(selected)
         if selected_id and selected_id != active_wl["id"]:
             _wm.set_active_watchlist(selected_id)
-            st.session_state.pop('scan_results', None)
-            st.session_state.pop('scan_results_summary', None)
-            st.session_state.pop('ticker_data_cache', None)
+            st.session_state['scan_results'] = []
+            st.session_state['scan_results_summary'] = []
+            st.session_state['scan_timestamp'] = ''
+            st.session_state['ticker_data_cache'] = {}
+            st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1
             st.rerun()
     else:
         # Single watchlist — just show create button
@@ -730,8 +732,9 @@ def render_sidebar():
                             if new_id:
                                 _wm.set_active_watchlist(new_id)
                                 st.session_state['show_wl_create'] = False
-                                st.session_state.pop('scan_results', None)
-                                st.session_state.pop('scan_results_summary', None)
+                                st.session_state['scan_results'] = []
+                                st.session_state['scan_results_summary'] = []
+                                st.session_state['scan_timestamp'] = ''
 
                                 # Auto-fetch tickers for auto watchlists
                                 if actual_type == "auto" and source_type:
@@ -1275,8 +1278,13 @@ def render_scanner_table():
                         _load_ticker_for_view(t)
                 with tc4:
                     if st.button("🗑️", key=f"del_{t}",
-                                 help="Delete"):
-                        jm.delete_single_ticker(t)
+                                 help="Remove from watchlist"):
+                        bridge.remove_from_watchlist(t)
+                        # Also remove from JM for metadata sync
+                        try:
+                            jm.delete_single_ticker(t)
+                        except Exception:
+                            pass
                         st.session_state['wl_version'] += 1  # Force text_area refresh
                         # Also remove from scan results
                         if 'scan_results' in st.session_state:
@@ -1348,9 +1356,10 @@ def render_scanner_table():
                 if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
                     bridge.clear_watchlist()
                     st.session_state['wl_version'] += 1
-                    st.session_state.pop('scan_results', None)
-                    st.session_state.pop('scan_results_summary', None)
-                    st.session_state.pop('ticker_data_cache', None)
+                    st.session_state['scan_results'] = []
+                    st.session_state['scan_results_summary'] = []
+                    st.session_state['scan_timestamp'] = ''
+                    st.session_state['ticker_data_cache'] = {}
                     st.rerun()
             with wl_col3:
                 _active_wl = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
@@ -1361,9 +1370,10 @@ def render_scanner_table():
                         _wm = st.session_state['watchlist_bridge'].manager
                         ok, msg = _wm.delete_watchlist(_active_wl["id"])
                         if ok:
-                            st.session_state.pop('scan_results', None)
-                            st.session_state.pop('scan_results_summary', None)
-                            st.session_state.pop('ticker_data_cache', None)
+                            st.session_state['scan_results'] = []
+                            st.session_state['scan_results_summary'] = []
+                            st.session_state['scan_timestamp'] = ''
+                            st.session_state['ticker_data_cache'] = {}
                             st.toast(f"✅ {msg}")
                             st.rerun()
                 else:
