@@ -157,8 +157,13 @@ class JournalManager:
         self.scan_results_file = self.data_dir / "v2_last_scan.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
+        # Guard: if file was overwritten with non-list data (e.g. WatchlistManager dict)
+        if not isinstance(self.watchlist, list):
+            print(f"[journal] WARNING: watchlist file contained {type(self.watchlist).__name__}, resetting to []")
+            self.watchlist = []
+            self._save(self.watchlist_file, self.watchlist)
         # Clean corrupt entries (strings instead of dicts from old comma-paste bug)
-        if self.watchlist and any(not isinstance(w, dict) for w in self.watchlist):
+        elif self.watchlist and any(not isinstance(w, dict) for w in self.watchlist):
             self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]
             self._save(self.watchlist_file, self.watchlist)
         self.open_trades: List[Dict] = self._load(self.open_trades_file, [])
@@ -195,10 +200,10 @@ class JournalManager:
         item.ticker = ticker
         item.added_date = item.added_date or datetime.now().strftime('%Y-%m-%d')
 
-        if any(w['ticker'] == ticker for w in self.watchlist):
-            # Update existing
-            self.watchlist = [w if w['ticker'] != ticker else item.to_dict()
-                              for w in self.watchlist]
+        if any(isinstance(w, dict) and w.get('ticker') == ticker for w in self.watchlist):
+            # Update existing (skip non-dict entries)
+            self.watchlist = [(item.to_dict() if isinstance(w, dict) and w.get('ticker') == ticker else w)
+                              for w in self.watchlist if isinstance(w, dict)]
             self._save(self.watchlist_file, self.watchlist)
             return f"Updated {ticker} in watchlist"
 
@@ -209,7 +214,7 @@ class JournalManager:
     def remove_from_watchlist(self, ticker: str) -> str:
         ticker = ticker.upper().strip()
         before = len(self.watchlist)
-        self.watchlist = [w for w in self.watchlist if w['ticker'] != ticker]
+        self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and w.get('ticker') != ticker]
         if len(self.watchlist) < before:
             self._save(self.watchlist_file, self.watchlist)
             return f"Removed {ticker}"
@@ -219,7 +224,7 @@ class JournalManager:
         return self.watchlist
 
     def get_watchlist_tickers(self) -> List[str]:
-        return [w['ticker'] for w in self.watchlist]
+        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]
 
     def clear_watchlist(self) -> str:
         self.watchlist = []
@@ -228,7 +233,7 @@ class JournalManager:
 
     def set_watchlist_tickers(self, tickers: List[str]):
         """Bulk set watchlist from a list of ticker strings."""
-        existing = {w['ticker'] for w in self.watchlist}
+        existing = {w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w}
         for t in tickers:
             t = t.upper().strip()
             if t and t not in existing:
@@ -258,7 +263,7 @@ class JournalManager:
 
     def get_favorite_tickers(self) -> List[str]:
         """Get list of favorited tickers."""
-        return [w['ticker'] for w in self.watchlist if w.get('is_favorite', False)]
+        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and w.get('is_favorite', False)]
 
     def set_focus_label(self, ticker: str, label: str) -> str:
         """Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'.
@@ -813,7 +818,8 @@ class JournalManager:
         """
         result = {}
         for w in self.watchlist:
-            result[w['ticker']] = 'watchlist'
+            if isinstance(w, dict) and 'ticker' in w:
+                result[w['ticker']] = 'watchlist'
         for c in self.conditionals:
             if c.get('status') == 'PENDING':
                 result[c['ticker']] = 'conditional'
