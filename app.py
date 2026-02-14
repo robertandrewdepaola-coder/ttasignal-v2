@@ -731,6 +731,28 @@ def render_sidebar():
                                 st.session_state['show_wl_create'] = False
                                 st.session_state.pop('scan_results', None)
                                 st.session_state.pop('scan_results_summary', None)
+
+                                # Auto-fetch tickers for auto watchlists
+                                if actual_type == "auto" and source_type:
+                                    from scraping_bridge import ScrapingBridge
+                                    _scraper = st.session_state.get('scraping_bridge')
+                                    if not _scraper:
+                                        _scraper = ScrapingBridge()
+                                        st.session_state['scraping_bridge'] = _scraper
+                                    new_wl = _wm.get_watchlist(new_id)
+                                    if new_wl:
+                                        _wm.record_refresh_request(new_id)
+                                        success, msg, tickers = _scraper.fetch_tickers(new_wl)
+                                        if success and tickers:
+                                            _wm.update_tickers(new_id, tickers, backup_old=False)
+                                            _wm.record_refresh_success(new_id)
+                                            st.toast(f"✅ Created '{final_name}' with {len(tickers)} tickers")
+                                        else:
+                                            _wm.record_refresh_failure(new_id, msg)
+                                            st.toast(f"⚠️ Created '{final_name}' but fetch failed: {msg}")
+                                else:
+                                    st.toast(f"✅ Created '{final_name}'")
+
                                 st.rerun()
                         except ValueError as e:
                             st.error(str(e))
@@ -744,7 +766,22 @@ def render_sidebar():
     # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
     if active_wl.get("type") == "auto":
         from scraping_bridge import ScrapingBridge
+
+        # Show source info
+        src = active_wl.get("source", "")
+        if active_wl.get("source_type") == "etf_shortcut" and src:
+            st.sidebar.caption(f"Source: ETF `{src.upper()}`")
+
+        # Show last error if any
+        stats = active_wl.get("scraping_stats", {})
+        last_error = stats.get("last_error")
+        if last_error:
+            st.sidebar.warning(f"⚠️ Last fetch: {last_error[:100]}")
+
+        # Skip cooldown if last attempt failed (let user retry immediately)
         can_refresh, remaining = _wm.can_refresh_auto(active_wl["id"])
+        if last_error:
+            can_refresh = True  # Allow retry after failure
 
         if can_refresh:
             if st.sidebar.button("🔄 Refresh Tickers", key="sidebar_refresh_wl"):
@@ -754,12 +791,14 @@ def render_sidebar():
                     if not _bridge_scraper:
                         _bridge_scraper = ScrapingBridge()
                         st.session_state['scraping_bridge'] = _bridge_scraper
-                    success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
+                    with st.sidebar:
+                        with st.spinner("Fetching tickers from source..."):
+                            success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
                     if success and tickers:
                         ok, update_msg, cleaned = _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
                         if ok:
                             _wm.record_refresh_success(active_wl["id"])
-                            st.sidebar.success(f"✓ {update_msg}")
+                            st.sidebar.success(f"✅ {update_msg}")
                         else:
                             _wm.record_refresh_failure(active_wl["id"], update_msg)
                             st.sidebar.error(update_msg)
@@ -768,10 +807,10 @@ def render_sidebar():
                         st.sidebar.error(f"✗ {msg}")
                 except Exception as e:
                     _wm.record_refresh_failure(active_wl["id"], str(e))
-                    st.sidebar.error(f"Refresh failed: {str(e)[:100]}")
+                    st.sidebar.error(f"Fetch failed: {str(e)[:100]}")
                 st.rerun()
         else:
-            st.sidebar.caption(f"🔄 Refresh cooldown: {remaining}s")
+            st.sidebar.caption(f"⏳ Retry in {remaining}s")
 
         # Rollback option
         backup = active_wl.get("last_backup")
