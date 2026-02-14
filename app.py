@@ -288,19 +288,70 @@ if 'watchlist_bridge' not in st.session_state:
     _wm = WatchlistManager()
     st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, st.session_state['journal'])
 
-# Initialize scan results — restore from disk if available
-if 'scan_results' not in st.session_state:
-    jm_init = st.session_state['journal']
-    saved_scan = jm_init.load_scan_results()
-    if saved_scan and saved_scan.get('results'):
-        # Restore minimal scan summary for display (not full TickerAnalysis objects)
-        st.session_state['scan_results'] = []
-        st.session_state['scan_results_summary'] = saved_scan['results']
-        st.session_state['scan_timestamp'] = saved_scan.get('timestamp', '')
+# =============================================================================
+# PER-WATCHLIST SCAN CACHE — persist scan results per watchlist
+# =============================================================================
+import json as _json
+from pathlib import Path as _Path
+
+_SCAN_CACHE_FILE = _Path("v2_scan_cache.json")
+
+def _load_scan_cache_file() -> dict:
+    """Load the per-watchlist scan cache from disk."""
+    if _SCAN_CACHE_FILE.exists():
+        try:
+            with open(_SCAN_CACHE_FILE, 'r') as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_scan_cache_file(cache: dict):
+    """Save the per-watchlist scan cache to disk (atomic write)."""
+    tmp = str(_SCAN_CACHE_FILE) + ".tmp"
+    try:
+        with open(tmp, 'w') as f:
+            _json.dump(cache, f)
+        import os
+        os.replace(tmp, str(_SCAN_CACHE_FILE))
+    except Exception:
+        pass
+
+def save_scan_for_watchlist(wl_id: str):
+    """Save current session scan results to per-watchlist cache (session + disk)."""
+    scan_data = {
+        'results': st.session_state.get('scan_results_summary', []),
+        'timestamp': st.session_state.get('scan_timestamp', ''),
+    }
+    # Session state cache (instant switching)
+    st.session_state[f'_scan_cache_{wl_id}'] = scan_data
+    # Disk cache (survives restarts)
+    disk_cache = _load_scan_cache_file()
+    disk_cache[wl_id] = scan_data
+    _save_scan_cache_file(disk_cache)
+
+def load_scan_for_watchlist(wl_id: str):
+    """Load scan results for a watchlist into session state."""
+    # Try session state cache first (fast)
+    cached = st.session_state.get(f'_scan_cache_{wl_id}')
+    if not cached:
+        # Try disk cache (restart recovery)
+        disk_cache = _load_scan_cache_file()
+        cached = disk_cache.get(wl_id)
+
+    if cached and cached.get('results'):
+        st.session_state['scan_results'] = []  # No live TickerAnalysis objects
+        st.session_state['scan_results_summary'] = cached['results']
+        st.session_state['scan_timestamp'] = cached.get('timestamp', '')
     else:
         st.session_state['scan_results'] = []
         st.session_state['scan_results_summary'] = []
         st.session_state['scan_timestamp'] = ''
+
+# Initialize scan results — restore from per-watchlist disk cache
+if 'scan_results' not in st.session_state:
+    _active_wl_init = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+    load_scan_for_watchlist(_active_wl_init["id"])
 
 # Fetch sector rotation on startup if not already loaded (critical for sector colors)
 if 'sector_rotation' not in st.session_state:
@@ -681,10 +732,12 @@ def render_sidebar():
 
         selected_id = wl_id_map.get(selected)
         if selected_id and selected_id != active_wl["id"]:
+            # Save current watchlist's scan results before switching
+            save_scan_for_watchlist(active_wl["id"])
+            # Switch active watchlist
             _wm.set_active_watchlist(selected_id)
-            st.session_state['scan_results'] = []
-            st.session_state['scan_results_summary'] = []
-            st.session_state['scan_timestamp'] = ''
+            # Load target watchlist's scan results
+            load_scan_for_watchlist(selected_id)
             st.session_state['ticker_data_cache'] = {}
             st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1
             st.rerun()
@@ -730,6 +783,8 @@ def render_sidebar():
                                 source_type=source_type, source=source,
                             )
                             if new_id:
+                                # Save current watchlist's scan before switching
+                                save_scan_for_watchlist(active_wl["id"])
                                 _wm.set_active_watchlist(new_id)
                                 st.session_state['show_wl_create'] = False
                                 st.session_state['scan_results'] = []
@@ -822,6 +877,44 @@ def render_sidebar():
             if st.sidebar.button(f"↩️ Rollback ({len(backup['tickers'])} tickers)", key="sidebar_rollback_wl"):
                 _wm.rollback_tickers(active_wl["id"])
                 st.rerun()
+
+    # ── Manage Watchlist (rename, delete) ─────────────────────────────
+    if not active_wl.get("is_system"):
+        with st.sidebar.expander("⚙️ Manage Watchlist", expanded=False):
+            # Rename
+            new_name = st.text_input("Rename", value=active_wl["name"], key="wl_rename_input")
+            if new_name and new_name.strip() != active_wl["name"]:
+                if st.button("✏️ Rename", key="wl_rename_btn"):
+                    _wm.update_watchlist_metadata(active_wl["id"], name=new_name.strip())
+                    st.toast(f"✅ Renamed to '{new_name.strip()}'")
+                    st.rerun()
+
+            st.divider()
+
+            # Delete
+            st.caption(f"⚠️ Delete **{active_wl['name']}** permanently")
+            if st.button("🗑️ Delete This Watchlist", key="wl_delete_sidebar",
+                         type="secondary", use_container_width=True):
+                st.session_state['confirm_delete_wl'] = True
+                st.rerun()
+            if st.session_state.get('confirm_delete_wl'):
+                st.warning("Are you sure? This cannot be undone.")
+                d1, d2 = st.columns(2)
+                with d1:
+                    if st.button("Yes, Delete", key="wl_confirm_del", type="primary"):
+                        ok, msg = _wm.delete_watchlist(active_wl["id"])
+                        if ok:
+                            st.session_state['confirm_delete_wl'] = False
+                            st.session_state['scan_results'] = []
+                            st.session_state['scan_results_summary'] = []
+                            st.session_state['scan_timestamp'] = ''
+                            st.session_state['ticker_data_cache'] = {}
+                            st.toast(f"✅ {msg}")
+                            st.rerun()
+                with d2:
+                    if st.button("Cancel", key="wl_cancel_del"):
+                        st.session_state['confirm_delete_wl'] = False
+                        st.rerun()
 
     # ── Scan Controls ─────────────────────────────────────────────────
     watchlist_tickers = bridge.get_watchlist_tickers()
@@ -1146,6 +1239,10 @@ def _run_scan(mode='all'):
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
         st.session_state['scan_timestamp'] = datetime.now().isoformat()
+        # Save per-watchlist scan cache (for switching + restart)
+        _active_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+        if _active_wl_id:
+            save_scan_for_watchlist(_active_wl_id)
 
         # Check conditional alerts
         # Use all cached data (both old and new)
@@ -1360,25 +1457,14 @@ def render_scanner_table():
                     st.session_state['scan_results_summary'] = []
                     st.session_state['scan_timestamp'] = ''
                     st.session_state['ticker_data_cache'] = {}
+                    # Clear per-watchlist scan cache
+                    _clear_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+                    if _clear_wl_id:
+                        save_scan_for_watchlist(_clear_wl_id)
                     st.rerun()
             with wl_col3:
-                _active_wl = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
-                if not _active_wl.get("is_system"):
-                    st.caption(f"{len(watchlist_tickers)} saved | [{_active_wl['name']}]")
-                    if st.button("🗑️ Delete Watchlist", key="wl_delete_active",
-                                 help=f"Delete '{_active_wl['name']}' and switch to Master"):
-                        _wm = st.session_state['watchlist_bridge'].manager
-                        ok, msg = _wm.delete_watchlist(_active_wl["id"])
-                        if ok:
-                            st.session_state['scan_results'] = []
-                            st.session_state['scan_results_summary'] = []
-                            st.session_state['scan_timestamp'] = ''
-                            st.session_state['ticker_data_cache'] = {}
-                            st.toast(f"✅ {msg}")
-                            st.rerun()
-                else:
-                    st.caption(f"{len(watchlist_tickers)} saved"
-                               + (f" | ⭐ {len(favorite_tickers)} favorites" if favorite_tickers else ""))
+                st.caption(f"{len(watchlist_tickers)} saved"
+                           + (f" | ⭐ {len(favorite_tickers)}" if favorite_tickers else ""))
 
     # ══════════════════════════════════════════════════════════════════
     # SCAN RESULTS
