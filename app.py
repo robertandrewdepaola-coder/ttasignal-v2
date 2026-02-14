@@ -714,11 +714,16 @@ def render_sidebar():
             c1, c2 = st.columns(2)
             with c1:
                 if st.button("Create", type="primary", key="create_wl_submit", use_container_width=True):
-                    if wl_name and wl_name.strip():
+                    # Auto-fill name from ETF selection if left blank
+                    final_name = wl_name.strip() if wl_name and wl_name.strip() else ""
+                    if not final_name and wl_type == "Auto (ETF)" and choice:
+                        final_name = choice.split(" - ")[0].strip()  # e.g. "ARKK"
+                    
+                    if final_name:
                         try:
                             actual_type = "manual" if wl_type == "Manual" else "auto"
                             new_id = _wm.create_watchlist(
-                                name=wl_name.strip(), wl_type=actual_type,
+                                name=final_name, wl_type=actual_type,
                                 source_type=source_type, source=source,
                             )
                             if new_id:
