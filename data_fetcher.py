@@ -20,6 +20,8 @@ import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any, List
 import time
+import re
+import requests as _requests_lib
 
 from signal_engine import (
     DAILY_PERIOD, WEEKLY_PERIOD, MONTHLY_PERIOD,
@@ -585,6 +587,186 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
     return rotation
 
 
+# =============================================================================
+# ALTERNATIVE EARNINGS DATE SOURCES
+# =============================================================================
+
+_ALT_EARNINGS_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "application/json, text/html, */*",
+}
+
+
+def _fetch_earnings_nasdaq(ticker: str, today=None):
+    """
+    Strategy 4: Nasdaq API — independent source from Yahoo.
+
+    Endpoint: https://api.nasdaq.com/api/company/{ticker}/earnings-date
+    Returns JSON with earnings announcement dates.
+    """
+    if today is None:
+        today = datetime.now().date()
+    try:
+        url = f"https://api.nasdaq.com/api/company/{ticker}/earnings-date"
+        headers = {
+            **_ALT_EARNINGS_HEADERS,
+            "Accept": "application/json",
+        }
+        resp = _requests_lib.get(url, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        # Nasdaq returns data.data.earningsDate or data.data.announceDate
+        inner = data.get("data", {})
+        if not inner:
+            return None
+
+        # Try multiple Nasdaq response formats
+        date_str = None
+        for key in ("earningsDate", "dateReported", "announceDate"):
+            val = inner.get(key)
+            if val and isinstance(val, str) and len(val) >= 8:
+                date_str = val
+                break
+
+        # Also check nested announcement structure
+        if not date_str:
+            announcements = inner.get("announcements") or inner.get("rows") or []
+            if isinstance(announcements, list) and announcements:
+                first = announcements[0]
+                if isinstance(first, dict):
+                    for key in ("dateReported", "epsSurpriseDateReported", "date"):
+                        val = first.get(key)
+                        if val and isinstance(val, str) and len(val) >= 8:
+                            date_str = val
+                            break
+
+        if date_str:
+            # Parse various date formats
+            for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
+                try:
+                    earn_dt = datetime.strptime(date_str.strip(), fmt).date()
+                    if (earn_dt - today).days >= -7:
+                        return earn_dt
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_earnings_yahoo_html(ticker: str, today=None):
+    """
+    Strategy 5: Direct Yahoo Finance earnings calendar page scrape.
+
+    Uses the calendar endpoint which is a DIFFERENT data path than what
+    yfinance's library uses (quoteSummary API). Sometimes has data when the API doesn't.
+
+    URL: https://finance.yahoo.com/calendar/earnings?symbol={ticker}
+    """
+    if today is None:
+        today = datetime.now().date()
+    try:
+        url = f"https://finance.yahoo.com/calendar/earnings?symbol={ticker}"
+        resp = _requests_lib.get(url, headers=_ALT_EARNINGS_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return None
+
+        html = resp.text
+
+        # Look for date patterns near the ticker
+        # Yahoo's calendar page has dates in format "Feb 06, 2026" or "2026-02-06"
+        date_patterns = [
+            r'(\w{3}\s+\d{1,2},\s*\d{4})',       # "Feb 06, 2026"
+            r'(\d{4}-\d{2}-\d{2})',                 # "2026-02-06"
+            r'(\d{1,2}/\d{1,2}/\d{4})',             # "02/06/2026"
+        ]
+        date_fmts = [
+            "%b %d, %Y",
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+        ]
+
+        candidates = []
+        for pattern, fmt in zip(date_patterns, date_fmts):
+            for match in re.finditer(pattern, html):
+                try:
+                    d = datetime.strptime(match.group(1).strip(), fmt).date()
+                    if (d - today).days >= -7:
+                        candidates.append(d)
+                except ValueError:
+                    continue
+
+        if candidates:
+            # Return the nearest future date
+            future = [d for d in candidates if d >= today]
+            if future:
+                return min(future)
+            # If no future dates, return most recent past (within 7 days)
+            return max(candidates)
+
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_earnings_stockanalysis(ticker: str, today=None):
+    """
+    Strategy 6: stockanalysis.com — fully independent from Yahoo.
+
+    Scrapes the forecast page for next earnings date.
+    """
+    if today is None:
+        today = datetime.now().date()
+    try:
+        url = f"https://stockanalysis.com/stocks/{ticker.lower()}/forecast/"
+        resp = _requests_lib.get(url, headers=_ALT_EARNINGS_HEADERS, timeout=8)
+        if resp.status_code != 200:
+            return None
+
+        html = resp.text
+
+        # Look for "Next Earnings Date" or "Earnings Date" + date pattern
+        # stockanalysis uses format like "Feb 6, 2026" or "February 6, 2026"
+        patterns = [
+            r'(?:next\s+)?earnings\s+(?:date|report)[^"]*?(\w+\s+\d{1,2},\s*\d{4})',
+            r'(?:reports?\s+earnings?)[^"]*?(\w+\s+\d{1,2},\s*\d{4})',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                date_str = m.group(1).strip()
+                for fmt in ("%B %d, %Y", "%b %d, %Y"):
+                    try:
+                        d = datetime.strptime(date_str, fmt).date()
+                        if (d - today).days >= -7:
+                            return d
+                    except ValueError:
+                        continue
+
+        # Fallback: any date near "earnings" text
+        earnings_section = re.search(r'earnings.{0,500}', html, re.IGNORECASE)
+        if earnings_section:
+            snippet = earnings_section.group(0)
+            for fmt_pattern, fmt in [
+                (r'(\w{3,9}\s+\d{1,2},\s*\d{4})', "%B %d, %Y"),
+                (r'(\d{4}-\d{2}-\d{2})', "%Y-%m-%d"),
+            ]:
+                m = re.search(fmt_pattern, snippet)
+                if m:
+                    try:
+                        d = datetime.strptime(m.group(1).strip(), fmt).date()
+                        if (d - today).days >= -7:
+                            return d
+                    except ValueError:
+                        pass
+
+    except Exception:
+        pass
+    return None
+
+
 def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str, Dict]:
     """
     Check earnings dates for a batch of tickers using parallel threading.
@@ -594,6 +776,7 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
     Uses ThreadPoolExecutor with 5 workers to balance speed vs rate-limiting.
     Three strategies per ticker: info dict → calendar → earnings_dates.
+    Caches negative results to avoid re-querying known failures.
     """
     cache_key = "BATCH_EARNINGS_FLAGS"
     cached = _cache.get(cache_key)
@@ -601,6 +784,23 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
         return cached
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import logging
+
+    # Suppress yfinance's noisy "No earnings dates found" warnings
+    _yf_logger = logging.getLogger('yfinance')
+    _yf_prev_level = _yf_logger.level
+    _yf_logger.setLevel(logging.CRITICAL)
+
+    # Per-session negative cache — tickers we already know have no earnings data
+    if not hasattr(fetch_batch_earnings_flags, '_no_data_cache'):
+        fetch_batch_earnings_flags._no_data_cache = set()
+    no_data = fetch_batch_earnings_flags._no_data_cache
+
+    # Skip tickers already known to have no data
+    tickers_to_fetch = [t for t in tickers if t not in no_data]
+    skipped = len(tickers) - len(tickers_to_fetch)
+    if skipped > 0:
+        print(f"[earnings] Skipping {skipped} tickers with no earnings data (cached)")
 
     today = datetime.now().date()
 
@@ -693,15 +893,61 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                         'days_until': days_until,
                         'within_window': 0 <= days_until <= days_ahead,
                     })
+
+            # All 3 yfinance strategies failed — mark for alt-source pass
+            no_data.add(ticker)
         except Exception:
             pass
         return (ticker, None)
 
-    # Run in parallel — 3 workers (reduced to avoid rate limiting), 8s per ticker
+    def _fetch_one_alt_sources(ticker: str):
+        """Fetch earnings from alternative non-Yahoo sources (Strategies 4-6)."""
+        earn_dt = None
+
+        # Strategy 4: Nasdaq API (completely independent from Yahoo)
+        try:
+            earn_dt = _fetch_earnings_nasdaq(ticker, today)
+            if earn_dt:
+                print(f"[earnings] {ticker}: found via Nasdaq API")
+        except Exception:
+            pass
+
+        # Strategy 5: Yahoo earnings calendar HTML (different path than yfinance API)
+        if earn_dt is None:
+            try:
+                earn_dt = _fetch_earnings_yahoo_html(ticker, today)
+                if earn_dt:
+                    print(f"[earnings] {ticker}: found via Yahoo calendar HTML")
+            except Exception:
+                pass
+
+        # Strategy 6: stockanalysis.com (fully independent)
+        if earn_dt is None:
+            try:
+                earn_dt = _fetch_earnings_stockanalysis(ticker, today)
+                if earn_dt:
+                    print(f"[earnings] {ticker}: found via stockanalysis.com")
+            except Exception:
+                pass
+
+        if earn_dt is not None:
+            days_until = (earn_dt - today).days
+            if days_until >= -7:
+                # Found via alt source — remove from negative cache
+                no_data.discard(ticker)
+                return (ticker, {
+                    'next_earnings': earn_dt.strftime('%Y-%m-%d'),
+                    'days_until': days_until,
+                    'within_window': 0 <= days_until <= days_ahead,
+                })
+
+        return (ticker, None)
+
+    # ── Pass 1: yfinance (parallel, Strategies 1-3) ──────────────────
     flags = {}
     try:
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {executor.submit(_fetch_one_earnings, t): t for t in tickers}
+            futures = {executor.submit(_fetch_one_earnings, t): t for t in tickers_to_fetch}
             for future in as_completed(futures, timeout=90):
                 try:
                     ticker, result = future.result(timeout=8)
@@ -713,10 +959,9 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
         print(f"[data_fetcher] Batch earnings error: {e}")
 
     # If batch got very few results (possible rate-limiting), retry missing ones sequentially
-    if len(flags) < len(tickers) * 0.3 and len(tickers) > 1:
-        import time
+    if len(flags) < len(tickers_to_fetch) * 0.3 and len(tickers_to_fetch) > 1:
         time.sleep(2)  # Back off before retry
-        missing = [t for t in tickers if t not in flags]
+        missing = [t for t in tickers_to_fetch if t not in flags]
         for t in missing[:10]:  # Cap at 10 retries
             try:
                 _, result = _fetch_one_earnings(t)
@@ -725,6 +970,27 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                 time.sleep(0.5)  # Stagger
             except Exception:
                 pass
+
+    # ── Pass 2: Alternative sources for yfinance failures (sequential) ──
+    yf_failures = [t for t in tickers_to_fetch if t not in flags]
+    if yf_failures:
+        print(f"[earnings] Pass 2: trying {len(yf_failures)} tickers via alternative sources")
+        for t in yf_failures[:15]:  # Cap to avoid slowdown
+            try:
+                _, result = _fetch_one_alt_sources(t)
+                if result:
+                    flags[t] = result
+                time.sleep(0.3)  # Be polite to alt sources
+            except Exception:
+                pass
+
+        # Report final status
+        still_missing = [t for t in yf_failures if t not in flags]
+        if still_missing:
+            print(f"[earnings] No data from any source for: {', '.join(still_missing[:10])}")
+
+    # Restore yfinance logger level
+    _yf_logger.setLevel(_yf_prev_level)
 
     # Only cache if we got meaningful results (don't cache empty on failure)
     if flags:
@@ -1401,6 +1667,43 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                         break
                     except Exception:
                         continue
+        except Exception:
+            pass
+
+    # ── METHOD 5: Alternative non-Yahoo sources ───────────────
+    if not result['next_earnings']:
+        # Try Nasdaq API
+        try:
+            earn_dt = _fetch_earnings_nasdaq(ticker, today)
+            if earn_dt:
+                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (earn_dt - today).days)
+                result['confidence'] = 'MEDIUM'
+                result['source'] = 'Nasdaq API'
+        except Exception:
+            pass
+
+    if not result['next_earnings']:
+        # Try Yahoo earnings calendar HTML (different endpoint)
+        try:
+            earn_dt = _fetch_earnings_yahoo_html(ticker, today)
+            if earn_dt:
+                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (earn_dt - today).days)
+                result['confidence'] = 'MEDIUM'
+                result['source'] = 'Yahoo Calendar HTML'
+        except Exception:
+            pass
+
+    if not result['next_earnings']:
+        # Try stockanalysis.com (fully independent)
+        try:
+            earn_dt = _fetch_earnings_stockanalysis(ticker, today)
+            if earn_dt:
+                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (earn_dt - today).days)
+                result['confidence'] = 'MEDIUM'
+                result['source'] = 'stockanalysis.com'
         except Exception:
             pass
     
