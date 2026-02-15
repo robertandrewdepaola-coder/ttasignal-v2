@@ -185,6 +185,12 @@ class JournalManager:
         try:
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2, default=str)
+            # Queue for GitHub backup
+            try:
+                import github_backup
+                github_backup.mark_dirty(path.name)
+            except ImportError:
+                pass
         except Exception as e:
             print(f"[journal] Error saving {path}: {e}")
 
