@@ -260,10 +260,13 @@ def _get_ai_clients() -> Dict:
     # ── Gemini fallback ───────────────────────────────────────────────
     try:
         import warnings
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=FutureWarning,
-                                     module="google.generativeai")
-            import google.generativeai as genai
+        # Suppress the deprecation warning from google-generativeai package
+        # TODO: Migrate to google.genai when ready (google-generativeai is deprecated)
+        warnings.filterwarnings("ignore", category=FutureWarning,
+                                 module="google.*")
+        warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                 module="google.*")
+        import google.generativeai as genai
         gkey = st.secrets.get("GEMINI_API_KEY", "")
         if gkey:
             genai.configure(api_key=gkey)
@@ -499,7 +502,7 @@ def _render_morning_briefing():
             st.caption("Click refresh to generate sector rotation analysis")
 
         # Refresh button
-        if st.button("🔄 Refresh Analysis", use_container_width=True,
+        if st.button("🔄 Refresh Analysis", width="stretch",
                      key="refresh_deep_analysis"):
             _run_deep_analysis()
 
@@ -645,10 +648,10 @@ def _render_factual_market_brief():
                     st.caption(f"{br_ic} **Breadth**: {br_regime} (RSP-SPY: {br_spread:+.1f}%)")
 
         # Refresh button
-        if st.sidebar.button("🔄 Refresh Brief", use_container_width=True, key="refresh_brief"):
+        if st.sidebar.button("🔄 Refresh Brief", width="stretch", key="refresh_brief"):
             _run_factual_brief()
     else:
-        if st.sidebar.button("📊 Generate Market Brief", use_container_width=True, key="gen_brief"):
+        if st.sidebar.button("📊 Generate Market Brief", width="stretch", key="gen_brief"):
             _run_factual_brief()
 
 
@@ -769,7 +772,7 @@ def render_sidebar():
 
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("Create", type="primary", key="create_wl_submit", use_container_width=True):
+                if st.button("Create", type="primary", key="create_wl_submit", width="stretch"):
                     # Auto-fill name from ETF selection if left blank
                     final_name = wl_name.strip() if wl_name and wl_name.strip() else ""
                     if not final_name and wl_type == "Auto (ETF)" and choice:
@@ -818,7 +821,7 @@ def render_sidebar():
                     else:
                         st.error("Enter a name")
             with c2:
-                if st.button("Cancel", key="create_wl_cancel", use_container_width=True):
+                if st.button("Cancel", key="create_wl_cancel", width="stretch"):
                     st.session_state['show_wl_create'] = False
                     st.rerun()
 
@@ -971,7 +974,7 @@ def render_sidebar():
             # Delete
             st.caption(f"⚠️ Delete **{active_wl['name']}** permanently")
             if st.button("🗑️ Delete This Watchlist", key="wl_delete_sidebar",
-                         type="secondary", use_container_width=True):
+                         type="secondary", width="stretch"):
                 st.session_state['confirm_delete_wl'] = True
                 st.rerun()
             if st.session_state.get('confirm_delete_wl'):
@@ -1006,12 +1009,12 @@ def render_sidebar():
 
     scan_col1, scan_col2 = st.sidebar.columns(2)
     with scan_col1:
-        if st.button("🔍 Scan All", use_container_width=True, type="primary",
+        if st.button("🔍 Scan All", width="stretch", type="primary",
                      disabled=(ticker_count == 0)):
             _run_scan(mode='all')
     with scan_col2:
         btn_label = f"⚡ New ({new_count})" if new_count > 0 else "⚡ New"
-        if st.button(btn_label, use_container_width=True,
+        if st.button(btn_label, width="stretch",
                      disabled=(new_count == 0)):
             _run_scan(mode='new_only')
 
@@ -1046,7 +1049,7 @@ def render_sidebar():
             if st.sidebar.button(
                 f"{icon} {ticker}  ${current:.2f}  ({pnl_pct:+.1f}%)",
                 key=f"sidebar_pos_{ticker}",
-                use_container_width=True,
+                width="stretch",
             ):
                 _load_ticker_for_view(ticker)
 
@@ -1390,7 +1393,7 @@ def render_scanner_table():
             new_ticker = st.text_input("Add ticker", placeholder="e.g. AAPL",
                                        key="wl_add_input", label_visibility="collapsed")
         with qa2:
-            if st.button("➕ Add", key="wl_add_btn", use_container_width=True):
+            if st.button("➕ Add", key="wl_add_btn", width="stretch"):
                 if new_ticker:
                     import re as _re
                     ticker_clean = new_ticker.strip().upper()
@@ -1491,7 +1494,7 @@ def render_scanner_table():
 
             wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
             with wl_col1:
-                if st.button("💾 Save", use_container_width=True, type="primary",
+                if st.button("💾 Save", width="stretch", type="primary",
                              key="wl_save"):
                     import re
                     raw = re.split(r'[,\s\n\t]+', new_text)
@@ -1527,7 +1530,7 @@ def render_scanner_table():
                     st.success(msg)
                     st.rerun()
             with wl_col2:
-                if st.button("🗑️ Clear All", use_container_width=True, key="wl_clear"):
+                if st.button("🗑️ Clear All", width="stretch", key="wl_clear"):
                     bridge.clear_watchlist()
                     st.session_state['wl_version'] += 1
                     st.session_state['scan_results'] = []
@@ -1819,7 +1822,7 @@ def render_scanner_table():
                 ticker_label = f"{ticker_label} ⚡"
 
             if st.button(ticker_label, key=f"row_{row['Ticker']}_{global_idx}",
-                        use_container_width=True):
+                        width="stretch"):
                 st.session_state['default_detail_tab'] = 0  # Signal tab
                 st.session_state['scroll_to_detail'] = True
                 _load_ticker_for_view(row['Ticker'])
@@ -1926,7 +1929,7 @@ def render_scanner_table():
         quick_ticker = st.text_input("Quick add ticker", placeholder="Type ticker and press Enter",
                                       key="quick_add_main", label_visibility="collapsed")
     with qa_col2:
-        if st.button("➕ Add & Scan", use_container_width=True):
+        if st.button("➕ Add & Scan", width="stretch"):
             if quick_ticker:
                 ticker_clean = quick_ticker.strip().upper()
                 wl = bridge.get_watchlist_tickers()
@@ -2474,7 +2477,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
                 })
             st.dataframe(
                 pd.DataFrame(history_data),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2558,7 +2561,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
     elif keys_available:
         # Show prominent run button — don't auto-fire (saves ~10 API calls per ticker switch)
         st.info("🤖 **AI analysis ready.** Click below to fetch fundamentals, market intel & AI recommendation.")
-        if st.button("▶️ Run AI Analysis", type="primary", use_container_width=True):
+        if st.button("▶️ Run AI Analysis", type="primary", width="stretch"):
             should_run = True
     else:
         # No providers + no cached results — show manual button (to fetch data at least)
@@ -4540,7 +4543,7 @@ Q: "Why PASS when analysts say $23?"
         if not history:
             # Show run button — don't auto-fire (saves ~15 API calls per ticker switch)
             st.info("💬 **AI Research Analyst ready.** Click below to fetch research data & generate analysis.")
-            if st.button("▶️ Run Research Analysis", type="primary", use_container_width=True,
+            if st.button("▶️ Run Research Analysis", type="primary", width="stretch",
                          key=f"chat_run_{ticker}"):
                 pass  # Fall through to run the analysis below
             else:
@@ -4882,7 +4885,7 @@ def _render_capital_overview(jm: JournalManager):
     if table_rows:
         st.dataframe(
             pd.DataFrame(table_rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -5475,11 +5478,11 @@ def render_position_manager():
     an_col1, an_col2, an_col3 = st.columns([1, 1, 2])
 
     with an_col1:
-        if st.button("🤖 Analyze All Positions", type="primary", use_container_width=True):
+        if st.button("🤖 Analyze All Positions", type="primary", width="stretch"):
             _run_exit_analysis(open_trades)
 
     with an_col2:
-        if st.button("📧 Analyze + Email Report", use_container_width=True):
+        if st.button("📧 Analyze + Email Report", width="stretch"):
             _run_exit_analysis(open_trades, send_email=True)
 
     with an_col3:
@@ -5607,7 +5610,7 @@ def _render_alerts_panel():
 
         col1, col2, col3, col4 = st.columns([2, 1.5, 1.5, 0.5])
         with col1:
-            if st.button(f"📊 {ticker}", key=f"alert_view_{ticker}", use_container_width=True):
+            if st.button(f"📊 {ticker}", key=f"alert_view_{ticker}", width="stretch"):
                 _load_ticker_for_view(ticker)
         with col2:
             st.caption(f"Trigger: **${trigger:.2f}**")
