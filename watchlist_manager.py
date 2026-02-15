@@ -135,6 +135,12 @@ class WatchlistManager:
             with open(temp_path, "w") as f:
                 json.dump(self.data, f, indent=2)
             os.replace(temp_path, self.json_path)
+            # Queue for GitHub backup
+            try:
+                import github_backup
+                github_backup.mark_dirty(os.path.basename(self.json_path))
+            except ImportError:
+                pass
         except Exception as e:
             if os.path.exists(temp_path):
                 try:
