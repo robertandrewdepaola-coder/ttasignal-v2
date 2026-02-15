@@ -282,6 +282,19 @@ def _get_ai_clients() -> Dict:
     st.session_state['_ai_clients_cache'] = result
     return result
 
+# ── Restore data files from GitHub backup (before any data managers load) ──
+if '_github_backup_restored' not in st.session_state:
+    try:
+        import github_backup
+        restored = github_backup.restore_all()
+        if restored:
+            files_restored = [k for k, v in restored.items() if v]
+            if files_restored:
+                print(f"[startup] Restored from GitHub: {', '.join(files_restored)}")
+    except Exception as e:
+        print(f"[startup] GitHub restore skipped: {e}")
+    st.session_state['_github_backup_restored'] = True
+
 # Initialize journal
 if 'journal' not in st.session_state:
     st.session_state['journal'] = JournalManager(data_dir=".")
@@ -317,6 +330,12 @@ def _save_scan_cache_file(cache: dict):
             _json.dump(cache, f)
         import os
         os.replace(tmp, str(_SCAN_CACHE_FILE))
+        # Queue for GitHub backup
+        try:
+            import github_backup
+            github_backup.mark_dirty(_SCAN_CACHE_FILE.name)
+        except ImportError:
+            pass
     except Exception:
         pass
 
@@ -5625,3 +5644,9 @@ def _render_alerts_panel():
 
 if __name__ == "__main__":
     main()
+    # Flush any queued GitHub backups (debounced — won't push on every rerun)
+    try:
+        import github_backup
+        github_backup.flush()
+    except Exception:
+        pass
