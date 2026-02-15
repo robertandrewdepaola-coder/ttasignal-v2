@@ -22,6 +22,16 @@ from typing import Dict, Optional, Any, List
 import time
 import re
 import requests as _requests_lib
+import logging
+
+# ── Suppress noisy yfinance logging globally ────────────────────────────────
+# yfinance emits ERROR-level messages for perfectly normal situations:
+# - "No earnings dates found, symbol may be delisted" (ETFs, foreign tickers)
+# - "HTTP Error 404: No fundamentals data found" (ETFs don't have fundamentals)
+# - "$TICKER: possibly delisted" (foreign tickers without .PA/.AS suffix)
+# These flood production logs with hundreds of false alarms per scan.
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+logging.getLogger('peewee').setLevel(logging.WARNING)
 
 from signal_engine import (
     DAILY_PERIOD, WEEKLY_PERIOD, MONTHLY_PERIOD,
@@ -457,6 +467,34 @@ SECTOR_SHORT = {
     'Basic Materials': 'Mater',
 }
 
+# ── ETFs/ETPs to SKIP for earnings lookups ──────────────────────────────────
+# ETFs don't have earnings dates. Querying them wastes API calls and floods
+# logs with "No fundamentals data found" / "No earnings dates found" spam.
+# This set covers: sector SPDRs, thematic ETFs, commodity ETPs, volatility
+# products, country/region ETFs, and ARK ETFs.
+SKIP_EARNINGS_TICKERS = frozenset({
+    # ── Sector SPDRs ──
+    'XLB', 'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLV', 'XLY',
+    # ── Thematic / Industry ETFs ──
+    'SOXX', 'SMH', 'IGV', 'HACK', 'FINX', 'XBI', 'IBB', 'IHI',
+    'XRT', 'RTH', 'XHB', 'XOP', 'OIH', 'XAR', 'ITA', 'IAI',
+    'KRE', 'KBE', 'TAN', 'ICLN', 'LIT', 'COPX', 'PAVE',
+    'MORT', 'VDC', 'AMLP',
+    # ── Commodity / Precious Metal ETPs ──
+    'GLD', 'SLV', 'GDX', 'GDXJ', 'USO', 'UNG', 'DBC',
+    # ── Volatility Products ──
+    'VXX', 'UVXY', 'SVXY', 'VIXY',
+    # ── Country / Region ETFs ──
+    'FXI', 'EEM', 'EWJ', 'VGK', 'EWZ', 'EWY', 'EWT', 'INDA',
+    # ── Real Estate ETFs ──
+    'VNQ', 'IYR',
+    # ── ARK ETFs ──
+    'ARKK', 'ARKW', 'ARKG', 'ARKQ', 'ARKF', 'ARKX', 'ARKB', 'PRNT', 'IZRL',
+    # ── Broad Market / Bond ETFs ──
+    'SPY', 'QQQ', 'IWM', 'DIA', 'VOO', 'VTI', 'TLT', 'HYG', 'LQD', 'AGG',
+    'BND', 'IEMG', 'EFA', 'ACWI', 'VEA', 'VWO',
+})
+
 
 def fetch_sector_rotation() -> Dict[str, Dict]:
     """
@@ -784,23 +822,20 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
         return cached
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    import logging
-
-    # Suppress yfinance's noisy "No earnings dates found" warnings
-    _yf_logger = logging.getLogger('yfinance')
-    _yf_prev_level = _yf_logger.level
-    _yf_logger.setLevel(logging.CRITICAL)
 
     # Per-session negative cache — tickers we already know have no earnings data
     if not hasattr(fetch_batch_earnings_flags, '_no_data_cache'):
         fetch_batch_earnings_flags._no_data_cache = set()
     no_data = fetch_batch_earnings_flags._no_data_cache
 
-    # Skip tickers already known to have no data
-    tickers_to_fetch = [t for t in tickers if t not in no_data]
-    skipped = len(tickers) - len(tickers_to_fetch)
-    if skipped > 0:
-        print(f"[earnings] Skipping {skipped} tickers with no earnings data (cached)")
+    # Skip ETFs (they don't have earnings) and previously-failed tickers
+    tickers_to_fetch = [t for t in tickers if t not in no_data and t not in SKIP_EARNINGS_TICKERS]
+    skipped_etfs = sum(1 for t in tickers if t in SKIP_EARNINGS_TICKERS)
+    skipped_cached = sum(1 for t in tickers if t in no_data and t not in SKIP_EARNINGS_TICKERS)
+    if skipped_etfs > 0:
+        print(f"[earnings] Skipping {skipped_etfs} ETFs (no earnings dates for funds)")
+    if skipped_cached > 0:
+        print(f"[earnings] Skipping {skipped_cached} tickers with no earnings data (cached)")
 
     today = datetime.now().date()
 
@@ -988,9 +1023,6 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
         still_missing = [t for t in yf_failures if t not in flags]
         if still_missing:
             print(f"[earnings] No data from any source for: {', '.join(still_missing[:10])}")
-
-    # Restore yfinance logger level
-    _yf_logger.setLevel(_yf_prev_level)
 
     # Only cache if we got meaningful results (don't cache empty on failure)
     if flags:
@@ -1505,6 +1537,12 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
         'source': None,
         'error': None,
     }
+
+    # ETFs don't have earnings — return empty immediately
+    if ticker in SKIP_EARNINGS_TICKERS:
+        result['error'] = 'ETF/ETP — no earnings dates'
+        _cache.set(cache_key, result)
+        return result
     
     today = datetime.now().date()
     
