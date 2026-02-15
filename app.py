@@ -1566,6 +1566,59 @@ def render_scanner_table():
                            + (f" | ⭐ {len(favorite_tickers)}" if favorite_tickers else ""))
 
     # ══════════════════════════════════════════════════════════════════
+    # WATCHLIST NOTES (collapsible accordion)
+    # ══════════════════════════════════════════════════════════════════
+    _active_wl = bridge.manager.get_active_watchlist()
+    _active_wl_id = _active_wl.get("id", "")
+    _existing_notes = _active_wl.get("notes", "")
+    _notes_edit_key = f"_notes_editing_{_active_wl_id}"
+    _is_editing = st.session_state.get(_notes_edit_key, False)
+
+    # Only show if notes exist OR user is editing
+    _has_notes = bool(_existing_notes and _existing_notes.strip())
+
+    # Build label
+    if _has_notes:
+        # Show preview of first line (truncated)
+        _first_line = _existing_notes.strip().split('\n')[0][:60]
+        _notes_label = f"📝 Notes — {_first_line}{'…' if len(_first_line) >= 60 else ''}"
+    else:
+        _notes_label = "📝 Notes — click to add"
+
+    with st.expander(_notes_label, expanded=_is_editing):
+        if _is_editing:
+            # ── Edit mode ──
+            _edited = st.text_area(
+                "Watchlist notes (Markdown supported)",
+                value=_existing_notes,
+                height=250,
+                key=f"notes_textarea_{_active_wl_id}",
+                placeholder="Add notes, rationales, strategy context...\n\n"
+                            "Supports **bold**, *italic*, - bullet lists, 1. numbered lists",
+                label_visibility="collapsed",
+            )
+            _nc1, _nc2, _nc3 = st.columns([1, 1, 3])
+            with _nc1:
+                if st.button("💾 Save", key="notes_save", type="primary", width="stretch"):
+                    bridge.manager.update_watchlist_metadata(_active_wl_id, notes=_edited)
+                    st.session_state[_notes_edit_key] = False
+                    st.toast("Notes saved ✓")
+                    st.rerun()
+            with _nc2:
+                if st.button("Cancel", key="notes_cancel", width="stretch"):
+                    st.session_state[_notes_edit_key] = False
+                    st.rerun()
+        else:
+            # ── View mode ──
+            if _has_notes:
+                st.markdown(_existing_notes)
+            else:
+                st.caption("No notes yet.")
+            if st.button("✏️ Edit Notes", key="notes_edit_btn"):
+                st.session_state[_notes_edit_key] = True
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════
     # SCAN RESULTS
     # ══════════════════════════════════════════════════════════════════
 
