@@ -59,6 +59,18 @@ FALSE_POSITIVES = frozenset({
 # Foreign exchange suffixes to reject
 FOREIGN_SUFFIXES = frozenset({"F", "TO", "L", "SW", "V", "O", "DE", "PA", "AS", "HK"})
 
+# Foreign tickers that appear in ARK CSVs WITHOUT exchange suffixes.
+# These are European-listed stocks that yfinance US can't resolve,
+# generating "possibly delisted" and "Quote not found" 404 errors.
+# They need a suffix like .AS (Amsterdam), .PA (Paris) but ARK uses bare symbols.
+# Only includes tickers confirmed NOT to have a US listing.
+FOREIGN_BARE_TICKERS = frozenset({
+    "ADYEN",  # Adyen NV — Euronext Amsterdam only (no US ADR)
+    "ALDP",   # Ahold Delhaize — Euronext Amsterdam only (no US ADR)
+    "HO",     # Thales Group — Euronext Paris only (no US ADR)
+    "DSY",    # Dassault Systèmes — Euronext Paris only (no US ADR)
+})
+
 # Valid US class-share suffixes
 VALID_CLASS_SHARES = frozenset({"A", "B", "C", "D"})
 
@@ -392,6 +404,10 @@ class ScrapingBridge:
     def _validate_us_ticker(self, ticker: str) -> bool:
         """Validate a US market ticker symbol."""
         if not ticker or ticker in FALSE_POSITIVES:
+            return False
+
+        # Reject known foreign tickers that appear without exchange suffixes
+        if ticker in FOREIGN_BARE_TICKERS:
             return False
 
         if not re.match(r'^[A-Z]{1,5}(\.[A-Z])?$', ticker):
