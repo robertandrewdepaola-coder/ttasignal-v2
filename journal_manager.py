@@ -1,1 +1,885 @@
-"""\nTTA v2 Journal Manager — Trade Lifecycle Management\n=====================================================\n\nHandles: watchlist persistence, trade entry/exit, position tracking,\nP&L calculation, and exit categorization.\n\nNO yfinance calls. NO UI code. Pure data + business logic.\nPrice updates come from data_fetcher via the UI layer.\n\nPersistence: JSON files (upgradeable to SQLite later).\n\nVersion: 2.2.0 (2026-02-16) - Phase 2: File locking, Decimal precision, timezones\n"""\n\nimport json\nimport uuid\nimport sys\nimport time\nfrom pathlib import Path\nfrom datetime import datetime, timezone\nfrom decimal import Decimal, ROUND_HALF_UP\nfrom typing import Dict, List, Optional, Any, Union\nfrom dataclasses import dataclass, field, asdict\nimport pandas as pd\nimport shutil\n\n# Cross-platform file locking\ntry:\n    if sys.platform == 'win32':\n        import msvcrt\n    else:\n        import fcntl\n    FILE_LOCKING_AVAILABLE = True\nexcept ImportError:\n    FILE_LOCKING_AVAILABLE = False\n    print(\"[journal] WARNING: File locking not available on this platform\")\n\n\n# =============================================================================\n# CONSTANTS\n# =============================================================================\n\nDEFAULT_DATA_DIR = \".\"\nMAX_WATCHLIST_SIZE = 500  # Prevent unbounded growth\nFILE_LOCK_TIMEOUT = 5.0   # Seconds to wait for file lock\n\nEXIT_REASONS = [\n    'stop_loss',        # Hit initial or trailing stop\n    'target_hit',       # Hit profit target\n    'weekly_cross',     # Weekly MACD crossed bearish\n    'time_exit',        # Held too long without progress\n    'manual',           # Trader decided to exit\n    'batch_close',      # Closed all positions\n]\n\nSIGNAL_TYPES = ['PRIMARY', 'AO_CONFIRMATION', 'RE_ENTRY', 'LATE_ENTRY']\n\nCONDITION_TYPES = [\n    'breakout_above',   # Buy when price breaks above level on volume\n    'pullback_to',      # Buy when price pulls back to level\n    'breakout_volume',  # Breakout + volume confirmation\n]\n\n\n# =============================================================================\n# DECIMAL HELPERS\n# =============================================================================\n\ndef to_decimal(value: Union[float, int, str, Decimal]) -> Decimal:\n    \"\"\"Convert value to Decimal with proper precision.\"\"\"\n    if isinstance(value, Decimal):\n        return value\n    return Decimal(str(value))\n\n\ndef decimal_to_float(value: Decimal, places: int = 2) -> float:\n    \"\"\"Convert Decimal to float with specified decimal places.\"\"\"\n    quantize_str = '0.' + '0' * places\n    return float(value.quantize(Decimal(quantize_str), rounding=ROUND_HALF_UP))\n\n\ndef now_utc() -> datetime:\n    \"\"\"Get current UTC datetime with timezone info.\"\"\"\n    return datetime.now(timezone.utc)\n\n\ndef now_utc_str() -> str:\n    \"\"\"Get current UTC timestamp as ISO string.\"\"\"\n    return now_utc().isoformat()\n\n\ndef today_utc_str() -> str:\n    \"\"\"Get today's date in UTC as YYYY-MM-DD string.\"\"\"\n    return now_utc().strftime('%Y-%m-%d')\n\n\n# =============================================================================\n# FILE LOCKING CONTEXT MANAGER\n# =============================================================================\n\nclass FileLock:\n    \"\"\"Cross-platform file locking context manager.\"\"\"\n\n    def __init__(self, file_path: Path, timeout: float = FILE_LOCK_TIMEOUT):\n        self.file_path = file_path\n        self.timeout = timeout\n        self.lock_file = None\n        self.locked = False\n\n    def __enter__(self):\n        if not FILE_LOCKING_AVAILABLE:\n            return self\n\n        lock_path = self.file_path.with_suffix(self.file_path.suffix + '.lock')\n        start_time = time.time()\n\n        while True:\n            try:\n                # Open lock file\n                self.lock_file = open(lock_path, 'w')\n\n                # Platform-specific locking\n                if sys.platform == 'win32':\n                    msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)\n                else:\n                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n\n                self.locked = True\n                return self\n\n            except (IOError, OSError):\n                # Lock is held by another process\n                if time.time() - start_time > self.timeout:\n                    if self.lock_file:\n                        self.lock_file.close()\n                    raise TimeoutError(f\"Could not acquire lock for {self.file_path} within {self.timeout}s\")\n                time.sleep(0.1)\n\n    def __exit__(self, exc_type, exc_val, exc_tb):\n        if not FILE_LOCKING_AVAILABLE or not self.locked:\n            return\n\n        try:\n            if sys.platform == 'win32':\n                msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)\n            else:\n                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)\n\n            self.lock_file.close()\n\n            # Clean up lock file\n            lock_path = self.file_path.with_suffix(self.file_path.suffix + '.lock')\n            if lock_path.exists():\n                try:\n                    lock_path.unlink()\n                except Exception:\n                    pass\n\n        except Exception as e:\n            print(f\"[journal] Error releasing lock: {e}\")\n\n\n# =============================================================================\n# DATA CLASSES\n# =============================================================================\n\n@dataclass\nclass ConditionalEntry:\n    \"\"\"A pending conditional order — triggers when price/volume conditions are met.\"\"\"\n    ticker: str\n    condition_type: str = 'breakout_above'  # One of CONDITION_TYPES\n    trigger_price: float = 0                # Price that must be exceeded\n    volume_multiplier: float = 1.5          # Required volume vs average (e.g. 1.5x)\n    stop_price: float = 0                   # Pre-planned stop loss\n    target_price: float = 0                 # Pre-planned target\n    position_size_pct: float = 12.5         # % of account to deploy\n    notes: str = ''\n    conviction: int = 0\n    signal_type: str = ''\n    quality_grade: str = ''\n    created_date: str = ''\n    expires_date: str = ''                  # Auto-expire if not triggered\n    status: str = 'PENDING'                 # PENDING, TRIGGERED, EXPIRED, CANCELLED\n\n    def to_dict(self) -> Dict:\n        return asdict(self)\n\n\n@dataclass\nclass WatchlistItem:\n    ticker: str\n    added_date: str = ''\n    signal_type: str = ''\n    quality_grade: str = ''\n    recommendation: str = ''\n    conviction: int = 0\n    entry_zone_low: float = 0\n    entry_zone_high: float = 0\n    stop_price: float = 0\n    notes: str = ''\n    is_favorite: bool = False\n    focus_label: str = ''  # '', 'green', 'yellow', 'red', 'blue'\n\n    def to_dict(self) -> Dict:\n        return asdict(self)\n\n\n@dataclass\nclass Trade:\n    trade_id: str\n    ticker: str\n    status: str = 'OPEN'  # OPEN, CLOSED\n\n    # Entry\n    entry_date: str = ''\n    entry_price: float = 0\n    shares: float = 0\n    position_size: float = 0\n    signal_type: str = ''       # PRIMARY, AO_CONFIRMATION, RE_ENTRY, LATE_ENTRY\n    signal_age_days: int = 0    # How old was the signal at execution\n    quality_grade: str = ''\n    conviction_at_entry: int = 0\n\n    # Risk\n    initial_stop: float = 0\n    current_stop: float = 0     # May be trailed up\n    stop_method: str = ''\n    target: float = 0\n    risk_per_share: float = 0\n    risk_pct: float = 0\n\n    # Exit\n    exit_date: str = ''\n    exit_price: float = 0\n    exit_reason: str = ''       # One of EXIT_REASONS\n\n    # P&L\n    realized_pnl: float = 0\n    realized_pnl_pct: float = 0\n    slippage_entry: float = 0   # Difference between signal price and actual fill\n    days_held: int = 0\n\n    # Context\n    weekly_bullish_at_entry: bool = False\n    monthly_bullish_at_entry: bool = False\n    weinstein_stage_at_entry: int = 0\n    notes: str = ''\n    opened_at: str = ''\n    closed_at: str = ''\n\n    def to_dict(self) -> Dict:\n        return asdict(self)\n\n\n# =============================================================================\n# JOURNAL MANAGER\n# =============================================================================\n\nclass JournalManager:\n    \"\"\"\n    Manages watchlist, open trades, and trade history with JSON persistence.\n    """\n\n    def __init__(self, data_dir: str = DEFAULT_DATA_DIR):\n        self.data_dir = Path(data_dir)\n        self.data_dir.mkdir(exist_ok=True)\n\n        self.watchlist_file = self.data_dir / \"v2_watchlist.json\"\n        self.open_trades_file = self.data_dir / \"v2_open_trades.json\"\n        self.history_file = self.data_dir / \"v2_trade_history.json\"\n        self.conditionals_file = self.data_dir / \"v2_conditionals.json\"\n        self.scan_results_file = self.data_dir / \"v2_last_scan.json\"\n\n        self.watchlist: List[Dict] = self._load(self.watchlist_file, [])\n        # Guard: if file was overwritten with non-list data (e.g. WatchlistManager dict)\n        if not isinstance(self.watchlist, list):\n            print(f\"[journal] WARNING: watchlist file contained {type(self.watchlist).__name__}, resetting to []\")\n            self.watchlist = []\n            self._save(self.watchlist_file, self.watchlist)\n        # Clean corrupt entries (strings instead of dicts from old comma-paste bug)\n        elif self.watchlist and any(not isinstance(w, dict) for w in self.watchlist):\n            self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]\n            self._save(self.watchlist_file, self.watchlist)\n        self.open_trades: List[Dict] = self._load(self.open_trades_file, [])\n        self.trade_history: List[Dict] = self._load(self.history_file, [])\n        self.conditionals: List[Dict] = self._load(self.conditionals_file, [])\n\n    # ── Persistence ───────────────────────────────────────────────────\n\n    def _load(self, path: Path, default: Any) -> Any:\n        if path.exists():\n            try:\n                with FileLock(path):\n                    with open(path, 'r') as f:\n                        return json.load(f)\n            except TimeoutError:\n                print(f\"[journal] WARNING: Timeout acquiring lock for {path}, using default\")\n            except Exception as e:\n                print(f\"[journal] Error loading {path}: {e}\")\n        return default\n\n    def _save(self, path: Path, data: Any):\n        try:\n            with FileLock(path):\n                with open(path, 'w') as f:\n                    json.dump(data, f, indent=2, default=str)\n            # Queue for GitHub backup\n            try:\n                import github_backup\n                github_backup.mark_dirty(path.name)\n                print(f\"[journal] Queued {path.name} for GitHub backup\")\n            except ImportError:\n                print(f\"[journal] WARNING: github_backup module not available - no remote backup\")\n            except Exception as e:\n                print(f\"[journal] ERROR: GitHub backup failed for {path.name}: {e}\")\n        except TimeoutError:\n            print(f\"[journal] ERROR: Timeout acquiring lock for {path}, save failed\")\n        except Exception as e:\n            print(f\"[journal] Error saving {path}: {e}\")\n\n    def _save_atomic(self, path: Path, data: Any):\n        \"\"\"Atomic save: write to temp file, then rename. Prevents corruption on crash.\"\"\"\n        temp_path = path.with_suffix('.tmp')\n        try:\n            with FileLock(path):\n                with open(temp_path, 'w') as f:\n                    json.dump(data, f, indent=2, default=str)\n                shutil.move(str(temp_path), str(path))\n        except TimeoutError:\n            print(f\"[journal] ERROR: Timeout acquiring lock for {path}, atomic save failed\")\n            if temp_path.exists():\n                temp_path.unlink()\n        except Exception as e:\n            print(f\"[journal] Error in atomic save {path}: {e}\")\n            if temp_path.exists():\n                temp_path.unlink()\n\n    def _save_all(self):\n        self._save(self.watchlist_file, self.watchlist)\n        self._save(self.open_trades_file, self.open_trades)\n        self._save(self.history_file, self.trade_history)\n\n    # ── Watchlist ─────────────────────────────────────────────────────\n\n    def add_to_watchlist(self, item: WatchlistItem) -> str:\n        ticker = item.ticker.upper().strip()\n        item.ticker = ticker\n        item.added_date = item.added_date or today_utc_str()\n\n        # Check watchlist size limit\n        if len(self.watchlist) >= MAX_WATCHLIST_SIZE:\n            existing_idx = next((i for i, w in enumerate(self.watchlist) \n                               if isinstance(w, dict) and w.get('ticker') == ticker), None)\n            if existing_idx is None:\n                return f\"Watchlist full ({MAX_WATCHLIST_SIZE} tickers). Remove tickers before adding new ones.\"\n\n        if any(isinstance(w, dict) and w.get('ticker') == ticker for w in self.watchlist):\n            # Update existing (skip non-dict entries)\n            self.watchlist = [(item.to_dict() if isinstance(w, dict) and w.get('ticker') == ticker else w)\n                              for w in self.watchlist if isinstance(w, dict)]\n            self._save(self.watchlist_file, self.watchlist)\n            return f\"Updated {ticker} in watchlist\"\n\n        self.watchlist.append(item.to_dict())\n        self._save(self.watchlist_file, self.watchlist)\n        return f\"Added {ticker} to watchlist\"\n\n    def remove_from_watchlist(self, ticker: str) -> str:\n        ticker = ticker.upper().strip()\n        before = len(self.watchlist)\n        self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and w.get('ticker') != ticker]\n        if len(self.watchlist) < before:\n            self._save(self.watchlist_file, self.watchlist)\n            return f\"Removed {ticker}\"\n        return f\"{ticker} not in watchlist\"\n\n    def get_watchlist(self) -> List[Dict]:\n        return self.watchlist\n\n    def get_watchlist_tickers(self) -> List[str]:\n        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]\n\n    def clear_watchlist(self) -> str:\n        self.watchlist = []\n        self._save(self.watchlist_file, self.watchlist)\n        return \"Watchlist cleared\"\n\n    def set_watchlist_tickers(self, tickers: List[str]):\n        \"\"\"Bulk set watchlist from a list of ticker strings.\"\"\"\n        existing = {w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w}\n        added = 0\n        for t in tickers:\n            t = t.upper().strip()\n            if t and t not in existing:\n                if len(self.watchlist) >= MAX_WATCHLIST_SIZE:\n                    print(f\"[journal] WARNING: Watchlist limit reached ({MAX_WATCHLIST_SIZE}), skipping remaining tickers\")\n                    break\n                item = WatchlistItem(ticker=t, added_date=today_utc_str())\n                self.watchlist.append(item.to_dict())\n                existing.add(t)\n                added += 1\n        if added > 0:\n            self._save(self.watchlist_file, self.watchlist)\n\n    def toggle_favorite(self, ticker: str) -> bool:\n        \"\"\"Toggle is_favorite for a ticker. Returns new favorite state.\"\"\"\n        ticker = ticker.upper().strip()\n        for w in self.watchlist:\n            if w['ticker'] == ticker:\n                current = w.get('is_favorite', False)\n                w['is_favorite'] = not current\n                self._save(self.watchlist_file, self.watchlist)\n                return w['is_favorite']\n        return False\n\n    def is_favorite(self, ticker: str) -> bool:\n        \"\"\"Check if a ticker is favorited.\"\"\"\n        ticker = ticker.upper().strip()\n        for w in self.watchlist:\n            if w['ticker'] == ticker:\n                return w.get('is_favorite', False)\n        return False\n\n    def get_favorite_tickers(self) -> List[str]:\n        \"\"\"Get list of favorited tickers.\"\"\"\n        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and w.get('is_favorite', False)]\n\n    def set_focus_label(self, ticker: str, label: str) -> str:\n        \"\"\"Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'.\n        Auto-adds ticker to watchlist if not already present.\"\"\"\n        ticker = ticker.upper().strip()\n        for w in self.watchlist:\n            if w['ticker'] == ticker:\n                w['focus_label'] = label\n                self._save(self.watchlist_file, self.watchlist)\n                return label\n\n        # Ticker not in watchlist — auto-add with label\n        if label:  # Only auto-add if setting a non-empty label\n            if len(self.watchlist) >= MAX_WATCHLIST_SIZE:\n                return f\"ERROR: Watchlist full ({MAX_WATCHLIST_SIZE} tickers)\"\n            new_item = WatchlistItem(\n                ticker=ticker,\n                added_date=today_utc_str(),\n                focus_label=label,\n            )\n            self.watchlist.append(new_item.to_dict())\n            self._save(self.watchlist_file, self.watchlist)\n            return label\n        return ''\n\n    def get_focus_label(self, ticker: str) -> str:\n        \"\"\"Get focus label for a ticker.\"\"\"\n        ticker = ticker.upper().strip()\n        for w in self.watchlist:\n            if w['ticker'] == ticker:\n                return w.get('focus_label', '')\n        return ''\n\n    def get_focus_labels(self) -> Dict[str, str]:\n        \"\"\"Get all focus labels as {ticker: label} for non-empty labels.\"\"\"\n        return {w['ticker']: w['focus_label'] for w in self.watchlist\n                if isinstance(w, dict) and w.get('focus_label', '')}\n\n    def delete_single_ticker(self, ticker: str) -> str:\n        \"\"\"Delete a single ticker from watchlist with immediate persistence.\"\"\"\n        return self.remove_from_watchlist(ticker)\n\n    # ── Trade Entry ───────────────────────────────────────────────────\n\n    def enter_trade(self, trade: Trade) -> str:\n        ticker = trade.ticker.upper().strip()\n        trade.ticker = ticker\n\n        # Prevent duplicate open positions\n        if any(t['ticker'] == ticker and t['status'] == 'OPEN' for t in self.open_trades):\n            return f\"Already have open position in {ticker}\"\n\n        # Auto-fill fields - use UUID to prevent collision\n        trade.trade_id = trade.trade_id or f\"{ticker}_{uuid.uuid4().hex[:12]}\"\n        trade.entry_date = trade.entry_date or today_utc_str()\n        trade.opened_at = now_utc_str()\n        trade.status = 'OPEN'\n\n        # Calculate derived fields using Decimal for precision\n        if trade.entry_price > 0 and trade.initial_stop > 0:\n            entry_d = to_decimal(trade.entry_price)\n            stop_d = to_decimal(trade.initial_stop)\n            risk_d = entry_d - stop_d\n            trade.risk_per_share = decimal_to_float(risk_d, 2)\n            trade.risk_pct = decimal_to_float((risk_d / entry_d) * 100, 1)\n\n        # Position size validation and calculation with Decimal precision\n        if trade.entry_price > 0 and trade.shares > 0 and trade.position_size > 0:\n            shares_d = to_decimal(trade.shares)\n            entry_d = to_decimal(trade.entry_price)\n            calculated_d = shares_d * entry_d\n            calculated_size = decimal_to_float(calculated_d, 2)\n            \n            if abs(calculated_size - trade.position_size) > 1.0:  # Allow $1 tolerance\n                print(f\"[journal] WARNING: Position size mismatch for {ticker}. \"\n                      f\"Provided: ${trade.position_size:.2f}, Calculated: ${calculated_size:.2f}\")\n                trade.position_size = calculated_size  # Use calculated\n        elif trade.entry_price > 0 and trade.shares == 0 and trade.position_size > 0:\n            pos_d = to_decimal(trade.position_size)\n            entry_d = to_decimal(trade.entry_price)\n            trade.shares = decimal_to_float(pos_d / entry_d, 2)\n        elif trade.shares > 0 and trade.position_size == 0:\n            shares_d = to_decimal(trade.shares)\n            entry_d = to_decimal(trade.entry_price)\n            trade.position_size = decimal_to_float(shares_d * entry_d, 2)\n\n        if trade.current_stop == 0:\n            trade.current_stop = trade.initial_stop\n\n        self.open_trades.append(trade.to_dict())\n        self._save(self.open_trades_file, self.open_trades)\n\n        # Remove from watchlist\n        self.remove_from_watchlist(ticker)\n\n        return (f\"Opened {ticker}: {trade.shares:.0f} shares @ ${trade.entry_price:.2f} \"\n                f\"| Stop: ${trade.initial_stop:.2f} | Risk: {trade.risk_pct:.1f}%\")\n\n    # ── Trade Exit ────────────────────────────────────────────────────\n\n    def close_trade(self, ticker: str, exit_price: float,\n                    exit_reason: str = 'manual',\n                    exit_date: str = None,\n                    notes: str = '') -> str:\n        ticker = ticker.upper().strip()\n        trade = None\n        trade_idx = None\n\n        for i, t in enumerate(self.open_trades):\n            if t['ticker'] == ticker and t['status'] == 'OPEN':\n                trade = t\n                trade_idx = i\n                break\n\n        if trade is None:\n            return f\"No open position in {ticker}\"\n\n        # Check for duplicate in history (prevent double-entry on retry)\n        trade_id = trade.get('trade_id', '')\n        if any(h.get('trade_id') == trade_id for h in self.trade_history):\n            print(f\"[journal] WARNING: Trade {trade_id} already in history, skipping duplicate close\")\n            return f\"Trade {ticker} already closed\"\n\n        # Fill exit fields\n        trade['exit_price'] = float(exit_price)\n        trade['exit_date'] = exit_date or today_utc_str()\n        trade['exit_reason'] = exit_reason\n        trade['closed_at'] = now_utc_str()\n        trade['status'] = 'CLOSED'\n\n        if notes:\n            trade['notes'] = (trade.get('notes', '') + ' | EXIT: ' + notes).strip()\n\n        # Calculate P&L using Decimal for precision\n        entry = trade.get('entry_price', 0)\n        shares = trade.get('shares', 0)\n        if entry > 0 and shares > 0:\n            entry_d = to_decimal(entry)\n            exit_d = to_decimal(exit_price)\n            shares_d = to_decimal(shares)\n            \n            pnl_d = (exit_d - entry_d) * shares_d\n            pnl_pct_d = ((exit_d - entry_d) / entry_d) * 100\n            \n            trade['realized_pnl'] = decimal_to_float(pnl_d, 2)\n            trade['realized_pnl_pct'] = decimal_to_float(pnl_pct_d, 1)\n\n        # Days held\n        try:\n            entry_dt = datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')\n            exit_dt = datetime.strptime(trade['exit_date'], '%Y-%m-%d')\n            trade['days_held'] = (exit_dt - entry_dt).days\n        except Exception:\n            trade['days_held'] = 0\n\n        # Atomic transaction: save to history first, then remove from open\n        # If crash happens after history save, duplicate check above prevents re-adding\n        self.trade_history.append(trade)\n        self._save_atomic(self.history_file, self.trade_history)\n        \n        # Only remove from open trades after successful history save\n        self.open_trades.pop(trade_idx)\n        self._save_atomic(self.open_trades_file, self.open_trades)\n\n        pnl = trade['realized_pnl']\n        pnl_pct = trade['realized_pnl_pct']\n        emoji = '🟢' if pnl >= 0 else '🔴'\n        return (f\"{emoji} Closed {ticker} @ ${exit_price:.2f} | \"\n                f\"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%) | \"\n                f\"Held: {trade['days_held']}d | Reason: {exit_reason}\")\n\n    def close_all_trades(self, exit_prices: Dict[str, float],\n                         exit_reason: str = 'batch_close') -> List[str]:\n        \"\"\"Close all open positions. exit_prices: {ticker: price}\"\"\"\n        results = []\n        tickers = [t['ticker'] for t in self.open_trades if t['status'] == 'OPEN']\n        for ticker in tickers:\n            price = exit_prices.get(ticker, 0)\n            if price > 0:\n                results.append(self.close_trade(ticker, price, exit_reason))\n        return results\n\n    # ── Position Updates ──────────────────────────────────────────────\n\n    def update_stop(self, ticker: str, new_stop: float) -> str:\n        \"\"\"Trail stop up for an open position.\"\"\"\n        ticker = ticker.upper().strip()\n        for trade in self.open_trades:\n            if trade['ticker'] == ticker and trade['status'] == 'OPEN':\n                old_stop = trade.get('current_stop', 0)\n                if new_stop > old_stop:\n                    trade['current_stop'] = float(new_stop)\n                    self._save(self.open_trades_file, self.open_trades)\n                    return f\"Trailed stop {ticker}: ${old_stop:.2f} → ${new_stop:.2f}\"\n                else:\n                    return f\"New stop ${new_stop:.2f} not higher than current ${old_stop:.2f}\"\n        return f\"No open position in {ticker}\"\n\n    def check_stops(self, current_prices: Dict[str, float], auto_execute: bool = False) -> List[Dict]:\n        \"\"\"\n        Check all open positions against stop levels.\n        Returns list of triggered stops.\n        \n        current_prices: {ticker: current_price} from data_fetcher\n        auto_execute: if True, automatically close positions when stops are hit\n        \"\"\"\n        triggered = []\n        for trade in self.open_trades:\n            if trade['status'] != 'OPEN':\n                continue\n            ticker = trade['ticker']\n            price = current_prices.get(ticker)\n            if price is None:\n                continue\n\n            stop = trade.get('current_stop', trade.get('initial_stop', 0))\n            target = trade.get('target', 0)\n\n            if stop > 0 and price <= stop:\n                triggered.append({\n                    'ticker': ticker,\n                    'trigger': 'stop_loss',\n                    'price': price,\n                    'level': stop,\n                    'entry_price': trade.get('entry_price', 0),\n                })\n                if auto_execute:\n                    self.close_trade(ticker, price, 'stop_loss')\n            elif target > 0 and price >= target:\n                triggered.append({\n                    'ticker': ticker,\n                    'trigger': 'target_hit',\n                    'price': price,\n                    'level': target,\n                    'entry_price': trade.get('entry_price', 0),\n                })\n                if auto_execute:\n                    self.close_trade(ticker, price, 'target_hit')\n\n        return triggered\n\n    # ── Queries ───────────────────────────────────────────────────────\n\n    def get_open_trades(self) -> List[Dict]:\n        return [t for t in self.open_trades if t.get('status') == 'OPEN']\n\n    def get_open_tickers(self) -> List[str]:\n        return [t['ticker'] for t in self.open_trades if t.get('status') == 'OPEN']\n\n    def get_trade_history(self, last_n: int = None) -> List[Dict]:\n        trades = sorted(self.trade_history,\n                        key=lambda t: t.get('closed_at', ''), reverse=True)\n        return trades[:last_n] if last_n else trades\n\n    def get_trade_by_id(self, trade_id: str) -> Optional[Dict]:\n        for t in self.open_trades + self.trade_history:\n            if t.get('trade_id') == trade_id:\n                return t\n        return None\n\n    def get_position_summary(self, current_prices: Dict[str, float] = None) -> Dict:\n        \"\"\"\n        Summary of all open positions with current P&L.\n        \n        current_prices: {ticker: price} — if provided, calculates unrealized P&L.\n        \"\"\"\n        open_trades = self.get_open_trades()\n        if not open_trades:\n            return {\n                'count': 0, 'total_exposure': 0, 'unrealized_pnl': 0,\n                'unrealized_pnl_pct': 0, 'positions': [],\n            }\n\n        total_exposure_d = Decimal('0')\n        unrealized_pnl_d = Decimal('0')\n        positions = []\n\n        for trade in open_trades:\n            entry = trade.get('entry_price', 0)\n            shares = trade.get('shares', 0)\n            pos_size = trade.get('position_size', 0)\n            \n            entry_d = to_decimal(entry)\n            shares_d = to_decimal(shares)\n            pos_size_d = to_decimal(pos_size)\n            total_exposure_d += pos_size_d\n\n            current = current_prices.get(trade['ticker']) if current_prices else None\n\n            pos = {\n                'ticker': trade['ticker'],\n                'entry_price': entry,\n                'shares': shares,\n                'position_size': pos_size,\n                'stop': trade.get('current_stop', trade.get('initial_stop', 0)),\n                'target': trade.get('target', 0),\n                'entry_date': trade.get('entry_date', ''),\n                'signal_type': trade.get('signal_type', ''),\n            }\n\n            if current and entry > 0:\n                current_d = to_decimal(current)\n                pnl_d = (current_d - entry_d) * shares_d\n                pnl_pct_d = ((current_d - entry_d) / entry_d) * 100\n                unrealized_pnl_d += pnl_d\n                \n                pos['current_price'] = current\n                pos['unrealized_pnl'] = decimal_to_float(pnl_d, 2)\n                pos['unrealized_pnl_pct'] = decimal_to_float(pnl_pct_d, 1)\n\n            positions.append(pos)\n\n        total_exposure_f = decimal_to_float(total_exposure_d, 2)\n        unrealized_pnl_f = decimal_to_float(unrealized_pnl_d, 2)\n        \n        return {\n            'count': len(positions),\n            'total_exposure': total_exposure_f,\n            'unrealized_pnl': unrealized_pnl_f,\n            'unrealized_pnl_pct': decimal_to_float((unrealized_pnl_d / total_exposure_d) * 100, 1)\n            if total_exposure_d > 0 else 0,\n            'positions': positions,\n        }\n\n    # ── Performance Analytics ─────────────────────────────────────────\n\n    def get_performance_stats(self) -> Dict:\n        \"\"\"\n        Calculate performance statistics from closed trades.\n        \"\"\"\n        trades = self.trade_history\n        if not trades:\n            return {\n                'total_trades': 0, 'win_rate': 0, 'avg_pnl_pct': 0,\n                'total_pnl': 0, 'best_trade': 0, 'worst_trade': 0,\n                'avg_days_held': 0, 'by_signal_type': {}, 'by_exit_reason': {},\n            }\n\n        pnls = [t.get('realized_pnl_pct', 0) for t in trades]\n        wins = [p for p in pnls if p > 0]\n        losses = [p for p in pnls if p <= 0]\n        dollar_pnls = [t.get('realized_pnl', 0) for t in trades]\n        days = [t.get('days_held', 0) for t in trades]\n\n        # By signal type\n        by_signal = {}\n        for t in trades:\n            st = t.get('signal_type', 'Unknown')\n            if st not in by_signal:\n                by_signal[st] = {'count': 0, 'wins': 0, 'total_pnl_pct': 0}\n            by_signal[st]['count'] += 1\n            if t.get('realized_pnl_pct', 0) > 0:\n                by_signal[st]['wins'] += 1\n            by_signal[st]['total_pnl_pct'] += t.get('realized_pnl_pct', 0)\n\n        for st in by_signal:\n            c = by_signal[st]['count']\n            by_signal[st]['win_rate'] = round(by_signal[st]['wins'] / c * 100, 1) if c > 0 else 0\n            by_signal[st]['avg_pnl_pct'] = round(by_signal[st]['total_pnl_pct'] / c, 1) if c > 0 else 0\n\n        # By exit reason\n        by_exit = {}\n        for t in trades:\n            er = t.get('exit_reason', 'unknown')\n            if er not in by_exit:\n                by_exit[er] = {'count': 0, 'avg_pnl_pct': 0, 'total_pnl_pct': 0}\n            by_exit[er]['count'] += 1\n            by_exit[er]['total_pnl_pct'] += t.get('realized_pnl_pct', 0)\n\n        for er in by_exit:\n            c = by_exit[er]['count']\n            by_exit[er]['avg_pnl_pct'] = round(by_exit[er]['total_pnl_pct'] / c, 1) if c > 0 else 0\n\n        return {\n            'total_trades': len(trades),\n            'wins': len(wins),\n            'losses': len(losses),\n            'win_rate': round(len(wins) / len(trades) * 100, 1) if trades else 0,\n            'avg_pnl_pct': round(sum(pnls) / len(pnls), 1) if pnls else 0,\n            'total_pnl': round(sum(dollar_pnls), 2),\n            'best_trade': round(max(pnls), 1) if pnls else 0,\n            'worst_trade': round(min(pnls), 1) if pnls else 0,\n            'avg_days_held': round(sum(days) / len(days), 0) if days else 0,\n            'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 0,\n            'by_signal_type': by_signal,\n            'by_exit_reason': by_exit,\n        }\n\n    # ── Sector Exposure ───────────────────────────────────────────────\n\n    def get_recent_win_rate(self, last_n: int = 20) -> float:\n        \"\"\"Win rate over last N closed trades. Returns 0-1.\"\"\"\n        trades = self.get_trade_history(last_n=last_n)\n        if not trades:\n            return 0.5  # Default when no history\n        wins = sum(1 for t in trades if t.get('realized_pnl_pct', 0) > 0)\n        return round(wins / len(trades), 2)\n\n    def get_current_losing_streak(self) -> int:\n        \"\"\"Count consecutive losses from most recent trade backwards.\"\"\"\n        trades = self.get_trade_history()\n        streak = 0\n        for t in trades:\n            if t.get('realized_pnl_pct', 0) <= 0:\n                streak += 1\n            else:\n                break\n        return streak\n\n    def get_portfolio_risk_summary(self) -> Dict:\n        \"\"\"\n        Get risk metrics for all open positions.\n        Returns: {total_risk_dollars, total_risk_pct, positions: [{ticker, risk}]}\n        \"\"\"\n        open_trades = self.get_open_trades()\n        positions = []\n        total_risk_d = Decimal('0')\n\n        for trade in open_trades:\n            entry = trade.get('entry_price', 0)\n            stop = trade.get('current_stop', trade.get('initial_stop', 0))\n            shares = trade.get('shares', 0)\n\n            if entry > 0 and stop > 0 and shares > 0:\n                entry_d = to_decimal(entry)\n                stop_d = to_decimal(stop)\n                shares_d = to_decimal(shares)\n                risk_d = shares_d * (entry_d - stop_d)\n                total_risk_d += risk_d\n                risk_f = decimal_to_float(risk_d, 2)\n            else:\n                risk_f = 0\n\n            positions.append({\n                'ticker': trade['ticker'],\n                'risk_dollars': max(0, risk_f),\n                'entry': entry,\n                'stop': stop,\n                'shares': shares,\n            })\n\n        return {\n            'total_risk_dollars': decimal_to_float(total_risk_d, 2),\n            'positions': positions,\n        }\n\n    def get_sector_exposure(self, ticker_sectors: Dict[str, str]) -> Dict[str, int]:\n        \"\"\"\n        Count open positions by sector.\n        ticker_sectors: {ticker: sector} from data_fetcher.fetch_ticker_info()\n        \"\"\"\n        exposure = {}\n        for trade in self.get_open_trades():\n            sector = ticker_sectors.get(trade['ticker'], 'Unknown')\n            exposure[sector] = exposure.get(sector, 0) + 1\n        return exposure\n\n    # ── Conditional Entries (Breakout/Pullback Alerts) ────────────────\n\n    def add_conditional(self, entry: ConditionalEntry) -> str:\n        \"\"\"Add a conditional entry (breakout alert).\"\"\"\n        ticker = entry.ticker.upper().strip()\n        entry.ticker = ticker\n        entry.created_date = entry.created_date or today_utc_str()\n        entry.status = 'PENDING'\n\n        # Check for duplicate\n        existing = [c for c in self.conditionals\n                    if c['ticker'] == ticker and c['status'] == 'PENDING']\n        if existing:\n            # Update existing\n            for i, c in enumerate(self.conditionals):\n                if c['ticker'] == ticker and c['status'] == 'PENDING':\n                    self.conditionals[i] = entry.to_dict()\n                    break\n            self._save(self.conditionals_file, self.conditionals)\n            return f\"Updated conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}\"\n\n        self.conditionals.append(entry.to_dict())\n        self._save(self.conditionals_file, self.conditionals)\n        return f\"Set conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}\"\n\n    def remove_conditional(self, ticker: str) -> str:\n        ticker = ticker.upper().strip()\n        before = len(self.conditionals)\n        self.conditionals = [c for c in self.conditionals\n                             if not (c['ticker'] == ticker and c['status'] == 'PENDING')]\n        if len(self.conditionals) < before:\n            self._save(self.conditionals_file, self.conditionals)\n            return f\"Removed conditional for {ticker}\"\n        return f\"No pending conditional for {ticker}\"\n\n    def get_pending_conditionals(self) -> List[Dict]:\n        return [c for c in self.conditionals if c.get('status') == 'PENDING']\n\n    def get_conditional(self, ticker: str) -> Optional[Dict]:\n        ticker = ticker.upper().strip()\n        for c in self.conditionals:\n            if c['ticker'] == ticker and c['status'] == 'PENDING':\n                return c\n        return None\n\n    def check_conditionals(self, current_prices: Dict[str, float],\n                           volume_ratios: Dict[str, float] = None) -> List[Dict]:\n        \"\"\"\n        Check all pending conditionals against current prices.\n        Returns list of triggered conditionals.\n\n        current_prices: {ticker: current_price}\n        volume_ratios: {ticker: today_volume / avg_volume_50d}\n        \"\"\"\n        volume_ratios = volume_ratios or {}\n        triggered = []\n\n        for cond in self.conditionals:\n            if cond.get('status') != 'PENDING':\n                continue\n\n            ticker = cond['ticker']\n            price = current_prices.get(ticker)\n            if price is None:\n                continue\n\n            trigger = float(cond.get('trigger_price', 0))\n            vol_required = float(cond.get('volume_multiplier', 1.5))\n            vol_actual = volume_ratios.get(ticker, 0)\n            cond_type = cond.get('condition_type', '')\n\n            # Check expiry\n            expires = cond.get('expires_date', '')\n            if expires:\n                try:\n                    expires_dt = datetime.strptime(expires, '%Y-%m-%d').replace(tzinfo=timezone.utc)\n                    if expires_dt < now_utc():\n                        cond['status'] = 'EXPIRED'\n                        continue\n                except Exception:\n                    pass\n\n            is_triggered = False\n            if cond_type == 'breakout_above' and trigger > 0 and price > trigger:\n                is_triggered = True\n            elif cond_type == 'breakout_volume' and trigger > 0 and price > trigger:\n                if vol_actual >= vol_required:\n                    is_triggered = True\n            elif cond_type == 'pullback_to' and trigger > 0 and price <= trigger:\n                is_triggered = True\n\n            if is_triggered:\n                cond['status'] = 'TRIGGERED'\n                cond['triggered_price'] = price\n                cond['triggered_date'] = today_utc_str()\n                cond['triggered_volume_ratio'] = vol_actual\n                triggered.append(cond)\n\n        if triggered:\n            self._save(self.conditionals_file, self.conditionals)\n\n        return triggered\n\n    def expire_old_conditionals(self, days: int = 30):\n        \"\"\"Expire conditionals older than N days.\"\"\"\n        cutoff = now_utc()\n        changed = False\n        for cond in self.conditionals:\n            if cond.get('status') != 'PENDING':\n                continue\n            created = cond.get('created_date', '')\n            try:\n                created_dt = datetime.strptime(created, '%Y-%m-%d').replace(tzinfo=timezone.utc)\n                if (cutoff - created_dt).days > days:\n                    cond['status'] = 'EXPIRED'\n                    changed = True\n            except Exception:\n                pass\n        if changed:\n            self._save(self.conditionals_file, self.conditionals)\n\n    # ── Scan Results Persistence ──────────────────────────────────────\n\n    def save_scan_results(self, results: List[Dict]):\n        \"\"\"\n        Save scan results summary to JSON for cross-session persistence.\n        results: list of dicts with ticker, recommendation, conviction, etc.\n        \"\"\"\n        payload = {\n            'timestamp': now_utc_str(),\n            'count': len(results),\n            'results': results,\n        }\n        self._save(self.scan_results_file, payload)\n\n    def load_scan_results(self) -> Optional[Dict]:\n        \"\"\"Load last scan results. Returns {timestamp, count, results} or None.\"\"\"\n        data = self._load(self.scan_results_file, None)\n        return data\n\n    # ── All Tracked Tickers ───────────────────────────────────────────\n\n    def get_all_tracked_tickers(self) -> Dict[str, str]:\n        \"\"\"\n        Get all tickers being tracked with their status.\n        Returns: {ticker: status} where status is 'watchlist', 'open', 'conditional'\n        \"\"\"\n        result = {}\n        for w in self.watchlist:\n            if isinstance(w, dict) and 'ticker' in w:\n                result[w['ticker']] = 'watchlist'\n        for c in self.conditionals:\n            if c.get('status') == 'PENDING':\n                result[c['ticker']] = 'conditional'\n        for t in self.open_trades:\n            if t.get('status') == 'OPEN':\n                result[t['ticker']] = 'open'\n        return result\n
+"""
+TTA v2 Journal Manager — Trade Lifecycle Management
+=====================================================
+
+Handles: watchlist persistence, trade entry/exit, position tracking,
+P&L calculation, and exit categorization.
+
+NO yfinance calls. NO UI code. Pure data + business logic.
+Price updates come from data_fetcher via the UI layer.
+
+Persistence: JSON files (upgradeable to SQLite later).
+
+Version: 2.1.0 (2026-02-16) - Critical fixes applied
+"""
+
+import json
+import uuid
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass, field, asdict
+import pandas as pd
+import shutil
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+DEFAULT_DATA_DIR = "."
+MAX_WATCHLIST_SIZE = 500  # Prevent unbounded growth
+
+EXIT_REASONS = [
+    'stop_loss',        # Hit initial or trailing stop
+    'target_hit',       # Hit profit target
+    'weekly_cross',     # Weekly MACD crossed bearish
+    'time_exit',        # Held too long without progress
+    'manual',           # Trader decided to exit
+    'batch_close',      # Closed all positions
+]
+
+SIGNAL_TYPES = ['PRIMARY', 'AO_CONFIRMATION', 'RE_ENTRY', 'LATE_ENTRY']
+
+CONDITION_TYPES = [
+    'breakout_above',   # Buy when price breaks above level on volume
+    'pullback_to',      # Buy when price pulls back to level
+    'breakout_volume',  # Breakout + volume confirmation
+]
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class ConditionalEntry:
+    """A pending conditional order — triggers when price/volume conditions are met."""
+    ticker: str
+    condition_type: str = 'breakout_above'  # One of CONDITION_TYPES
+    trigger_price: float = 0                # Price that must be exceeded
+    volume_multiplier: float = 1.5          # Required volume vs average (e.g. 1.5x)
+    stop_price: float = 0                   # Pre-planned stop loss
+    target_price: float = 0                 # Pre-planned target
+    position_size_pct: float = 12.5         # % of account to deploy
+    notes: str = ''
+    conviction: int = 0
+    signal_type: str = ''
+    quality_grade: str = ''
+    created_date: str = ''
+    expires_date: str = ''                  # Auto-expire if not triggered
+    status: str = 'PENDING'                 # PENDING, TRIGGERED, EXPIRED, CANCELLED
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class WatchlistItem:
+    ticker: str
+    added_date: str = ''
+    signal_type: str = ''
+    quality_grade: str = ''
+    recommendation: str = ''
+    conviction: int = 0
+    entry_zone_low: float = 0
+    entry_zone_high: float = 0
+    stop_price: float = 0
+    notes: str = ''
+    is_favorite: bool = False
+    focus_label: str = ''  # '', 'green', 'yellow', 'red', 'blue'
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class Trade:
+    trade_id: str
+    ticker: str
+    status: str = 'OPEN'  # OPEN, CLOSED
+
+    # Entry
+    entry_date: str = ''
+    entry_price: float = 0
+    shares: float = 0
+    position_size: float = 0
+    signal_type: str = ''       # PRIMARY, AO_CONFIRMATION, RE_ENTRY, LATE_ENTRY
+    signal_age_days: int = 0    # How old was the signal at execution
+    quality_grade: str = ''
+    conviction_at_entry: int = 0
+
+    # Risk
+    initial_stop: float = 0
+    current_stop: float = 0     # May be trailed up
+    stop_method: str = ''
+    target: float = 0
+    risk_per_share: float = 0
+    risk_pct: float = 0
+
+    # Exit
+    exit_date: str = ''
+    exit_price: float = 0
+    exit_reason: str = ''       # One of EXIT_REASONS
+
+    # P&L
+    realized_pnl: float = 0
+    realized_pnl_pct: float = 0
+    slippage_entry: float = 0   # Difference between signal price and actual fill
+    days_held: int = 0
+
+    # Context
+    weekly_bullish_at_entry: bool = False
+    monthly_bullish_at_entry: bool = False
+    weinstein_stage_at_entry: int = 0
+    notes: str = ''
+    opened_at: str = ''
+    closed_at: str = ''
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+# =============================================================================
+# JOURNAL MANAGER
+# =============================================================================
+
+class JournalManager:
+    """
+    Manages watchlist, open trades, and trade history with JSON persistence.
+    """
+
+    def __init__(self, data_dir: str = DEFAULT_DATA_DIR):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+
+        self.watchlist_file = self.data_dir / "v2_watchlist.json"
+        self.open_trades_file = self.data_dir / "v2_open_trades.json"
+        self.history_file = self.data_dir / "v2_trade_history.json"
+        self.conditionals_file = self.data_dir / "v2_conditionals.json"
+        self.scan_results_file = self.data_dir / "v2_last_scan.json"
+
+        self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
+        # Guard: if file was overwritten with non-list data (e.g. WatchlistManager dict)
+        if not isinstance(self.watchlist, list):
+            print(f"[journal] WARNING: watchlist file contained {type(self.watchlist).__name__}, resetting to []")
+            self.watchlist = []
+            self._save(self.watchlist_file, self.watchlist)
+        # Clean corrupt entries (strings instead of dicts from old comma-paste bug)
+        elif self.watchlist and any(not isinstance(w, dict) for w in self.watchlist):
+            self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]
+            self._save(self.watchlist_file, self.watchlist)
+        self.open_trades: List[Dict] = self._load(self.open_trades_file, [])
+        self.trade_history: List[Dict] = self._load(self.history_file, [])
+        self.conditionals: List[Dict] = self._load(self.conditionals_file, [])
+
+    # ── Persistence ───────────────────────────────────────────────────
+
+    def _load(self, path: Path, default: Any) -> Any:
+        if path.exists():
+            try:
+                with open(path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"[journal] Error loading {path}: {e}")
+        return default
+
+    def _save(self, path: Path, data: Any):
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            # Queue for GitHub backup
+            try:
+                import github_backup
+                github_backup.mark_dirty(path.name)
+                print(f"[journal] Queued {path.name} for GitHub backup")
+            except ImportError:
+                print(f"[journal] WARNING: github_backup module not available - no remote backup")
+            except Exception as e:
+                print(f"[journal] ERROR: GitHub backup failed for {path.name}: {e}")
+        except Exception as e:
+            print(f"[journal] Error saving {path}: {e}")
+
+    def _save_atomic(self, path: Path, data: Any):
+        """Atomic save: write to temp file, then rename. Prevents corruption on crash."""
+        temp_path = path.with_suffix('.tmp')
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            shutil.move(str(temp_path), str(path))
+        except Exception as e:
+            print(f"[journal] Error in atomic save {path}: {e}")
+            if temp_path.exists():
+                temp_path.unlink()
+
+    def _save_all(self):
+        self._save(self.watchlist_file, self.watchlist)
+        self._save(self.open_trades_file, self.open_trades)
+        self._save(self.history_file, self.trade_history)
+
+    # ── Watchlist ─────────────────────────────────────────────────────
+
+    def add_to_watchlist(self, item: WatchlistItem) -> str:
+        ticker = item.ticker.upper().strip()
+        item.ticker = ticker
+        item.added_date = item.added_date or datetime.now().strftime('%Y-%m-%d')
+
+        # Check watchlist size limit
+        if len(self.watchlist) >= MAX_WATCHLIST_SIZE:
+            existing_idx = next((i for i, w in enumerate(self.watchlist) 
+                               if isinstance(w, dict) and w.get('ticker') == ticker), None)
+            if existing_idx is None:
+                return f"Watchlist full ({MAX_WATCHLIST_SIZE} tickers). Remove tickers before adding new ones."
+
+        if any(isinstance(w, dict) and w.get('ticker') == ticker for w in self.watchlist):
+            # Update existing (skip non-dict entries)
+            self.watchlist = [(item.to_dict() if isinstance(w, dict) and w.get('ticker') == ticker else w)
+                              for w in self.watchlist if isinstance(w, dict)]
+            self._save(self.watchlist_file, self.watchlist)
+            return f"Updated {ticker} in watchlist"
+
+        self.watchlist.append(item.to_dict())
+        self._save(self.watchlist_file, self.watchlist)
+        return f"Added {ticker} to watchlist"
+
+    def remove_from_watchlist(self, ticker: str) -> str:
+        ticker = ticker.upper().strip()
+        before = len(self.watchlist)
+        self.watchlist = [w for w in self.watchlist if isinstance(w, dict) and w.get('ticker') != ticker]
+        if len(self.watchlist) < before:
+            self._save(self.watchlist_file, self.watchlist)
+            return f"Removed {ticker}"
+        return f"{ticker} not in watchlist"
+
+    def get_watchlist(self) -> List[Dict]:
+        return self.watchlist
+
+    def get_watchlist_tickers(self) -> List[str]:
+        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w]
+
+    def clear_watchlist(self) -> str:
+        self.watchlist = []
+        self._save(self.watchlist_file, self.watchlist)
+        return "Watchlist cleared"
+
+    def set_watchlist_tickers(self, tickers: List[str]):
+        """Bulk set watchlist from a list of ticker strings."""
+        existing = {w['ticker'] for w in self.watchlist if isinstance(w, dict) and 'ticker' in w}
+        added = 0
+        for t in tickers:
+            t = t.upper().strip()
+            if t and t not in existing:
+                if len(self.watchlist) >= MAX_WATCHLIST_SIZE:
+                    print(f"[journal] WARNING: Watchlist limit reached ({MAX_WATCHLIST_SIZE}), skipping remaining tickers")
+                    break
+                item = WatchlistItem(ticker=t, added_date=datetime.now().strftime('%Y-%m-%d'))
+                self.watchlist.append(item.to_dict())
+                existing.add(t)
+                added += 1
+        if added > 0:
+            self._save(self.watchlist_file, self.watchlist)
+
+    def toggle_favorite(self, ticker: str) -> bool:
+        """Toggle is_favorite for a ticker. Returns new favorite state."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                current = w.get('is_favorite', False)
+                w['is_favorite'] = not current
+                self._save(self.watchlist_file, self.watchlist)
+                return w['is_favorite']
+        return False
+
+    def is_favorite(self, ticker: str) -> bool:
+        """Check if a ticker is favorited."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                return w.get('is_favorite', False)
+        return False
+
+    def get_favorite_tickers(self) -> List[str]:
+        """Get list of favorited tickers."""
+        return [w['ticker'] for w in self.watchlist if isinstance(w, dict) and w.get('is_favorite', False)]
+
+    def set_focus_label(self, ticker: str, label: str) -> str:
+        """Set focus label for a ticker. label = '' to clear, or 'green','yellow','red','blue'.
+        Auto-adds ticker to watchlist if not already present."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                w['focus_label'] = label
+                self._save(self.watchlist_file, self.watchlist)
+                return label
+
+        # Ticker not in watchlist — auto-add with label
+        if label:  # Only auto-add if setting a non-empty label
+            if len(self.watchlist) >= MAX_WATCHLIST_SIZE:
+                return f"ERROR: Watchlist full ({MAX_WATCHLIST_SIZE} tickers)"
+            new_item = WatchlistItem(
+                ticker=ticker,
+                added_date=datetime.now().strftime('%Y-%m-%d'),
+                focus_label=label,
+            )
+            self.watchlist.append(new_item.to_dict())
+            self._save(self.watchlist_file, self.watchlist)
+            return label
+        return ''
+
+    def get_focus_label(self, ticker: str) -> str:
+        """Get focus label for a ticker."""
+        ticker = ticker.upper().strip()
+        for w in self.watchlist:
+            if w['ticker'] == ticker:
+                return w.get('focus_label', '')
+        return ''
+
+    def get_focus_labels(self) -> Dict[str, str]:
+        """Get all focus labels as {ticker: label} for non-empty labels."""
+        return {w['ticker']: w['focus_label'] for w in self.watchlist
+                if isinstance(w, dict) and w.get('focus_label', '')}
+
+    def delete_single_ticker(self, ticker: str) -> str:
+        """Delete a single ticker from watchlist with immediate persistence."""
+        return self.remove_from_watchlist(ticker)
+
+    # ── Trade Entry ───────────────────────────────────────────────────
+
+    def enter_trade(self, trade: Trade) -> str:
+        ticker = trade.ticker.upper().strip()
+        trade.ticker = ticker
+
+        # Prevent duplicate open positions
+        if any(t['ticker'] == ticker and t['status'] == 'OPEN' for t in self.open_trades):
+            return f"Already have open position in {ticker}"
+
+        # Auto-fill fields - use UUID to prevent collision
+        trade.trade_id = trade.trade_id or f"{ticker}_{uuid.uuid4().hex[:12]}"
+        trade.entry_date = trade.entry_date or datetime.now().strftime('%Y-%m-%d')
+        trade.opened_at = datetime.now().isoformat()
+        trade.status = 'OPEN'
+
+        # Calculate derived fields
+        if trade.entry_price > 0 and trade.initial_stop > 0:
+            trade.risk_per_share = round(trade.entry_price - trade.initial_stop, 2)
+            trade.risk_pct = round(trade.risk_per_share / trade.entry_price * 100, 1)
+
+        # Position size validation and calculation
+        if trade.entry_price > 0 and trade.shares > 0 and trade.position_size > 0:
+            calculated_size = trade.shares * trade.entry_price
+            if abs(calculated_size - trade.position_size) > 1.0:  # Allow $1 tolerance
+                print(f"[journal] WARNING: Position size mismatch for {ticker}. "
+                      f"Provided: ${trade.position_size:.2f}, Calculated: ${calculated_size:.2f}")
+                trade.position_size = round(calculated_size, 2)  # Use calculated
+        elif trade.entry_price > 0 and trade.shares == 0 and trade.position_size > 0:
+            trade.shares = round(trade.position_size / trade.entry_price, 2)
+        elif trade.shares > 0 and trade.position_size == 0:
+            trade.position_size = round(trade.shares * trade.entry_price, 2)
+
+        if trade.current_stop == 0:
+            trade.current_stop = trade.initial_stop
+
+        self.open_trades.append(trade.to_dict())
+        self._save(self.open_trades_file, self.open_trades)
+
+        # Remove from watchlist
+        self.remove_from_watchlist(ticker)
+
+        return (f"Opened {ticker}: {trade.shares:.0f} shares @ ${trade.entry_price:.2f} "
+                f"| Stop: ${trade.initial_stop:.2f} | Risk: {trade.risk_pct:.1f}%")
+
+    # ── Trade Exit ────────────────────────────────────────────────────
+
+    def close_trade(self, ticker: str, exit_price: float,
+                    exit_reason: str = 'manual',
+                    exit_date: str = None,
+                    notes: str = '') -> str:
+        ticker = ticker.upper().strip()
+        trade = None
+        trade_idx = None
+
+        for i, t in enumerate(self.open_trades):
+            if t['ticker'] == ticker and t['status'] == 'OPEN':
+                trade = t
+                trade_idx = i
+                break
+
+        if trade is None:
+            return f"No open position in {ticker}"
+
+        # Check for duplicate in history (prevent double-entry on retry)
+        trade_id = trade.get('trade_id', '')
+        if any(h.get('trade_id') == trade_id for h in self.trade_history):
+            print(f"[journal] WARNING: Trade {trade_id} already in history, skipping duplicate close")
+            return f"Trade {ticker} already closed"
+
+        # Fill exit fields
+        trade['exit_price'] = float(exit_price)
+        trade['exit_date'] = exit_date or datetime.now().strftime('%Y-%m-%d')
+        trade['exit_reason'] = exit_reason
+        trade['closed_at'] = datetime.now().isoformat()
+        trade['status'] = 'CLOSED'
+
+        if notes:
+            trade['notes'] = (trade.get('notes', '') + ' | EXIT: ' + notes).strip()
+
+        # Calculate P&L
+        entry = float(trade.get('entry_price', 0))
+        shares = float(trade.get('shares', 0))
+        if entry > 0:
+            trade['realized_pnl'] = round((exit_price - entry) * shares, 2)
+            trade['realized_pnl_pct'] = round((exit_price - entry) / entry * 100, 1)
+
+        # Days held
+        try:
+            entry_dt = datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')
+            exit_dt = datetime.strptime(trade['exit_date'], '%Y-%m-%d')
+            trade['days_held'] = (exit_dt - entry_dt).days
+        except Exception:
+            trade['days_held'] = 0
+
+        # Atomic transaction: save to history first, then remove from open
+        # If crash happens after history save, duplicate check above prevents re-adding
+        self.trade_history.append(trade)
+        self._save_atomic(self.history_file, self.trade_history)
+        
+        # Only remove from open trades after successful history save
+        self.open_trades.pop(trade_idx)
+        self._save_atomic(self.open_trades_file, self.open_trades)
+
+        pnl = trade['realized_pnl']
+        pnl_pct = trade['realized_pnl_pct']
+        emoji = '🟢' if pnl >= 0 else '🔴'
+        return (f"{emoji} Closed {ticker} @ ${exit_price:.2f} | "
+                f"P&L: ${pnl:+,.2f} ({pnl_pct:+.1f}%) | "
+                f"Held: {trade['days_held']}d | Reason: {exit_reason}")
+
+    def close_all_trades(self, exit_prices: Dict[str, float],
+                         exit_reason: str = 'batch_close') -> List[str]:
+        """Close all open positions. exit_prices: {ticker: price}"""
+        results = []
+        tickers = [t['ticker'] for t in self.open_trades if t['status'] == 'OPEN']
+        for ticker in tickers:
+            price = exit_prices.get(ticker, 0)
+            if price > 0:
+                results.append(self.close_trade(ticker, price, exit_reason))
+        return results
+
+    # ── Position Updates ──────────────────────────────────────────────
+
+    def update_stop(self, ticker: str, new_stop: float) -> str:
+        """Trail stop up for an open position."""
+        ticker = ticker.upper().strip()
+        for trade in self.open_trades:
+            if trade['ticker'] == ticker and trade['status'] == 'OPEN':
+                old_stop = trade.get('current_stop', 0)
+                if new_stop > old_stop:
+                    trade['current_stop'] = float(new_stop)
+                    self._save(self.open_trades_file, self.open_trades)
+                    return f"Trailed stop {ticker}: ${old_stop:.2f} → ${new_stop:.2f}"
+                else:
+                    return f"New stop ${new_stop:.2f} not higher than current ${old_stop:.2f}"
+        return f"No open position in {ticker}"
+
+    def check_stops(self, current_prices: Dict[str, float], auto_execute: bool = False) -> List[Dict]:
+        """
+        Check all open positions against stop levels.
+        Returns list of triggered stops.
+        
+        current_prices: {ticker: current_price} from data_fetcher
+        auto_execute: if True, automatically close positions when stops are hit
+        """
+        triggered = []
+        for trade in self.open_trades:
+            if trade['status'] != 'OPEN':
+                continue
+            ticker = trade['ticker']
+            price = current_prices.get(ticker)
+            if price is None:
+                continue
+
+            stop = trade.get('current_stop', trade.get('initial_stop', 0))
+            target = trade.get('target', 0)
+
+            if stop > 0 and price <= stop:
+                triggered.append({
+                    'ticker': ticker,
+                    'trigger': 'stop_loss',
+                    'price': price,
+                    'level': stop,
+                    'entry_price': trade.get('entry_price', 0),
+                })
+                if auto_execute:
+                    self.close_trade(ticker, price, 'stop_loss')
+            elif target > 0 and price >= target:
+                triggered.append({
+                    'ticker': ticker,
+                    'trigger': 'target_hit',
+                    'price': price,
+                    'level': target,
+                    'entry_price': trade.get('entry_price', 0),
+                })
+                if auto_execute:
+                    self.close_trade(ticker, price, 'target_hit')
+
+        return triggered
+
+    # ── Queries ───────────────────────────────────────────────────────
+
+    def get_open_trades(self) -> List[Dict]:
+        return [t for t in self.open_trades if t.get('status') == 'OPEN']
+
+    def get_open_tickers(self) -> List[str]:
+        return [t['ticker'] for t in self.open_trades if t.get('status') == 'OPEN']
+
+    def get_trade_history(self, last_n: int = None) -> List[Dict]:
+        trades = sorted(self.trade_history,
+                        key=lambda t: t.get('closed_at', ''), reverse=True)
+        return trades[:last_n] if last_n else trades
+
+    def get_trade_by_id(self, trade_id: str) -> Optional[Dict]:
+        for t in self.open_trades + self.trade_history:
+            if t.get('trade_id') == trade_id:
+                return t
+        return None
+
+    def get_position_summary(self, current_prices: Dict[str, float] = None) -> Dict:
+        """
+        Summary of all open positions with current P&L.
+        
+        current_prices: {ticker: price} — if provided, calculates unrealized P&L.
+        """
+        open_trades = self.get_open_trades()
+        if not open_trades:
+            return {
+                'count': 0, 'total_exposure': 0, 'unrealized_pnl': 0,
+                'unrealized_pnl_pct': 0, 'positions': [],
+            }
+
+        total_exposure = 0
+        unrealized_pnl = 0
+        positions = []
+
+        for trade in open_trades:
+            entry = float(trade.get('entry_price', 0))
+            shares = float(trade.get('shares', 0))
+            pos_size = float(trade.get('position_size', 0))
+            total_exposure += pos_size
+
+            current = current_prices.get(trade['ticker']) if current_prices else None
+
+            pos = {
+                'ticker': trade['ticker'],
+                'entry_price': entry,
+                'shares': shares,
+                'position_size': pos_size,
+                'stop': trade.get('current_stop', trade.get('initial_stop', 0)),
+                'target': trade.get('target', 0),
+                'entry_date': trade.get('entry_date', ''),
+                'signal_type': trade.get('signal_type', ''),
+            }
+
+            if current and entry > 0:
+                pnl = (current - entry) * shares
+                pnl_pct = (current - entry) / entry * 100
+                unrealized_pnl += pnl
+                pos['current_price'] = current
+                pos['unrealized_pnl'] = round(pnl, 2)
+                pos['unrealized_pnl_pct'] = round(pnl_pct, 1)
+
+            positions.append(pos)
+
+        return {
+            'count': len(positions),
+            'total_exposure': round(total_exposure, 2),
+            'unrealized_pnl': round(unrealized_pnl, 2),
+            'unrealized_pnl_pct': round(unrealized_pnl / total_exposure * 100, 1)
+            if total_exposure > 0 else 0,
+            'positions': positions,
+        }
+
+    # ── Performance Analytics ─────────────────────────────────────────
+
+    def get_performance_stats(self) -> Dict:
+        """
+        Calculate performance statistics from closed trades.
+        """
+        trades = self.trade_history
+        if not trades:
+            return {
+                'total_trades': 0, 'win_rate': 0, 'avg_pnl_pct': 0,
+                'total_pnl': 0, 'best_trade': 0, 'worst_trade': 0,
+                'avg_days_held': 0, 'by_signal_type': {}, 'by_exit_reason': {},
+            }
+
+        pnls = [t.get('realized_pnl_pct', 0) for t in trades]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        dollar_pnls = [t.get('realized_pnl', 0) for t in trades]
+        days = [t.get('days_held', 0) for t in trades]
+
+        # By signal type
+        by_signal = {}
+        for t in trades:
+            st = t.get('signal_type', 'Unknown')
+            if st not in by_signal:
+                by_signal[st] = {'count': 0, 'wins': 0, 'total_pnl_pct': 0}
+            by_signal[st]['count'] += 1
+            if t.get('realized_pnl_pct', 0) > 0:
+                by_signal[st]['wins'] += 1
+            by_signal[st]['total_pnl_pct'] += t.get('realized_pnl_pct', 0)
+
+        for st in by_signal:
+            c = by_signal[st]['count']
+            by_signal[st]['win_rate'] = round(by_signal[st]['wins'] / c * 100, 1) if c > 0 else 0
+            by_signal[st]['avg_pnl_pct'] = round(by_signal[st]['total_pnl_pct'] / c, 1) if c > 0 else 0
+
+        # By exit reason
+        by_exit = {}
+        for t in trades:
+            er = t.get('exit_reason', 'unknown')
+            if er not in by_exit:
+                by_exit[er] = {'count': 0, 'avg_pnl_pct': 0, 'total_pnl_pct': 0}
+            by_exit[er]['count'] += 1
+            by_exit[er]['total_pnl_pct'] += t.get('realized_pnl_pct', 0)
+
+        for er in by_exit:
+            c = by_exit[er]['count']
+            by_exit[er]['avg_pnl_pct'] = round(by_exit[er]['total_pnl_pct'] / c, 1) if c > 0 else 0
+
+        return {
+            'total_trades': len(trades),
+            'wins': len(wins),
+            'losses': len(losses),
+            'win_rate': round(len(wins) / len(trades) * 100, 1) if trades else 0,
+            'avg_pnl_pct': round(sum(pnls) / len(pnls), 1) if pnls else 0,
+            'total_pnl': round(sum(dollar_pnls), 2),
+            'best_trade': round(max(pnls), 1) if pnls else 0,
+            'worst_trade': round(min(pnls), 1) if pnls else 0,
+            'avg_days_held': round(sum(days) / len(days), 0) if days else 0,
+            'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 0,
+            'by_signal_type': by_signal,
+            'by_exit_reason': by_exit,
+        }
+
+    # ── Sector Exposure ───────────────────────────────────────────────
+
+    def get_recent_win_rate(self, last_n: int = 20) -> float:
+        """Win rate over last N closed trades. Returns 0-1."""
+        trades = self.get_trade_history(last_n=last_n)
+        if not trades:
+            return 0.5  # Default when no history
+        wins = sum(1 for t in trades if t.get('realized_pnl_pct', 0) > 0)
+        return round(wins / len(trades), 2)
+
+    def get_current_losing_streak(self) -> int:
+        """Count consecutive losses from most recent trade backwards."""
+        trades = self.get_trade_history()
+        streak = 0
+        for t in trades:
+            if t.get('realized_pnl_pct', 0) <= 0:
+                streak += 1
+            else:
+                break
+        return streak
+
+    def get_portfolio_risk_summary(self) -> Dict:
+        """
+        Get risk metrics for all open positions.
+        Returns: {total_risk_dollars, total_risk_pct, positions: [{ticker, risk}]}
+        """
+        open_trades = self.get_open_trades()
+        positions = []
+        total_risk = 0
+
+        for trade in open_trades:
+            entry = float(trade.get('entry_price', 0))
+            stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+            shares = float(trade.get('shares', 0))
+
+            risk = 0
+            if entry > 0 and stop > 0 and shares > 0:
+                risk = shares * (entry - stop)
+
+            total_risk += max(0, risk)
+            positions.append({
+                'ticker': trade['ticker'],
+                'risk_dollars': round(max(0, risk), 2),
+                'entry': entry,
+                'stop': stop,
+                'shares': shares,
+            })
+
+        return {
+            'total_risk_dollars': round(total_risk, 2),
+            'positions': positions,
+        }
+
+    def get_sector_exposure(self, ticker_sectors: Dict[str, str]) -> Dict[str, int]:
+        """
+        Count open positions by sector.
+        ticker_sectors: {ticker: sector} from data_fetcher.fetch_ticker_info()
+        """
+        exposure = {}
+        for trade in self.get_open_trades():
+            sector = ticker_sectors.get(trade['ticker'], 'Unknown')
+            exposure[sector] = exposure.get(sector, 0) + 1
+        return exposure
+
+    # ── Conditional Entries (Breakout/Pullback Alerts) ────────────────
+
+    def add_conditional(self, entry: ConditionalEntry) -> str:
+        """Add a conditional entry (breakout alert)."""
+        ticker = entry.ticker.upper().strip()
+        entry.ticker = ticker
+        entry.created_date = entry.created_date or datetime.now().strftime('%Y-%m-%d')
+        entry.status = 'PENDING'
+
+        # Check for duplicate
+        existing = [c for c in self.conditionals
+                    if c['ticker'] == ticker and c['status'] == 'PENDING']
+        if existing:
+            # Update existing
+            for i, c in enumerate(self.conditionals):
+                if c['ticker'] == ticker and c['status'] == 'PENDING':
+                    self.conditionals[i] = entry.to_dict()
+                    break
+            self._save(self.conditionals_file, self.conditionals)
+            return f"Updated conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}"
+
+        self.conditionals.append(entry.to_dict())
+        self._save(self.conditionals_file, self.conditionals)
+        return f"Set conditional for {ticker}: {entry.condition_type} @ ${entry.trigger_price:.2f}"
+
+    def remove_conditional(self, ticker: str) -> str:
+        ticker = ticker.upper().strip()
+        before = len(self.conditionals)
+        self.conditionals = [c for c in self.conditionals
+                             if not (c['ticker'] == ticker and c['status'] == 'PENDING')]
+        if len(self.conditionals) < before:
+            self._save(self.conditionals_file, self.conditionals)
+            return f"Removed conditional for {ticker}"
+        return f"No pending conditional for {ticker}"
+
+    def get_pending_conditionals(self) -> List[Dict]:
+        return [c for c in self.conditionals if c.get('status') == 'PENDING']
+
+    def get_conditional(self, ticker: str) -> Optional[Dict]:
+        ticker = ticker.upper().strip()
+        for c in self.conditionals:
+            if c['ticker'] == ticker and c['status'] == 'PENDING':
+                return c
+        return None
+
+    def check_conditionals(self, current_prices: Dict[str, float],
+                           volume_ratios: Dict[str, float] = None) -> List[Dict]:
+        """
+        Check all pending conditionals against current prices.
+        Returns list of triggered conditionals.
+
+        current_prices: {ticker: current_price}
+        volume_ratios: {ticker: today_volume / avg_volume_50d}
+        """
+        volume_ratios = volume_ratios or {}
+        triggered = []
+
+        for cond in self.conditionals:
+            if cond.get('status') != 'PENDING':
+                continue
+
+            ticker = cond['ticker']
+            price = current_prices.get(ticker)
+            if price is None:
+                continue
+
+            trigger = float(cond.get('trigger_price', 0))
+            vol_required = float(cond.get('volume_multiplier', 1.5))
+            vol_actual = volume_ratios.get(ticker, 0)
+            cond_type = cond.get('condition_type', '')
+
+            # Check expiry
+            expires = cond.get('expires_date', '')
+            if expires:
+                try:
+                    if datetime.strptime(expires, '%Y-%m-%d') < datetime.now():
+                        cond['status'] = 'EXPIRED'
+                        continue
+                except Exception:
+                    pass
+
+            is_triggered = False
+            if cond_type == 'breakout_above' and trigger > 0 and price > trigger:
+                is_triggered = True
+            elif cond_type == 'breakout_volume' and trigger > 0 and price > trigger:
+                if vol_actual >= vol_required:
+                    is_triggered = True
+            elif cond_type == 'pullback_to' and trigger > 0 and price <= trigger:
+                is_triggered = True
+
+            if is_triggered:
+                cond['status'] = 'TRIGGERED'
+                cond['triggered_price'] = price
+                cond['triggered_date'] = datetime.now().strftime('%Y-%m-%d')
+                cond['triggered_volume_ratio'] = vol_actual
+                triggered.append(cond)
+
+        if triggered:
+            self._save(self.conditionals_file, self.conditionals)
+
+        return triggered
+
+    def expire_old_conditionals(self, days: int = 30):
+        """Expire conditionals older than N days."""
+        cutoff = datetime.now()
+        changed = False
+        for cond in self.conditionals:
+            if cond.get('status') != 'PENDING':
+                continue
+            created = cond.get('created_date', '')
+            try:
+                created_dt = datetime.strptime(created, '%Y-%m-%d')
+                if (cutoff - created_dt).days > days:
+                    cond['status'] = 'EXPIRED'
+                    changed = True
+            except Exception:
+                pass
+        if changed:
+            self._save(self.conditionals_file, self.conditionals)
+
+    # ── Scan Results Persistence ──────────────────────────────────────
+
+    def save_scan_results(self, results: List[Dict]):
+        """
+        Save scan results summary to JSON for cross-session persistence.
+        results: list of dicts with ticker, recommendation, conviction, etc.
+        """
+        payload = {
+            'timestamp': datetime.now().isoformat(),
+            'count': len(results),
+            'results': results,
+        }
+        self._save(self.scan_results_file, payload)
+
+    def load_scan_results(self) -> Optional[Dict]:
+        """Load last scan results. Returns {timestamp, count, results} or None."""
+        data = self._load(self.scan_results_file, None)
+        return data
+
+    # ── All Tracked Tickers ───────────────────────────────────────────
+
+    def get_all_tracked_tickers(self) -> Dict[str, str]:
+        """
+        Get all tickers being tracked with their status.
+        Returns: {ticker: status} where status is 'watchlist', 'open', 'conditional'
+        """
+        result = {}
+        for w in self.watchlist:
+            if isinstance(w, dict) and 'ticker' in w:
+                result[w['ticker']] = 'watchlist'
+        for c in self.conditionals:
+            if c.get('status') == 'PENDING':
+                result[c['ticker']] = 'conditional'
+        for t in self.open_trades:
+            if t.get('status') == 'OPEN':
+                result[t['ticker']] = 'open'
+        return result
