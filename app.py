@@ -1368,33 +1368,6 @@ def _run_scan(mode='all'):
 # MAIN CONTENT — Scanner Results Table
 # =============================================================================
 
-
-def render_market_structure_section():
-    from market_structure import MarketStructureAnalyzer
-    cache_key = 'market_structure_data'
-    cache_ts_key = 'market_structure_ts'
-    now = datetime.now().timestamp()
-    cached_ts = st.session_state.get(cache_ts_key, 0)
-    stale = (now - cached_ts) > 1800
-    with st.expander("🏛️ Market Structure Dashboard", expanded=False):
-        if cache_key not in st.session_state or stale:
-            st.info("📊 Real-time market analysis")
-            if st.button("▶️ Run Analysis", type="primary", key="ms_run"):
-                with st.spinner("Analyzing..."):
-                    try:
-                        analyzer = MarketStructureAnalyzer()
-                        structure = analyzer.analyze()
-                        st.session_state[cache_key] = structure.to_dict()
-                        st.session_state[cache_ts_key] = now
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
-            return
-        structure = st.session_state.get(cache_key)
-        if structure:
-            st.metric("Score", f"{structure.get('market_score', 0)}/100")
-            st.info(structure.get('recommendation', ''))
-
 def render_scanner_table():
     """Render scan results with watchlist management, filters, and click-to-view."""
     results = st.session_state.get('scan_results', [])
