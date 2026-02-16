@@ -808,6 +808,7 @@ def render_sidebar():
                                 # Save current watchlist's scan before switching
                                 save_scan_for_watchlist(active_wl["id"])
                                 _wm.set_active_watchlist(new_id)
+                                st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1  # FIX: Force text_area refresh
                                 st.session_state['show_wl_create'] = False
                                 st.session_state['scan_results'] = []
                                 st.session_state['scan_results_summary'] = []
