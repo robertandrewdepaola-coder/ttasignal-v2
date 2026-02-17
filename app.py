@@ -663,6 +663,9 @@ def _run_deep_analysis():
             ai_cfg = ai_clients.get('ai_config', {}) or {}
             ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
             fallback_model = ai_cfg.get('fallback_model', '')
+            ai_cfg = ai_clients.get('ai_config', {}) or {}
+            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
+            fallback_model = ai_cfg.get('fallback_model', '')
 
             result = generate_deep_market_analysis(
                 macro_data,
@@ -844,6 +847,95 @@ def _run_factual_brief():
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Brief error: {e}")
+
+
+def _compute_system_health(force: bool = False) -> Dict[str, Any]:
+    """Compute cached system health snapshot (AI + price feed + heartbeat)."""
+    now = time.time()
+    ttl_sec = 60
+    cached = st.session_state.get('_system_health_snapshot')
+    if cached and not force and (now - float(cached.get('ts_epoch', 0.0))) < ttl_sec:
+        return cached
+
+    ai_clients = _get_ai_clients()
+    ai_cfg = ai_clients.get('ai_config', {}) or {}
+    has_openai_compat = ai_clients.get('openai_client') is not None
+    has_gemini = ai_clients.get('gemini') is not None
+    ai_ok = bool(has_openai_compat or has_gemini)
+
+    spy_px = fetch_current_price("SPY")
+    price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
+
+    ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ts_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    issues = []
+    if not ai_ok:
+        issues.append("AI connection unavailable")
+    if not price_feed_ok:
+        issues.append("Price feed unavailable")
+
+    overall_ok = len(issues) == 0
+    snapshot = {
+        'ts_epoch': now,
+        'ts_local': ts_local,
+        'ts_utc': ts_utc,
+        'overall_ok': overall_ok,
+        'issues': issues,
+        'ai_ok': ai_ok,
+        'provider': ai_cfg.get('provider', 'none'),
+        'model': ai_cfg.get('model', ''),
+        'has_openai_compat': has_openai_compat,
+        'has_gemini': has_gemini,
+        'primary_error': ai_clients.get('primary_error'),
+        'gemini_error': ai_clients.get('gemini_error'),
+        'price_feed_ok': price_feed_ok,
+        'spy_price': float(spy_px) if price_feed_ok else None,
+    }
+    st.session_state['_system_health_snapshot'] = snapshot
+
+    last_log = float(st.session_state.get('_last_system_health_log_ts', 0.0) or 0.0)
+    if force or (now - last_log) > 300:
+        st.session_state['_last_system_health_log_ts'] = now
+        _append_perf_metric({
+            "kind": "system_health",
+            "ok": overall_ok,
+            "ai_ok": ai_ok,
+            "price_feed_ok": price_feed_ok,
+            "provider": snapshot['provider'],
+            "model": snapshot['model'],
+        })
+
+    return snapshot
+
+
+def _render_system_status_panel():
+    """Persistent sidebar system status panel with clear health indicator."""
+    st.sidebar.divider()
+    health = _compute_system_health(force=False)
+
+    with st.sidebar.container(border=True):
+        if health.get('overall_ok'):
+            st.sidebar.success("🟢 System Status: ALL SYSTEMS OPERATIONAL")
+        else:
+            st.sidebar.error("🔴 System Status: DEGRADED")
+            st.sidebar.error("Alert: " + "; ".join(health.get('issues', [])))
+
+        c1, c2 = st.sidebar.columns([2, 1])
+        with c1:
+            st.sidebar.caption(
+                f"AI: {'OK' if health.get('ai_ok') else 'FAIL'} "
+                f"({health.get('provider', 'none')} / {health.get('model', '') or 'n/a'})"
+            )
+            st.sidebar.caption(
+                f"Price Feed: {'OK' if health.get('price_feed_ok') else 'FAIL'} "
+                + (f"(SPY ${health.get('spy_price', 0):.2f})" if health.get('price_feed_ok') else "")
+            )
+            st.sidebar.caption(f"Heartbeat: {health.get('ts_local', '')} | {health.get('ts_utc', '')}")
+        with c2:
+            if st.sidebar.button("↻ Check", key="system_health_recheck"):
+                _compute_system_health(force=True)
+                st.rerun()
 
 
 # =============================================================================
@@ -1224,6 +1316,7 @@ def render_sidebar():
     # ── Market Brief (replaces old green/yellow/red rectangle) ──────
     st.sidebar.divider()
     _render_factual_market_brief()
+    _render_system_status_panel()
 
     # ── Settings (bottom of sidebar) ──────────────────────────────────
     with st.sidebar.expander("⚙️ Settings", expanded=False):
@@ -1269,7 +1362,13 @@ def render_sidebar():
             _diag_key = st.secrets.get("GROQ_API_KEY", "")
             if _diag_key:
                 _diag_cfg = _detect_ai_provider(_diag_key)
-                _status = st.session_state.get('_groq_key_status', 'not tested')
+                _diag_clients = _get_ai_clients()
+                if _diag_clients.get('openai_client') is not None:
+                    _status = 'connected'
+                elif _diag_clients.get('primary_error'):
+                    _status = f"error: {_diag_clients.get('primary_error')}"
+                else:
+                    _status = st.session_state.get('_groq_key_status', 'not tested')
                 st.caption(f"🔑 API key: `{_diag_cfg['key'][:8]}...{_diag_cfg['key'][-4:]}` "
                            f"({len(_diag_cfg['key'])} chars)")
                 st.caption(f"   Provider: **{_diag_cfg['provider'].upper()}** → {_diag_cfg['base_url']} | "
