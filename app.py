@@ -53,6 +53,7 @@ from watchlist_manager import WatchlistManager
 from watchlist_bridge import WatchlistBridge
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 from scan_utils import resolve_tickers_to_scan
+from trade_decision import build_trade_decision_card
 
 
 # =============================================================================
@@ -2072,6 +2073,8 @@ def _run_trade_finder_workflow() -> None:
         return
 
     ai_clients = _get_ai_clients()
+    snap = _build_dashboard_snapshot()
+    gate = _evaluate_trade_gate(snap)
     profile_cache = st.session_state.get('_trade_finder_profile_cache', {}) or {}
     rows = []
     _t0 = time.time()
@@ -2110,6 +2113,30 @@ def _run_trade_finder_workflow() -> None:
             'rank_score': float(ai_rec.get('rank_score', 0) or 0),
             'ai_rationale': str(ai_rec.get('rationale', '') or ''),
             'provider': ai_rec.get('provider', 'system'),
+            'decision_card': build_trade_decision_card(
+                ticker=ticker,
+                source="trade_finder",
+                recommendation=str(c.get('recommendation', '') or ''),
+                ai_buy_recommendation=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
+                conviction=int(c.get('conviction', 0) or 0),
+                quality_grade=str(c.get('quality_grade', '?') or '?'),
+                entry=entry,
+                stop=stop,
+                target=target,
+                rank_score=float(ai_rec.get('rank_score', 0) or 0),
+                regime=snap.regime,
+                gate_status=gate.status,
+                reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
+                ai_rationale=str(ai_rec.get('rationale', '') or ''),
+                sector_phase=str(c.get('sector_phase', '') or ''),
+                earn_days=int(c.get('earn_days', 999) or 999),
+                explainability_bits=[
+                    f"rec={str(c.get('recommendation', '') or '')}",
+                    f"conv={int(c.get('conviction', 0) or 0)}",
+                    f"phase={str(c.get('sector_phase', '') or '')}",
+                    f"rr={rr:.2f}",
+                ],
+            ).to_dict(),
         })
 
     st.session_state['_trade_finder_profile_cache'] = profile_cache
@@ -2155,6 +2182,7 @@ def render_trade_finder_tab():
 
     table_rows = []
     for r in rows:
+        card = r.get('decision_card', {}) or {}
         table_rows.append({
             'Ticker': r.get('ticker', ''),
             'Company': r.get('company_name', ''),
@@ -2166,16 +2194,19 @@ def render_trade_finder_tab():
             'Risk/Reward': f"{float(r.get('risk_reward', 0) or 0):.2f}:1",
             'AI Rationale': r.get('ai_rationale', ''),
             'Rank': f"{float(r.get('rank_score', 0) or 0):.2f}",
+            'Readiness': card.get('execution_readiness', ''),
+            'Regime Fit': card.get('regime_fit_score', ''),
         })
     st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
 
     st.markdown("### Open In New Trade")
     for i, r in enumerate(rows[:25]):
         ticker = r.get('ticker', '')
+        card = r.get('decision_card', {}) or {}
         label = (
             f"{ticker} | {r.get('ai_buy_recommendation', '')} | "
             f"R:R {float(r.get('risk_reward', 0) or 0):.2f}:1 | "
-            f"Score {float(r.get('rank_score', 0) or 0):.2f}"
+            f"Score {float(r.get('rank_score', 0) or 0):.2f} | {card.get('execution_readiness', '')}"
         )
         if st.button(label, key=f"tf_open_{i}_{ticker}", width="stretch"):
             st.session_state['trade_finder_selected_trade'] = {
@@ -7461,6 +7492,32 @@ def render_executive_dashboard():
         find_new_cands = find_new.get('candidates', []) or []
         if find_new_cands:
             for c in find_new_cands:
+                entry = float(c.get('price', 0) or 0)
+                stop = float(c.get('price', 0) or 0) * 0.94 if entry > 0 else 0.0
+                target = float(c.get('price', 0) or 0) * 1.10 if entry > 0 else 0.0
+                card = build_trade_decision_card(
+                    ticker=str(c.get('ticker', '') or ''),
+                    source="find_new",
+                    recommendation=str(c.get('recommendation', '') or ''),
+                    ai_buy_recommendation=str(c.get('recommendation', '') or ''),
+                    conviction=int(c.get('conviction', 0) or 0),
+                    quality_grade=str(c.get('quality_grade', '?') or '?'),
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    rank_score=float(c.get('score', 0) or 0),
+                    regime=snap.regime,
+                    gate_status=gate.status,
+                    reason=str(c.get('summary', '') or ''),
+                    ai_rationale="",
+                    sector_phase=str(c.get('sector_phase', '') or ''),
+                    earn_days=int(c.get('earn_days', 999) or 999),
+                    explainability_bits=[
+                        "source=find_new",
+                        f"conv={int(c.get('conviction', 0) or 0)}",
+                        f"phase={str(c.get('sector_phase', '') or '')}",
+                    ],
+                ).to_dict()
                 candidate_rows.append({
                     'row': {
                         'ticker': c.get('ticker', ''),
@@ -7473,6 +7530,7 @@ def render_executive_dashboard():
                         f"Quality {c.get('quality_grade', '?')}",
                         f"Sector {c.get('sector_phase', '')}".strip(),
                     ],
+                    'card': card,
                 })
         else:
             for row in snap.scan_summary:
@@ -7480,10 +7538,33 @@ def render_executive_dashboard():
                 if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
                     scored = _score_candidate_with_policy(row, snap)
                     if not scored['blocked']:
+                        entry = float(row.get('price', 0) or 0)
+                        stop = entry * 0.94 if entry > 0 else 0.0
+                        target = entry * 1.10 if entry > 0 else 0.0
+                        card = build_trade_decision_card(
+                            ticker=str(row.get('ticker', '') or ''),
+                            source="scanner",
+                            recommendation=str(row.get('recommendation', '') or ''),
+                            ai_buy_recommendation=str(row.get('recommendation', '') or ''),
+                            conviction=int(row.get('conviction', 0) or 0),
+                            quality_grade=str(row.get('quality_grade', '?') or '?'),
+                            entry=entry,
+                            stop=stop,
+                            target=target,
+                            rank_score=float(scored['score'] or 0),
+                            regime=snap.regime,
+                            gate_status=gate.status,
+                            reason=str(row.get('summary', '') or ''),
+                            ai_rationale="",
+                            sector_phase=str(row.get('sector_phase', '') or ''),
+                            earn_days=int(row.get('earn_days', 999) or 999),
+                            explainability_bits=list(scored['reasons'][:3]),
+                        ).to_dict()
                         candidate_rows.append({
                             'row': row,
                             'score': scored['score'],
                             'reasons': scored['reasons'],
+                            'card': card,
                         })
     candidate_rows = sorted(candidate_rows, key=lambda x: x['score'], reverse=True)
     actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
@@ -7601,15 +7682,19 @@ def render_executive_dashboard():
             st.caption("No actionable entries in current scan.")
         for cand in actionable[:12]:
             row = cand['row']
+            card = cand.get('card', {}) or {}
             ticker = row.get('ticker', '?')
             rec = row.get('recommendation', '?')
             conv = row.get('conviction', 0)
             score = cand['score']
-            why = "; ".join(cand['reasons'][:3])
+            why = card.get('explainability', '') or "; ".join(cand['reasons'][:3])
+            readiness = card.get('execution_readiness', '')
             if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
                          key=f"exec_pick_{ticker}", width="stretch"):
                 _load_ticker_for_view(ticker)
             st.caption(f"Why: {why}")
+            if readiness:
+                st.caption(f"Decision: {readiness} | Regime fit: {card.get('regime_fit_score', 0)}")
 
     with q3:
         st.markdown("**Open Positions Needing Attention**")
