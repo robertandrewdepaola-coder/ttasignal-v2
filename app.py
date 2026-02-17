@@ -8035,7 +8035,7 @@ def render_executive_dashboard():
         help="When enabled, stop-loss and target-hit rules auto-close positions during refresh runs.",
     )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         if st.button("⚡ Fast Refresh", key="exec_fast_refresh", type="primary", width="stretch"):
             _fast_refresh_dashboard()
