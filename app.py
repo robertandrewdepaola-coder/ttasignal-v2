@@ -717,6 +717,20 @@ def _render_factual_market_brief():
         st.sidebar.error(f"**{spy_str} | {vix_str}**")
     st.sidebar.caption(f"Unified Regime: **{_regime_u}** ({_reg_conf}%)")
 
+    # Single execution authority: should we be trading at all?
+    try:
+        gate = _evaluate_trade_gate(_build_dashboard_snapshot())
+        if gate.severity == "danger":
+            st.sidebar.error(f"**{gate.label}**")
+        elif gate.severity == "warning":
+            st.sidebar.warning(f"**{gate.label}**")
+        else:
+            st.sidebar.success(f"**{gate.label}**")
+        st.sidebar.caption(f"Reason: {gate.reason}")
+        st.sidebar.caption(f"Model alignment: {gate.model_alignment}")
+    except Exception:
+        pass
+
     # ── AI Narrative (if generated) ───────────────────────────────────
     narrative_data = st.session_state.get('morning_narrative')
     narrative_date = st.session_state.get('morning_narrative_date', '')
@@ -5441,6 +5455,7 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     open_trades = jm.get_open_trades()
     snap = _build_dashboard_snapshot()
     policy = snap.risk_policy
+    gate = _evaluate_trade_gate(snap)
     win_rate = jm.get_recent_win_rate(last_n=20)
     losing_streak = jm.get_current_losing_streak()
 
@@ -5456,6 +5471,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         f"Size x{policy.position_size_multiplier:.2f} | "
         f"Max open {policy.max_total_open_positions}"
     )
+    if gate.severity == "danger":
+        st.error(f"{gate.label} — {gate.reason}")
+    elif gate.severity == "warning":
+        st.warning(f"{gate.label} — {gate.reason}")
+    else:
+        st.success(f"{gate.label} — {gate.reason}")
     if len(open_trades) >= policy.max_total_open_positions:
         st.error(
             f"New entries blocked by policy: open positions {len(open_trades)} >= "
@@ -5622,7 +5643,9 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
         trades_today = _count_today_trade_entries()
-        if len(open_trades) >= policy.max_total_open_positions:
+        if not gate.allow_new_trades:
+            st.error(f"Blocked: {gate.label}. {gate.reason}")
+        elif len(open_trades) >= policy.max_total_open_positions:
             st.error(f"Blocked by regime policy: max open positions reached ({policy.max_total_open_positions}).")
         elif trades_today >= policy.max_new_trades:
             st.error(f"Blocked by regime policy: max new trades today reached ({policy.max_new_trades}).")
@@ -6191,6 +6214,16 @@ class DashboardSnapshot:
     risk_policy: RiskBudgetPolicy
 
 
+@dataclass
+class TradeGateDecision:
+    status: str  # NO_TRADE | TRADE_LIGHT | FAVOR_TRADING
+    label: str
+    allow_new_trades: bool
+    severity: str  # danger | warning | success
+    reason: str
+    model_alignment: str  # ALIGNED | DIVERGENT | PARTIAL
+
+
 def _is_exec_dashboard_enabled() -> bool:
     """
     Feature flag for phased rollout.
@@ -6292,6 +6325,106 @@ def _build_dashboard_snapshot() -> DashboardSnapshot:
         regime=regime,
         regime_confidence=confidence,
         risk_policy=policy,
+    )
+
+
+def _normalize_brief_regime(regime_text: str) -> str:
+    r = str(regime_text or "").lower()
+    if "risk-off" in r or "bearish" in r:
+        return "RISK_OFF"
+    if "neutral" in r or "balanced" in r or "caution" in r:
+        return "TRANSITION"
+    if "risk-on" in r or "bullish" in r:
+        return "RISK_ON"
+    return "UNKNOWN"
+
+
+def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
+    """
+    Single execution authority for whether new trades should be taken now.
+    """
+    vix = float(snap.market_filter.get('vix_close', 0) or 0)
+    spy_ok = bool(snap.market_filter.get('spy_above_200', True))
+
+    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)
+    stale_market = _is_stale(snap.market_ts, 30 * 60)
+    stale_sector = _is_stale(snap.sector_ts, 60 * 60)
+    stale_positions = _is_stale(snap.pos_ts, 10 * 60)
+    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)
+    stale_count = sum([stale_scan, stale_market, stale_sector, stale_positions, stale_alerts])
+
+    deep_score = 0
+    deep = st.session_state.get('deep_market_analysis') or {}
+    if isinstance(deep, dict):
+        deep_score = int(deep.get('score', 0) or 0)
+    brief = st.session_state.get('morning_narrative') or {}
+    brief_regime = _normalize_brief_regime(brief.get('regime', ''))
+
+    aligned = 0
+    if brief_regime == "UNKNOWN":
+        aligned += 0
+    elif brief_regime == snap.regime:
+        aligned += 1
+    if (deep_score >= 1 and snap.regime == "RISK_ON") or (deep_score <= -1 and snap.regime == "RISK_OFF"):
+        aligned += 1
+    elif deep_score == 0 and snap.regime in {"TRANSITION", "DEFENSIVE"}:
+        aligned += 1
+
+    if aligned >= 2:
+        model_alignment = "ALIGNED"
+    elif aligned == 1:
+        model_alignment = "PARTIAL"
+    else:
+        model_alignment = "DIVERGENT"
+
+    # Base decision from unified regime + volatility
+    if stale_count >= 3:
+        status = "NO_TRADE"
+        reason = "Core data is stale. Refresh before opening new trades."
+    elif snap.regime == "RISK_OFF" or vix >= 25:
+        status = "NO_TRADE"
+        reason = f"Risk-off environment (VIX {vix:.1f}). Preserve capital."
+    elif snap.regime in {"DEFENSIVE", "TRANSITION"} or vix >= 20 or not spy_ok:
+        status = "TRADE_LIGHT"
+        reason = f"Mixed/cautious regime with elevated risk (VIX {vix:.1f})."
+    else:
+        status = "FAVOR_TRADING"
+        reason = f"Benign risk backdrop and supportive trend (VIX {vix:.1f})."
+
+    # Downgrade one notch when models diverge materially.
+    if model_alignment == "DIVERGENT":
+        if status == "FAVOR_TRADING":
+            status = "TRADE_LIGHT"
+            reason += " Downgraded due to model divergence."
+        elif status == "TRADE_LIGHT":
+            status = "NO_TRADE"
+            reason += " Downgraded due to model divergence."
+
+    if status == "NO_TRADE":
+        return TradeGateDecision(
+            status=status,
+            label="🛑 TOO RISKY TO TRADE",
+            allow_new_trades=False,
+            severity="danger",
+            reason=reason,
+            model_alignment=model_alignment,
+        )
+    if status == "TRADE_LIGHT":
+        return TradeGateDecision(
+            status=status,
+            label="🟡 TRADE LIGHT (SELECTIVE)",
+            allow_new_trades=True,
+            severity="warning",
+            reason=reason,
+            model_alignment=model_alignment,
+        )
+    return TradeGateDecision(
+        status=status,
+        label="🟢 MARKET FAVORS TRADING",
+        allow_new_trades=True,
+        severity="success",
+        reason=reason,
+        model_alignment=model_alignment,
     )
 
 
@@ -6513,6 +6646,7 @@ def render_executive_dashboard():
     _render_started = time.time()
     jm = get_journal()
     snap = _build_dashboard_snapshot()
+    gate = _evaluate_trade_gate(snap)
     dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
 
     st.subheader("Executive Dashboard")
@@ -6549,16 +6683,17 @@ def render_executive_dashboard():
         st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
 
     candidate_rows = []
-    for row in snap.scan_summary:
-        rec = str(row.get('recommendation', '')).upper()
-        if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
-            scored = _score_candidate_with_policy(row, snap)
-            if not scored['blocked']:
-                candidate_rows.append({
-                    'row': row,
-                    'score': scored['score'],
-                    'reasons': scored['reasons'],
-                })
+    if gate.allow_new_trades:
+        for row in snap.scan_summary:
+            rec = str(row.get('recommendation', '')).upper()
+            if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
+                scored = _score_candidate_with_policy(row, snap)
+                if not scored['blocked']:
+                    candidate_rows.append({
+                        'row': row,
+                        'score': scored['score'],
+                        'reasons': scored['reasons'],
+                    })
     candidate_rows = sorted(candidate_rows, key=lambda x: x['score'], reverse=True)
     actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
 
@@ -6596,6 +6731,13 @@ def render_executive_dashboard():
         f"size x{snap.risk_policy.position_size_multiplier:.2f}, "
         f"max sector {snap.risk_policy.max_sector_exposure} | {snap.risk_policy.note}"
     )
+    if gate.severity == "danger":
+        st.error(f"{gate.label} — {gate.reason}")
+    elif gate.severity == "warning":
+        st.warning(f"{gate.label} — {gate.reason}")
+    else:
+        st.success(f"{gate.label} — {gate.reason}")
+    st.caption(f"Execution Authority: Unified Trade Gate | Model alignment: {gate.model_alignment}")
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Watchlist", len(snap.watchlist_tickers))
@@ -6654,7 +6796,9 @@ def render_executive_dashboard():
 
     with q2:
         st.markdown("**Top Trade Candidates**")
-        if not actionable:
+        if not gate.allow_new_trades:
+            st.caption("New trade entries are blocked by current market gate.")
+        elif not actionable:
             st.caption("No actionable entries in current scan.")
         for cand in actionable[:12]:
             row = cand['row']
