@@ -23,6 +23,7 @@ import time
 import re
 import requests as _requests_lib
 import logging
+import hashlib
 
 # ── Suppress noisy yfinance logging globally ────────────────────────────────
 # yfinance emits ERROR-level messages for perfectly normal situations:
@@ -685,7 +686,7 @@ def _fetch_earnings_nasdaq(ticker: str, today=None):
             for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%b %d, %Y", "%B %d, %Y"):
                 try:
                     earn_dt = datetime.strptime(date_str.strip(), fmt).date()
-                    if (earn_dt - today).days >= -7:
+                    if (earn_dt - today).days >= 0:
                         return earn_dt
                 except ValueError:
                     continue
@@ -731,7 +732,7 @@ def _fetch_earnings_yahoo_html(ticker: str, today=None):
             for match in re.finditer(pattern, html):
                 try:
                     d = datetime.strptime(match.group(1).strip(), fmt).date()
-                    if (d - today).days >= -7:
+                    if (d - today).days >= 0:
                         candidates.append(d)
                 except ValueError:
                     continue
@@ -741,8 +742,7 @@ def _fetch_earnings_yahoo_html(ticker: str, today=None):
             future = [d for d in candidates if d >= today]
             if future:
                 return min(future)
-            # If no future dates, return most recent past (within 7 days)
-            return max(candidates)
+            return None
 
     except Exception:
         pass
@@ -778,7 +778,7 @@ def _fetch_earnings_stockanalysis(ticker: str, today=None):
                 for fmt in ("%B %d, %Y", "%b %d, %Y"):
                     try:
                         d = datetime.strptime(date_str, fmt).date()
-                        if (d - today).days >= -7:
+                        if (d - today).days >= 0:
                             return d
                     except ValueError:
                         continue
@@ -795,7 +795,7 @@ def _fetch_earnings_stockanalysis(ticker: str, today=None):
                 if m:
                     try:
                         d = datetime.strptime(m.group(1).strip(), fmt).date()
-                        if (d - today).days >= -7:
+                        if (d - today).days >= 0:
                             return d
                     except ValueError:
                         pass
@@ -816,34 +816,45 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     Three strategies per ticker: info dict → calendar → earnings_dates.
     Caches negative results to avoid re-querying known failures.
     """
-    cache_key = "BATCH_EARNINGS_FLAGS"
+    # Cache must be keyed by date + universe, otherwise stale results leak across scans.
+    today = datetime.now().date()
+    tkey = ",".join(sorted(str(t).upper() for t in tickers if t))
+    thash = hashlib.md5(tkey.encode("utf-8")).hexdigest()[:12]
+    cache_key = f"BATCH_EARNINGS_FLAGS:{today.isoformat()}:{days_ahead}:{thash}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Per-session negative cache — tickers we already know have no earnings data
+    # Per-session negative cache with daily expiry.
     if not hasattr(fetch_batch_earnings_flags, '_no_data_cache'):
-        fetch_batch_earnings_flags._no_data_cache = set()
+        fetch_batch_earnings_flags._no_data_cache = {}
     no_data = fetch_batch_earnings_flags._no_data_cache
 
     # Skip ETFs (they don't have earnings) and previously-failed tickers
-    tickers_to_fetch = [t for t in tickers if t not in no_data and t not in SKIP_EARNINGS_TICKERS]
+    tickers_to_fetch = []
+    for t in tickers:
+        if t in SKIP_EARNINGS_TICKERS:
+            continue
+        last_miss = no_data.get(t)
+        if last_miss == today.isoformat():
+            continue
+        tickers_to_fetch.append(t)
     skipped_etfs = sum(1 for t in tickers if t in SKIP_EARNINGS_TICKERS)
-    skipped_cached = sum(1 for t in tickers if t in no_data and t not in SKIP_EARNINGS_TICKERS)
+    skipped_cached = sum(1 for t in tickers
+                         if t not in SKIP_EARNINGS_TICKERS and no_data.get(t) == today.isoformat())
     if skipped_etfs > 0:
         print(f"[earnings] Skipping {skipped_etfs} ETFs (no earnings dates for funds)")
     if skipped_cached > 0:
         print(f"[earnings] Skipping {skipped_cached} tickers with no earnings data (cached)")
-
-    today = datetime.now().date()
 
     def _fetch_one_earnings(ticker: str):
         """Fetch earnings date for a single ticker with 3 fallback strategies."""
         try:
             stock = yf.Ticker(ticker)
             earn_dt = None
+            recent_past = None
 
             # Strategy 1: info dict (often has earningsTimestamp — fast, same API call)
             try:
@@ -858,9 +869,12 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                             # earningsTimestamp is usually future; mostRecentQuarter is past
                             if key == 'mostRecentQuarter':
                                 continue  # Skip past dates from this key
-                            if (candidate - today).days >= -7:
+                            days = (candidate - today).days
+                            if days >= 0:
                                 earn_dt = candidate
                                 break
+                            if -30 <= days < 0 and (recent_past is None or candidate > recent_past):
+                                recent_past = candidate
                     # Also check string date format
                     if earn_dt is None:
                         for key in ('earningsDate',):
@@ -870,8 +884,11 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                                     val = val[0]
                                 if hasattr(val, 'date') and callable(getattr(val, 'date', None)):
                                     candidate = val.date()
-                                    if (candidate - today).days >= -7:
+                                    days = (candidate - today).days
+                                    if days >= 0:
                                         earn_dt = candidate
+                                    elif -30 <= days < 0 and (recent_past is None or candidate > recent_past):
+                                        recent_past = candidate
             except Exception:
                 pass
 
@@ -912,9 +929,12 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                                     d = dt_idx.to_pydatetime().date()
                                 else:
                                     continue
-                                if (d - today).days >= -7:
-                                    earn_dt = d
-                                    break
+                                    days = (d - today).days
+                                    if days >= 0:
+                                        earn_dt = d
+                                        break
+                                    if -30 <= days < 0 and (recent_past is None or d > recent_past):
+                                        recent_past = d
                             except Exception:
                                 continue
                 except Exception:
@@ -922,15 +942,30 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
             if earn_dt is not None:
                 days_until = (earn_dt - today).days
-                if days_until >= -7:
+                if days_until >= 0:
                     return (ticker, {
                         'next_earnings': earn_dt.strftime('%Y-%m-%d'),
                         'days_until': days_until,
                         'within_window': 0 <= days_until <= days_ahead,
                     })
+                if -30 <= days_until < 0 and (recent_past is None or earn_dt > recent_past):
+                    recent_past = earn_dt
+
+            # If we only found a recent past report, estimate next quarter.
+            if recent_past is not None:
+                est = recent_past + timedelta(days=91)
+                while est < today:
+                    est += timedelta(days=91)
+                days_until = (est - today).days
+                return (ticker, {
+                    'next_earnings': est.strftime('%Y-%m-%d'),
+                    'days_until': days_until,
+                    'within_window': 0 <= days_until <= days_ahead,
+                    'estimated': True,
+                })
 
             # All 3 yfinance strategies failed — mark for alt-source pass
-            no_data.add(ticker)
+            no_data[ticker] = today.isoformat()
         except Exception:
             pass
         return (ticker, None)
@@ -967,14 +1002,13 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
         if earn_dt is not None:
             days_until = (earn_dt - today).days
-            if days_until >= -7:
-                # Found via alt source — remove from negative cache
-                no_data.discard(ticker)
-                return (ticker, {
-                    'next_earnings': earn_dt.strftime('%Y-%m-%d'),
-                    'days_until': days_until,
-                    'within_window': 0 <= days_until <= days_ahead,
-                })
+            # Found via alt source — remove from negative cache
+            no_data.pop(ticker, None)
+            return (ticker, {
+                'next_earnings': earn_dt.strftime('%Y-%m-%d'),
+                'days_until': days_until,
+                'within_window': 0 <= days_until <= days_ahead,
+            })
 
         return (ticker, None)
 
@@ -1577,11 +1611,14 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                         
                         if earn_dt:
                             days = (earn_dt - today).days
-                            if days >= -7:  # Accept recent past (just reported)
+                            if days >= 0:
                                 result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
                                 result['days_until_earnings'] = max(0, days)
                                 result['confidence'] = 'HIGH'
                                 result['source'] = 'Yahoo (.calendar)'
+                            elif -30 <= days < 0:
+                                if not result.get('last_earnings'):
+                                    result['last_earnings'] = earn_dt.strftime('%Y-%m-%d')
             except Exception:
                 pass
             
@@ -1596,12 +1633,14 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                             from datetime import timezone
                             earn_dt = datetime.fromtimestamp(ts, tz=timezone.utc).date()
                             days = (earn_dt - today).days
-                            if days >= -7:
+                            if days >= 0:
                                 result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
                                 result['days_until_earnings'] = max(0, days)
                                 result['confidence'] = 'MEDIUM-HIGH'
                                 result['source'] = f'Yahoo (.info:{ts_key})'
                                 break
+                            elif -30 <= days < 0 and not result.get('last_earnings'):
+                                result['last_earnings'] = earn_dt.strftime('%Y-%m-%d')
                 except Exception:
                     pass
             
@@ -1610,31 +1649,33 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                 try:
                     edates = stock.earnings_dates
                     if edates is not None and len(edates) > 0:
-                        # Sort and find the next date >= today - 7
+                        dates = []
                         for dt_idx in sorted(edates.index):
                             try:
                                 d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                                days = (d - today).days
-                                if days >= -7:
-                                    result['next_earnings'] = d.strftime('%Y-%m-%d')
-                                    result['days_until_earnings'] = max(0, days)
-                                    result['confidence'] = 'MEDIUM-HIGH'
-                                    result['source'] = 'Yahoo (.earnings_dates)'
-                                    # Grab EPS estimate if available
-                                    row = edates.loc[dt_idx]
-                                    eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
-                                    if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
-                                        result['next_eps_estimate'] = float(eps_est)
-                                    break
+                                dates.append((d, dt_idx))
                             except Exception:
                                 continue
+
+                        # First preference: nearest future date
+                        for d, dt_idx in dates:
+                            if d >= today:
+                                days = (d - today).days
+                                result['next_earnings'] = d.strftime('%Y-%m-%d')
+                                result['days_until_earnings'] = max(0, days)
+                                result['confidence'] = 'MEDIUM-HIGH'
+                                result['source'] = 'Yahoo (.earnings_dates)'
+                                row = edates.loc[dt_idx]
+                                eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
+                                if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
+                                    result['next_eps_estimate'] = float(eps_est)
+                                break
                         
                         # Also grab last earnings date (most recent past)
-                        for dt_idx in sorted(edates.index, reverse=True):
+                        for d, _dt_idx in sorted(dates, key=lambda x: x[0], reverse=True):
                             try:
-                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
                                 days = (d - today).days
-                                if days < -7:
+                                if days < 0:
                                     result['last_earnings'] = d.strftime('%Y-%m-%d')
                                     break
                             except Exception:
