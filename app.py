@@ -7884,6 +7884,123 @@ def render_executive_dashboard():
                     if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
                         _load_ticker_for_view(ticker)
 
+    st.divider()
+    with st.expander("🗂️ Planned Trades Board", expanded=False):
+        all_plans = jm.get_planned_trades()
+        status_filter = st.selectbox(
+            "Status Filter",
+            ["ALL", "PLANNED", "TRIGGERED", "CANCELLED", "ENTERED"],
+            key="exec_plan_status_filter",
+        )
+        only_today = st.checkbox("Today only", value=False, key="exec_plan_today_only")
+        stale_days = st.number_input(
+            "Stale threshold (days)",
+            min_value=1,
+            max_value=30,
+            value=3,
+            step=1,
+            key="exec_plan_stale_days",
+        )
+
+        def _parse_dt(s: str):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        filtered = []
+        now_dt = datetime.now()
+        for p in all_plans:
+            p_status = str(p.get('status', '')).upper()
+            if status_filter != "ALL" and p_status != status_filter:
+                continue
+            created = _parse_dt(str(p.get('created_at', '') or ''))
+            if only_today and created is not None and created.date() != now_dt.date():
+                continue
+            filtered.append(p)
+
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            if st.button("✖ Cancel All Planned", key="exec_cancel_all_planned", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="PLANNED"):
+                    pid = str(p.get('plan_id', ''))
+                    if pid:
+                        jm.update_planned_trade_status(pid, "CANCELLED", notes="bulk-cancelled from executive board")
+                        cnt += 1
+                st.success(f"Cancelled {cnt} planned trade(s).")
+                st.rerun()
+        with bc2:
+            if st.button("🧹 Cancel Stale Planned", key="exec_cancel_stale_planned", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="PLANNED"):
+                    pid = str(p.get('plan_id', ''))
+                    created = _parse_dt(str(p.get('created_at', '') or ''))
+                    if pid and created is not None and (now_dt - created.replace(tzinfo=None) if created.tzinfo else now_dt - created).days >= int(stale_days):
+                        jm.update_planned_trade_status(pid, "CANCELLED", notes=f"stale >={int(stale_days)}d")
+                        cnt += 1
+                st.success(f"Cancelled {cnt} stale planned trade(s).")
+                st.rerun()
+        with bc3:
+            if st.button("✅ Mark Triggered Entered", key="exec_mark_triggered_entered", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="TRIGGERED"):
+                    pid = str(p.get('plan_id', ''))
+                    if pid:
+                        jm.update_planned_trade_status(pid, "ENTERED", notes="manual-entered from executive board")
+                        cnt += 1
+                st.success(f"Marked {cnt} triggered trade(s) as entered.")
+                st.rerun()
+
+        st.caption(f"Showing {len(filtered)} / {len(all_plans)} planned trades")
+        if not filtered:
+            st.caption("No planned trades match filters.")
+        for p in filtered[:50]:
+            pid = str(p.get('plan_id', ''))
+            pticker = str(p.get('ticker', '')).upper().strip()
+            pstatus = str(p.get('status', 'PLANNED')).upper()
+            pentry = float(p.get('entry', 0) or 0)
+            pstop = float(p.get('stop', 0) or 0)
+            ptarget = float(p.get('target', 0) or 0)
+            prr = float(p.get('risk_reward', 0) or 0)
+            pscore = float(p.get('rank_score', 0) or 0)
+            st.caption(
+                f"{pticker} | {pstatus} | Entry ${pentry:.2f} Stop ${pstop:.2f} Target ${ptarget:.2f} "
+                f"| R:R {prr:.2f}:1 | Score {pscore:.2f}"
+            )
+            r1, r2, r3, r4 = st.columns(4)
+            with r1:
+                if st.button("▶ Open", key=f"exec_plan_open_{pid}", width="stretch"):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'plan_id': pid,
+                        'ticker': pticker,
+                        'entry': pentry,
+                        'stop': pstop,
+                        'target': ptarget,
+                        'risk_reward': prr,
+                        'reason': str(p.get('reason', '') or ''),
+                        'ai_rationale': str(p.get('notes', '') or ''),
+                        'provider': str(p.get('source', 'planned') or 'planned'),
+                    }
+                    st.session_state['default_detail_tab'] = 4
+                    st.session_state['_switch_to_scanner_tab'] = True
+                    _load_ticker_for_view(pticker)
+                    st.rerun()
+            with r2:
+                if st.button("⚡ Trigger", key=f"exec_plan_trigger_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
+                    st.rerun()
+            with r3:
+                if st.button("✖ Cancel", key=f"exec_plan_cancel_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "CANCELLED"))
+                    st.rerun()
+            with r4:
+                if st.button("✅ Entered", key=f"exec_plan_entered_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "ENTERED", notes="manual-entered from executive row"))
+                    st.rerun()
+
     # Render telemetry (throttled)
     now_ts = time.time()
     if (now_ts - float(st.session_state.get('_last_exec_render_log_ts', 0.0))) > 60:
