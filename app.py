@@ -6182,6 +6182,24 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     gate = _evaluate_trade_gate(snap)
     win_rate = jm.get_recent_win_rate(last_n=20)
     losing_streak = jm.get_current_losing_streak()
+    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)
+    stale_market = _is_stale(snap.market_ts, 30 * 60)
+    stale_sector = _is_stale(snap.sector_ts, 60 * 60)
+    stale_positions = _is_stale(snap.pos_ts, 10 * 60)
+    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)
+    stale_tags = []
+    if stale_scan:
+        stale_tags.append("scan")
+    if stale_market:
+        stale_tags.append("market")
+    if stale_sector:
+        stale_tags.append("sectors")
+    if stale_positions:
+        stale_tags.append("positions")
+    if stale_alerts:
+        stale_tags.append("alerts")
+    stale_count = len(stale_tags)
+    hard_block_stale = stale_count >= 3
 
     st.subheader(f"📐 Position Sizer — {ticker}")
 
@@ -6201,6 +6219,11 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.warning(f"{gate.label} — {gate.reason}")
     else:
         st.success(f"{gate.label} — {gate.reason}")
+    if hard_block_stale:
+        st.error(
+            "Entry hard-blocked: critical stale data streams detected "
+            f"({', '.join(stale_tags)}). Run Fast Refresh before entering new trades."
+        )
     if len(open_trades) >= policy.max_total_open_positions:
         st.error(
             f"New entries blocked by policy: open positions {len(open_trades)} >= "
@@ -6430,9 +6453,13 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=notes_key)
     attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
 
-    if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
+    if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}", disabled=hard_block_stale):
         trades_today = _count_today_trade_entries()
-        if not gate.allow_new_trades:
+        if hard_block_stale:
+            st.error(
+                "Blocked: critical stale data streams. Run Fast Refresh and recheck before entering."
+            )
+        elif not gate.allow_new_trades:
             st.error(f"Blocked: {gate.label}. {gate.reason}")
         elif len(open_trades) >= policy.max_total_open_positions:
             st.error(f"Blocked by regime policy: max open positions reached ({policy.max_total_open_positions}).")
