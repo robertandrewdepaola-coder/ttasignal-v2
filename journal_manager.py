@@ -234,6 +234,8 @@ class Trade:
     regime_at_entry: str = ''
     gate_status_at_entry: str = ''
     vix_at_entry: float = 0
+    entry_source: str = 'scanner'
+    trade_finder_run_id: str = ''
     notes: str = ''
     opened_at: str = ''
     closed_at: str = ''
@@ -257,6 +259,7 @@ class PlannedTrade:
     risk_reward: float = 0
     ai_recommendation: str = ''
     rank_score: float = 0
+    trade_finder_run_id: str = ''
     reason: str = ''
     notes: str = ''
 
@@ -741,6 +744,8 @@ class JournalManager:
                 'avg_alpha_pct': 0, 'beat_benchmark_rate': 0, 'total_alpha_pct': 0,
                 'by_ticker': {},
                 'by_regime': {},
+                'by_entry_source': {},
+                'by_trade_finder_run': {},
                 'underperforming_buckets': [],
                 'trade_details': [],
             }
@@ -808,6 +813,38 @@ class JournalManager:
             by_regime[rg]['avg_pnl_pct'] = round(by_regime[rg]['total_pnl_pct'] / c, 2) if c > 0 else 0
             by_regime[rg]['win_rate'] = round(by_regime[rg]['wins'] / c * 100, 1) if c > 0 else 0
 
+        by_entry_source = {}
+        for t in trades:
+            src = str(t.get('entry_source', '') or t.get('source', '') or 'UNKNOWN').upper()
+            if src not in by_entry_source:
+                by_entry_source[src] = {'count': 0, 'wins': 0, 'total_pnl_pct': 0}
+            by_entry_source[src]['count'] += 1
+            pnlp = float(t.get('realized_pnl_pct', 0) or 0)
+            by_entry_source[src]['total_pnl_pct'] += pnlp
+            if pnlp > 0:
+                by_entry_source[src]['wins'] += 1
+        for src in by_entry_source:
+            c = by_entry_source[src]['count']
+            by_entry_source[src]['avg_pnl_pct'] = round(by_entry_source[src]['total_pnl_pct'] / c, 2) if c > 0 else 0
+            by_entry_source[src]['win_rate'] = round(by_entry_source[src]['wins'] / c * 100, 1) if c > 0 else 0
+
+        by_trade_finder_run = {}
+        for t in trades:
+            run_id = str(t.get('trade_finder_run_id', '') or '').strip()
+            if not run_id:
+                continue
+            if run_id not in by_trade_finder_run:
+                by_trade_finder_run[run_id] = {'count': 0, 'wins': 0, 'total_pnl_pct': 0}
+            by_trade_finder_run[run_id]['count'] += 1
+            pnlp = float(t.get('realized_pnl_pct', 0) or 0)
+            by_trade_finder_run[run_id]['total_pnl_pct'] += pnlp
+            if pnlp > 0:
+                by_trade_finder_run[run_id]['wins'] += 1
+        for run_id in by_trade_finder_run:
+            c = by_trade_finder_run[run_id]['count']
+            by_trade_finder_run[run_id]['avg_pnl_pct'] = round(by_trade_finder_run[run_id]['total_pnl_pct'] / c, 2) if c > 0 else 0
+            by_trade_finder_run[run_id]['win_rate'] = round(by_trade_finder_run[run_id]['wins'] / c * 100, 1) if c > 0 else 0
+
         avg_win = round(sum(wins) / len(wins), 2) if wins else 0
         avg_loss = round(sum(losses) / len(losses), 2) if losses else 0
         win_rate_frac = (len(wins) / len(trades)) if trades else 0
@@ -855,6 +892,8 @@ class JournalManager:
             'by_exit_reason': by_exit,
             'by_ticker': by_ticker,
             'by_regime': by_regime,
+            'by_entry_source': by_entry_source,
+            'by_trade_finder_run': by_trade_finder_run,
             'underperforming_buckets': underperforming,
             'trade_details': [dict(t) for t in trades],
         }

@@ -539,6 +539,7 @@ if 'trade_finder_results' not in st.session_state:
         if isinstance(_tf_latest, dict) and _tf_latest:
             _rows = _tf_latest.get('rows', []) or []
             st.session_state['trade_finder_results'] = {
+                'run_id': _tf_latest.get('run_id', ''),
                 'generated_at_iso': _tf_latest.get('generated_at_iso', ''),
                 'rows': _rows if isinstance(_rows, list) else [],
                 'provider': _tf_latest.get('provider', 'system'),
@@ -1932,6 +1933,7 @@ def _run_find_new_trades():
         _existing_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
         get_journal().save_trade_finder_snapshot({
             'generated_at_iso': report.get('generated_at_iso', ''),
+            'run_id': (st.session_state.get('trade_finder_results', {}) or {}).get('run_id', ''),
             'provider': (st.session_state.get('trade_finder_results', {}) or {}).get('provider', 'system'),
             'elapsed_sec': float(report.get('elapsed_sec', 0) or 0),
             'input_candidates': int(report.get('candidate_count', 0) or 0),
@@ -2188,6 +2190,7 @@ def _run_trade_finder_workflow() -> None:
     ai_clients = _get_ai_clients()
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
+    run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
     profile_cache = st.session_state.get('_trade_finder_profile_cache', {}) or {}
     rows = []
     _t0 = time.time()
@@ -2213,6 +2216,7 @@ def _run_trade_finder_workflow() -> None:
             rr = _calc_rr(entry, stop, target)
         rows.append({
             'ticker': ticker,
+            'trade_finder_run_id': run_id,
             'company_name': company_name,
             'price': float(c.get('price', 0) or 0),
             'earn_days': int(c.get('earn_days', 999) or 999),
@@ -2257,6 +2261,7 @@ def _run_trade_finder_workflow() -> None:
     rows = sorted(rows, key=lambda x: x.get('rank_score', 0), reverse=True)
     elapsed = max(0.0, time.time() - _t0)
     st.session_state['trade_finder_results'] = {
+        'run_id': run_id,
         'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'rows': rows,
         'provider': rows[0].get('provider', 'system') if rows else 'system',
@@ -2266,6 +2271,7 @@ def _run_trade_finder_workflow() -> None:
     try:
         get_journal().save_trade_finder_snapshot({
             'generated_at_iso': st.session_state['trade_finder_results'].get('generated_at_iso', ''),
+            'run_id': run_id,
             'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
             'elapsed_sec': float(elapsed),
             'input_candidates': int(len(base_candidates)),
@@ -2332,6 +2338,7 @@ def render_trade_finder_tab():
 
     st.caption(
         f"Generated: {results.get('generated_at_iso', '')} | "
+        f"Run: {results.get('run_id', 'n/a') or 'n/a'} | "
         f"Candidates: {len(rows)} | Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
         f"Provider: {results.get('provider', 'system')}"
     )
@@ -2379,6 +2386,7 @@ def render_trade_finder_tab():
                     risk_reward=float(r.get('risk_reward', 0) or 0),
                     ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
                     rank_score=float(r.get('rank_score', 0) or 0),
+                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
                     reason=str(r.get('reason', '') or ''),
                     notes=str(r.get('ai_rationale', '') or ''),
                 )
@@ -2410,6 +2418,7 @@ def render_trade_finder_tab():
                     'ai_rationale': r.get('ai_rationale', ''),
                     'provider': r.get('provider', 'system'),
                     'generated_at_iso': results.get('generated_at_iso', ''),
+                    'trade_finder_run_id': str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
                 }
                 st.session_state['default_detail_tab'] = 4
                 st.session_state['_switch_to_scanner_tab'] = True
@@ -2428,6 +2437,7 @@ def render_trade_finder_tab():
                     risk_reward=float(r.get('risk_reward', 0) or 0),
                     ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
                     rank_score=float(r.get('rank_score', 0) or 0),
+                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
                     reason=str(r.get('reason', '') or ''),
                     notes=str(r.get('ai_rationale', '') or ''),
                 )
@@ -2459,6 +2469,7 @@ def render_trade_finder_tab():
                         'target': float(p.get('target', 0) or 0),
                         'ai_buy_recommendation': str(p.get('ai_recommendation', '') or ''),
                         'risk_reward': float(p.get('risk_reward', 0) or 0),
+                        'trade_finder_run_id': str(p.get('trade_finder_run_id', '') or ''),
                         'reason': str(p.get('reason', '') or ''),
                         'ai_rationale': str(p.get('notes', '') or ''),
                         'provider': str(p.get('source', 'planned') or 'planned'),
@@ -6629,12 +6640,13 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     notes_key = f"notes_{ticker}"
     finder_note_applied_key = f"_tf_note_applied_{ticker}"
+    tf_run_id = str(finder_for_ticker.get('trade_finder_run_id', '') or '').strip()
     if finder_for_ticker and not st.session_state.get(finder_note_applied_key):
         tf_reason = str(finder_for_ticker.get('ai_rationale', '') or finder_for_ticker.get('reason', '') or '').strip()
         tf_rr = float(finder_for_ticker.get('risk_reward', 0) or 0)
         tf_rec = str(finder_for_ticker.get('ai_buy_recommendation', '') or '').strip()
         seed = rec.get('summary', '') or ''
-        tf_line = f"[Trade Finder] {tf_rec} | R:R {tf_rr:.2f}:1 | {tf_reason}".strip()
+        tf_line = f"[Trade Finder {tf_run_id or 'run:unknown'}] {tf_rec} | R:R {tf_rr:.2f}:1 | {tf_reason}".strip()
         st.session_state[notes_key] = f"{seed}\n{tf_line}".strip() if seed else tf_line
         st.session_state[finder_note_applied_key] = True
     notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=notes_key)
@@ -6709,7 +6721,7 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                 )
                 final_notes = f"{final_notes}\n\n{ticket}".strip() if final_notes else ticket
 
-            trade = Trade(
+                trade = Trade(
                 trade_id='',
                 ticker=ticker,
                 entry_price=confirm_entry,
@@ -6723,13 +6735,15 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                 weekly_bullish_at_entry=signal.weekly_macd.get('bullish', False) if signal else False,
                 monthly_bullish_at_entry=signal.monthly_macd.get('bullish', False) if signal else False,
                 weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
-                regime_at_entry=str(snap.regime or ''),
-                gate_status_at_entry=str(gate.status or ''),
-                vix_at_entry=float(snap.market_filter.get('vix_close', 0) or 0),
-                risk_per_share=confirm_entry - confirm_stop,
-                risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
-                notes=final_notes,
-            )
+                    regime_at_entry=str(snap.regime or ''),
+                    gate_status_at_entry=str(gate.status or ''),
+                    vix_at_entry=float(snap.market_filter.get('vix_close', 0) or 0),
+                    entry_source='trade_finder' if finder_for_ticker else 'scanner',
+                    trade_finder_run_id=tf_run_id,
+                    risk_per_share=confirm_entry - confirm_stop,
+                    risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
+                    notes=final_notes,
+                )
             result = jm.enter_trade(trade)
             st.success(result)
             try:
@@ -6738,15 +6752,16 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                     jm.update_planned_trade_status(plan_id, "ENTERED", notes=f"Entered {ticker} @ {confirm_entry:.2f}")
             except Exception:
                 pass
-            _append_audit_event(
-                "ENTER_TRADE",
-                (
-                    f"{ticker} entry={confirm_entry:.2f} stop={confirm_stop:.2f} "
-                    f"target={confirm_target:.2f} shares={confirm_shares} "
-                    f"regime={policy.regime}"
-                ),
-                source="trade_entry",
-            )
+                _append_audit_event(
+                    "ENTER_TRADE",
+                    (
+                        f"{ticker} entry={confirm_entry:.2f} stop={confirm_stop:.2f} "
+                        f"target={confirm_target:.2f} shares={confirm_shares} "
+                        f"regime={policy.regime} source={'trade_finder' if finder_for_ticker else 'scanner'} "
+                        f"tf_run={tf_run_id or 'n/a'}"
+                    ),
+                    source="trade_entry",
+                )
             st.rerun()
 
 
@@ -7124,6 +7139,36 @@ def render_performance():
         rows_rg = sorted(rows_rg, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
         st.dataframe(pd.DataFrame(rows_rg), hide_index=True, width='stretch')
 
+    by_src = stats.get('by_entry_source', {}) or {}
+    if by_src:
+        st.divider()
+        st.subheader("By Entry Source")
+        rows_src = []
+        for src, d in by_src.items():
+            rows_src.append({
+                'Source': src,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_src = sorted(rows_src, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_src), hide_index=True, width='stretch')
+
+    by_tf_run = stats.get('by_trade_finder_run', {}) or {}
+    if by_tf_run:
+        st.divider()
+        st.subheader("Trade Finder Attribution (By Run)")
+        rows_run = []
+        for run_id, d in by_tf_run.items():
+            rows_run.append({
+                'Run ID': run_id,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_run = sorted(rows_run, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_run), hide_index=True, width='stretch')
+
     # Underperforming buckets
     under = stats.get('underperforming_buckets', []) or []
     if under:
@@ -7158,6 +7203,8 @@ def render_performance():
                 'Days': t.get('days_held', 0),
                 'Reason': t.get('exit_reason', '?'),
                 'Signal': t.get('signal_type', '?'),
+                'Source': t.get('entry_source', t.get('source', '?')),
+                'TF Run': t.get('trade_finder_run_id', ''),
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
@@ -8305,6 +8352,7 @@ def render_executive_dashboard():
                         'ai_rationale': str(tr.get('ai_rationale', '') or ''),
                         'provider': str(tr.get('provider', 'system') or 'system'),
                         'generated_at_iso': str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '')),
+                        'trade_finder_run_id': str(tr.get('trade_finder_run_id', '') or (st.session_state.get('trade_finder_results', {}) or {}).get('run_id', '') or ''),
                     }
                     st.session_state['default_detail_tab'] = 4
                     st.session_state['_switch_to_scanner_tab'] = True
@@ -8748,7 +8796,7 @@ def render_executive_dashboard():
             pscore = float(p.get('rank_score', 0) or 0)
             st.caption(
                 f"{pticker} | {pstatus} | Entry ${pentry:.2f} Stop ${pstop:.2f} Target ${ptarget:.2f} "
-                f"| R:R {prr:.2f}:1 | Score {pscore:.2f}"
+                f"| R:R {prr:.2f}:1 | Score {pscore:.2f} | Run {str(p.get('trade_finder_run_id', '') or 'n/a')}"
             )
             r1, r2, r3, r4 = st.columns(4)
             with r1:
@@ -8760,6 +8808,7 @@ def render_executive_dashboard():
                         'stop': pstop,
                         'target': ptarget,
                         'risk_reward': prr,
+                        'trade_finder_run_id': str(p.get('trade_finder_run_id', '') or ''),
                         'reason': str(p.get('reason', '') or ''),
                         'ai_rationale': str(p.get('notes', '') or ''),
                         'provider': str(p.get('source', 'planned') or 'planned'),
