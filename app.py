@@ -1579,8 +1579,21 @@ def render_scanner_table():
 
                     existing_set = set(watchlist_tickers)
                     if append_only:
-                        # Merge mode (default): never remove existing tickers.
-                        unique = sorted(existing_set | set(unique))
+                        # Merge mode (default): incremental adds via the same path
+                        # as quick-add, so auto/manual watchlist rules stay consistent.
+                        added_count = 0
+                        for t in unique:
+                            if t not in existing_set:
+                                bridge.add_to_watchlist(WatchlistItem(ticker=t))
+                                existing_set.add(t)
+                                added_count += 1
+                        st.session_state['wl_version'] += 1
+                        msg = f"✅ Added {added_count} ticker(s) | Total: {len(existing_set)}"
+                        if rejected:
+                            msg += f" | ⚠️ Rejected {len(rejected)}: {', '.join(rejected[:5])}"
+                        st.success(msg)
+                        st.rerun()
+
                     new_set = set(unique)
                     removed = sorted(existing_set - new_set)
 
