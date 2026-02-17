@@ -532,6 +532,26 @@ def get_bridge() -> WatchlistBridge:
     return st.session_state['watchlist_bridge']
 
 
+if 'trade_finder_results' not in st.session_state:
+    try:
+        _tf_snapshot_payload = get_journal().load_trade_finder_snapshot() or {}
+        _tf_latest = _tf_snapshot_payload.get('latest', {}) if isinstance(_tf_snapshot_payload, dict) else {}
+        if isinstance(_tf_latest, dict) and _tf_latest:
+            _rows = _tf_latest.get('rows', []) or []
+            st.session_state['trade_finder_results'] = {
+                'generated_at_iso': _tf_latest.get('generated_at_iso', ''),
+                'rows': _rows if isinstance(_rows, list) else [],
+                'provider': _tf_latest.get('provider', 'system'),
+                'elapsed_sec': float(_tf_latest.get('elapsed_sec', 0) or 0),
+                'input_candidates': int(_tf_latest.get('input_candidates', 0) or 0),
+            }
+            _find_new = _tf_latest.get('find_new_report', {}) or {}
+            if isinstance(_find_new, dict) and _find_new:
+                st.session_state['find_new_trades_report'] = _find_new
+    except Exception:
+        pass
+
+
 # =============================================================================
 # =============================================================================
 # MORNING BRIEFING — AI Market Narrative (sidebar)
@@ -1908,6 +1928,18 @@ def _run_find_new_trades():
     }
     st.session_state['find_new_trades_report'] = report
     st.session_state['_find_new_trades_ts'] = time.time()
+    try:
+        _existing_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        get_journal().save_trade_finder_snapshot({
+            'generated_at_iso': report.get('generated_at_iso', ''),
+            'provider': (st.session_state.get('trade_finder_results', {}) or {}).get('provider', 'system'),
+            'elapsed_sec': float(report.get('elapsed_sec', 0) or 0),
+            'input_candidates': int(report.get('candidate_count', 0) or 0),
+            'rows': _existing_rows,
+            'find_new_report': report,
+        })
+    except Exception:
+        pass
     _append_perf_metric({
         'kind': 'find_new_trades',
         'watchlists': len(all_watchlists),
@@ -2182,6 +2214,17 @@ def _run_trade_finder_workflow() -> None:
         'elapsed_sec': elapsed,
         'input_candidates': len(base_candidates),
     }
+    try:
+        get_journal().save_trade_finder_snapshot({
+            'generated_at_iso': st.session_state['trade_finder_results'].get('generated_at_iso', ''),
+            'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
+            'elapsed_sec': float(elapsed),
+            'input_candidates': int(len(base_candidates)),
+            'rows': rows,
+            'find_new_report': report,
+        })
+    except Exception:
+        pass
     _append_perf_metric({
         'kind': 'trade_finder',
         'candidates_in': len(base_candidates),
@@ -2213,6 +2256,7 @@ def render_trade_finder_tab():
         f"Candidates: {len(rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
         f"Provider: {results.get('provider', 'system')}"
     )
+    st.caption("Snapshot is saved daily and restored after app restart.")
 
     table_rows = []
     for r in rows:
@@ -6017,7 +6061,7 @@ def _render_capital_overview(jm: JournalManager):
     # ── Capital Bar ───────────────────────────────────────────────
     st.markdown("### 💼 Portfolio Capital")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.metric("Account", f"${account_size:,.0f}")
     with c2:
@@ -7827,12 +7871,23 @@ def render_executive_dashboard():
             res = _run_auto_exit_engine(jm, prices, source="manual_button")
             st.success(f"Auto-manage complete. Checked {res.get('checked', 0)} positions; auto-closed {res.get('closed', 0)}.")
             st.rerun()
+    with c6:
+        if st.button("🧭 Find New Trades", key="exec_find_new_trades", width="stretch"):
+            with st.spinner("Scanning all watchlists and ranking candidates..."):
+                _run_trade_finder_workflow()
+            st.success("Trade Finder updated from all watchlists.")
+            st.rerun()
 
     last_auto_ts = float(st.session_state.get('_auto_exit_last_ts', 0.0) or 0.0)
     last_auto_count = int(st.session_state.get('_auto_exit_last_count', 0) or 0)
     st.caption(
         f"Auto Exit: {'ON' if st.session_state.get('exec_auto_exit_enabled') else 'OFF'} | "
         f"Last run: {_fmt_last_update(last_auto_ts)} | Last closed: {last_auto_count}"
+    )
+    tf_last = st.session_state.get('trade_finder_results', {}) or {}
+    st.caption(
+        f"Trade Finder: {len(tf_last.get('rows', []) or [])} ranked candidate(s) | "
+        f"Updated: {tf_last.get('generated_at_iso', 'never') or 'never'}"
     )
 
     st.caption(
@@ -8064,31 +8119,63 @@ def render_executive_dashboard():
 
     with q2:
         st.markdown("**Top Trade Candidates**")
+        tf_ranked = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
         _find_new = st.session_state.get('find_new_trades_report', {}) or {}
         if _find_new.get('candidates'):
             st.caption(
                 f"Source: Find New Trades ({int(_find_new.get('scan_universe', 0) or 0)} tickers, "
                 f"{int(_find_new.get('watchlists_count', 0) or 0)} watchlists)"
             )
+        if tf_ranked:
+            st.caption("Source: Trade Finder ranked list")
         if not gate.allow_new_trades:
             st.caption("New trade entries are blocked by current market gate.")
-        elif not actionable:
+        elif not actionable and not tf_ranked:
             st.caption("No actionable entries in current scan.")
-        for cand in actionable[:12]:
-            row = cand['row']
-            card = cand.get('card', {}) or {}
-            ticker = row.get('ticker', '?')
-            rec = row.get('recommendation', '?')
-            conv = row.get('conviction', 0)
-            score = cand['score']
-            why = card.get('explainability', '') or "; ".join(cand['reasons'][:3])
-            readiness = card.get('execution_readiness', '')
-            if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
-                         key=f"exec_pick_{ticker}", width="stretch"):
-                _load_ticker_for_view(ticker)
-            st.caption(f"Why: {why}")
-            if readiness:
-                st.caption(f"Decision: {readiness} | Regime fit: {card.get('regime_fit_score', 0)}")
+        if tf_ranked:
+            for idx, tr in enumerate(tf_ranked[:12]):
+                ticker = str(tr.get('ticker', '?') or '?')
+                ai_rec = str(tr.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only')
+                score = float(tr.get('rank_score', 0) or 0)
+                rr = float(tr.get('risk_reward', 0) or 0)
+                if st.button(
+                    f"{ticker} | {ai_rec} | R:R {rr:.2f}:1 | Score {score:.1f}",
+                    key=f"exec_pick_tf_{idx}_{ticker}",
+                    width="stretch",
+                ):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'ticker': ticker,
+                        'entry': float(tr.get('suggested_entry', tr.get('price', 0)) or tr.get('price', 0) or 0),
+                        'stop': float(tr.get('suggested_stop_loss', 0) or 0),
+                        'target': float(tr.get('suggested_target', 0) or 0),
+                        'ai_buy_recommendation': ai_rec,
+                        'risk_reward': rr,
+                        'reason': str(tr.get('reason', '') or ''),
+                        'ai_rationale': str(tr.get('ai_rationale', '') or ''),
+                        'provider': str(tr.get('provider', 'system') or 'system'),
+                        'generated_at_iso': str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '')),
+                    }
+                    st.session_state['default_detail_tab'] = 4
+                    st.session_state['_switch_to_scanner_tab'] = True
+                    _load_ticker_for_view(ticker)
+                    st.rerun()
+                st.caption(f"Why: {str(tr.get('ai_rationale', '') or str(tr.get('scanner_summary', '') or ''))[:180]}")
+        else:
+            for cand in actionable[:12]:
+                row = cand['row']
+                card = cand.get('card', {}) or {}
+                ticker = row.get('ticker', '?')
+                rec = row.get('recommendation', '?')
+                conv = row.get('conviction', 0)
+                score = cand['score']
+                why = card.get('explainability', '') or "; ".join(cand['reasons'][:3])
+                readiness = card.get('execution_readiness', '')
+                if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
+                             key=f"exec_pick_{ticker}", width="stretch"):
+                    _load_ticker_for_view(ticker)
+                st.caption(f"Why: {why}")
+                if readiness:
+                    st.caption(f"Decision: {readiness} | Regime fit: {card.get('regime_fit_score', 0)}")
 
     with q3:
         st.markdown("**Open Positions Needing Attention**")

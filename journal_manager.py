@@ -281,6 +281,7 @@ class JournalManager:
         self.conditionals_file = self.data_dir / "v2_conditionals.json"
         self.scan_results_file = self.data_dir / "v2_last_scan.json"
         self.planned_trades_file = self.data_dir / "v2_planned_trades.json"
+        self.trade_finder_snapshot_file = self.data_dir / "v2_trade_finder_snapshot.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
         if not isinstance(self.watchlist, list):
@@ -1045,6 +1046,41 @@ class JournalManager:
         """Load last scan results. Returns {timestamp, count, results} or None."""
         data = self._load(self.scan_results_file, None)
         return data
+
+    def save_trade_finder_snapshot(self, snapshot: Dict[str, Any]):
+        """
+        Save latest Trade Finder snapshot with rolling daily history.
+        snapshot: dict containing at least generated_at_iso and rows.
+        """
+        snap = dict(snapshot or {})
+        generated = str(snap.get('generated_at_iso', '') or '')
+        day_key = generated[:10] if len(generated) >= 10 else today_utc_str()
+
+        payload = self._load(self.trade_finder_snapshot_file, {})
+        if not isinstance(payload, dict):
+            payload = {}
+
+        history = payload.get('history', {})
+        if not isinstance(history, dict):
+            history = {}
+
+        # Keep one latest snapshot per day in history.
+        history[day_key] = snap
+        ordered_days = sorted(history.keys(), reverse=True)
+        trimmed_history = {d: history[d] for d in ordered_days[:30]}
+
+        out = {
+            'latest': snap,
+            'latest_day': day_key,
+            'history': trimmed_history,
+            'updated_at': now_utc_str(),
+        }
+        self._save(self.trade_finder_snapshot_file, out)
+
+    def load_trade_finder_snapshot(self) -> Optional[Dict]:
+        """Load latest Trade Finder snapshot payload or None."""
+        data = self._load(self.trade_finder_snapshot_file, None)
+        return data if isinstance(data, dict) else None
 
     def get_all_tracked_tickers(self) -> Dict[str, str]:
         """Get all tickers being tracked with their status."""
