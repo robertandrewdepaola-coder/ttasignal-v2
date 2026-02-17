@@ -22,7 +22,8 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 # Backend imports
 from signal_engine import EntrySignal
@@ -859,13 +860,25 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
     ai_cfg = ai_clients.get('ai_config', {}) or {}
     has_openai_compat = ai_clients.get('openai_client') is not None
     has_gemini = ai_clients.get('gemini') is not None
-    ai_ok = bool(has_openai_compat or has_gemini)
+    ai_key = str(ai_cfg.get('key', '') or '')
+    ai_validation_ok = False
+    if ai_key:
+        ai_validation_ok = bool(st.session_state.get(f"_ai_validated_{ai_key[:8]}"))
+    ai_ok = bool((has_openai_compat and ai_validation_ok) or has_gemini)
 
     spy_px = fetch_current_price("SPY")
     price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
 
     ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ts_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    market_open = (
+        now_et.weekday() < 5
+        and ((now_et.hour > 9) or (now_et.hour == 9 and now_et.minute >= 30))
+        and (now_et.hour < 16)
+    )
+    market_session = "OPEN" if market_open else "CLOSED"
+    market_et_time = now_et.strftime('%Y-%m-%d %H:%M:%S ET')
 
     issues = []
     if not ai_ok:
@@ -881,6 +894,7 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         'overall_ok': overall_ok,
         'issues': issues,
         'ai_ok': ai_ok,
+        'ai_validation_ok': ai_validation_ok,
         'provider': ai_cfg.get('provider', 'none'),
         'model': ai_cfg.get('model', ''),
         'has_openai_compat': has_openai_compat,
@@ -889,6 +903,8 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         'gemini_error': ai_clients.get('gemini_error'),
         'price_feed_ok': price_feed_ok,
         'spy_price': float(spy_px) if price_feed_ok else None,
+        'market_session': market_session,
+        'market_et_time': market_et_time,
     }
     st.session_state['_system_health_snapshot'] = snapshot
 
@@ -918,6 +934,16 @@ def _render_system_status_panel():
         else:
             st.sidebar.error("🔴 System Status: DEGRADED")
             st.sidebar.error("Alert: " + "; ".join(health.get('issues', [])))
+        prev_ok = st.session_state.get('_system_health_last_ok')
+        now_ok = bool(health.get('overall_ok'))
+        if prev_ok is None:
+            st.session_state['_system_health_last_ok'] = now_ok
+        elif prev_ok != now_ok:
+            if now_ok:
+                st.toast("🟢 System recovered: feeds and AI are operational.")
+            else:
+                st.toast("🔴 System degraded: check AI/feed status.")
+            st.session_state['_system_health_last_ok'] = now_ok
 
         c1, c2 = st.sidebar.columns([2, 1])
         with c1:
@@ -926,8 +952,14 @@ def _render_system_status_panel():
                 f"({health.get('provider', 'none')} / {health.get('model', '') or 'n/a'})"
             )
             st.sidebar.caption(
+                f"AI validation: {'tested' if health.get('ai_validation_ok') else 'not tested'}"
+            )
+            st.sidebar.caption(
                 f"Price Feed: {'OK' if health.get('price_feed_ok') else 'FAIL'} "
                 + (f"(SPY ${health.get('spy_price', 0):.2f})" if health.get('price_feed_ok') else "")
+            )
+            st.sidebar.caption(
+                f"Market: {health.get('market_session', 'n/a')} | {health.get('market_et_time', '')}"
             )
             st.sidebar.caption(f"Heartbeat: {health.get('ts_local', '')} | {health.get('ts_utc', '')}")
         with c2:
@@ -1375,8 +1407,9 @@ def render_sidebar():
             if _diag_key:
                 _diag_cfg = _detect_ai_provider(_diag_key)
                 _diag_clients = _get_ai_clients()
+                _validated = bool(st.session_state.get(f"_ai_validated_{_diag_cfg['key'][:8]}")) if _diag_cfg.get('key') else False
                 if _diag_clients.get('openai_client') is not None:
-                    _status = 'connected'
+                    _status = 'connected/tested' if _validated else 'connected/not-tested'
                 elif _diag_clients.get('primary_error'):
                     _status = f"error: {_diag_clients.get('primary_error')}"
                 else:
@@ -8084,8 +8117,17 @@ def render_executive_dashboard():
         st.session_state['_queue_action_executed'] = {}
     if '_queue_recent_actions' not in st.session_state:
         st.session_state['_queue_recent_actions'] = []
+    if '_queue_last_result_toasts' not in st.session_state:
+        st.session_state['_queue_last_result_toasts'] = []
 
     undo_window_s = 12
+    confirm_ttl_s = 20
+
+    now_ts = time.time()
+    # Expire stale confirmation prompts so accidental stale confirms are not executed.
+    for ckey, ts in list(st.session_state['_queue_action_confirm'].items()):
+        if (now_ts - float(ts or 0)) > confirm_ttl_s:
+            st.session_state['_queue_action_confirm'].pop(ckey, None)
 
     def _record_queue_recent(status: str, detail: str):
         recent = st.session_state.get('_queue_recent_actions', [])
@@ -8112,6 +8154,16 @@ def render_executive_dashboard():
         msg = f"op={op} status={status} {details}".strip()
         _append_audit_event("QUEUE_ACTION", msg, source="exec_queue")
         _record_queue_recent(status, msg)
+
+    def _confirm_remaining(confirm_key: str) -> int:
+        ts = float(st.session_state.get('_queue_action_confirm', {}).get(confirm_key, 0) or 0)
+        if ts <= 0:
+            return 0
+        left = max(0, int(confirm_ttl_s - (time.time() - ts)))
+        if left <= 0:
+            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+            return 0
+        return left
 
     def _queue_schedule(action_key: str, payload: Dict[str, Any]) -> str:
         pending = st.session_state.get('_queue_pending_actions', {})
@@ -8194,6 +8246,10 @@ def render_executive_dashboard():
             executed[action_key] = now_ts
             pending.pop(action_key, None)
             _queue_log(kind or 'unknown', status, detail)
+            st.session_state['_queue_last_result_toasts'].append({
+                'status': status,
+                'detail': f"{kind} {ticker}".strip(),
+            })
             did_any = True
 
         st.session_state['_queue_pending_actions'] = pending
@@ -8206,6 +8262,11 @@ def render_executive_dashboard():
     with st.expander(f"⚡ Unified Action Queue ({len(action_queue)})", expanded=False):
         if not action_queue:
             st.caption("No queued actions.")
+        toast_rows = st.session_state.get('_queue_last_result_toasts', [])
+        for row in toast_rows[:5]:
+            st.toast(f"{row.get('status', 'INFO')}: {row.get('detail', '')}")
+        if toast_rows:
+            st.session_state['_queue_last_result_toasts'] = []
         pending_actions = st.session_state.get('_queue_pending_actions', {})
         if pending_actions:
             st.markdown("**Pending Queue Actions (undo window)**")
@@ -8231,8 +8292,36 @@ def render_executive_dashboard():
             current = float(item.get('current', 0) or 0)
             stop = float(item.get('stop', 0) or 0)
             cmsg, c1, c2, c3 = st.columns([4, 1, 1, 1])
+            row_badges = []
+            if action == 'planned_queued' and plan_id:
+                _k = f"trigger_plan:{plan_id}"
+                if _k in pending_actions:
+                    _left = max(0, int(float(pending_actions[_k].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {_left}s")
+                if _k in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
+            if action == 'planned_triggered' and plan_id:
+                _ek = f"entered_plan:{plan_id}"
+                _ck = f"cancel_plan:{plan_id}"
+                if _ek in pending_actions or _ck in pending_actions:
+                    _lefts = []
+                    if _ek in pending_actions:
+                        _lefts.append(int(float(pending_actions[_ek].get('execute_at', 0) or 0) - time.time()))
+                    if _ck in pending_actions:
+                        _lefts.append(int(float(pending_actions[_ck].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {max(0, min(_lefts))}s")
+                if _ek in st.session_state.get('_queue_action_executed', {}) or _ck in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
+            if action == 'risk_manage' and ticker:
+                _ck = f"close_now:{ticker}"
+                if _ck in pending_actions:
+                    _left = max(0, int(float(pending_actions[_ck].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {_left}s")
+                if _ck in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
             with cmsg:
-                st.caption(f"P{pri} | {msg}")
+                badge_txt = (" | " + " | ".join(row_badges)) if row_badges else ""
+                st.caption(f"P{pri} | {msg}{badge_txt}")
             with c1:
                 if action == 'refresh':
                     if st.button("Refresh", key=f"aq_refresh_{i}", width="stretch"):
@@ -8260,7 +8349,9 @@ def render_executive_dashboard():
                     confirm_key = f"entered_{plan_id}"
                     if st.button("Entered", key=f"aq_entered_{i}_{plan_id}", width="stretch"):
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
-                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
                         if st.button("Confirm Entered", key=f"aq_entered_confirm_{i}_{plan_id}", width="stretch"):
                             action_key = f"entered_plan:{plan_id}"
                             status_msg = _queue_schedule(action_key, {
@@ -8289,7 +8380,9 @@ def render_executive_dashboard():
                     confirm_key = f"cancel_{plan_id}"
                     if st.button("Cancel", key=f"aq_cancel_{i}_{plan_id}", width="stretch"):
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
-                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
                         if st.button("Confirm Cancel", key=f"aq_cancel_confirm_{i}_{plan_id}", width="stretch"):
                             action_key = f"cancel_plan:{plan_id}"
                             status_msg = _queue_schedule(action_key, {
@@ -8304,7 +8397,9 @@ def render_executive_dashboard():
                     confirm_key = f"close_{ticker}_{i}"
                     if st.button("Close Now", key=f"aq_close_{i}_{ticker}", width="stretch"):
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
-                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
                         if st.button("Confirm Close", key=f"aq_close_confirm_{i}_{ticker}", width="stretch"):
                             action_key = f"close_now:{ticker}"
                             status_msg = _queue_schedule(action_key, {
