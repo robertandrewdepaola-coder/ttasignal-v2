@@ -7392,6 +7392,49 @@ def _run_alert_check_now(jm: JournalManager) -> int:
     return len(triggered)
 
 
+def _run_auto_exit_engine(jm: JournalManager, current_prices: Dict[str, float], source: str = "manual") -> Dict[str, Any]:
+    """
+    Evaluate open positions against stop/target and auto-close breaches.
+    Returns summary for UI + telemetry.
+    """
+    if not current_prices:
+        return {'checked': 0, 'triggered': 0, 'closed': 0, 'events': []}
+
+    open_trades = jm.get_open_trades()
+    checked = len(open_trades)
+    events = jm.check_stops(current_prices, auto_execute=True)
+    closed = len(events)
+    stop_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'stop_loss')
+    target_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'target_hit')
+
+    st.session_state['_auto_exit_last_ts'] = time.time()
+    st.session_state['_auto_exit_last_count'] = closed
+
+    if closed > 0:
+        tickers = ",".join(sorted({str(e.get('ticker', '')).upper() for e in events if e.get('ticker')}))
+        _append_audit_event(
+            "AUTO_EXIT",
+            f"source={source} checked={checked} closed={closed} stops={stop_hits} targets={target_hits} tickers={tickers}",
+            source="auto_exit",
+        )
+    else:
+        _append_audit_event(
+            "AUTO_EXIT",
+            f"source={source} checked={checked} closed=0",
+            source="auto_exit",
+        )
+
+    _append_perf_metric({
+        "kind": "auto_exit",
+        "source": source,
+        "checked": checked,
+        "closed": closed,
+        "stop_hits": stop_hits,
+        "target_hits": target_hits,
+    })
+    return {'checked': checked, 'triggered': closed, 'closed': closed, 'events': events}
+
+
 def _fast_refresh_dashboard() -> None:
     """Fast refresh for dashboard metrics without running a full scan."""
     _t0 = time.time()
@@ -7413,11 +7456,25 @@ def _fast_refresh_dashboard() -> None:
     st.session_state['_position_prices'] = prices
     st.session_state['_position_prices_ts'] = time.time()
 
+    auto_exit_enabled = bool(st.session_state.get('exec_auto_exit_enabled', False))
+    auto_exit = {'closed': 0}
+    if auto_exit_enabled:
+        auto_exit = _run_auto_exit_engine(jm, prices, source="fast_refresh")
+        # refresh prices map after closes to keep panel consistent
+        refreshed_open = jm.get_open_trades()
+        refreshed_prices = {}
+        for trade in refreshed_open:
+            t = trade.get('ticker', '').upper().strip()
+            if t:
+                refreshed_prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+        st.session_state['_position_prices'] = refreshed_prices
+        st.session_state['_position_prices_ts'] = time.time()
+
     trig_count = _run_alert_check_now(jm)
     st.session_state['_dashboard_last_refresh'] = time.time()
     _append_audit_event(
         "FAST_REFRESH",
-        f"positions={len(open_trades)} alerts_triggered={trig_count}",
+        f"positions={len(open_trades)} alerts_triggered={trig_count} auto_closed={int(auto_exit.get('closed', 0) or 0)}",
         source="exec_dashboard",
     )
     _append_perf_metric({
@@ -7425,8 +7482,12 @@ def _fast_refresh_dashboard() -> None:
         "sec": round(time.time() - _t0, 3),
         "positions": len(open_trades),
         "alerts_triggered": trig_count,
+        "auto_closed": int(auto_exit.get('closed', 0) or 0),
     })
-    st.success(f"Fast refresh complete. Triggered alerts: {trig_count}")
+    st.success(
+        f"Fast refresh complete. Triggered alerts: {trig_count}. "
+        f"Auto-closed: {int(auto_exit.get('closed', 0) or 0)}."
+    )
 
 
 def _run_daily_workflow() -> Dict[str, float]:
@@ -7455,8 +7516,15 @@ def render_executive_dashboard():
 
     st.subheader("Executive Dashboard")
     st.caption(f"Now: {snap.generated_at_iso}")
+    if 'exec_auto_exit_enabled' not in st.session_state:
+        st.session_state['exec_auto_exit_enabled'] = False
+    st.checkbox(
+        "Enable Auto Exit on Fast Refresh / Daily Workflow",
+        key="exec_auto_exit_enabled",
+        help="When enabled, stop-loss and target-hit rules auto-close positions during refresh runs.",
+    )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         if st.button("⚡ Fast Refresh", key="exec_fast_refresh", type="primary", width="stretch"):
             _fast_refresh_dashboard()
@@ -7473,6 +7541,24 @@ def render_executive_dashboard():
     with c4:
         if st.button("✅ Run Daily Workflow", key="exec_daily_workflow", width="stretch"):
             _run_daily_workflow()
+    with c5:
+        if st.button("🛑 Auto-Manage Now", key="exec_auto_manage_now", width="stretch"):
+            open_trades = jm.get_open_trades()
+            prices = {}
+            for trade in open_trades:
+                t = trade.get('ticker', '').upper().strip()
+                if t:
+                    prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+            res = _run_auto_exit_engine(jm, prices, source="manual_button")
+            st.success(f"Auto-manage complete. Checked {res.get('checked', 0)} positions; auto-closed {res.get('closed', 0)}.")
+            st.rerun()
+
+    last_auto_ts = float(st.session_state.get('_auto_exit_last_ts', 0.0) or 0.0)
+    last_auto_count = int(st.session_state.get('_auto_exit_last_count', 0) or 0)
+    st.caption(
+        f"Auto Exit: {'ON' if st.session_state.get('exec_auto_exit_enabled') else 'OFF'} | "
+        f"Last run: {_fmt_last_update(last_auto_ts)} | Last closed: {last_auto_count}"
+    )
 
     st.caption(
         f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
