@@ -7970,16 +7970,23 @@ def render_executive_dashboard():
     action_queue = []
     planned_trades = jm.get_planned_trades()
     for p in planned_trades:
+        plan_id = str(p.get('plan_id', '')).strip()
         pstatus = str(p.get('status', '')).upper()
         pticker = str(p.get('ticker', '')).upper().strip()
         if not pticker:
             continue
         if pstatus == "TRIGGERED":
             must_act.append((92, f"🗂️ Planned triggered: {pticker}", pticker))
-            action_queue.append({'priority': 92, 'category': 'planned', 'ticker': pticker, 'message': f"Planned triggered: {pticker}", 'action': 'open_trade'})
+            action_queue.append({
+                'priority': 92, 'category': 'planned', 'ticker': pticker, 'plan_id': plan_id,
+                'message': f"Planned triggered: {pticker}", 'action': 'planned_triggered'
+            })
         elif pstatus == "PLANNED":
             must_act.append((55, f"🗂️ Planned queued: {pticker}", pticker))
-            action_queue.append({'priority': 55, 'category': 'planned', 'ticker': pticker, 'message': f"Planned queued: {pticker}", 'action': 'open_trade'})
+            action_queue.append({
+                'priority': 55, 'category': 'planned', 'ticker': pticker, 'plan_id': plan_id,
+                'message': f"Planned queued: {pticker}", 'action': 'planned_queued'
+            })
     for t in snap.triggered_alerts:
         ticker = t.get('ticker', '')
         must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
@@ -7992,10 +7999,16 @@ def render_executive_dashboard():
         pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
         if stop > 0 and current <= stop:
             must_act.append((95, f"🔴 Stop breached: {ticker}", ticker))
-            action_queue.append({'priority': 95, 'category': 'risk', 'ticker': ticker, 'message': f"Stop breached: {ticker}", 'action': 'open_position'})
+            action_queue.append({
+                'priority': 95, 'category': 'risk', 'ticker': ticker, 'message': f"Stop breached: {ticker}",
+                'action': 'risk_manage', 'current': current, 'stop': stop
+            })
         elif pnl_pct <= -3:
             must_act.append((75, f"🟠 Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", ticker))
-            action_queue.append({'priority': 75, 'category': 'risk', 'ticker': ticker, 'message': f"Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", 'action': 'open_position'})
+            action_queue.append({
+                'priority': 75, 'category': 'risk', 'ticker': ticker, 'message': f"Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)",
+                'action': 'risk_manage', 'current': current, 'stop': stop
+            })
     for row in snap.scan_summary:
         earn_days = int(row.get('earn_days', 999) or 999)
         if 0 <= earn_days <= 3:
@@ -8070,11 +8083,14 @@ def render_executive_dashboard():
             pri = int(item.get('priority', 0))
             msg = str(item.get('message', ''))
             ticker = str(item.get('ticker', '') or '').upper().strip()
+            plan_id = str(item.get('plan_id', '') or '').strip()
             action = str(item.get('action', 'open_trade'))
-            cmsg, cbtn = st.columns([4, 1])
+            current = float(item.get('current', 0) or 0)
+            stop = float(item.get('stop', 0) or 0)
+            cmsg, c1, c2, c3 = st.columns([4, 1, 1, 1])
             with cmsg:
                 st.caption(f"P{pri} | {msg}")
-            with cbtn:
+            with c1:
                 if action == 'refresh':
                     if st.button("Refresh", key=f"aq_refresh_{i}", width="stretch"):
                         _fast_refresh_dashboard()
@@ -8086,6 +8102,30 @@ def render_executive_dashboard():
                             st.session_state['default_detail_tab'] = 4
                             st.session_state['_switch_to_scanner_tab'] = True
                             st.rerun()
+            with c2:
+                if action == 'planned_queued' and plan_id:
+                    if st.button("Trigger", key=f"aq_trigger_{i}_{plan_id}", width="stretch"):
+                        st.info(jm.update_planned_trade_status(plan_id, "TRIGGERED", notes="triggered from action queue"))
+                        st.rerun()
+                elif action == 'planned_triggered' and plan_id:
+                    if st.button("Entered", key=f"aq_entered_{i}_{plan_id}", width="stretch"):
+                        st.info(jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue"))
+                        st.rerun()
+                elif action == 'risk_manage' and ticker and current > 0:
+                    if st.button("Tighten +1%", key=f"aq_tighten_{i}_{ticker}", width="stretch"):
+                        # quick risk action: move stop to 1% below current if this tightens risk
+                        new_stop = round(max(stop, current * 0.99), 2) if stop > 0 else round(current * 0.99, 2)
+                        st.info(jm.update_stop(ticker, new_stop))
+                        st.rerun()
+            with c3:
+                if action in {'planned_queued', 'planned_triggered'} and plan_id:
+                    if st.button("Cancel", key=f"aq_cancel_{i}_{plan_id}", width="stretch"):
+                        st.info(jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue"))
+                        st.rerun()
+                elif action == 'risk_manage' and ticker and current > 0:
+                    if st.button("Close Now", key=f"aq_close_{i}_{ticker}", width="stretch"):
+                        st.info(jm.close_trade(ticker, current, exit_reason='manual', notes='Closed from action queue'))
+                        st.rerun()
 
     st.divider()
     with st.expander("🗂️ Planned Trades Board", expanded=False):
