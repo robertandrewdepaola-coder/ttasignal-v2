@@ -660,6 +660,9 @@ def _run_deep_analysis():
             ai_clients = _get_ai_clients()
             gemini_model = ai_clients.get('gemini')
             openai_client = ai_clients.get('openai_client')
+            ai_cfg = ai_clients.get('ai_config', {}) or {}
+            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
+            fallback_model = ai_cfg.get('fallback_model', '')
 
             result = generate_deep_market_analysis(
                 macro_data,
@@ -6158,6 +6161,8 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
                 fetch_signal_fn=fetch_signal_for_exit,
                 gemini_model=gemini_model,
                 openai_client=openai_client,
+                ai_model=ai_model,
+                fallback_model=fallback_model,
             )
 
             # Store results in session state for display

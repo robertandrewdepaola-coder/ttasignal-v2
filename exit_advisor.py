@@ -205,7 +205,9 @@ def parse_exit_response(text: str, ticker: str) -> ExitAdvice:
 
 def analyze_position(ticker: str, trade: Dict, current_price: float,
                      signal_data: Dict = None,
-                     gemini_model=None, openai_client=None) -> ExitAdvice:
+                     gemini_model=None, openai_client=None,
+                     ai_model: str = "llama-3.3-70b-versatile",
+                     fallback_model: str = "") -> ExitAdvice:
     """
     Full analysis pipeline for one position:
     1. Build prompt
@@ -219,23 +221,28 @@ def analyze_position(ticker: str, trade: Dict, current_price: float,
     raw_text = None
     provider = 'system'
 
-    # Try Groq first
+    # Try OpenAI-compatible provider first (Groq or xAI)
     if openai_client is not None:
-        try:
-            response = openai_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system",
-                     "content": "You are a senior portfolio manager focused on risk management and exit timing."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=400,
-                temperature=0.4
-            )
-            raw_text = response.choices[0].message.content
-            provider = 'groq'
-        except Exception:
-            pass
+        models = [m for m in [ai_model, fallback_model] if m]
+        if not models:
+            models = ["llama-3.3-70b-versatile"]
+        for model_name in models:
+            try:
+                response = openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system",
+                         "content": "You are a senior portfolio manager focused on risk management and exit timing."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=400,
+                    temperature=0.4
+                )
+                raw_text = response.choices[0].message.content
+                provider = 'openai_compat'
+                break
+            except Exception:
+                continue
 
     # Gemini fallback
     if raw_text is None and gemini_model is not None:
@@ -276,7 +283,9 @@ def analyze_all_positions(open_trades: List[Dict],
                           fetch_price_fn=None,
                           fetch_signal_fn=None,
                           gemini_model=None,
-                          openai_client=None) -> List[ExitAdvice]:
+                          openai_client=None,
+                          ai_model: str = "llama-3.3-70b-versatile",
+                          fallback_model: str = "") -> List[ExitAdvice]:
     """
     Analyze all open positions and return list of ExitAdvice.
 
@@ -309,7 +318,10 @@ def analyze_all_positions(open_trades: List[Dict],
         # Analyze
         advice = analyze_position(
             ticker, trade, current_price, signal_data,
-            gemini_model=gemini_model, openai_client=openai_client
+            gemini_model=gemini_model,
+            openai_client=openai_client,
+            ai_model=ai_model,
+            fallback_model=fallback_model,
         )
         results.append(advice)
 
