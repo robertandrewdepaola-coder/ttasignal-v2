@@ -325,6 +325,8 @@ import json as _json
 from pathlib import Path as _Path
 
 _SCAN_CACHE_FILE = _Path("v2_scan_cache.json")
+_AUDIT_FILE = _Path("v2_watchlist_audit.json")
+_AUDIT_MAX_ENTRIES = 500
 
 def _load_scan_cache_file() -> dict:
     """Load the per-watchlist scan cache from disk."""
@@ -352,6 +354,75 @@ def _save_scan_cache_file(cache: dict):
             pass
     except Exception:
         pass
+
+
+def _load_audit_file() -> list:
+    """Load persistent watchlist/scan audit events."""
+    if _AUDIT_FILE.exists():
+        try:
+            with open(_AUDIT_FILE, 'r') as f:
+                data = _json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _save_audit_file(events: list):
+    """Persist audit events to disk (atomic write)."""
+    tmp = str(_AUDIT_FILE) + ".tmp"
+    try:
+        with open(tmp, 'w') as f:
+            _json.dump(events, f)
+        import os
+        os.replace(tmp, str(_AUDIT_FILE))
+        try:
+            import github_backup
+            github_backup.mark_dirty(_AUDIT_FILE.name)
+        except ImportError:
+            pass
+    except Exception:
+        pass
+
+
+def _get_audit_events() -> list:
+    """Get cached audit events, loading from disk once per session."""
+    if '_watchlist_audit_events' not in st.session_state:
+        st.session_state['_watchlist_audit_events'] = _load_audit_file()
+    return st.session_state['_watchlist_audit_events']
+
+
+def _append_audit_event(action: str, details: str = '', source: str = 'ui'):
+    """Append a watchlist/scan activity event."""
+    wl_id = ''
+    wl_name = ''
+    try:
+        active = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+        wl_id = active.get('id', '')
+        wl_name = active.get('name', '')
+    except Exception:
+        pass
+
+    events = _get_audit_events()
+    events.insert(0, {
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'action': action,
+        'source': source,
+        'wl_id': wl_id,
+        'wl_name': wl_name,
+        'details': details[:300] if details else '',
+    })
+    if len(events) > _AUDIT_MAX_ENTRIES:
+        del events[_AUDIT_MAX_ENTRIES:]
+    st.session_state['_watchlist_audit_events'] = events
+    _save_audit_file(events)
+
+
+def _clear_audit_events():
+    """Clear all audit events."""
+    st.session_state['_watchlist_audit_events'] = []
+    _save_audit_file([])
+
 
 def save_scan_for_watchlist(wl_id: str):
     """Save current session scan results to per-watchlist cache (session + disk)."""
@@ -849,6 +920,7 @@ def render_sidebar():
                                 else:
                                     st.toast(f"✅ Created '{final_name}'")
 
+                                _append_audit_event("CREATE_WATCHLIST", f"name={final_name} type={actual_type}", source="sidebar_create")
                                 st.rerun()
                         except ValueError as e:
                             st.error(str(e))
@@ -1018,6 +1090,7 @@ def render_sidebar():
                     if st.button("Yes, Delete", key="wl_confirm_del", type="primary"):
                         ok, msg = _wm.delete_watchlist(active_wl["id"])
                         if ok:
+                            _append_audit_event("DELETE_WATCHLIST", msg, source="sidebar_delete")
                             st.session_state['confirm_delete_wl'] = False
                             st.session_state['scan_results'] = []
                             st.session_state['scan_results_summary'] = []
@@ -1220,6 +1293,7 @@ def _run_scan(mode='all'):
     full_list = valid_list
 
     if not full_list:
+        _append_audit_event("SCAN_SKIPPED", "empty watchlist", source=f"scan:{mode}")
         st.sidebar.warning("Add tickers to watchlist first")
         return
 
@@ -1235,6 +1309,11 @@ def _run_scan(mode='all'):
         tickers_to_scan = full_list
 
     with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
+        _append_audit_event(
+            "SCAN_START",
+            f"mode={mode} universe={len(full_list)} scan_count={len(tickers_to_scan)}",
+            source=f"scan:{mode}",
+        )
         all_data = fetch_scan_data(tickers_to_scan)
         new_results = scan_watchlist(all_data)
 
@@ -1391,6 +1470,12 @@ def _run_scan(mode='all'):
         if triggered:
             st.session_state['triggered_alerts'] = triggered
 
+        _append_audit_event(
+            "SCAN_DONE",
+            f"mode={mode} scanned={len(tickers_to_scan)} results={len(summary)} triggered={len(triggered)}",
+            source=f"scan:{mode}",
+        )
+
     st.rerun()
 
 
@@ -1454,6 +1539,7 @@ def render_scanner_table():
                     if ticker_clean and (is_base or is_class or is_index):
                         if ticker_clean not in watchlist_tickers:
                             bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                            _append_audit_event("ADD_TICKER", ticker_clean, source="quick_add")
                             st.session_state['wl_version'] += 1
                             st.rerun()
                         else:
@@ -1527,6 +1613,7 @@ def render_scanner_table():
                                 s for s in st.session_state['scan_results_summary']
                                 if s.get('ticker') != t
                             ]
+                        _append_audit_event("REMOVE_TICKER", t, source="row_delete")
                         st.rerun()
 
         # ── Bulk Editor (for pasting 200 tickers) ─────────────────────
@@ -1590,6 +1677,11 @@ def render_scanner_table():
                         st.session_state.pop('wl_bulk_pending_unique', None)
                         st.session_state.pop('wl_bulk_pending_rejected', None)
                         st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event(
+                            "BULK_ADD",
+                            f"added={added_count} total={len(existing_set)} rejected={len(rejected)}",
+                            source="bulk_merge",
+                        )
                         st.session_state['wl_version'] += 1
                         msg = f"✅ Added {added_count} ticker(s) | Total: {len(existing_set)}"
                         if rejected:
@@ -1614,6 +1706,11 @@ def render_scanner_table():
                         if fav in unique and not bridge.is_favorite(fav):
                             bridge.toggle_favorite(fav)
 
+                    _append_audit_event(
+                        "BULK_REPLACE",
+                        f"saved={len(unique)} removed={len(removed)} rejected={len(rejected)}",
+                        source="bulk_replace",
+                    )
                     st.session_state['wl_version'] += 1
                     msg = f"✅ Saved {len(unique)} tickers"
                     if rejected:
@@ -1635,6 +1732,7 @@ def render_scanner_table():
                     _clear_wl_id = bridge.manager.get_active_watchlist().get("id", "")
                     if _clear_wl_id:
                         save_scan_for_watchlist(_clear_wl_id)
+                    _append_audit_event("CLEAR_WATCHLIST", "all tickers removed", source="bulk_clear")
                     st.rerun()
             with wl_col3:
                 st.caption(f"{len(watchlist_tickers)} saved"
@@ -1659,6 +1757,11 @@ def render_scanner_table():
                         st.session_state.pop('wl_bulk_pending_unique', None)
                         st.session_state.pop('wl_bulk_pending_rejected', None)
                         st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event(
+                            "BULK_REPLACE_CONFIRM",
+                            f"saved={len(pending_unique)} removed={len(pending_removed)} rejected={len(pending_rejected)}",
+                            source="bulk_replace_confirm",
+                        )
                         st.session_state['wl_version'] += 1
                         msg = f"✅ Saved {len(pending_unique)} tickers"
                         if pending_rejected:
@@ -1670,7 +1773,33 @@ def render_scanner_table():
                         st.session_state.pop('wl_bulk_pending_unique', None)
                         st.session_state.pop('wl_bulk_pending_rejected', None)
                         st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event("BULK_REPLACE_CANCEL", "user canceled replacement", source="bulk_replace_confirm")
                         st.info("Bulk save canceled.")
+
+            with st.expander("🧾 Activity Log", expanded=False):
+                current_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+                show_all = st.checkbox("Show all watchlists", value=False, key="wl_audit_show_all")
+                events = _get_audit_events()
+                if not show_all:
+                    events = [e for e in events if e.get('wl_id') == current_wl_id]
+
+                if not events:
+                    st.caption("No activity logged yet.")
+                else:
+                    for e in events[:30]:
+                        ts = e.get('ts', '')
+                        action = e.get('action', '')
+                        src = e.get('source', '')
+                        details = e.get('details', '')
+                        st.caption(f"{ts} | {action} | {src} | {details}")
+
+                a1, a2 = st.columns(2)
+                with a1:
+                    if st.button("Clear Log", key="wl_audit_clear", width="stretch"):
+                        _clear_audit_events()
+                        st.rerun()
+                with a2:
+                    st.caption(f"{len(events)} shown")
 
     # ══════════════════════════════════════════════════════════════════
     # WATCHLIST NOTES (collapsible accordion)
