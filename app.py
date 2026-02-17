@@ -24,11 +24,25 @@ from typing import Dict, List
 
 # Backend imports
 from signal_engine import EntrySignal
-from data_fetcher import (
-    fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
-    fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
-    clear_cache,
-)
+try:
+    from data_fetcher import (
+        fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
+        fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
+        clear_cache,
+    )
+except KeyError:
+    # Streamlit Cloud can race module loading during hot-reload after git pulls.
+    # Retry via importlib to recover from transient sys.modules inconsistencies.
+    import importlib as _importlib
+    _df = _importlib.import_module("data_fetcher")
+    fetch_all_ticker_data = _df.fetch_all_ticker_data
+    fetch_scan_data = _df.fetch_scan_data
+    fetch_market_filter = _df.fetch_market_filter
+    fetch_current_price = _df.fetch_current_price
+    fetch_daily = _df.fetch_daily
+    fetch_weekly = _df.fetch_weekly
+    fetch_monthly = _df.fetch_monthly
+    clear_cache = _df.clear_cache
 from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
@@ -1546,7 +1560,11 @@ def render_scanner_table():
                     for t in tickers:
                         if t in seen:
                             continue
-                        if not re.match(r'^[A-Z]{1,5}$', t):
+                        is_base = bool(re.match(r'^[A-Z]{1,5}$', t))
+                        class_match = re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+                        is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+                        is_index = t.startswith('^')
+                        if not (is_base or is_class or is_index):
                             rejected.append(t)
                             continue
                         seen.add(t)
