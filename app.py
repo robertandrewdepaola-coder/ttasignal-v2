@@ -663,9 +663,6 @@ def _run_deep_analysis():
             ai_cfg = ai_clients.get('ai_config', {}) or {}
             ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
             fallback_model = ai_cfg.get('fallback_model', '')
-            ai_cfg = ai_clients.get('ai_config', {}) or {}
-            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
-            fallback_model = ai_cfg.get('fallback_model', '')
 
             result = generate_deep_market_analysis(
                 macro_data,
@@ -673,7 +670,7 @@ def _run_deep_analysis():
                 sector_rotation=sector_rotation,
                 gemini_model=gemini_model,
                 openai_client=openai_client,
-                ai_model=st.session_state.get('_ai_config', {}).get('model', 'llama-3.3-70b-versatile'),
+                ai_model=ai_model,
             )
 
             result['macro_data'] = macro_data
@@ -6244,6 +6241,9 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
             ai_clients = _get_ai_clients()
             gemini_model = ai_clients.get('gemini')
             openai_client = ai_clients.get('openai_client')
+            ai_cfg = ai_clients.get('ai_config', {}) or {}
+            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
+            fallback_model = ai_cfg.get('fallback_model', '')
 
             if not openai_client and not gemini_model:
                 primary_err = ai_clients.get('primary_error') or "primary unavailable"
