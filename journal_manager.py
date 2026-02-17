@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field, asdict
-import pandas as pd
 import shutil
 
 # Cross-platform file locking
