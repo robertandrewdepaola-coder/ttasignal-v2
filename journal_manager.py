@@ -239,6 +239,28 @@ class Trade:
         return asdict(self)
 
 
+@dataclass
+class PlannedTrade:
+    """Planned trade candidate queued before execution."""
+    plan_id: str
+    ticker: str
+    status: str = 'PLANNED'  # PLANNED | TRIGGERED | CANCELLED | ENTERED
+    source: str = 'trade_finder'
+    created_at: str = ''
+    updated_at: str = ''
+    entry: float = 0
+    stop: float = 0
+    target: float = 0
+    risk_reward: float = 0
+    ai_recommendation: str = ''
+    rank_score: float = 0
+    reason: str = ''
+    notes: str = ''
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
 # =============================================================================
 # JOURNAL MANAGER
 # =============================================================================
@@ -255,6 +277,7 @@ class JournalManager:
         self.history_file = self.data_dir / "v2_trade_history.json"
         self.conditionals_file = self.data_dir / "v2_conditionals.json"
         self.scan_results_file = self.data_dir / "v2_last_scan.json"
+        self.planned_trades_file = self.data_dir / "v2_planned_trades.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
         if not isinstance(self.watchlist, list):
@@ -267,6 +290,7 @@ class JournalManager:
         self.open_trades: List[Dict] = self._load(self.open_trades_file, [])
         self.trade_history: List[Dict] = self._load(self.history_file, [])
         self.conditionals: List[Dict] = self._load(self.conditionals_file, [])
+        self.planned_trades: List[Dict] = self._load(self.planned_trades_file, [])
 
     def _load(self, path: Path, default: Any) -> Any:
         if path.exists():
@@ -959,4 +983,67 @@ class JournalManager:
         for t in self.open_trades:
             if t.get('status') == 'OPEN':
                 result[t['ticker']] = 'open'
+        for p in self.planned_trades:
+            if p.get('status') in {'PLANNED', 'TRIGGERED'}:
+                result[p.get('ticker', '')] = 'planned'
         return result
+
+    # --- Planned Trades -------------------------------------------------------
+
+    def add_planned_trade(self, plan: PlannedTrade) -> str:
+        ticker = plan.ticker.upper().strip()
+        plan.ticker = ticker
+        plan.plan_id = plan.plan_id or f"plan_{ticker}_{uuid.uuid4().hex[:10]}"
+        now = now_utc_str()
+        plan.created_at = plan.created_at or now
+        plan.updated_at = now
+
+        # Upsert by ticker for active statuses, so one active planned ticket per ticker.
+        replaced = False
+        for i, p in enumerate(self.planned_trades):
+            if p.get('ticker') == ticker and p.get('status') in {'PLANNED', 'TRIGGERED'}:
+                existing = dict(p)
+                existing.update(plan.to_dict())
+                existing['updated_at'] = now
+                self.planned_trades[i] = existing
+                replaced = True
+                break
+        if not replaced:
+            self.planned_trades.append(plan.to_dict())
+
+        self._save(self.planned_trades_file, self.planned_trades)
+        return f"{'Updated' if replaced else 'Added'} planned trade for {ticker}"
+
+    def get_planned_trades(self, status: Optional[str] = None) -> List[Dict]:
+        rows = list(self.planned_trades)
+        if status:
+            status_u = status.upper().strip()
+            rows = [r for r in rows if str(r.get('status', '')).upper() == status_u]
+        rows.sort(key=lambda r: r.get('updated_at', ''), reverse=True)
+        return rows
+
+    def update_planned_trade_status(self, plan_id: str, status: str, notes: str = '') -> str:
+        pid = str(plan_id).strip()
+        new_status = str(status).upper().strip()
+        if new_status not in {'PLANNED', 'TRIGGERED', 'CANCELLED', 'ENTERED'}:
+            return f"Invalid planned trade status: {status}"
+
+        for i, p in enumerate(self.planned_trades):
+            if str(p.get('plan_id', '')).strip() == pid:
+                p['status'] = new_status
+                p['updated_at'] = now_utc_str()
+                if notes:
+                    p['notes'] = ((p.get('notes', '') + " | " + notes).strip(" |"))
+                self.planned_trades[i] = p
+                self._save(self.planned_trades_file, self.planned_trades)
+                return f"Planned trade {p.get('ticker', '')} marked {new_status}"
+        return "Planned trade not found"
+
+    def remove_planned_trade(self, plan_id: str) -> str:
+        pid = str(plan_id).strip()
+        before = len(self.planned_trades)
+        self.planned_trades = [p for p in self.planned_trades if str(p.get('plan_id', '')).strip() != pid]
+        if len(self.planned_trades) < before:
+            self._save(self.planned_trades_file, self.planned_trades)
+            return "Removed planned trade"
+        return "Planned trade not found"

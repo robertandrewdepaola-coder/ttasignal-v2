@@ -48,7 +48,7 @@ except KeyError:
 from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 from ai_analysis import analyze as run_ai_analysis
 from chart_engine import render_tv_chart, render_mtf_chart
-from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry
+from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry, PlannedTrade
 from watchlist_manager import WatchlistManager
 from watchlist_bridge import WatchlistBridge
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
@@ -2162,6 +2162,7 @@ def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
     st.subheader("🧭 Trade Finder")
     st.caption("Runs cross-watchlist scan, ranks candidates with Grok, and opens prefilled trade entry.")
+    jm = get_journal()
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
         with st.spinner("Running trade finder and AI ranking..."):
@@ -2208,23 +2209,89 @@ def render_trade_finder_tab():
             f"R:R {float(r.get('risk_reward', 0) or 0):.2f}:1 | "
             f"Score {float(r.get('rank_score', 0) or 0):.2f} | {card.get('execution_readiness', '')}"
         )
-        if st.button(label, key=f"tf_open_{i}_{ticker}", width="stretch"):
-            st.session_state['trade_finder_selected_trade'] = {
-                'ticker': ticker,
-                'entry': float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
-                'stop': float(r.get('suggested_stop_loss', 0) or 0),
-                'target': float(r.get('suggested_target', 0) or 0),
-                'ai_buy_recommendation': r.get('ai_buy_recommendation', ''),
-                'risk_reward': float(r.get('risk_reward', 0) or 0),
-                'reason': r.get('reason', ''),
-                'ai_rationale': r.get('ai_rationale', ''),
-                'provider': r.get('provider', 'system'),
-                'generated_at_iso': results.get('generated_at_iso', ''),
-            }
-            st.session_state['default_detail_tab'] = 4
-            st.session_state['_switch_to_scanner_tab'] = True
-            _load_ticker_for_view(ticker)
-            st.rerun()
+        c_open, c_stage = st.columns([3, 1])
+        with c_open:
+            if st.button(label, key=f"tf_open_{i}_{ticker}", width="stretch"):
+                st.session_state['trade_finder_selected_trade'] = {
+                    'ticker': ticker,
+                    'entry': float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
+                    'stop': float(r.get('suggested_stop_loss', 0) or 0),
+                    'target': float(r.get('suggested_target', 0) or 0),
+                    'ai_buy_recommendation': r.get('ai_buy_recommendation', ''),
+                    'risk_reward': float(r.get('risk_reward', 0) or 0),
+                    'reason': r.get('reason', ''),
+                    'ai_rationale': r.get('ai_rationale', ''),
+                    'provider': r.get('provider', 'system'),
+                    'generated_at_iso': results.get('generated_at_iso', ''),
+                }
+                st.session_state['default_detail_tab'] = 4
+                st.session_state['_switch_to_scanner_tab'] = True
+                _load_ticker_for_view(ticker)
+                st.rerun()
+        with c_stage:
+            if st.button("🗂️ Stage", key=f"tf_stage_{i}_{ticker}", width="stretch"):
+                plan = PlannedTrade(
+                    plan_id='',
+                    ticker=ticker,
+                    status='PLANNED',
+                    source='trade_finder',
+                    entry=float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
+                    stop=float(r.get('suggested_stop_loss', 0) or 0),
+                    target=float(r.get('suggested_target', 0) or 0),
+                    risk_reward=float(r.get('risk_reward', 0) or 0),
+                    ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
+                    rank_score=float(r.get('rank_score', 0) or 0),
+                    reason=str(r.get('reason', '') or ''),
+                    notes=str(r.get('ai_rationale', '') or ''),
+                )
+                msg = jm.add_planned_trade(plan)
+                st.success(msg)
+                st.rerun()
+
+    planned = jm.get_planned_trades()
+    if planned:
+        st.divider()
+        st.markdown(f"### 🗂️ Planned Trades ({len(planned)})")
+        for p in planned[:30]:
+            pid = str(p.get('plan_id', ''))
+            pt = str(p.get('ticker', ''))
+            pstatus = str(p.get('status', 'PLANNED'))
+            plabel = (
+                f"{pt} | {pstatus} | Entry ${float(p.get('entry', 0) or 0):.2f} "
+                f"| Stop ${float(p.get('stop', 0) or 0):.2f} | Target ${float(p.get('target', 0) or 0):.2f}"
+            )
+            st.caption(plabel)
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                if st.button("▶ Open", key=f"plan_open_{pid}", width="stretch"):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'plan_id': pid,
+                        'ticker': pt,
+                        'entry': float(p.get('entry', 0) or 0),
+                        'stop': float(p.get('stop', 0) or 0),
+                        'target': float(p.get('target', 0) or 0),
+                        'ai_buy_recommendation': str(p.get('ai_recommendation', '') or ''),
+                        'risk_reward': float(p.get('risk_reward', 0) or 0),
+                        'reason': str(p.get('reason', '') or ''),
+                        'ai_rationale': str(p.get('notes', '') or ''),
+                        'provider': str(p.get('source', 'planned') or 'planned'),
+                    }
+                    st.session_state['default_detail_tab'] = 4
+                    st.session_state['_switch_to_scanner_tab'] = True
+                    _load_ticker_for_view(pt)
+                    st.rerun()
+            with a2:
+                if st.button("⚡ Trigger", key=f"plan_trigger_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
+                    st.rerun()
+            with a3:
+                if st.button("✖ Cancel", key=f"plan_cancel_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "CANCELLED"))
+                    st.rerun()
+            with a4:
+                if st.button("🗑️ Remove", key=f"plan_remove_{pid}", width="stretch"):
+                    st.info(jm.remove_planned_trade(pid))
+                    st.rerun()
 
 
 # =============================================================================
@@ -6413,6 +6480,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             )
             result = jm.enter_trade(trade)
             st.success(result)
+            try:
+                plan_id = str((finder_for_ticker or {}).get('plan_id', '')).strip()
+                if plan_id:
+                    jm.update_planned_trade_status(plan_id, "ENTERED", notes=f"Entered {ticker} @ {confirm_entry:.2f}")
+            except Exception:
+                pass
             _append_audit_event(
                 "ENTER_TRADE",
                 (
@@ -7725,6 +7798,16 @@ def render_executive_dashboard():
     q1, q2, q3 = st.columns(3)
 
     must_act = []
+    planned_trades = jm.get_planned_trades()
+    for p in planned_trades:
+        pstatus = str(p.get('status', '')).upper()
+        pticker = str(p.get('ticker', '')).upper().strip()
+        if not pticker:
+            continue
+        if pstatus == "TRIGGERED":
+            must_act.append((92, f"🗂️ Planned triggered: {pticker}", pticker))
+        elif pstatus == "PLANNED":
+            must_act.append((55, f"🗂️ Planned queued: {pticker}", pticker))
     for t in snap.triggered_alerts:
         ticker = t.get('ticker', '')
         must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
