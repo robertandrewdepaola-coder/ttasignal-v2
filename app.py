@@ -1570,13 +1570,22 @@ def render_scanner_table():
                         seen.add(t)
                         unique.append(t)
 
-                    # Preserve favorites across bulk save
+                    existing_set = set(watchlist_tickers)
+                    new_set = set(unique)
+                    removed = sorted(existing_set - new_set)
+
+                    # Guardrail: require explicit confirmation before removing existing tickers.
+                    if removed:
+                        st.session_state['wl_bulk_pending_unique'] = unique
+                        st.session_state['wl_bulk_pending_rejected'] = rejected
+                        st.session_state['wl_bulk_pending_removed'] = removed
+                        st.rerun()
+
+                    # Preserve favorites across bulk save (non-destructive path).
                     old_favorites = set(bridge.get_favorite_tickers())
-                    bridge.clear_watchlist()
                     bridge.set_watchlist_tickers(unique)
-                    # Re-apply favorites
                     for fav in old_favorites:
-                        if fav in unique:
+                        if fav in unique and not bridge.is_favorite(fav):
                             bridge.toggle_favorite(fav)
 
                     st.session_state['wl_version'] += 1
@@ -1601,6 +1610,38 @@ def render_scanner_table():
             with wl_col3:
                 st.caption(f"{len(watchlist_tickers)} saved"
                            + (f" | ⭐ {len(favorite_tickers)}" if favorite_tickers else ""))
+
+            pending_unique = st.session_state.get('wl_bulk_pending_unique')
+            pending_rejected = st.session_state.get('wl_bulk_pending_rejected', [])
+            pending_removed = st.session_state.get('wl_bulk_pending_removed', [])
+            if pending_unique is not None:
+                st.warning(
+                    f"This save will remove {len(pending_removed)} ticker(s): "
+                    f"{', '.join(pending_removed[:10])}"
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Confirm Save", key="wl_bulk_confirm_save", type="primary", width="stretch"):
+                        old_favorites = set(bridge.get_favorite_tickers())
+                        bridge.set_watchlist_tickers(pending_unique)
+                        for fav in old_favorites:
+                            if fav in pending_unique and not bridge.is_favorite(fav):
+                                bridge.toggle_favorite(fav)
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
+                        st.session_state['wl_version'] += 1
+                        msg = f"✅ Saved {len(pending_unique)} tickers"
+                        if pending_rejected:
+                            msg += f" | ⚠️ Rejected {len(pending_rejected)}: {', '.join(pending_rejected[:5])}"
+                        st.success(msg)
+                        st.rerun()
+                with c2:
+                    if st.button("Cancel", key="wl_bulk_confirm_cancel", width="stretch"):
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
+                        st.info("Bulk save canceled.")
 
     # ══════════════════════════════════════════════════════════════════
     # WATCHLIST NOTES (collapsible accordion)
