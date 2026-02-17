@@ -1313,6 +1313,7 @@ def _run_scan(mode='all'):
     else:
         tickers_to_scan = full_list
 
+    _scan_started = time.time()
     with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
         _append_audit_event(
             "SCAN_START",
@@ -1482,6 +1483,26 @@ def _run_scan(mode='all'):
             f"mode={mode} scanned={len(tickers_to_scan)} results={len(summary)} triggered={len(triggered)}",
             source=f"scan:{mode}",
         )
+
+        # Telemetry: runtime history + daily workflow finalize
+        _scan_elapsed = max(0.0, time.time() - _scan_started)
+        hist = st.session_state.get('_scan_duration_hist', [])
+        hist.append(_scan_elapsed)
+        st.session_state['_scan_duration_hist'] = hist[-30:]
+        st.session_state['_last_scan_duration_sec'] = _scan_elapsed
+        st.session_state['_last_scan_mode'] = mode
+
+        if st.session_state.get('_daily_workflow_in_progress'):
+            wf_start = float(st.session_state.get('_daily_workflow_start_ts', _scan_started) or _scan_started)
+            wf_sec = max(0.0, time.time() - wf_start)
+            st.session_state['_daily_workflow_sec'] = wf_sec
+            st.session_state['_daily_workflow_ts'] = time.time()
+            st.session_state['_daily_workflow_in_progress'] = False
+            _append_audit_event(
+                "DAILY_WORKFLOW_DONE",
+                f"mode={mode} scan_sec={_scan_elapsed:.1f} total_sec={wf_sec:.1f}",
+                source=f"scan:{mode}",
+            )
 
     st.rerun()
 
@@ -5893,6 +5914,70 @@ def _fmt_last_update(ts: float, fallback: str = "Never") -> str:
     return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} ({age})"
 
 
+def _is_stale(ts: float, max_age_sec: int) -> bool:
+    """True if timestamp is missing or older than max_age_sec."""
+    if not ts:
+        return True
+    return (time.time() - ts) > max_age_sec
+
+
+def _scan_health_snapshot() -> Dict[str, float]:
+    """Compute scan telemetry from audit events + session metrics."""
+    events = _get_audit_events()
+    scan_done = [e for e in events if e.get('action') == 'SCAN_DONE']
+    scan_start = [e for e in events if e.get('action') == 'SCAN_START']
+
+    last_mode = ""
+    last_count = 0
+    if scan_done:
+        details = str(scan_done[0].get('details', ''))
+        m_mode = re.search(r'mode=([a-z_]+)', details)
+        m_count = re.search(r'scanned=(\d+)', details)
+        if m_mode:
+            last_mode = m_mode.group(1)
+        if m_count:
+            last_count = int(m_count.group(1))
+
+    dur_hist = st.session_state.get('_scan_duration_hist', [])
+    last_dur = float(dur_hist[-1]) if dur_hist else 0.0
+    avg_dur = (sum(dur_hist) / len(dur_hist)) if dur_hist else 0.0
+
+    return {
+        'total_scans_logged': float(len(scan_done)),
+        'scan_starts_logged': float(len(scan_start)),
+        'last_scan_count': float(last_count),
+        'last_scan_duration': last_dur,
+        'avg_scan_duration': avg_dur,
+        'last_scan_mode': last_mode,
+    }
+
+
+def _recommendation_score(row: Dict) -> float:
+    """Simple ranking score for trade candidates."""
+    grade_rank = {'A+': 8, 'A': 7, 'A-': 6, 'B+': 5, 'B': 4, 'B-': 3, 'C+': 2, 'C': 1}
+    rec = str(row.get('recommendation', '')).upper()
+    conv = float(row.get('conviction', 0) or 0)
+    vol_ratio = float(row.get('volume_ratio', 0) or 0)
+    grade = str(row.get('quality_grade', '')).upper()
+    sector_phase = str(row.get('sector_phase', '')).lower()
+    earn_days = int(row.get('earn_days', 999) or 999)
+
+    score = conv * 3 + min(vol_ratio, 4) * 2 + grade_rank.get(grade, 0)
+    if "RE_ENTRY" in rec or "LATE_ENTRY" in rec:
+        score += 1.0
+    if "SKIP" in rec or "AVOID" in rec:
+        score -= 8.0
+    if sector_phase == "leading":
+        score += 2.0
+    elif sector_phase == "emerging":
+        score += 1.0
+    elif sector_phase == "lagging":
+        score -= 1.5
+    if 0 <= earn_days <= 7:
+        score -= 2.0
+    return score
+
+
 def _run_alert_check_now(jm: JournalManager) -> int:
     """Evaluate pending conditionals immediately using current prices."""
     conditionals = jm.get_pending_conditionals()
@@ -5910,6 +5995,8 @@ def _run_alert_check_now(jm: JournalManager) -> int:
     triggered = jm.check_conditionals(current_prices, volume_ratios={})
     if triggered:
         st.session_state['triggered_alerts'] = triggered
+    st.session_state['_alert_check_ts'] = time.time()
+    _append_audit_event("ALERT_CHECK", f"pending={len(conditionals)} triggered={len(triggered)}", source="exec_dashboard")
     return len(triggered)
 
 
@@ -5935,7 +6022,28 @@ def _fast_refresh_dashboard() -> None:
 
     trig_count = _run_alert_check_now(jm)
     st.session_state['_dashboard_last_refresh'] = time.time()
+    _append_audit_event(
+        "FAST_REFRESH",
+        f"positions={len(open_trades)} alerts_triggered={trig_count}",
+        source="exec_dashboard",
+    )
     st.success(f"Fast refresh complete. Triggered alerts: {trig_count}")
+
+
+def _run_daily_workflow() -> Dict[str, float]:
+    """
+    Execute practical daily cycle:
+    1) Fast refresh macro/sector/positions/alerts
+    2) Scan only new tickers for speed
+    """
+    t0 = time.time()
+    st.session_state['_daily_workflow_start_ts'] = t0
+    st.session_state['_daily_workflow_in_progress'] = True
+    _append_audit_event("DAILY_WORKFLOW_START", "fast_refresh + scan_new_only", source="exec_dashboard")
+    _fast_refresh_dashboard()
+    _run_scan(mode='new_only')
+    # Note: _run_scan triggers rerun; completion metrics are finalized in _run_scan.
+    return {'elapsed': 0.0}
 
 
 def render_executive_dashboard():
@@ -5955,11 +6063,14 @@ def render_executive_dashboard():
     sector_ts = float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0)
     pos_ts = float(st.session_state.get('_position_prices_ts', 0.0) or 0.0)
     dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
+    alert_ts = float(st.session_state.get('_alert_check_ts', 0.0) or 0.0)
+    daily_ts = float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0)
+    daily_sec = float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0)
 
     st.subheader("Executive Dashboard")
     st.caption(f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         if st.button("⚡ Fast Refresh", key="exec_fast_refresh", type="primary", width="stretch"):
             _fast_refresh_dashboard()
@@ -5970,16 +6081,24 @@ def render_executive_dashboard():
     with c3:
         if st.button("🎯 Check Alerts Now", key="exec_alert_refresh", width="stretch"):
             trig_count = _run_alert_check_now(jm)
+            st.session_state['_alert_check_ts'] = time.time()
             st.success(f"Alert check complete. Triggered alerts: {trig_count}")
             st.rerun()
+    with c4:
+        if st.button("✅ Run Daily Workflow", key="exec_daily_workflow", width="stretch"):
+            _run_daily_workflow()
 
     st.caption(
         f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
         f"Scan: {_fmt_last_update(scan_ts)} | "
         f"Market: {_fmt_last_update(market_ts)} | "
         f"Sectors: {_fmt_last_update(sector_ts)} | "
-        f"Position prices: {_fmt_last_update(pos_ts)}"
+        f"Position prices: {_fmt_last_update(pos_ts)} | "
+        f"Alerts check: {_fmt_last_update(alert_ts)} | "
+        f"Workflow: {_fmt_last_update(daily_ts)}"
     )
+    if daily_sec > 0:
+        st.caption(f"Last workflow runtime: {daily_sec:.1f}s")
 
     watchlist = bridge.get_watchlist_tickers()
     open_trades = jm.get_open_trades()
@@ -5991,19 +6110,81 @@ def render_executive_dashboard():
         rec = str(s.get('recommendation', '')).upper()
         if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
             actionable.append(s)
-    actionable = sorted(actionable, key=lambda x: x.get('conviction', 0), reverse=True)
+    actionable = sorted(actionable, key=_recommendation_score, reverse=True)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    # SLA freshness checks
+    stale_scan = _is_stale(scan_ts, 3 * 3600)
+    stale_market = _is_stale(market_ts, 30 * 60)
+    stale_sector = _is_stale(sector_ts, 60 * 60)
+    stale_positions = _is_stale(pos_ts, 10 * 60)
+    stale_alerts = _is_stale(alert_ts, 5 * 60)
+    stale_count = sum([stale_scan, stale_market, stale_sector, stale_positions, stale_alerts])
+
+    if stale_count > 0:
+        stale_tags = []
+        if stale_scan:
+            stale_tags.append("scan")
+        if stale_market:
+            stale_tags.append("market")
+        if stale_sector:
+            stale_tags.append("sectors")
+        if stale_positions:
+            stale_tags.append("positions")
+        if stale_alerts:
+            stale_tags.append("alerts")
+        st.warning(f"Stale data detected: {', '.join(stale_tags)}")
+    else:
+        st.success("All core data streams are fresh.")
+
+    health = _scan_health_snapshot()
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Watchlist", len(watchlist))
     m2.metric("Scanned", len(summary))
     m3.metric("Actionable", len(actionable))
     m4.metric("Open Positions", len(open_trades))
     m5.metric("Alerts", len(conditionals), delta=f"{len(triggered)} triggered")
+    m6.metric("Stale Streams", stale_count, delta=f"Last scan {health['last_scan_mode'] or 'n/a'}")
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Last Scan Count", int(health['last_scan_count']))
+    t2.metric("Last Scan Runtime", f"{health['last_scan_duration']:.1f}s")
+    t3.metric("Avg Scan Runtime", f"{health['avg_scan_duration']:.1f}s")
 
     st.divider()
-    q1, q2 = st.columns(2)
+    q1, q2, q3 = st.columns(3)
+
+    must_act = []
+    for t in triggered:
+        ticker = t.get('ticker', '')
+        must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
+    for trade in open_trades:
+        ticker = trade.get('ticker', '').upper().strip()
+        entry = float(trade.get('entry_price', 0) or 0)
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+        current = float(st.session_state.get('_position_prices', {}).get(ticker) or entry)
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        if stop > 0 and current <= stop:
+            must_act.append((95, f"🔴 Stop breached: {ticker}", ticker))
+        elif pnl_pct <= -3:
+            must_act.append((75, f"🟠 Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", ticker))
+    for row in summary:
+        earn_days = int(row.get('earn_days', 999) or 999)
+        if 0 <= earn_days <= 3:
+            ticker = row.get('ticker', '')
+            must_act.append((70 - earn_days, f"🗓️ Earnings soon ({earn_days}d): {ticker}", ticker))
+    must_act.sort(key=lambda x: x[0], reverse=True)
 
     with q1:
+        st.markdown("**Must Act Now**")
+        if not must_act:
+            st.caption("No urgent actions right now.")
+        for i, (_, msg, ticker) in enumerate(must_act[:12]):
+            if st.button(msg, key=f"exec_urgent_{i}_{ticker}", width="stretch"):
+                if ticker:
+                    _load_ticker_for_view(ticker)
+
+    with q2:
         st.markdown("**Top Trade Candidates**")
         if not actionable:
             st.caption("No actionable entries in current scan.")
@@ -6011,10 +6192,12 @@ def render_executive_dashboard():
             ticker = row.get('ticker', '?')
             rec = row.get('recommendation', '?')
             conv = row.get('conviction', 0)
-            if st.button(f"{ticker} | {rec} | Conviction {conv}", key=f"exec_pick_{ticker}", width="stretch"):
+            score = _recommendation_score(row)
+            if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
+                         key=f"exec_pick_{ticker}", width="stretch"):
                 _load_ticker_for_view(ticker)
 
-    with q2:
+    with q3:
         st.markdown("**Open Positions Needing Attention**")
         if not open_trades:
             st.caption("No open positions.")
