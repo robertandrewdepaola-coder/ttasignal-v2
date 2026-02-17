@@ -1190,11 +1190,10 @@ def _run_scan(mode='all'):
     bridge = get_bridge()
     all_watchlist = bridge.get_watchlist_tickers()
 
-    # Also include conditional alert tickers and open positions
-    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    # Scan universe is strictly the active watchlist.
+    # This avoids re-introducing stale/non-watchlist tickers into scanner results.
     open_tickers = jm.get_open_tickers()
-
-    full_list = list(set(all_watchlist + conditional_tickers + open_tickers))
+    full_list = list(set(all_watchlist))
     
     # ── Validate tickers — reject corrupt entries before they hit yfinance ──
     import re as _re
@@ -1282,6 +1281,8 @@ def _run_scan(mode='all'):
         # Merge with existing results if new_only mode
         if mode == 'new_only':
             existing_results = st.session_state.get('scan_results', [])
+            # Drop stale rows that are no longer in the current scan universe.
+            existing_results = [r for r in existing_results if r.ticker in full_list]
             existing_tickers = {r.ticker for r in new_results}
             # Keep old results that aren't being rescanned
             merged_results = [r for r in existing_results if r.ticker not in existing_tickers]
