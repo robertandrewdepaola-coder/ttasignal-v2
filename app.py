@@ -1849,6 +1849,7 @@ def _run_find_new_trades():
                     'conviction': row['conviction'],
                     'quality_grade': row['quality_grade'],
                     'price': row['price'],
+                    'summary': row.get('summary', ''),
                     'sector': row['sector'],
                     'sector_phase': row['sector_phase'],
                     'earn_date': row['earn_date'],
@@ -1887,6 +1888,312 @@ def _run_find_new_trades():
         source="find_new",
     )
     st.success(f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists.")
+
+
+def _extract_first_json_object(raw: str) -> Dict[str, Any]:
+    """Best-effort JSON extractor for AI responses."""
+    if not raw:
+        return {}
+    txt = str(raw).strip()
+    try:
+        return _json.loads(txt)
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", txt)
+    if not m:
+        return {}
+    try:
+        return _json.loads(m.group(0))
+    except Exception:
+        return {}
+
+
+def _calc_rr(entry: float, stop: float, target: float) -> float:
+    """Compute reward/risk ratio with guardrails."""
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return 0.0
+    risk = entry - stop
+    reward = target - entry
+    if risk <= 0 or reward <= 0:
+        return 0.0
+    return round(reward / risk, 2)
+
+
+def _heuristic_trade_finder_ai(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback AI recommendation when Grok is unavailable."""
+    price = float(candidate.get('price', 0) or 0)
+    conv = int(candidate.get('conviction', 0) or 0)
+    rec = str(candidate.get('recommendation', '')).upper()
+    summary = str(candidate.get('summary', '') or '')
+    quality = str(candidate.get('quality_grade', '?') or '?')
+
+    entry = price
+    if conv >= 8:
+        stop = round(entry * 0.95, 2) if entry > 0 else 0.0
+        target = round(entry * 1.12, 2) if entry > 0 else 0.0
+        ai_buy = "Strong Buy"
+    elif "BUY" in rec or "ENTRY" in rec:
+        stop = round(entry * 0.94, 2) if entry > 0 else 0.0
+        target = round(entry * 1.10, 2) if entry > 0 else 0.0
+        ai_buy = "Buy"
+    else:
+        stop = round(entry * 0.93, 2) if entry > 0 else 0.0
+        target = round(entry * 1.08, 2) if entry > 0 else 0.0
+        ai_buy = "Watch Only"
+    rr = _calc_rr(entry, stop, target)
+    rank_score = round(conv * 1.5 + rr * 3 + (2 if quality.startswith('A') else 0), 2)
+    return {
+        'ai_buy_recommendation': ai_buy if entry > 0 else "Skip",
+        'suggested_entry': entry,
+        'suggested_stop_loss': stop,
+        'suggested_target': target,
+        'risk_reward': rr,
+        'rank_score': rank_score,
+        'rationale': summary or "Heuristic fallback used (AI unavailable).",
+        'provider': 'system',
+    }
+
+
+def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ask Grok/OpenAI-compatible provider for trade-finder scoring and risk levels.
+    Returns normalized fields used by the Trade Finder table.
+    """
+    openai_client = ai_clients.get('openai_client')
+    ai_cfg = ai_clients.get('ai_config', {}) or {}
+    model = ai_cfg.get('model', 'grok-3-fast')
+    fallback_model = ai_cfg.get('fallback_model', '')
+
+    if openai_client is None:
+        return _heuristic_trade_finder_ai(candidate)
+
+    payload = {
+        "ticker": candidate.get('ticker', ''),
+        "recommendation": candidate.get('recommendation', ''),
+        "conviction": int(candidate.get('conviction', 0) or 0),
+        "quality_grade": candidate.get('quality_grade', '?'),
+        "price": float(candidate.get('price', 0) or 0),
+        "summary": candidate.get('summary', ''),
+        "sector": candidate.get('sector', ''),
+        "sector_phase": candidate.get('sector_phase', ''),
+        "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "watchlists": candidate.get('watchlists', ''),
+    }
+    prompt = (
+        "You are scoring swing-trade candidates. Return ONLY valid JSON with keys: "
+        "ai_buy_recommendation, suggested_entry, suggested_stop_loss, suggested_target, "
+        "risk_reward, rank_score, rationale. "
+        "ai_buy_recommendation must be one of: Strong Buy, Buy, Watch Only, Skip. "
+        "Set stop below entry, target above entry. Keep rationale <= 180 chars.\n\n"
+        f"Candidate:\n{_json.dumps(payload)}"
+    )
+
+    models = [m for m in [model, fallback_model] if m]
+    raw_text = None
+    provider = None
+    for m in models:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=m,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=260,
+                temperature=0.2,
+            )
+            raw_text = resp.choices[0].message.content
+            provider = m
+            if raw_text:
+                break
+        except Exception:
+            continue
+
+    if not raw_text:
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = 'system'
+        return out
+
+    parsed = _extract_first_json_object(raw_text)
+    if not parsed:
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = provider or 'system'
+        return out
+
+    entry = float(parsed.get('suggested_entry', payload['price']) or payload['price'] or 0)
+    stop = float(parsed.get('suggested_stop_loss', 0) or 0)
+    target = float(parsed.get('suggested_target', 0) or 0)
+    if entry > 0 and (stop <= 0 or stop >= entry):
+        stop = round(entry * 0.94, 2)
+    if entry > 0 and (target <= entry):
+        target = round(entry * 1.10, 2)
+
+    rr = float(parsed.get('risk_reward', 0) or 0)
+    if rr <= 0:
+        rr = _calc_rr(entry, stop, target)
+    rank_score = float(parsed.get('rank_score', 0) or 0)
+    if rank_score <= 0:
+        rank_score = round(payload['conviction'] * 1.5 + rr * 3, 2)
+
+    ai_buy = str(parsed.get('ai_buy_recommendation', '') or '').strip() or "Watch Only"
+    if ai_buy not in {"Strong Buy", "Buy", "Watch Only", "Skip"}:
+        ai_buy = "Watch Only"
+    rationale = str(parsed.get('rationale', '') or '').strip()[:180]
+    if not rationale:
+        rationale = payload.get('summary') or "AI-ranked candidate."
+
+    return {
+        'ai_buy_recommendation': ai_buy,
+        'suggested_entry': round(entry, 2),
+        'suggested_stop_loss': round(stop, 2),
+        'suggested_target': round(target, 2),
+        'risk_reward': round(rr, 2),
+        'rank_score': round(rank_score, 2),
+        'rationale': rationale,
+        'provider': provider or 'system',
+    }
+
+
+def _run_trade_finder_workflow() -> None:
+    """
+    Executes scanner candidate discovery + Grok scoring.
+    Reuses existing find-new logic, then enriches/ranks candidates.
+    """
+    _run_find_new_trades()
+    report = st.session_state.get('find_new_trades_report', {}) or {}
+    base_candidates = report.get('candidates', []) or []
+    if not base_candidates:
+        st.session_state['trade_finder_results'] = {
+            'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'rows': [],
+            'provider': 'system',
+            'elapsed_sec': 0.0,
+        }
+        return
+
+    ai_clients = _get_ai_clients()
+    profile_cache = st.session_state.get('_trade_finder_profile_cache', {}) or {}
+    rows = []
+    _t0 = time.time()
+    for c in base_candidates:
+        ticker = str(c.get('ticker', '')).upper().strip()
+        company_name = profile_cache.get(ticker, "")
+        if not company_name:
+            try:
+                from data_fetcher import fetch_fundamental_profile
+                prof = fetch_fundamental_profile(ticker) or {}
+                company_name = str(prof.get('name', '') or '')
+                if company_name:
+                    profile_cache[ticker] = company_name
+            except Exception:
+                company_name = ""
+
+        ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+        entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
+        stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
+        target = float(ai_rec.get('suggested_target', 0) or 0)
+        rr = float(ai_rec.get('risk_reward', 0) or 0)
+        if rr <= 0:
+            rr = _calc_rr(entry, stop, target)
+        rows.append({
+            'ticker': ticker,
+            'company_name': company_name,
+            'price': float(c.get('price', 0) or 0),
+            'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
+            'scanner_summary': str(c.get('summary', '') or ''),
+            'watchlists': str(c.get('watchlists', '') or ''),
+            'ai_buy_recommendation': ai_rec.get('ai_buy_recommendation', 'Watch Only'),
+            'suggested_entry': round(entry, 2),
+            'suggested_stop_loss': round(stop, 2),
+            'suggested_target': round(target, 2),
+            'risk_reward': round(rr, 2),
+            'rank_score': float(ai_rec.get('rank_score', 0) or 0),
+            'ai_rationale': str(ai_rec.get('rationale', '') or ''),
+            'provider': ai_rec.get('provider', 'system'),
+        })
+
+    st.session_state['_trade_finder_profile_cache'] = profile_cache
+    rows = sorted(rows, key=lambda x: x.get('rank_score', 0), reverse=True)
+    elapsed = max(0.0, time.time() - _t0)
+    st.session_state['trade_finder_results'] = {
+        'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'rows': rows,
+        'provider': rows[0].get('provider', 'system') if rows else 'system',
+        'elapsed_sec': elapsed,
+        'input_candidates': len(base_candidates),
+    }
+    _append_perf_metric({
+        'kind': 'trade_finder',
+        'candidates_in': len(base_candidates),
+        'candidates_out': len(rows),
+        'sec': round(elapsed, 3),
+        'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
+    })
+
+
+def render_trade_finder_tab():
+    """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
+    st.subheader("🧭 Trade Finder")
+    st.caption("Runs cross-watchlist scan, ranks candidates with Grok, and opens prefilled trade entry.")
+
+    if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
+        with st.spinner("Running trade finder and AI ranking..."):
+            _run_trade_finder_workflow()
+        st.rerun()
+
+    results = st.session_state.get('trade_finder_results', {}) or {}
+    rows = results.get('rows', []) or []
+    if not rows:
+        st.info("Click Find New Trades to generate ranked candidates.")
+        return
+
+    st.caption(
+        f"Generated: {results.get('generated_at_iso', '')} | "
+        f"Candidates: {len(rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
+        f"Provider: {results.get('provider', 'system')}"
+    )
+
+    table_rows = []
+    for r in rows:
+        table_rows.append({
+            'Ticker': r.get('ticker', ''),
+            'Company': r.get('company_name', ''),
+            'Price': f"${float(r.get('price', 0) or 0):.2f}",
+            'Reason': r.get('reason', ''),
+            'AI Buy Recommendation': r.get('ai_buy_recommendation', ''),
+            'Suggested Stop Loss': f"${float(r.get('suggested_stop_loss', 0) or 0):.2f}",
+            'Suggested Target': f"${float(r.get('suggested_target', 0) or 0):.2f}",
+            'Risk/Reward': f"{float(r.get('risk_reward', 0) or 0):.2f}:1",
+            'AI Rationale': r.get('ai_rationale', ''),
+            'Rank': f"{float(r.get('rank_score', 0) or 0):.2f}",
+        })
+    st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+
+    st.markdown("### Open In New Trade")
+    for i, r in enumerate(rows[:25]):
+        ticker = r.get('ticker', '')
+        label = (
+            f"{ticker} | {r.get('ai_buy_recommendation', '')} | "
+            f"R:R {float(r.get('risk_reward', 0) or 0):.2f}:1 | "
+            f"Score {float(r.get('rank_score', 0) or 0):.2f}"
+        )
+        if st.button(label, key=f"tf_open_{i}_{ticker}", width="stretch"):
+            st.session_state['trade_finder_selected_trade'] = {
+                'ticker': ticker,
+                'entry': float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
+                'stop': float(r.get('suggested_stop_loss', 0) or 0),
+                'target': float(r.get('suggested_target', 0) or 0),
+                'ai_buy_recommendation': r.get('ai_buy_recommendation', ''),
+                'risk_reward': float(r.get('risk_reward', 0) or 0),
+                'reason': r.get('reason', ''),
+                'ai_rationale': r.get('ai_rationale', ''),
+                'provider': r.get('provider', 'system'),
+                'generated_at_iso': results.get('generated_at_iso', ''),
+            }
+            st.session_state['default_detail_tab'] = 4
+            st.session_state['_switch_to_scanner_tab'] = True
+            _load_ticker_for_view(ticker)
+            st.rerun()
 
 
 # =============================================================================
@@ -3021,34 +3328,32 @@ def render_detail_view():
 
     st.caption(rec.get('summary', ''))
 
-    # ── Tabs (with optional default tab from chart-first navigation) ──
-    tab_names = ["📊 Signal", "📈 Chart", "🤖 AI Intel", "💬 Ask AI", "💼 Trade"]
-    default_tab = st.session_state.pop('default_detail_tab', 0)
+    # ── Tabs (supports programmatic default by ordering selected tab first) ──
+    tab_defs = [
+        ("📊 Signal", "signal"),
+        ("📈 Chart", "chart"),
+        ("🤖 AI Intel", "ai"),
+        ("💬 Ask AI", "chat"),
+        ("💼 Trade", "trade"),
+    ]
+    default_tab = int(st.session_state.pop('default_detail_tab', 0) or 0)
+    if default_tab < 0 or default_tab >= len(tab_defs):
+        default_tab = 0
+    ordered_defs = tab_defs[default_tab:] + tab_defs[:default_tab]
+    tabs = st.tabs([name for name, _ in ordered_defs])
 
-    # Streamlit tabs don't support programmatic selection directly,
-    # so we reorder tabs to put the desired one first, then reorder back
-    # Actually, we can't reorder. We use a workaround with session state key.
-    tab_signal, tab_chart, tab_ai, tab_chat, tab_trade = st.tabs(tab_names)
-
-    # ── Signal Tab ────────────────────────────────────────────────────
-    with tab_signal:
-        _render_signal_tab(signal, analysis)
-
-    # ── Chart Tab ─────────────────────────────────────────────────────
-    with tab_chart:
-        _render_chart_tab(ticker, signal)
-
-    # ── AI Intel Tab ──────────────────────────────────────────────────
-    with tab_ai:
-        _render_ai_tab(ticker, signal, rec, analysis)
-
-    # ── Ask AI Chat Tab ───────────────────────────────────────────────
-    with tab_chat:
-        _render_chat_tab(ticker, signal, rec, analysis)
-
-    # ── Trade Tab ─────────────────────────────────────────────────────
-    with tab_trade:
-        _render_trade_tab(ticker, signal, analysis)
+    for tab, (_name, key) in zip(tabs, ordered_defs):
+        with tab:
+            if key == "signal":
+                _render_signal_tab(signal, analysis)
+            elif key == "chart":
+                _render_chart_tab(ticker, signal)
+            elif key == "ai":
+                _render_ai_tab(ticker, signal, rec, analysis)
+            elif key == "chat":
+                _render_chat_tab(ticker, signal, rec, analysis)
+            elif key == "trade":
+                _render_trade_tab(ticker, signal, analysis)
 
 
 def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
@@ -5764,6 +6069,13 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     tech_target = float(stops.get('target', 0.0))
     ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
     ai_levels = _extract_ai_trade_levels(ai_result, tech_entry, tech_stop, tech_target, current_price)
+    finder_trade = st.session_state.get('trade_finder_selected_trade', {}) or {}
+    finder_for_ticker = finder_trade if str(finder_trade.get('ticker', '')).upper() == str(ticker).upper() else {}
+    if finder_for_ticker:
+        ai_levels['entry'] = float(finder_for_ticker.get('entry', ai_levels.get('entry', current_price)) or ai_levels.get('entry', current_price) or current_price)
+        ai_levels['stop'] = float(finder_for_ticker.get('stop', ai_levels.get('stop', 0)) or ai_levels.get('stop', 0) or 0)
+        ai_levels['target'] = float(finder_for_ticker.get('target', ai_levels.get('target', 0)) or ai_levels.get('target', 0) or 0)
+        ai_levels['using_ai'] = True
 
     account_size = float(st.session_state.get('account_size', 100000.0))
     open_trades = jm.get_open_trades()
@@ -5812,6 +6124,8 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     selected_entry = ai_levels['entry'] if selected_source == "AI Recommended" else tech_entry
     selected_stop = ai_levels['stop'] if selected_source == "AI Recommended" else tech_stop
     selected_target = ai_levels['target'] if selected_source == "AI Recommended" else tech_target
+    recommended_stop_ref = float(ai_levels.get('stop', 0) or 0)
+    recommended_stop_src = "Grok/AI" if ai_levels.get('using_ai') else "System"
 
     if selected_source == "AI Recommended":
         if ai_levels.get('using_ai'):
@@ -5824,6 +6138,9 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     entry_key = f"sizer_entry_{ticker}"
     stop_key = f"sizer_stop_{ticker}"
     target_key = f"sizer_target_{ticker}"
+    stop_dist_key = f"sizer_stop_dist_pct_{ticker}"
+    stop_dist_prev_key = f"sizer_stop_dist_pct_prev_{ticker}"
+    stop_prev_key = f"sizer_stop_prev_{ticker}"
     confirm_entry_key = f"confirm_entry_{ticker}"
     confirm_stop_key = f"confirm_stop_{ticker}"
     confirm_target_key = f"confirm_target_{ticker}"
@@ -5834,6 +6151,15 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.session_state[stop_key] = float(selected_stop)
     if target_key not in st.session_state:
         st.session_state[target_key] = float(selected_target)
+    if stop_dist_key not in st.session_state:
+        _entry0 = float(st.session_state.get(entry_key, selected_entry) or 0)
+        _stop0 = float(st.session_state.get(stop_key, selected_stop) or 0)
+        _dist0 = ((_entry0 - _stop0) / _entry0 * 100) if _entry0 > 0 and _stop0 > 0 and _entry0 > _stop0 else 0.0
+        st.session_state[stop_dist_key] = round(max(0.0, _dist0), 2)
+    if stop_dist_prev_key not in st.session_state:
+        st.session_state[stop_dist_prev_key] = float(st.session_state.get(stop_dist_key, 0.0) or 0.0)
+    if stop_prev_key not in st.session_state:
+        st.session_state[stop_prev_key] = float(st.session_state.get(stop_key, selected_stop) or selected_stop or 0.0)
 
     prev_source = st.session_state.get(prev_source_key)
     if prev_source != selected_source:
@@ -5843,6 +6169,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
         st.session_state[confirm_stop_key] = float(selected_stop)
         st.session_state[confirm_target_key] = float(selected_target)
+        _entry = float(st.session_state.get(entry_key, 0) or 0)
+        _stop = float(st.session_state.get(stop_key, 0) or 0)
+        _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
+        st.session_state[stop_dist_key] = round(max(0.0, _dist), 2)
+        st.session_state[stop_dist_prev_key] = float(st.session_state[stop_dist_key])
+        st.session_state[stop_prev_key] = float(_stop)
         st.session_state[prev_source_key] = selected_source
 
     if st.button("↺ Apply Selected Defaults", key=f"apply_defaults_{ticker}"):
@@ -5852,9 +6184,17 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
         st.session_state[confirm_stop_key] = float(selected_stop)
         st.session_state[confirm_target_key] = float(selected_target)
+        _entry = float(st.session_state.get(entry_key, 0) or 0)
+        _stop = float(st.session_state.get(stop_key, 0) or 0)
+        _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
+        st.session_state[stop_dist_key] = round(max(0.0, _dist), 2)
+        st.session_state[stop_dist_prev_key] = float(st.session_state[stop_dist_key])
+        st.session_state[stop_prev_key] = float(_stop)
         st.rerun()
 
-    col1, col2, col3, col4 = st.columns(4)
+    if recommended_stop_ref > 0:
+        st.caption(f"Recommended Stop Loss ({recommended_stop_src}): ${recommended_stop_ref:.2f}")
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         entry_price = st.number_input("Entry Price", step=0.01, format="%.2f", key=entry_key)
     with col2:
@@ -5862,6 +6202,16 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     with col3:
         target_price = st.number_input("Target", step=0.01, format="%.2f", key=target_key)
     with col4:
+        stop_dist_pct = st.number_input(
+            "Stop Distance %",
+            min_value=0.10,
+            max_value=50.00,
+            step=0.10,
+            format="%.2f",
+            key=stop_dist_key,
+            help="Percent distance from Entry. Changing this recalculates Stop Loss.",
+        )
+    with col5:
         max_risk = st.number_input(
             "Max Risk %",
             value=max(0.5, min(5.0, round(1.5 * policy.position_size_multiplier, 2))),
@@ -5871,6 +6221,23 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             format="%.2f",
             key=f"sizer_risk_{ticker}",
         )
+
+    prev_stop_dist_pct = float(st.session_state.get(stop_dist_prev_key, stop_dist_pct) or 0.0)
+    if abs(stop_dist_pct - prev_stop_dist_pct) > 1e-9 and entry_price > 0:
+        new_stop_from_pct = max(0.01, entry_price * (1 - (stop_dist_pct / 100.0)))
+        st.session_state[stop_key] = round(new_stop_from_pct, 2)
+        st.session_state[confirm_stop_key] = round(new_stop_from_pct, 2)
+        st.session_state[stop_prev_key] = float(st.session_state[stop_key])
+        st.session_state[stop_dist_prev_key] = float(stop_dist_pct)
+        st.rerun()
+
+    prev_stop_price = float(st.session_state.get(stop_prev_key, stop_price) or 0.0)
+    if abs(stop_price - prev_stop_price) > 1e-9 and entry_price > 0:
+        derived_stop_dist_pct = ((entry_price - stop_price) / entry_price * 100.0) if stop_price > 0 else 0.0
+        derived_stop_dist_pct = round(max(0.0, derived_stop_dist_pct), 2)
+        st.session_state[stop_dist_key] = derived_stop_dist_pct
+        st.session_state[stop_dist_prev_key] = float(derived_stop_dist_pct)
+        st.session_state[stop_prev_key] = float(stop_price)
 
     if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
         result = calculate_position_size(
@@ -5952,7 +6319,17 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             f"({total_cost / account_size * 100:.1f}% of account)"
         )
 
-    notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=f"notes_{ticker}")
+    notes_key = f"notes_{ticker}"
+    finder_note_applied_key = f"_tf_note_applied_{ticker}"
+    if finder_for_ticker and not st.session_state.get(finder_note_applied_key):
+        tf_reason = str(finder_for_ticker.get('ai_rationale', '') or finder_for_ticker.get('reason', '') or '').strip()
+        tf_rr = float(finder_for_ticker.get('risk_reward', 0) or 0)
+        tf_rec = str(finder_for_ticker.get('ai_buy_recommendation', '') or '').strip()
+        seed = rec.get('summary', '') or ''
+        tf_line = f"[Trade Finder] {tf_rec} | R:R {tf_rr:.2f}:1 | {tf_reason}".strip()
+        st.session_state[notes_key] = f"{seed}\n{tf_line}".strip() if seed else tf_line
+        st.session_state[finder_note_applied_key] = True
+    notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=notes_key)
     attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
@@ -7281,12 +7658,15 @@ def main():
     conditionals = jm.get_pending_conditionals()
     alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
     if _is_exec_dashboard_enabled():
-        tab_exec, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
-            "📌 Executive Dashboard", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        tab_exec, tab_finder, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "📌 Executive Dashboard", "🧭 Trade Finder", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
         ])
 
         with tab_exec:
             render_executive_dashboard()
+
+        with tab_finder:
+            render_trade_finder_tab()
 
         with tab_scanner:
             render_scanner_table()
@@ -7303,9 +7683,11 @@ def main():
         with tab_perf:
             render_performance()
     else:
-        tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
-            "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        tab_finder, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "🧭 Trade Finder", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
         ])
+        with tab_finder:
+            render_trade_finder_tab()
         with tab_scanner:
             render_scanner_table()
             if st.session_state.get('selected_analysis'):
@@ -7317,6 +7699,22 @@ def main():
             render_position_manager()
         with tab_perf:
             render_performance()
+
+    if st.session_state.pop('_switch_to_scanner_tab', False):
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            setTimeout(function() {
+              const doc = window.parent.document;
+              const buttons = Array.from(doc.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button'));
+              const scanner = buttons.find(b => (b.innerText || '').includes('Scanner'));
+              if (scanner) scanner.click();
+            }, 80);
+            </script>
+            """,
+            height=0,
+        )
 
 
 def _render_alerts_panel():
