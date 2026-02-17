@@ -6724,6 +6724,84 @@ def render_performance():
     jm = get_journal()
     stats = jm.get_performance_stats()
 
+    def _compute_spy_alpha(details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compute per-trade SPY benchmark returns and alpha in UI layer."""
+        if not details:
+            return {'details': [], 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+        try:
+            from data_fetcher import fetch_historical_data
+        except Exception:
+            return {'details': details, 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+
+        min_entry = None
+        max_exit = None
+        for t in details:
+            e = str(t.get('entry_date', '') or '')
+            x = str(t.get('exit_date', '') or '')
+            if not e or not x:
+                continue
+            if min_entry is None or e < min_entry:
+                min_entry = e
+            if max_exit is None or x > max_exit:
+                max_exit = x
+        if not min_entry or not max_exit:
+            return {'details': details, 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+
+        spy_map = {}
+        try:
+            spy_df = fetch_historical_data("SPY", min_entry, max_exit, interval='1d')
+            if isinstance(spy_df, pd.DataFrame) and not spy_df.empty and 'Close' in spy_df.columns:
+                for idx, row in spy_df.iterrows():
+                    try:
+                        spy_map[idx.strftime('%Y-%m-%d')] = float(row['Close'])
+                    except Exception:
+                        pass
+        except Exception:
+            spy_map = {}
+
+        def _nearest(date_str: str, forward: bool = True):
+            if date_str in spy_map:
+                return spy_map.get(date_str)
+            if not spy_map:
+                return None
+            keys = sorted(spy_map.keys())
+            if forward:
+                for k in keys:
+                    if k >= date_str:
+                        return spy_map.get(k)
+            else:
+                for k in reversed(keys):
+                    if k <= date_str:
+                        return spy_map.get(k)
+            return None
+
+        out = []
+        alphas = []
+        beats = 0
+        for t in details:
+            tr = float(t.get('realized_pnl_pct', 0) or 0)
+            e = str(t.get('entry_date', '') or '')
+            x = str(t.get('exit_date', '') or '')
+            se = _nearest(e, forward=True) if e else None
+            sx = _nearest(x, forward=False) if x else None
+            spy_ret = 0.0
+            if se and sx and se > 0:
+                spy_ret = round((sx - se) / se * 100.0, 2)
+            alpha = round(tr - spy_ret, 2)
+            if alpha > 0:
+                beats += 1
+            alphas.append(alpha)
+            row = dict(t)
+            row['spy_return_pct'] = spy_ret
+            row['alpha_pct'] = alpha
+            out.append(row)
+        return {
+            'details': out,
+            'avg_alpha_pct': round(sum(alphas) / len(alphas), 2) if alphas else 0.0,
+            'total_alpha_pct': round(sum(alphas), 2) if alphas else 0.0,
+            'beat_rate': round(beats / len(out) * 100, 1) if out else 0.0,
+        }
+
     if stats['total_trades'] == 0:
         st.info("No closed trades yet.")
         return
@@ -6742,6 +6820,18 @@ def render_performance():
     col7.metric("Profit Factor", f"{stats['profit_factor']:.2f}")
     col8.metric("Avg Hold", f"{stats['avg_days_held']:.0f}d")
 
+    enriched = _compute_spy_alpha(stats.get('trade_details', []) or [])
+    stats['avg_alpha_pct'] = enriched.get('avg_alpha_pct', 0.0)
+    stats['total_alpha_pct'] = enriched.get('total_alpha_pct', 0.0)
+    stats['beat_benchmark_rate'] = enriched.get('beat_rate', 0.0)
+    details = enriched.get('details', []) or stats.get('trade_details', []) or []
+
+    col9, col10, col11, col12 = st.columns(4)
+    col9.metric("Expectancy", f"{stats.get('expectancy_pct', 0):+.2f}%")
+    col10.metric("Payoff Ratio", f"{stats.get('payoff_ratio', 0):.2f}")
+    col11.metric("Avg Win / Loss", f"{stats.get('avg_win_pct', 0):+.1f}% / {stats.get('avg_loss_pct', 0):+.1f}%")
+    col12.metric("Avg Alpha vs SPY", f"{stats.get('avg_alpha_pct', 0):+.2f}%", f"Beat rate {stats.get('beat_benchmark_rate', 0):.1f}%")
+
     # By signal type
     if stats['by_signal_type']:
         st.divider()
@@ -6751,8 +6841,40 @@ def render_performance():
                     f"Win rate: {st_data['win_rate']:.0f}%, "
                     f"Avg: {st_data['avg_pnl_pct']:+.1f}%")
 
+    # By ticker
+    by_ticker = stats.get('by_ticker', {}) or {}
+    if by_ticker:
+        st.divider()
+        st.subheader("By Ticker")
+        rows_tk = []
+        for tk, d in by_ticker.items():
+            rows_tk.append({
+                'Ticker': tk,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_tk = sorted(rows_tk, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_tk), hide_index=True, width='stretch')
+
+    # Underperforming buckets
+    under = stats.get('underperforming_buckets', []) or []
+    if under:
+        st.divider()
+        st.subheader("What To Stop Doing")
+        st.warning("Buckets below have negative expectancy over meaningful sample size (>=5). Reduce size or pause them.")
+        under_rows = []
+        for u in under:
+            under_rows.append({
+                'Bucket': u.get('bucket', ''),
+                'Trades': u.get('count', 0),
+                'Avg P&L %': u.get('avg_pnl_pct', 0),
+                'Win Rate %': u.get('win_rate', '—') if u.get('win_rate', None) is not None else '—',
+            })
+        st.dataframe(pd.DataFrame(under_rows), hide_index=True, width='stretch')
+
     # Trade history table
-    history = jm.get_trade_history(last_n=20)
+    history = details[:20] if details else jm.get_trade_history(last_n=20)
     if history:
         st.divider()
         st.subheader("Recent Trades")
@@ -6764,6 +6886,8 @@ def render_performance():
                 'Entry': f"${t.get('entry_price', 0):.2f}",
                 'Exit': f"${t.get('exit_price', 0):.2f}",
                 'P&L': f"{pnl:+.1f}%",
+                'SPY': f"{float(t.get('spy_return_pct', 0) or 0):+.1f}%" if 'spy_return_pct' in t else "—",
+                'Alpha': f"{float(t.get('alpha_pct', 0) or 0):+.1f}%" if 'alpha_pct' in t else "—",
                 'Days': t.get('days_held', 0),
                 'Reason': t.get('exit_reason', '?'),
                 'Signal': t.get('signal_type', '?'),

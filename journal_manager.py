@@ -733,6 +733,11 @@ class JournalManager:
                 'total_trades': 0, 'win_rate': 0, 'avg_pnl_pct': 0,
                 'total_pnl': 0, 'best_trade': 0, 'worst_trade': 0,
                 'avg_days_held': 0, 'by_signal_type': {}, 'by_exit_reason': {},
+                'avg_win_pct': 0, 'avg_loss_pct': 0, 'payoff_ratio': 0, 'expectancy_pct': 0,
+                'avg_alpha_pct': 0, 'beat_benchmark_rate': 0, 'total_alpha_pct': 0,
+                'by_ticker': {},
+                'underperforming_buckets': [],
+                'trade_details': [],
             }
 
         pnls = [t.get('realized_pnl_pct', 0) for t in trades]
@@ -768,6 +773,46 @@ class JournalManager:
             c = by_exit[er]['count']
             by_exit[er]['avg_pnl_pct'] = round(by_exit[er]['total_pnl_pct'] / c, 1) if c > 0 else 0
 
+        by_ticker = {}
+        for t in trades:
+            tk = t.get('ticker', 'Unknown')
+            if tk not in by_ticker:
+                by_ticker[tk] = {'count': 0, 'total_pnl_pct': 0, 'wins': 0}
+            by_ticker[tk]['count'] += 1
+            pnlp = float(t.get('realized_pnl_pct', 0) or 0)
+            by_ticker[tk]['total_pnl_pct'] += pnlp
+            if pnlp > 0:
+                by_ticker[tk]['wins'] += 1
+        for tk in by_ticker:
+            c = by_ticker[tk]['count']
+            by_ticker[tk]['avg_pnl_pct'] = round(by_ticker[tk]['total_pnl_pct'] / c, 2) if c > 0 else 0
+            by_ticker[tk]['win_rate'] = round(by_ticker[tk]['wins'] / c * 100, 1) if c > 0 else 0
+
+        avg_win = round(sum(wins) / len(wins), 2) if wins else 0
+        avg_loss = round(sum(losses) / len(losses), 2) if losses else 0
+        win_rate_frac = (len(wins) / len(trades)) if trades else 0
+        loss_rate_frac = (len(losses) / len(trades)) if trades else 0
+        payoff = round(abs(avg_win / avg_loss), 2) if avg_loss < 0 else 0
+        expectancy = round(win_rate_frac * avg_win + loss_rate_frac * avg_loss, 2)
+
+        underperforming = []
+        for st_key, st_data in by_signal.items():
+            if st_data.get('count', 0) >= 5 and st_data.get('avg_pnl_pct', 0) < 0:
+                underperforming.append({
+                    'bucket': f"signal:{st_key}",
+                    'count': st_data.get('count', 0),
+                    'avg_pnl_pct': st_data.get('avg_pnl_pct', 0),
+                    'win_rate': st_data.get('win_rate', 0),
+                })
+        for er_key, er_data in by_exit.items():
+            if er_data.get('count', 0) >= 5 and er_data.get('avg_pnl_pct', 0) < 0:
+                underperforming.append({
+                    'bucket': f"exit:{er_key}",
+                    'count': er_data.get('count', 0),
+                    'avg_pnl_pct': er_data.get('avg_pnl_pct', 0),
+                    'win_rate': None,
+                })
+
         return {
             'total_trades': len(trades),
             'wins': len(wins),
@@ -779,8 +824,18 @@ class JournalManager:
             'worst_trade': round(min(pnls), 1) if pnls else 0,
             'avg_days_held': round(sum(days) / len(days), 0) if days else 0,
             'profit_factor': round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) != 0 else 0,
+            'avg_win_pct': avg_win,
+            'avg_loss_pct': avg_loss,
+            'payoff_ratio': payoff,
+            'expectancy_pct': expectancy,
+            'avg_alpha_pct': 0,
+            'total_alpha_pct': 0,
+            'beat_benchmark_rate': 0,
             'by_signal_type': by_signal,
             'by_exit_reason': by_exit,
+            'by_ticker': by_ticker,
+            'underperforming_buckets': underperforming,
+            'trade_details': [dict(t) for t in trades],
         }
 
     def get_recent_win_rate(self, last_n: int = 20) -> float:
