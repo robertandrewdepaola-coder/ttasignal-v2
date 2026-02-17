@@ -8076,11 +8076,152 @@ def render_executive_dashboard():
                     if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
                         _load_ticker_for_view(ticker)
 
+    if '_queue_action_confirm' not in st.session_state:
+        st.session_state['_queue_action_confirm'] = {}
+    if '_queue_pending_actions' not in st.session_state:
+        st.session_state['_queue_pending_actions'] = {}
+    if '_queue_action_executed' not in st.session_state:
+        st.session_state['_queue_action_executed'] = {}
+    if '_queue_recent_actions' not in st.session_state:
+        st.session_state['_queue_recent_actions'] = []
+
+    undo_window_s = 12
+
+    def _record_queue_recent(status: str, detail: str):
+        recent = st.session_state.get('_queue_recent_actions', [])
+        recent.insert(0, {
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'status': status,
+            'detail': (detail or '')[:220],
+        })
+        st.session_state['_queue_recent_actions'] = recent[:30]
+
+    def _open_trade_for_ticker(tkr: str) -> Optional[dict]:
+        for tr in jm.open_trades:
+            if str(tr.get('ticker', '')).upper().strip() == tkr and str(tr.get('status', '')).upper() == 'OPEN':
+                return tr
+        return None
+
+    def _planned_trade_for_id(pid: str) -> Optional[dict]:
+        for tr in jm.get_planned_trades():
+            if str(tr.get('plan_id', '')).strip() == pid:
+                return tr
+        return None
+
+    def _queue_log(op: str, status: str, details: str):
+        msg = f"op={op} status={status} {details}".strip()
+        _append_audit_event("QUEUE_ACTION", msg, source="exec_queue")
+        _record_queue_recent(status, msg)
+
+    def _queue_schedule(action_key: str, payload: Dict[str, Any]) -> str:
+        pending = st.session_state.get('_queue_pending_actions', {})
+        executed = st.session_state.get('_queue_action_executed', {})
+        if action_key in executed:
+            return "Action already executed"
+        if action_key in pending:
+            return f"Action already pending ({max(0, int(pending[action_key].get('execute_at', 0) - time.time()))}s)"
+        now_ts = time.time()
+        payload['created_at'] = now_ts
+        payload['execute_at'] = now_ts + undo_window_s
+        pending[action_key] = payload
+        st.session_state['_queue_pending_actions'] = pending
+        _queue_log(payload.get('kind', 'unknown'), "QUEUED", f"action_key={action_key}")
+        return f"Queued. Undo available for {undo_window_s}s"
+
+    def _process_pending_queue_actions() -> bool:
+        pending = st.session_state.get('_queue_pending_actions', {})
+        executed = st.session_state.get('_queue_action_executed', {})
+        now_ts = time.time()
+        did_any = False
+        for action_key, payload in list(pending.items()):
+            if now_ts < float(payload.get('execute_at', 0) or 0):
+                continue
+
+            kind = str(payload.get('kind', '')).strip()
+            ticker = str(payload.get('ticker', '')).upper().strip()
+            plan_id = str(payload.get('plan_id', '')).strip()
+            status = "SKIPPED"
+            detail = f"action_key={action_key} ticker={ticker} plan_id={plan_id}"
+
+            if action_key in executed:
+                detail += " reason=already_executed"
+            elif kind == 'trigger_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status == 'PLANNED':
+                    jm.update_planned_trade_status(plan_id, "TRIGGERED", notes="triggered from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'entered_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status == 'TRIGGERED':
+                    jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'cancel_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status in {'PLANNED', 'TRIGGERED'}:
+                    jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'tighten_stop':
+                tr = _open_trade_for_ticker(ticker)
+                new_stop = float(payload.get('new_stop', 0) or 0)
+                old_stop = float(payload.get('old_stop', 0) or 0)
+                if tr and new_stop > float(tr.get('current_stop', tr.get('initial_stop', 0)) or 0):
+                    jm.update_stop(ticker, new_stop)
+                    status = "EXECUTED"
+                    detail += f" old_stop={old_stop:.2f} new_stop={new_stop:.2f}"
+                else:
+                    detail += " reason=not_tightening_or_missing"
+            elif kind == 'close_now':
+                tr = _open_trade_for_ticker(ticker)
+                close_px = float(payload.get('close_price', 0) or 0)
+                if tr and close_px > 0:
+                    jm.close_trade(ticker, close_px, exit_reason='manual', notes='Closed from action queue')
+                    status = "EXECUTED"
+                    detail += f" price={close_px:.2f}"
+                else:
+                    detail += " reason=no_open_position"
+            else:
+                detail += " reason=unknown_kind"
+
+            executed[action_key] = now_ts
+            pending.pop(action_key, None)
+            _queue_log(kind or 'unknown', status, detail)
+            did_any = True
+
+        st.session_state['_queue_pending_actions'] = pending
+        st.session_state['_queue_action_executed'] = executed
+        return did_any
+
+    if _process_pending_queue_actions():
+        st.rerun()
+
     with st.expander(f"⚡ Unified Action Queue ({len(action_queue)})", expanded=False):
         if not action_queue:
             st.caption("No queued actions.")
-        if '_queue_action_confirm' not in st.session_state:
-            st.session_state['_queue_action_confirm'] = {}
+        pending_actions = st.session_state.get('_queue_pending_actions', {})
+        if pending_actions:
+            st.markdown("**Pending Queue Actions (undo window)**")
+            for pkey, payload in sorted(pending_actions.items(), key=lambda x: x[1].get('execute_at', 0)):
+                secs_left = max(0, int(float(payload.get('execute_at', 0) or 0) - time.time()))
+                p_kind = str(payload.get('kind', 'action'))
+                p_ticker = str(payload.get('ticker', '')).upper().strip()
+                pc1, pc2 = st.columns([4, 1])
+                with pc1:
+                    st.caption(f"⏳ {p_kind} {p_ticker} executing in {secs_left}s")
+                with pc2:
+                    if st.button("Undo", key=f"aq_undo_{pkey}", width="stretch"):
+                        st.session_state['_queue_pending_actions'].pop(pkey, None)
+                        _queue_log(p_kind, "UNDONE", f"action_key={pkey} ticker={p_ticker}")
+                        st.rerun()
+            st.divider()
         for i, item in enumerate(action_queue[:30]):
             pri = int(item.get('priority', 0))
             msg = str(item.get('message', ''))
@@ -8107,8 +8248,13 @@ def render_executive_dashboard():
             with c2:
                 if action == 'planned_queued' and plan_id:
                     if st.button("Trigger", key=f"aq_trigger_{i}_{plan_id}", width="stretch"):
-                        st.info(jm.update_planned_trade_status(plan_id, "TRIGGERED", notes="triggered from action queue"))
-                        _append_audit_event("QUEUE_ACTION", f"trigger plan_id={plan_id} ticker={ticker}", source="exec_queue")
+                        action_key = f"trigger_plan:{plan_id}"
+                        status_msg = _queue_schedule(action_key, {
+                            'kind': 'trigger_plan',
+                            'plan_id': plan_id,
+                            'ticker': ticker,
+                        })
+                        st.info(status_msg)
                         st.rerun()
                 elif action == 'planned_triggered' and plan_id:
                     confirm_key = f"entered_{plan_id}"
@@ -8116,21 +8262,27 @@ def render_executive_dashboard():
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
                     if st.session_state['_queue_action_confirm'].get(confirm_key):
                         if st.button("Confirm Entered", key=f"aq_entered_confirm_{i}_{plan_id}", width="stretch"):
-                            st.info(jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue"))
-                            _append_audit_event("QUEUE_ACTION", f"entered plan_id={plan_id} ticker={ticker}", source="exec_queue")
+                            action_key = f"entered_plan:{plan_id}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'entered_plan',
+                                'plan_id': plan_id,
+                                'ticker': ticker,
+                            })
+                            st.info(status_msg)
                             st.session_state['_queue_action_confirm'].pop(confirm_key, None)
                             st.rerun()
                 elif action == 'risk_manage' and ticker and current > 0:
                     if st.button("Tighten +1%", key=f"aq_tighten_{i}_{ticker}", width="stretch"):
                         # quick risk action: move stop to 1% below current if this tightens risk
                         new_stop = round(max(stop, current * 0.99), 2) if stop > 0 else round(current * 0.99, 2)
-                        old_stop = stop
-                        st.info(jm.update_stop(ticker, new_stop))
-                        _append_audit_event(
-                            "QUEUE_ACTION",
-                            f"tighten_stop ticker={ticker} old_stop={old_stop:.2f} new_stop={new_stop:.2f} current={current:.2f}",
-                            source="exec_queue",
-                        )
+                        action_key = f"tighten_stop:{ticker}:{new_stop:.2f}"
+                        status_msg = _queue_schedule(action_key, {
+                            'kind': 'tighten_stop',
+                            'ticker': ticker,
+                            'old_stop': stop,
+                            'new_stop': new_stop,
+                        })
+                        st.info(status_msg)
                         st.rerun()
             with c3:
                 if action in {'planned_queued', 'planned_triggered'} and plan_id:
@@ -8139,8 +8291,13 @@ def render_executive_dashboard():
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
                     if st.session_state['_queue_action_confirm'].get(confirm_key):
                         if st.button("Confirm Cancel", key=f"aq_cancel_confirm_{i}_{plan_id}", width="stretch"):
-                            st.info(jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue"))
-                            _append_audit_event("QUEUE_ACTION", f"cancel plan_id={plan_id} ticker={ticker}", source="exec_queue")
+                            action_key = f"cancel_plan:{plan_id}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'cancel_plan',
+                                'plan_id': plan_id,
+                                'ticker': ticker,
+                            })
+                            st.info(status_msg)
                             st.session_state['_queue_action_confirm'].pop(confirm_key, None)
                             st.rerun()
                 elif action == 'risk_manage' and ticker and current > 0:
@@ -8149,14 +8306,30 @@ def render_executive_dashboard():
                         st.session_state['_queue_action_confirm'][confirm_key] = time.time()
                     if st.session_state['_queue_action_confirm'].get(confirm_key):
                         if st.button("Confirm Close", key=f"aq_close_confirm_{i}_{ticker}", width="stretch"):
-                            st.info(jm.close_trade(ticker, current, exit_reason='manual', notes='Closed from action queue'))
-                            _append_audit_event(
-                                "QUEUE_ACTION",
-                                f"close_now ticker={ticker} price={current:.2f}",
-                                source="exec_queue",
-                            )
+                            action_key = f"close_now:{ticker}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'close_now',
+                                'ticker': ticker,
+                                'close_price': current,
+                            })
+                            st.info(status_msg)
                             st.session_state['_queue_action_confirm'].pop(confirm_key, None)
                             st.rerun()
+
+        with st.expander("🧾 Recent Queue Actions", expanded=False):
+            recent_queue_audit = []
+            for evt in _get_audit_events():
+                if evt.get('action') == 'QUEUE_ACTION' and evt.get('source') == 'exec_queue':
+                    recent_queue_audit.append(evt)
+                if len(recent_queue_audit) >= 12:
+                    break
+            if not recent_queue_audit:
+                st.caption("No queue actions yet.")
+            else:
+                for evt in recent_queue_audit:
+                    ts = str(evt.get('ts', ''))
+                    det = str(evt.get('details', ''))
+                    st.caption(f"{ts} | {det}")
 
     st.divider()
     with st.expander("🗂️ Planned Trades Board", expanded=False):
