@@ -463,6 +463,15 @@ class WatchlistManager:
             return False, "Already migrated"
 
         try:
+            master = self._find(MASTER_ID)
+            if master and master.get("tickers"):
+                # Safety guard: never auto-merge legacy journal tickers into
+                # an already-populated Master list. Mark migration complete.
+                self.data["metadata"]["migrated_from_journal"] = True
+                self.data["metadata"]["migration_date"] = datetime.now().isoformat()
+                self.save()
+                return False, "Skipped migration (Master already populated)"
+
             old_tickers = journal_manager.get_watchlist_tickers()
             if not old_tickers:
                 self.data["metadata"]["migrated_from_journal"] = True
@@ -474,7 +483,6 @@ class WatchlistManager:
             cleaned = [t for t in cleaned if self._validate_us_ticker(t)]
             cleaned = sorted(cleaned)
 
-            master = self._find(MASTER_ID)
             if master:
                 existing = set(master["tickers"])
                 master["tickers"] = sorted(existing | set(cleaned))
