@@ -1431,8 +1431,12 @@ def render_scanner_table():
                 if new_ticker:
                     import re as _re
                     ticker_clean = new_ticker.strip().upper()
-                    # Validate: 1-5 uppercase alpha chars only
-                    if ticker_clean and _re.match(r'^[A-Z]{1,5}$', ticker_clean):
+                    # Validate: base symbols (AAPL), class shares (BRK.B), or indices (^VIX).
+                    is_base = bool(_re.match(r'^[A-Z]{1,5}$', ticker_clean))
+                    class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', ticker_clean)
+                    is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+                    is_index = ticker_clean.startswith('^')
+                    if ticker_clean and (is_base or is_class or is_index):
                         if ticker_clean not in watchlist_tickers:
                             bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
                             st.session_state['wl_version'] += 1
