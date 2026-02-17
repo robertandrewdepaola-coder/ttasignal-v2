@@ -24,6 +24,7 @@ import re
 import requests as _requests_lib
 import logging
 import hashlib
+from earnings_utils import select_earnings_dates
 
 # ── Suppress noisy yfinance logging globally ────────────────────────────────
 # yfinance emits ERROR-level messages for perfectly normal situations:
@@ -497,6 +498,7 @@ SKIP_EARNINGS_TICKERS = frozenset({
 })
 
 
+
 def fetch_sector_rotation() -> Dict[str, Dict]:
     """
     Fetch sector rotation data — which sectors are leading/lagging vs SPY.
@@ -921,22 +923,11 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                 try:
                     edates = stock.earnings_dates
                     if edates is not None and len(edates) > 0:
-                        for dt_idx in sorted(edates.index):
-                            try:
-                                if hasattr(dt_idx, 'date') and callable(getattr(dt_idx, 'date')):
-                                    d = dt_idx.date()
-                                elif hasattr(dt_idx, 'to_pydatetime'):
-                                    d = dt_idx.to_pydatetime().date()
-                                else:
-                                    continue
-                                    days = (d - today).days
-                                    if days >= 0:
-                                        earn_dt = d
-                                        break
-                                    if -30 <= days < 0 and (recent_past is None or d > recent_past):
-                                        recent_past = d
-                            except Exception:
-                                continue
+                        picks = select_earnings_dates(list(edates.index), today)
+                        if picks.get('next') is not None:
+                            earn_dt = picks['next']
+                        if picks.get('recent_past') is not None:
+                            recent_past = picks['recent_past']
                 except Exception:
                     pass
 
@@ -1649,37 +1640,26 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                 try:
                     edates = stock.earnings_dates
                     if edates is not None and len(edates) > 0:
-                        dates = []
-                        for dt_idx in sorted(edates.index):
-                            try:
-                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                                dates.append((d, dt_idx))
-                            except Exception:
-                                continue
+                        picks = select_earnings_dates(list(edates.index), today)
+                        next_dt = picks.get('next')
+                        past_dt = picks.get('recent_past')
 
-                        # First preference: nearest future date
-                        for d, dt_idx in dates:
-                            if d >= today:
-                                days = (d - today).days
-                                result['next_earnings'] = d.strftime('%Y-%m-%d')
-                                result['days_until_earnings'] = max(0, days)
-                                result['confidence'] = 'MEDIUM-HIGH'
-                                result['source'] = 'Yahoo (.earnings_dates)'
-                                row = edates.loc[dt_idx]
+                        if next_dt is not None:
+                            days = (next_dt - today).days
+                            result['next_earnings'] = next_dt.strftime('%Y-%m-%d')
+                            result['days_until_earnings'] = max(0, days)
+                            result['confidence'] = 'MEDIUM-HIGH'
+                            result['source'] = 'Yahoo (.earnings_dates)'
+                            try:
+                                row = edates.loc[next_dt]
                                 eps_est = row.get('EPS Estimate') if hasattr(row, 'get') else None
                                 if eps_est is not None and not (isinstance(eps_est, float) and pd.isna(eps_est)):
                                     result['next_eps_estimate'] = float(eps_est)
-                                break
-                        
-                        # Also grab last earnings date (most recent past)
-                        for d, _dt_idx in sorted(dates, key=lambda x: x[0], reverse=True):
-                            try:
-                                days = (d - today).days
-                                if days < 0:
-                                    result['last_earnings'] = d.strftime('%Y-%m-%d')
-                                    break
                             except Exception:
-                                continue
+                                pass
+
+                        if past_dt is not None:
+                            result['last_earnings'] = past_dt.strftime('%Y-%m-%d')
                 except Exception:
                     pass
             
@@ -1732,20 +1712,17 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
             stock = yf.Ticker(ticker)
             edates = stock.earnings_dates
             if edates is not None and len(edates) > 0:
-                for dt_idx in sorted(edates.index, reverse=True):
-                    try:
-                        d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
-                        result['last_earnings'] = d.strftime('%Y-%m-%d')
-                        estimated = d + timedelta(days=91)
-                        while (estimated - today).days < -7:
-                            estimated += timedelta(days=91)
-                        result['next_earnings'] = estimated.strftime('%Y-%m-%d')
-                        result['days_until_earnings'] = max(0, (estimated - today).days)
-                        result['confidence'] = 'LOW'
-                        result['source'] = 'Estimated (historical + 91d)'
-                        break
-                    except Exception:
-                        continue
+                picks = select_earnings_dates(list(edates.index), today)
+                recent = picks.get('recent_past') or picks.get('latest_any')
+                if recent is not None:
+                    result['last_earnings'] = recent.strftime('%Y-%m-%d')
+                    estimated = recent + timedelta(days=91)
+                    while (estimated - today).days < -7:
+                        estimated += timedelta(days=91)
+                    result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+                    result['days_until_earnings'] = max(0, (estimated - today).days)
+                    result['confidence'] = 'LOW'
+                    result['source'] = 'Estimated (historical + 91d)'
         except Exception:
             pass
 

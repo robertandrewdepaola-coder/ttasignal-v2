@@ -20,8 +20,9 @@ import streamlit as st
 import pandas as pd
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Any, Dict, List
 
 # Backend imports
 from signal_engine import EntrySignal
@@ -51,6 +52,7 @@ from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEnt
 from watchlist_manager import WatchlistManager
 from watchlist_bridge import WatchlistBridge
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
+from scan_utils import resolve_tickers_to_scan
 
 
 # =============================================================================
@@ -1169,6 +1171,15 @@ def render_sidebar():
 
     # ── Settings (bottom of sidebar) ──────────────────────────────────
     with st.sidebar.expander("⚙️ Settings", expanded=False):
+        current_beta = bool(st.session_state.get('exec_dashboard_beta_enabled', _is_exec_dashboard_enabled()))
+        beta_enabled = st.checkbox(
+            "Executive Dashboard Beta",
+            value=current_beta,
+            key="exec_dashboard_beta_toggle",
+            help="Toggle phased rollout of Executive Dashboard tab.",
+        )
+        st.session_state['exec_dashboard_beta_enabled'] = beta_enabled
+
         s1, s2 = st.columns(2)
         with s1:
             if st.button("🔑 Reset API", key="reset_api_cache",
@@ -1257,6 +1268,11 @@ def _load_ticker_for_view(ticker: str):
         st.sidebar.error(f"Error loading {ticker}: {e}")
 
 
+def _resolve_tickers_to_scan(full_list: List[str], existing_summary: List[Dict], mode: str) -> List[str]:
+    """Deterministic scan universe resolver used by scan-all and scan-new paths."""
+    return resolve_tickers_to_scan(full_list, existing_summary, mode)
+
+
 def _run_scan(mode='all'):
     """
     Execute watchlist scan with persistence and conditional checking.
@@ -1303,25 +1319,39 @@ def _run_scan(mode='all'):
         return
 
     # Determine which tickers to scan
-    if mode == 'new_only':
-        existing_summary = st.session_state.get('scan_results_summary', [])
-        already_scanned = {s.get('ticker', '') for s in existing_summary}
-        tickers_to_scan = [t for t in full_list if t not in already_scanned]
-        if not tickers_to_scan:
-            st.sidebar.info("All tickers already scanned")
-            return
-    else:
-        tickers_to_scan = full_list
+    existing_summary = st.session_state.get('scan_results_summary', [])
+    tickers_to_scan = _resolve_tickers_to_scan(full_list, existing_summary, mode)
+    if mode == 'new_only' and not tickers_to_scan:
+        st.sidebar.info("All tickers already scanned")
+        return
 
     _scan_started = time.time()
     with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
+        _timing = {
+            'mode': mode,
+            'universe': len(full_list),
+            'to_scan': len(tickers_to_scan),
+            'fetch_scan_data_sec': 0.0,
+            'scan_watchlist_sec': 0.0,
+            'sector_refresh_sec': 0.0,
+            'earnings_refresh_sec': 0.0,
+            'sector_assign_sec': 0.0,
+            'summary_build_sec': 0.0,
+            'alerts_check_sec': 0.0,
+            'total_sec': 0.0,
+        }
         _append_audit_event(
             "SCAN_START",
             f"mode={mode} universe={len(full_list)} scan_count={len(tickers_to_scan)}",
             source=f"scan:{mode}",
         )
+        _t = time.time()
         all_data = fetch_scan_data(tickers_to_scan)
+        _timing['fetch_scan_data_sec'] = time.time() - _t
+
+        _t = time.time()
         new_results = scan_watchlist(all_data)
+        _timing['scan_watchlist_sec'] = time.time() - _t
 
         # Defaults keep scan flow resilient if auxiliary fetches fail.
         sector_rotation = st.session_state.get('sector_rotation', {}) or {}
@@ -1329,15 +1359,18 @@ def _run_scan(mode='all'):
 
         # Fetch sector rotation (independent — failure doesn't block earnings)
         try:
+            _t = time.time()
             from data_fetcher import fetch_sector_rotation
             sector_rotation = fetch_sector_rotation()
             st.session_state['sector_rotation'] = sector_rotation
             st.session_state['_sector_rotation_ts'] = time.time()
+            _timing['sector_refresh_sec'] = time.time() - _t
         except Exception as e:
             print(f"Sector rotation error: {e}")
 
         # Fetch earnings flags (independent — failure doesn't block sectors)
         try:
+            _t = time.time()
             from data_fetcher import fetch_batch_earnings_flags
             all_scan_tickers = [r.ticker for r in new_results]
             earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=60)
@@ -1348,11 +1381,13 @@ def _run_scan(mode='all'):
                     st.session_state['earnings_flags'] = existing_flags
                 else:
                     st.session_state['earnings_flags'] = earnings_flags
+            _timing['earnings_refresh_sec'] = time.time() - _t
         except Exception as e:
             print(f"Earnings flags error: {e}")
 
         # Fetch sectors for scanned tickers (independent)
         try:
+            _t = time.time()
             from data_fetcher import get_ticker_sector
             ticker_sectors = st.session_state.get('ticker_sectors', {})
             for r in new_results:
@@ -1361,6 +1396,7 @@ def _run_scan(mode='all'):
                     if sector:
                         ticker_sectors[r.ticker] = sector
             st.session_state['ticker_sectors'] = ticker_sectors
+            _timing['sector_assign_sec'] = time.time() - _t
         except Exception as e:
             print(f"Sector assignment error: {e}")
 
@@ -1391,6 +1427,7 @@ def _run_scan(mode='all'):
 
         ticker_sectors = st.session_state.get('ticker_sectors', {})
 
+        _t = time.time()
         summary = []
         for r in results_for_summary:
             rec = r.recommendation or {}
@@ -1451,6 +1488,7 @@ def _run_scan(mode='all'):
                 'earn_days': earn_days,
                 'reentry_bars_ago': reentry_bars_ago,
             })
+        _timing['summary_build_sec'] = time.time() - _t
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
         st.session_state['scan_timestamp'] = datetime.now().isoformat()
@@ -1474,7 +1512,9 @@ def _run_scan(mode='all'):
                     if avg_vol > 0:
                         volume_ratios[ticker] = float(daily['Volume'].iloc[-1] / avg_vol)
 
+        _t = time.time()
         triggered = jm.check_conditionals(current_prices, volume_ratios)
+        _timing['alerts_check_sec'] = time.time() - _t
         if triggered:
             st.session_state['triggered_alerts'] = triggered
 
@@ -1486,6 +1526,8 @@ def _run_scan(mode='all'):
 
         # Telemetry: runtime history + daily workflow finalize
         _scan_elapsed = max(0.0, time.time() - _scan_started)
+        _timing['total_sec'] = _scan_elapsed
+        st.session_state['_timing_last_scan'] = _timing
         hist = st.session_state.get('_scan_duration_hist', [])
         hist.append(_scan_elapsed)
         st.session_state['_scan_duration_hist'] = hist[-30:]
@@ -6042,6 +6084,144 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
 # EXECUTIVE DASHBOARD
 # =============================================================================
 
+@dataclass
+class RiskBudgetPolicy:
+    regime: str
+    max_new_trades: int
+    position_size_multiplier: float
+    max_sector_exposure: int
+    max_total_open_positions: int
+    note: str
+
+
+@dataclass
+class DashboardSnapshot:
+    generated_at: float
+    generated_at_iso: str
+    watchlist_tickers: List[str]
+    scan_summary: List[Dict[str, Any]]
+    open_trades: List[Dict[str, Any]]
+    pending_alerts: List[Dict[str, Any]]
+    triggered_alerts: List[Dict[str, Any]]
+    market_filter: Dict[str, Any]
+    sector_rotation: Dict[str, Any]
+    earnings_flags: Dict[str, Any]
+    scan_ts: float
+    market_ts: float
+    sector_ts: float
+    pos_ts: float
+    alert_ts: float
+    workflow_ts: float
+    workflow_sec: float
+    regime: str
+    regime_confidence: int
+    risk_policy: RiskBudgetPolicy
+
+
+def _is_exec_dashboard_enabled() -> bool:
+    """
+    Feature flag for phased rollout.
+    Priority: session override > secrets > enabled.
+    """
+    if 'exec_dashboard_beta_enabled' in st.session_state:
+        return bool(st.session_state['exec_dashboard_beta_enabled'])
+    try:
+        raw = str(st.secrets.get('EXEC_DASHBOARD_BETA', 'true')).strip().lower()
+        return raw in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return True
+
+
+def _infer_exec_regime(market_filter: Dict[str, Any], sector_rotation: Dict[str, Any]) -> (str, int):
+    """Unified regime inference for dashboard/risk policy."""
+    spy_ok = bool(market_filter.get('spy_above_200', True))
+    vix = float(market_filter.get('vix_close', 0) or 0)
+
+    leading = 0
+    emerging = 0
+    lagging = 0
+    for _name, info in (sector_rotation or {}).items():
+        phase = str(info.get('phase', '')).lower()
+        if phase == 'leading':
+            leading += 1
+        elif phase == 'emerging':
+            emerging += 1
+        elif phase == 'lagging':
+            lagging += 1
+
+    score = 0
+    score += 35 if spy_ok else 5
+    if vix < 20:
+        score += 30
+    elif vix < 25:
+        score += 18
+    else:
+        score += 5
+    score += min(25, leading * 5 + emerging * 3)
+    score += max(0, 10 - lagging * 2)
+    score = int(max(0, min(100, score)))
+
+    if score >= 70:
+        return "RISK_ON", score
+    if score >= 50:
+        return "TRANSITION", score
+    if score >= 35:
+        return "DEFENSIVE", score
+    return "RISK_OFF", score
+
+
+def _risk_budget_for_regime(regime: str) -> RiskBudgetPolicy:
+    """Translate regime into execution guardrails."""
+    if regime == "RISK_ON":
+        return RiskBudgetPolicy(regime, max_new_trades=6, position_size_multiplier=1.00, max_sector_exposure=4,
+                                max_total_open_positions=12, note="Normal risk budget. Prioritize leading sectors.")
+    if regime == "TRANSITION":
+        return RiskBudgetPolicy(regime, max_new_trades=4, position_size_multiplier=0.75, max_sector_exposure=3,
+                                max_total_open_positions=10, note="Selective adds only. Favor strongest setups.")
+    if regime == "DEFENSIVE":
+        return RiskBudgetPolicy(regime, max_new_trades=2, position_size_multiplier=0.50, max_sector_exposure=2,
+                                max_total_open_positions=8, note="Capital preservation mode. Tight stops.")
+    return RiskBudgetPolicy(regime, max_new_trades=1, position_size_multiplier=0.35, max_sector_exposure=1,
+                            max_total_open_positions=6, note="Risk-off. Avoid new longs unless exceptional.")
+
+
+def _build_dashboard_snapshot() -> DashboardSnapshot:
+    """Create single dashboard source-of-truth snapshot."""
+    jm = get_journal()
+    bridge = get_bridge()
+    now = time.time()
+    scan_summary = st.session_state.get('scan_results_summary', []) or []
+    market_filter = st.session_state.get('market_filter_data', {}) or {}
+    sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+    earnings_flags = st.session_state.get('earnings_flags', {}) or {}
+
+    regime, confidence = _infer_exec_regime(market_filter, sector_rotation)
+    policy = _risk_budget_for_regime(regime)
+
+    return DashboardSnapshot(
+        generated_at=now,
+        generated_at_iso=datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+        watchlist_tickers=bridge.get_watchlist_tickers(),
+        scan_summary=scan_summary,
+        open_trades=jm.get_open_trades(),
+        pending_alerts=jm.get_pending_conditionals(),
+        triggered_alerts=st.session_state.get('triggered_alerts', []) or [],
+        market_filter=market_filter,
+        sector_rotation=sector_rotation,
+        earnings_flags=earnings_flags,
+        scan_ts=float(st.session_state.get('_scan_run_ts', 0.0) or 0.0),
+        market_ts=float(st.session_state.get('_market_filter_ts', 0.0) or 0.0),
+        sector_ts=float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0),
+        pos_ts=float(st.session_state.get('_position_prices_ts', 0.0) or 0.0),
+        alert_ts=float(st.session_state.get('_alert_check_ts', 0.0) or 0.0),
+        workflow_ts=float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0),
+        workflow_sec=float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0),
+        regime=regime,
+        regime_confidence=confidence,
+        risk_policy=policy,
+    )
+
+
 def _fmt_last_update(ts: float, fallback: str = "Never") -> str:
     """Format epoch timestamp to local date/time + age."""
     if not ts:
@@ -6123,6 +6303,63 @@ def _recommendation_score(row: Dict) -> float:
     return score
 
 
+def _score_candidate_with_policy(row: Dict, snap: DashboardSnapshot) -> Dict[str, Any]:
+    """Rank candidate and capture explainability tags + regime adjustments."""
+    score = _recommendation_score(row)
+    reasons: List[str] = []
+    rec = str(row.get('recommendation', '')).upper()
+    conv = int(row.get('conviction', 0) or 0)
+    phase = str(row.get('sector_phase', '')).lower()
+    earn_days = int(row.get('earn_days', 999) or 999)
+
+    if conv >= 8:
+        reasons.append("High conviction")
+    elif conv >= 6:
+        reasons.append("Solid conviction")
+    else:
+        reasons.append("Lower conviction")
+
+    if phase == 'leading':
+        reasons.append("Leading sector")
+    elif phase == 'emerging':
+        reasons.append("Emerging sector")
+    elif phase == 'lagging':
+        reasons.append("Lagging sector")
+
+    if earn_days <= 3:
+        reasons.append("Earnings very near")
+    elif earn_days <= 7:
+        reasons.append("Earnings near")
+    else:
+        reasons.append("No immediate earnings")
+
+    if snap.regime in {"DEFENSIVE", "RISK_OFF"}:
+        score -= 2.5
+        reasons.append(f"Regime {snap.regime}: tighter risk budget")
+        if conv < 8:
+            score -= 2.0
+            reasons.append("Filtered by conviction under defensive regime")
+    elif snap.regime == "TRANSITION":
+        score -= 1.0
+        reasons.append("Transition regime: selective entries")
+    else:
+        reasons.append("Risk-on support")
+
+    blocked = False
+    if "SKIP" in rec or "AVOID" in rec:
+        blocked = True
+        reasons.append("Recommendation is non-entry")
+    if snap.regime == "RISK_OFF" and conv < 9:
+        blocked = True
+        reasons.append("Blocked by risk-off policy")
+
+    return {
+        'score': score,
+        'reasons': reasons,
+        'blocked': blocked,
+    }
+
+
 def _run_alert_check_now(jm: JournalManager) -> int:
     """Evaluate pending conditionals immediately using current prices."""
     conditionals = jm.get_pending_conditionals()
@@ -6194,26 +6431,11 @@ def _run_daily_workflow() -> Dict[str, float]:
 def render_executive_dashboard():
     """Daily command center for actionable overview and refresh controls."""
     jm = get_journal()
-    bridge = get_bridge()
-    summary = st.session_state.get('scan_results_summary', [])
-    scan_ts_iso = st.session_state.get('scan_timestamp', '')
-    scan_ts = st.session_state.get('_scan_run_ts', 0.0)
-    if (not scan_ts) and scan_ts_iso:
-        try:
-            scan_ts = datetime.fromisoformat(scan_ts_iso).timestamp()
-        except Exception:
-            scan_ts = 0.0
-
-    market_ts = float(st.session_state.get('_market_filter_ts', 0.0) or 0.0)
-    sector_ts = float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0)
-    pos_ts = float(st.session_state.get('_position_prices_ts', 0.0) or 0.0)
+    snap = _build_dashboard_snapshot()
     dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
-    alert_ts = float(st.session_state.get('_alert_check_ts', 0.0) or 0.0)
-    daily_ts = float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0)
-    daily_sec = float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0)
 
     st.subheader("Executive Dashboard")
-    st.caption(f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"Now: {snap.generated_at_iso}")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -6235,34 +6457,36 @@ def render_executive_dashboard():
 
     st.caption(
         f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
-        f"Scan: {_fmt_last_update(scan_ts)} | "
-        f"Market: {_fmt_last_update(market_ts)} | "
-        f"Sectors: {_fmt_last_update(sector_ts)} | "
-        f"Position prices: {_fmt_last_update(pos_ts)} | "
-        f"Alerts check: {_fmt_last_update(alert_ts)} | "
-        f"Workflow: {_fmt_last_update(daily_ts)}"
+        f"Scan: {_fmt_last_update(snap.scan_ts)} | "
+        f"Market: {_fmt_last_update(snap.market_ts)} | "
+        f"Sectors: {_fmt_last_update(snap.sector_ts)} | "
+        f"Position prices: {_fmt_last_update(snap.pos_ts)} | "
+        f"Alerts check: {_fmt_last_update(snap.alert_ts)} | "
+        f"Workflow: {_fmt_last_update(snap.workflow_ts)}"
     )
-    if daily_sec > 0:
-        st.caption(f"Last workflow runtime: {daily_sec:.1f}s")
+    if snap.workflow_sec > 0:
+        st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
 
-    watchlist = bridge.get_watchlist_tickers()
-    open_trades = jm.get_open_trades()
-    conditionals = jm.get_pending_conditionals()
-    triggered = st.session_state.get('triggered_alerts', [])
-
-    actionable = []
-    for s in summary:
-        rec = str(s.get('recommendation', '')).upper()
+    candidate_rows = []
+    for row in snap.scan_summary:
+        rec = str(row.get('recommendation', '')).upper()
         if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
-            actionable.append(s)
-    actionable = sorted(actionable, key=_recommendation_score, reverse=True)
+            scored = _score_candidate_with_policy(row, snap)
+            if not scored['blocked']:
+                candidate_rows.append({
+                    'row': row,
+                    'score': scored['score'],
+                    'reasons': scored['reasons'],
+                })
+    candidate_rows = sorted(candidate_rows, key=lambda x: x['score'], reverse=True)
+    actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
 
-    # SLA freshness checks
-    stale_scan = _is_stale(scan_ts, 3 * 3600)
-    stale_market = _is_stale(market_ts, 30 * 60)
-    stale_sector = _is_stale(sector_ts, 60 * 60)
-    stale_positions = _is_stale(pos_ts, 10 * 60)
-    stale_alerts = _is_stale(alert_ts, 5 * 60)
+    # SLO freshness checks
+    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)      # target: <3h old
+    stale_market = _is_stale(snap.market_ts, 30 * 60)   # target: <30m old
+    stale_sector = _is_stale(snap.sector_ts, 60 * 60)   # target: <60m old
+    stale_positions = _is_stale(snap.pos_ts, 10 * 60)   # target: <10m old
+    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)     # target: <5m old
     stale_count = sum([stale_scan, stale_market, stale_sector, stale_positions, stale_alerts])
 
     if stale_count > 0:
@@ -6282,28 +6506,46 @@ def render_executive_dashboard():
         st.success("All core data streams are fresh.")
 
     health = _scan_health_snapshot()
+    last_timing = st.session_state.get('_timing_last_scan', {}) or {}
+
+    regime_col1, regime_col2 = st.columns(2)
+    regime_col1.metric("Regime", f"{snap.regime}", f"{snap.regime_confidence}% confidence")
+    regime_col2.caption(
+        f"Risk Budget: max new {snap.risk_policy.max_new_trades}, "
+        f"size x{snap.risk_policy.position_size_multiplier:.2f}, "
+        f"max sector {snap.risk_policy.max_sector_exposure} | {snap.risk_policy.note}"
+    )
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Watchlist", len(watchlist))
-    m2.metric("Scanned", len(summary))
+    m1.metric("Watchlist", len(snap.watchlist_tickers))
+    m2.metric("Scanned", len(snap.scan_summary))
     m3.metric("Actionable", len(actionable))
-    m4.metric("Open Positions", len(open_trades))
-    m5.metric("Alerts", len(conditionals), delta=f"{len(triggered)} triggered")
+    m4.metric("Open Positions", len(snap.open_trades))
+    m5.metric("Alerts", len(snap.pending_alerts), delta=f"{len(snap.triggered_alerts)} triggered")
     m6.metric("Stale Streams", stale_count, delta=f"Last scan {health['last_scan_mode'] or 'n/a'}")
 
     t1, t2, t3 = st.columns(3)
     t1.metric("Last Scan Count", int(health['last_scan_count']))
     t2.metric("Last Scan Runtime", f"{health['last_scan_duration']:.1f}s")
     t3.metric("Avg Scan Runtime", f"{health['avg_scan_duration']:.1f}s")
+    if last_timing:
+        st.caption(
+            f"Scan timings (sec): data={last_timing.get('fetch_scan_data_sec', 0.0):.1f}, "
+            f"analyze={last_timing.get('scan_watchlist_sec', 0.0):.1f}, "
+            f"sectors={last_timing.get('sector_refresh_sec', 0.0):.1f}, "
+            f"earnings={last_timing.get('earnings_refresh_sec', 0.0):.1f}, "
+            f"summary={last_timing.get('summary_build_sec', 0.0):.1f}, "
+            f"alerts={last_timing.get('alerts_check_sec', 0.0):.1f}"
+        )
 
     st.divider()
     q1, q2, q3 = st.columns(3)
 
     must_act = []
-    for t in triggered:
+    for t in snap.triggered_alerts:
         ticker = t.get('ticker', '')
         must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
-    for trade in open_trades:
+    for trade in snap.open_trades:
         ticker = trade.get('ticker', '').upper().strip()
         entry = float(trade.get('entry_price', 0) or 0)
         stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
@@ -6313,7 +6555,7 @@ def render_executive_dashboard():
             must_act.append((95, f"🔴 Stop breached: {ticker}", ticker))
         elif pnl_pct <= -3:
             must_act.append((75, f"🟠 Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", ticker))
-    for row in summary:
+    for row in snap.scan_summary:
         earn_days = int(row.get('earn_days', 999) or 999)
         if 0 <= earn_days <= 3:
             ticker = row.get('ticker', '')
@@ -6333,22 +6575,25 @@ def render_executive_dashboard():
         st.markdown("**Top Trade Candidates**")
         if not actionable:
             st.caption("No actionable entries in current scan.")
-        for row in actionable[:12]:
+        for cand in actionable[:12]:
+            row = cand['row']
             ticker = row.get('ticker', '?')
             rec = row.get('recommendation', '?')
             conv = row.get('conviction', 0)
-            score = _recommendation_score(row)
+            score = cand['score']
+            why = "; ".join(cand['reasons'][:3])
             if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
                          key=f"exec_pick_{ticker}", width="stretch"):
                 _load_ticker_for_view(ticker)
+            st.caption(f"Why: {why}")
 
     with q3:
         st.markdown("**Open Positions Needing Attention**")
-        if not open_trades:
+        if not snap.open_trades:
             st.caption("No open positions.")
         else:
             pos_cache = st.session_state.get('_position_prices', {})
-            for trade in open_trades:
+            for trade in snap.open_trades:
                 ticker = trade.get('ticker', '').upper().strip()
                 entry = float(trade.get('entry_price', 0) or 0)
                 stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
@@ -6374,28 +6619,43 @@ def main():
     # Main content area
     conditionals = jm.get_pending_conditionals()
     alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
-    tab_exec, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
-        "📌 Executive Dashboard", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
-    ])
+    if _is_exec_dashboard_enabled():
+        tab_exec, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "📌 Executive Dashboard", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        ])
 
-    with tab_exec:
-        render_executive_dashboard()
+        with tab_exec:
+            render_executive_dashboard()
 
-    with tab_scanner:
-        render_scanner_table()
+        with tab_scanner:
+            render_scanner_table()
+            if st.session_state.get('selected_analysis'):
+                st.divider()
+                render_detail_view()
 
-        if st.session_state.get('selected_analysis'):
-            st.divider()
-            render_detail_view()
+        with tab_alerts:
+            _render_alerts_panel()
 
-    with tab_alerts:
-        _render_alerts_panel()
+        with tab_positions:
+            render_position_manager()
 
-    with tab_positions:
-        render_position_manager()
-
-    with tab_perf:
-        render_performance()
+        with tab_perf:
+            render_performance()
+    else:
+        tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        ])
+        with tab_scanner:
+            render_scanner_table()
+            if st.session_state.get('selected_analysis'):
+                st.divider()
+                render_detail_view()
+        with tab_alerts:
+            _render_alerts_panel()
+        with tab_positions:
+            render_position_manager()
+        with tab_perf:
+            render_performance()
 
 
 def _render_alerts_panel():
