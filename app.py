@@ -1187,8 +1187,18 @@ def _run_scan(mode='all'):
     valid_list = []
     rejected = []
     for t in full_list:
-        # Valid ticker: 1-5 uppercase alpha, or known indices (^VIX, ^GSPC)
+        # Valid ticker: 1-5 uppercase alpha, class shares (e.g. BRK.B), or indices (^VIX).
+        if not isinstance(t, str):
+            rejected.append(t)
+            continue
+        t = t.upper().strip()
+
         if _re.match(r'^[A-Z]{1,5}$', t) or t.startswith('^'):
+            valid_list.append(t)
+            continue
+
+        class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+        if class_match and class_match.group(1) in {'A', 'B', 'C', 'D'}:
             valid_list.append(t)
         else:
             rejected.append(t)
@@ -1214,6 +1224,10 @@ def _run_scan(mode='all'):
     with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
         all_data = fetch_scan_data(tickers_to_scan)
         new_results = scan_watchlist(all_data)
+
+        # Defaults keep scan flow resilient if auxiliary fetches fail.
+        sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+        earnings_flags = st.session_state.get('earnings_flags', {}) or {}
 
         # Fetch sector rotation (independent — failure doesn't block earnings)
         try:

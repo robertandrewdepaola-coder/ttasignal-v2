@@ -306,6 +306,15 @@ class JournalManager:
                 with open(temp_path, 'w') as f:
                     json.dump(data, f, indent=2, default=str)
                 shutil.move(str(temp_path), str(path))
+            # Keep backup behavior consistent with _save().
+            try:
+                import github_backup
+                github_backup.mark_dirty(path.name)
+                print(f"[journal] Queued {path.name} for GitHub backup")
+            except ImportError:
+                print(f"[journal] WARNING: github_backup module not available - no remote backup")
+            except Exception as e:
+                print(f"[journal] ERROR: GitHub backup failed for {path.name}: {e}")
         except TimeoutError:
             print(f"[journal] ERROR: Timeout acquiring lock for {path}, atomic save failed")
             if temp_path.exists():
@@ -580,7 +589,8 @@ class JournalManager:
     def check_stops(self, current_prices: Dict[str, float], auto_execute: bool = False) -> List[Dict]:
         """Check all open positions against stop levels. Returns list of triggered stops."""
         triggered = []
-        for trade in self.open_trades:
+        # Iterate over a snapshot to avoid skipping items when auto_execute closes trades.
+        for trade in list(self.open_trades):
             if trade['status'] != 'OPEN':
                 continue
             ticker = trade['ticker']
@@ -856,6 +866,7 @@ class JournalManager:
         """Check all pending conditionals against current prices."""
         volume_ratios = volume_ratios or {}
         triggered = []
+        changed = False
 
         for cond in self.conditionals:
             if cond.get('status') != 'PENDING':
@@ -877,6 +888,7 @@ class JournalManager:
                     expires_dt = datetime.strptime(expires, '%Y-%m-%d').replace(tzinfo=timezone.utc)
                     if expires_dt < now_utc():
                         cond['status'] = 'EXPIRED'
+                        changed = True
                         continue
                 except Exception:
                     pass
@@ -896,8 +908,9 @@ class JournalManager:
                 cond['triggered_date'] = today_utc_str()
                 cond['triggered_volume_ratio'] = vol_actual
                 triggered.append(cond)
+                changed = True
 
-        if triggered:
+        if changed:
             self._save(self.conditionals_file, self.conditionals)
 
         return triggered
