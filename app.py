@@ -5236,58 +5236,206 @@ def _render_capital_overview(jm: JournalManager):
             st.rerun()
 
 
+def _extract_ai_trade_levels(
+    ai_result: Dict,
+    technical_entry: float,
+    technical_stop: float,
+    technical_target: float,
+    current_price: float,
+) -> Dict[str, float]:
+    """Parse AI text for entry/stop/target levels with technical fallback."""
+    action = str(ai_result.get('action', '') or '')
+    fields = [
+        action,
+        str(ai_result.get('resistance_verdict', '') or ''),
+        str(ai_result.get('analysis', '') or ''),
+        str(ai_result.get('raw_text', '') or ''),
+        str(ai_result.get('bull_case', '') or ''),
+        str(ai_result.get('bear_case', '') or ''),
+    ]
+    blob = "\n".join(fields)
+
+    def _find_labeled_price(labels: List[str]) -> float:
+        for label in labels:
+            m = re.search(rf"{label}\s*[:=]?\s*\$?\s*(\d+(?:\.\d+)?)", blob, flags=re.IGNORECASE)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    pass
+        return 0.0
+
+    ai_entry = _find_labeled_price([r'entry', r'buy(?:\s+zone)?', r'breakout(?:\s+above)?', r'entry zone'])
+    ai_stop = _find_labeled_price([r'stop(?:\s+loss)?', r'invalidat(?:ion|e)\s+below'])
+    ai_target = _find_labeled_price([r'target', r'price target', r'upside target'])
+
+    if not ai_entry:
+        m_break = re.search(r'WAIT\s+FOR\s+BREAKOUT\s+above\s+\$?(\d+(?:\.\d+)?)', action, flags=re.IGNORECASE)
+        if m_break:
+            ai_entry = float(m_break.group(1))
+
+    if not ai_entry and "BUY NOW" in action.upper() and current_price > 0:
+        ai_entry = float(current_price)
+
+    entry = ai_entry if ai_entry > 0 else float(technical_entry or current_price or 0.0)
+    stop = ai_stop if (ai_stop > 0 and ai_stop < entry) else float(technical_stop or 0.0)
+    target = ai_target if (ai_target > entry) else float(technical_target or 0.0)
+
+    using_ai = bool(ai_entry or ai_stop or ai_target)
+    return {
+        'entry': float(entry),
+        'stop': float(stop),
+        'target': float(target),
+        'using_ai': using_ai,
+        'parsed_entry': float(ai_entry),
+        'parsed_stop': float(ai_stop),
+        'parsed_target': float(ai_target),
+    }
+
+
+def _build_trade_ticket_note(
+    ticker: str,
+    ai_result: Dict,
+    rec: Dict,
+    signal: EntrySignal,
+    source_mode: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+) -> str:
+    """Build timestamped trade-ticket note attached to the trade."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    action = str(ai_result.get('action', ai_result.get('timing', '')) or '')
+    conviction = ai_result.get('conviction', rec.get('conviction', 0))
+    pos_size_txt = str(ai_result.get('position_sizing', '') or '')
+    resistance = str(ai_result.get('resistance_verdict', '') or '')
+    why = str(ai_result.get('why_moving', '') or '')
+    red_flags = str(ai_result.get('red_flags', '') or '')
+
+    lines = [
+        f"[TRADE TICKET | {ts}]",
+        f"Ticker: {ticker}",
+        f"Default Source: {source_mode}",
+        f"Action: {action or rec.get('recommendation', 'N/A')}",
+        f"Conviction: {conviction}/10",
+        f"Position Sizing Guidance: {pos_size_txt or 'N/A'}",
+        f"Planned Entry: ${entry_price:.2f} | Stop: ${stop_price:.2f} | Target: ${target_price:.2f}",
+    ]
+    if signal and signal.stops:
+        rr = signal.stops.get('reward_risk')
+        if rr:
+            lines.append(f"Technical Reward:Risk: {rr}")
+    if resistance:
+        lines.append(f"Resistance Verdict: {resistance[:220]}")
+    if why:
+        lines.append(f"Narrative: {why[:220]}")
+    if red_flags:
+        lines.append(f"Red Flags: {red_flags[:220]}")
+
+    return "\n".join(lines)
+
+
 def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     """
     Institutional-grade position calculator using position_sizer.py.
-    Shows full audit trail of sizing decision.
+    Uses AI-recommended defaults when available, with technical fallback.
     """
     from position_sizer import calculate_position_size
 
     current_price = float(analysis.current_price or 0.0)
-    entry_default = float(stops.get('entry', current_price or 0.0))
-    stop_default = float(stops.get('stop', 0.0))
-    target_default = float(stops.get('target', 0.0))
+    tech_entry = float(stops.get('entry', current_price or 0.0))
+    tech_stop = float(stops.get('stop', 0.0))
+    tech_target = float(stops.get('target', 0.0))
+    ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
+    ai_levels = _extract_ai_trade_levels(ai_result, tech_entry, tech_stop, tech_target, current_price)
 
     account_size = float(st.session_state.get('account_size', 100000.0))
     open_trades = jm.get_open_trades()
-
-    # Get performance context
     win_rate = jm.get_recent_win_rate(last_n=20)
     losing_streak = jm.get_current_losing_streak()
 
     st.subheader(f"📐 Position Sizer — {ticker}")
 
-    # ── Performance Context ───────────────────────────────────────────
     if losing_streak >= 2:
         st.warning(f"⚠️ On a {losing_streak}-trade losing streak — position sizes auto-reduced")
     if win_rate < 0.4 and jm.get_trade_history(last_n=5):
         st.warning(f"⚠️ Recent win rate: {win_rate:.0%} — consider reducing exposure")
 
-    # ── Input Row ─────────────────────────────────────────────────────
-    # All values MUST be float to avoid StreamlitMixedNumericTypesError
-    _entry_val = float(entry_default if entry_default > 0 else current_price)
+    source_options = ["AI Recommended", "Technical"]
+    default_source_key = f"sizer_default_source_{ticker}"
+    prev_source_key = f"sizer_default_source_prev_{ticker}"
+    if default_source_key not in st.session_state:
+        st.session_state[default_source_key] = "AI Recommended" if ai_levels.get('using_ai') else "Technical"
+    selected_source = st.selectbox(
+        "Default Price Source",
+        source_options,
+        index=source_options.index(st.session_state.get(default_source_key, "Technical")),
+        key=default_source_key,
+    )
+
+    selected_entry = ai_levels['entry'] if selected_source == "AI Recommended" else tech_entry
+    selected_stop = ai_levels['stop'] if selected_source == "AI Recommended" else tech_stop
+    selected_target = ai_levels['target'] if selected_source == "AI Recommended" else tech_target
+
+    if selected_source == "AI Recommended":
+        if ai_levels.get('using_ai'):
+            st.caption("AI defaults loaded (with technical fallback for missing fields).")
+        else:
+            st.caption("AI defaults not fully available for this ticker; using technical fallback.")
+    else:
+        st.caption("Technical defaults loaded from signal model.")
+
+    entry_key = f"sizer_entry_{ticker}"
+    stop_key = f"sizer_stop_{ticker}"
+    target_key = f"sizer_target_{ticker}"
+    confirm_entry_key = f"confirm_entry_{ticker}"
+    confirm_stop_key = f"confirm_stop_{ticker}"
+    confirm_target_key = f"confirm_target_{ticker}"
+
+    if entry_key not in st.session_state:
+        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+    if stop_key not in st.session_state:
+        st.session_state[stop_key] = float(selected_stop)
+    if target_key not in st.session_state:
+        st.session_state[target_key] = float(selected_target)
+
+    prev_source = st.session_state.get(prev_source_key)
+    if prev_source != selected_source:
+        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+        st.session_state[stop_key] = float(selected_stop)
+        st.session_state[target_key] = float(selected_target)
+        st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+        st.session_state[confirm_stop_key] = float(selected_stop)
+        st.session_state[confirm_target_key] = float(selected_target)
+        st.session_state[prev_source_key] = selected_source
+
+    if st.button("↺ Apply Selected Defaults", key=f"apply_defaults_{ticker}"):
+        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+        st.session_state[stop_key] = float(selected_stop)
+        st.session_state[target_key] = float(selected_target)
+        st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+        st.session_state[confirm_stop_key] = float(selected_stop)
+        st.session_state[confirm_target_key] = float(selected_target)
+        st.rerun()
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        entry_price = st.number_input("Entry Price",
-                                       value=_entry_val,
-                                       step=0.01, format="%.2f",
-                                       key=f"sizer_entry_{ticker}")
+        entry_price = st.number_input("Entry Price", step=0.01, format="%.2f", key=entry_key)
     with col2:
-        stop_price = st.number_input("Stop Loss",
-                                      value=float(stop_default),
-                                      step=0.01, format="%.2f",
-                                      key=f"sizer_stop_{ticker}")
+        stop_price = st.number_input("Stop Loss", step=0.01, format="%.2f", key=stop_key)
     with col3:
-        target_price = st.number_input("Target",
-                                        value=float(target_default),
-                                        step=0.01, format="%.2f",
-                                        key=f"sizer_target_{ticker}")
+        target_price = st.number_input("Target", step=0.01, format="%.2f", key=target_key)
     with col4:
-        max_risk = st.number_input("Max Risk %", value=1.5,
-                                    min_value=0.5, max_value=5.0, step=0.25, format="%.2f",
-                                    key=f"sizer_risk_{ticker}")
+        max_risk = st.number_input(
+            "Max Risk %",
+            value=1.5,
+            min_value=0.5,
+            max_value=5.0,
+            step=0.25,
+            format="%.2f",
+            key=f"sizer_risk_{ticker}",
+        )
 
-    # ── Run Sizer ─────────────────────────────────────────────────────
     if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
         result = calculate_position_size(
             ticker=ticker,
@@ -5301,83 +5449,65 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             max_risk_pct=max_risk,
         )
 
-        # ── Results Display ───────────────────────────────────────────
         st.markdown("---")
-
-        # Main recommendation
         if result.recommended_shares > 0:
             r1, r2, r3, r4 = st.columns(4)
-            r1.metric("✅ Recommended", f"{result.recommended_shares:,} shares",
-                      f"${result.position_cost:,.0f}")
-            r2.metric("💸 Risk", f"${result.risk_dollars:,.0f}",
-                      f"{result.risk_pct_of_equity:.1f}% of equity")
-            r3.metric("🔥 Heat", f"{result.portfolio_heat_before:.1f}% → {result.portfolio_heat_after:.1f}%",
-                      f"{'✅' if result.portfolio_heat_after < 8 else '⚠️'}")
+            r1.metric("✅ Recommended", f"{result.recommended_shares:,} shares", f"${result.position_cost:,.0f}")
+            r2.metric("💸 Risk", f"${result.risk_dollars:,.0f}", f"{result.risk_pct_of_equity:.1f}% of equity")
+            r3.metric(
+                "🔥 Heat",
+                f"{result.portfolio_heat_before:.1f}% → {result.portfolio_heat_after:.1f}%",
+                f"{'✅' if result.portfolio_heat_after < 8 else '⚠️'}",
+            )
             if result.reward_risk_ratio > 0:
-                r4.metric("🎯 R:R", f"{result.reward_risk_ratio:.1f}:1",
-                          "Good ✅" if result.reward_risk_ratio >= 2 else "Low ⚠️")
+                r4.metric("🎯 R:R", f"{result.reward_risk_ratio:.1f}:1", "Good ✅" if result.reward_risk_ratio >= 2 else "Low ⚠️")
             else:
-                r4.metric("📊 Concentration", f"{result.concentration_pct:.1f}%",
-                          f"{'✅' if result.concentration_pct < 20 else '⚠️'}")
+                r4.metric("📊 Concentration", f"{result.concentration_pct:.1f}%", f"{'✅' if result.concentration_pct < 20 else '⚠️'}")
 
-            # Show constraint breakdown
             with st.expander("📊 Sizing Breakdown"):
                 st.caption(f"**Risk limit (1.5%):** {result.shares_from_risk:,} shares")
                 st.caption(f"**Heat limit (8%):** {result.shares_from_heat:,} shares")
                 st.caption(f"**Concentration (20%):** {result.shares_from_concentration:,} shares")
                 st.caption(f"**Available capital:** {result.shares_from_capital:,} shares")
                 st.caption(f"**Binding constraint:** {result.limiting_factor.replace('_', ' ').title()}")
-
                 if result.scale_factor < 1.0:
-                    st.warning(f"⚠️ Base size: {result.base_shares:,} shares → "
-                               f"Reduced to {result.recommended_shares:,} — {result.scale_reason}")
-
+                    st.warning(
+                        f"⚠️ Base size: {result.base_shares:,} shares → "
+                        f"Reduced to {result.recommended_shares:,} — {result.scale_reason}"
+                    )
                 st.caption(f"Win rate (last 20): {win_rate:.0%} | Losing streak: {losing_streak}")
 
-            # Warnings
             for w in result.warnings:
                 st.warning(w)
             if not result.warnings:
                 st.success("✅ Position sizing within all risk parameters")
-
-            # Store for trade entry
             st.session_state[f'sizer_result_{ticker}'] = result.recommended_shares
-
         else:
             st.error(result.explanation)
-
     elif entry_price > 0 and stop_price > 0 and stop_price >= entry_price:
         st.error("Stop price must be below entry price")
 
-    # ══════════════════════════════════════════════════════════════
-    # ENTER TRADE
-    # ══════════════════════════════════════════════════════════════
     st.divider()
     st.markdown("### ✅ Enter Trade")
 
-    # Use sizer recommendation as default
     sizer_shares = st.session_state.get(f'sizer_result_{ticker}', 0)
-    final_shares = sizer_shares if sizer_shares > 0 else (
-        int(account_size * 0.125 / entry_price) if entry_price > 0 else 0
-    )
+    final_shares = sizer_shares if sizer_shares > 0 else (int(account_size * 0.125 / entry_price) if entry_price > 0 else 0)
 
     ec1, ec2, ec3, ec4 = st.columns(4)
     with ec1:
-        confirm_shares = st.number_input("Shares", value=final_shares,
-                                          min_value=0, step=1,
-                                          key=f"confirm_shares_{ticker}")
+        confirm_shares = st.number_input("Shares", value=final_shares, min_value=0, step=1, key=f"confirm_shares_{ticker}")
     with ec2:
-        confirm_entry = st.number_input("Entry $", value=float(entry_price) if entry_price > 0 else float(entry_default),
-                                         step=0.01, format="%.2f",
-                                         key=f"confirm_entry_{ticker}")
+        if confirm_entry_key not in st.session_state:
+            st.session_state[confirm_entry_key] = float(entry_price if entry_price > 0 else selected_entry)
+        confirm_entry = st.number_input("Entry $", step=0.01, format="%.2f", key=confirm_entry_key)
     with ec3:
-        confirm_stop = st.number_input("Stop $", value=float(stop_default),
-                                        step=0.01, format="%.2f",
-                                        key=f"confirm_stop_{ticker}")
+        if confirm_stop_key not in st.session_state:
+            st.session_state[confirm_stop_key] = float(stop_price if stop_price > 0 else selected_stop)
+        confirm_stop = st.number_input("Stop $", step=0.01, format="%.2f", key=confirm_stop_key)
     with ec4:
-        confirm_target = st.number_input("Target $", value=float(target_default),
-                                          step=0.01, format="%.2f",
-                                          key=f"confirm_target_{ticker}")
+        if confirm_target_key not in st.session_state:
+            st.session_state[confirm_target_key] = float(target_price if target_price > 0 else selected_target)
+        confirm_target = st.number_input("Target $", step=0.01, format="%.2f", key=confirm_target_key)
 
     if confirm_shares > 0 and confirm_entry > 0:
         total_cost = confirm_shares * confirm_entry
@@ -5386,7 +5516,8 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             f"({total_cost / account_size * 100:.1f}% of account)"
         )
 
-    notes = st.text_input("Notes", value=rec.get('summary', ''), key=f"notes_{ticker}")
+    notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=f"notes_{ticker}")
+    attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
         if confirm_entry <= 0 or confirm_shares <= 0:
@@ -5397,6 +5528,20 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             st.error("Stop must be below entry price")
         else:
             pos_size = confirm_shares * confirm_entry
+            final_notes = notes.strip()
+            if attach_ticket:
+                ticket = _build_trade_ticket_note(
+                    ticker=ticker,
+                    ai_result=ai_result,
+                    rec=rec,
+                    signal=signal,
+                    source_mode=selected_source,
+                    entry_price=float(confirm_entry),
+                    stop_price=float(confirm_stop),
+                    target_price=float(confirm_target),
+                )
+                final_notes = f"{final_notes}\n\n{ticket}".strip() if final_notes else ticket
+
             trade = Trade(
                 trade_id='',
                 ticker=ticker,
@@ -5413,7 +5558,7 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                 weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
                 risk_per_share=confirm_entry - confirm_stop,
                 risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
-                notes=notes,
+                notes=final_notes,
             )
             result = jm.enter_trade(trade)
             st.success(result)
