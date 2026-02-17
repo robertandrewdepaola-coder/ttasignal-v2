@@ -231,6 +231,9 @@ class Trade:
     weekly_bullish_at_entry: bool = False
     monthly_bullish_at_entry: bool = False
     weinstein_stage_at_entry: int = 0
+    regime_at_entry: str = ''
+    gate_status_at_entry: str = ''
+    vix_at_entry: float = 0
     notes: str = ''
     opened_at: str = ''
     closed_at: str = ''
@@ -736,6 +739,7 @@ class JournalManager:
                 'avg_win_pct': 0, 'avg_loss_pct': 0, 'payoff_ratio': 0, 'expectancy_pct': 0,
                 'avg_alpha_pct': 0, 'beat_benchmark_rate': 0, 'total_alpha_pct': 0,
                 'by_ticker': {},
+                'by_regime': {},
                 'underperforming_buckets': [],
                 'trade_details': [],
             }
@@ -788,6 +792,21 @@ class JournalManager:
             by_ticker[tk]['avg_pnl_pct'] = round(by_ticker[tk]['total_pnl_pct'] / c, 2) if c > 0 else 0
             by_ticker[tk]['win_rate'] = round(by_ticker[tk]['wins'] / c * 100, 1) if c > 0 else 0
 
+        by_regime = {}
+        for t in trades:
+            rg = str(t.get('regime_at_entry', '') or 'UNKNOWN').upper()
+            if rg not in by_regime:
+                by_regime[rg] = {'count': 0, 'wins': 0, 'total_pnl_pct': 0}
+            by_regime[rg]['count'] += 1
+            pnlp = float(t.get('realized_pnl_pct', 0) or 0)
+            by_regime[rg]['total_pnl_pct'] += pnlp
+            if pnlp > 0:
+                by_regime[rg]['wins'] += 1
+        for rg in by_regime:
+            c = by_regime[rg]['count']
+            by_regime[rg]['avg_pnl_pct'] = round(by_regime[rg]['total_pnl_pct'] / c, 2) if c > 0 else 0
+            by_regime[rg]['win_rate'] = round(by_regime[rg]['wins'] / c * 100, 1) if c > 0 else 0
+
         avg_win = round(sum(wins) / len(wins), 2) if wins else 0
         avg_loss = round(sum(losses) / len(losses), 2) if losses else 0
         win_rate_frac = (len(wins) / len(trades)) if trades else 0
@@ -834,6 +853,7 @@ class JournalManager:
             'by_signal_type': by_signal,
             'by_exit_reason': by_exit,
             'by_ticker': by_ticker,
+            'by_regime': by_regime,
             'underperforming_buckets': underperforming,
             'trade_details': [dict(t) for t in trades],
         }

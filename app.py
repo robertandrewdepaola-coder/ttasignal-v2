@@ -6474,6 +6474,9 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
                 weekly_bullish_at_entry=signal.weekly_macd.get('bullish', False) if signal else False,
                 monthly_bullish_at_entry=signal.monthly_macd.get('bullish', False) if signal else False,
                 weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
+                regime_at_entry=str(snap.regime or ''),
+                gate_status_at_entry=str(gate.status or ''),
+                vix_at_entry=float(snap.market_filter.get('vix_close', 0) or 0),
                 risk_per_share=confirm_entry - confirm_stop,
                 risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
                 notes=final_notes,
@@ -6856,6 +6859,21 @@ def render_performance():
             })
         rows_tk = sorted(rows_tk, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
         st.dataframe(pd.DataFrame(rows_tk), hide_index=True, width='stretch')
+
+    by_regime = stats.get('by_regime', {}) or {}
+    if by_regime:
+        st.divider()
+        st.subheader("By Regime At Entry")
+        rows_rg = []
+        for rg, d in by_regime.items():
+            rows_rg.append({
+                'Regime': rg,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_rg = sorted(rows_rg, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_rg), hide_index=True, width='stretch')
 
     # Underperforming buckets
     under = stats.get('underperforming_buckets', []) or []
@@ -7922,6 +7940,7 @@ def render_executive_dashboard():
     q1, q2, q3 = st.columns(3)
 
     must_act = []
+    action_queue = []
     planned_trades = jm.get_planned_trades()
     for p in planned_trades:
         pstatus = str(p.get('status', '')).upper()
@@ -7930,11 +7949,14 @@ def render_executive_dashboard():
             continue
         if pstatus == "TRIGGERED":
             must_act.append((92, f"🗂️ Planned triggered: {pticker}", pticker))
+            action_queue.append({'priority': 92, 'category': 'planned', 'ticker': pticker, 'message': f"Planned triggered: {pticker}", 'action': 'open_trade'})
         elif pstatus == "PLANNED":
             must_act.append((55, f"🗂️ Planned queued: {pticker}", pticker))
+            action_queue.append({'priority': 55, 'category': 'planned', 'ticker': pticker, 'message': f"Planned queued: {pticker}", 'action': 'open_trade'})
     for t in snap.triggered_alerts:
         ticker = t.get('ticker', '')
         must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
+        action_queue.append({'priority': 100, 'category': 'alert', 'ticker': ticker, 'message': f"Alert triggered: {ticker}", 'action': 'open_trade'})
     for trade in snap.open_trades:
         ticker = trade.get('ticker', '').upper().strip()
         entry = float(trade.get('entry_price', 0) or 0)
@@ -7943,14 +7965,20 @@ def render_executive_dashboard():
         pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
         if stop > 0 and current <= stop:
             must_act.append((95, f"🔴 Stop breached: {ticker}", ticker))
+            action_queue.append({'priority': 95, 'category': 'risk', 'ticker': ticker, 'message': f"Stop breached: {ticker}", 'action': 'open_position'})
         elif pnl_pct <= -3:
             must_act.append((75, f"🟠 Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", ticker))
+            action_queue.append({'priority': 75, 'category': 'risk', 'ticker': ticker, 'message': f"Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", 'action': 'open_position'})
     for row in snap.scan_summary:
         earn_days = int(row.get('earn_days', 999) or 999)
         if 0 <= earn_days <= 3:
             ticker = row.get('ticker', '')
             must_act.append((70 - earn_days, f"🗓️ Earnings soon ({earn_days}d): {ticker}", ticker))
+            action_queue.append({'priority': 70 - earn_days, 'category': 'earnings', 'ticker': ticker, 'message': f"Earnings soon ({earn_days}d): {ticker}", 'action': 'open_trade'})
+    if stale_count >= 3:
+        action_queue.append({'priority': 98, 'category': 'system', 'ticker': '', 'message': "Critical stale data streams — refresh required", 'action': 'refresh'})
     must_act.sort(key=lambda x: x[0], reverse=True)
+    action_queue = sorted(action_queue, key=lambda x: x['priority'], reverse=True)
 
     with q1:
         st.markdown("**Must Act Now**")
@@ -8007,6 +8035,30 @@ def render_executive_dashboard():
                     text = f"{icon} {ticker}  ${current:.2f} ({pnl_pct:+.1f}%)"
                     if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
                         _load_ticker_for_view(ticker)
+
+    with st.expander(f"⚡ Unified Action Queue ({len(action_queue)})", expanded=False):
+        if not action_queue:
+            st.caption("No queued actions.")
+        for i, item in enumerate(action_queue[:30]):
+            pri = int(item.get('priority', 0))
+            msg = str(item.get('message', ''))
+            ticker = str(item.get('ticker', '') or '').upper().strip()
+            action = str(item.get('action', 'open_trade'))
+            cmsg, cbtn = st.columns([4, 1])
+            with cmsg:
+                st.caption(f"P{pri} | {msg}")
+            with cbtn:
+                if action == 'refresh':
+                    if st.button("Refresh", key=f"aq_refresh_{i}", width="stretch"):
+                        _fast_refresh_dashboard()
+                        st.rerun()
+                else:
+                    if st.button("Open", key=f"aq_open_{i}_{ticker}", width="stretch"):
+                        if ticker:
+                            _load_ticker_for_view(ticker)
+                            st.session_state['default_detail_tab'] = 4
+                            st.session_state['_switch_to_scanner_tab'] = True
+                            st.rerun()
 
     st.divider()
     with st.expander("🗂️ Planned Trades Board", expanded=False):
