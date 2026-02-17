@@ -296,6 +296,9 @@ def _get_ai_clients() -> Dict:
         result['gemini_error'] = str(e)[:200]
 
     # Cache for all subsequent reruns
+    # Keep legacy session keys in sync for older call sites.
+    st.session_state['openai_client'] = result.get('openai_client')
+    st.session_state['gemini_model'] = result.get('gemini')
     st.session_state['_ai_clients_cache'] = result
     return result
 
@@ -654,8 +657,9 @@ def _run_deep_analysis():
             market_filter = fetch_market_filter()
             sector_rotation = fetch_sector_rotation()
 
-            gemini_model = st.session_state.get('gemini_model')
-            openai_client = st.session_state.get('openai_client')
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
 
             result = generate_deep_market_analysis(
                 macro_data,
@@ -820,8 +824,9 @@ def _run_factual_brief():
             from ai_analysis import generate_market_narrative
 
             macro_data = fetch_macro_narrative_data()
-            gemini_model = st.session_state.get('gemini_model')
-            openai_client = st.session_state.get('openai_client')
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
 
             narrative_result = generate_market_narrative(
                 macro_data,
@@ -6134,8 +6139,18 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
             from exit_advisor import analyze_all_positions, save_audit_batch, send_email_report
             from data_fetcher import fetch_current_price, fetch_signal_for_exit
 
-            gemini_model = st.session_state.get('gemini_model')
-            openai_client = st.session_state.get('openai_client')
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
+
+            if not openai_client and not gemini_model:
+                primary_err = ai_clients.get('primary_error') or "primary unavailable"
+                gemini_err = ai_clients.get('gemini_error') or "gemini unavailable"
+                st.warning(
+                    "AI providers unavailable for exit analysis. "
+                    f"Primary: {primary_err}. Fallback: {gemini_err}. "
+                    "System HOLD fallback will be used."
+                )
 
             advices = analyze_all_positions(
                 open_trades,
