@@ -19,6 +19,7 @@ Version: 2.0.0 (2026-02-08)
 import streamlit as st
 import pandas as pd
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -465,6 +466,7 @@ if 'sector_rotation' not in st.session_state:
     try:
         from data_fetcher import fetch_sector_rotation
         st.session_state['sector_rotation'] = fetch_sector_rotation()
+        st.session_state['_sector_rotation_ts'] = time.time()
     except Exception:
         st.session_state['sector_rotation'] = {}
 
@@ -652,6 +654,7 @@ def _render_factual_market_brief():
     # Cache market filter in session_state (survives reruns, refreshes via data_fetcher's 5min TTL)
     if 'market_filter_data' not in st.session_state:
         st.session_state['market_filter_data'] = fetch_market_filter()
+        st.session_state['_market_filter_ts'] = time.time()
     mkt = st.session_state['market_filter_data']
     spy_ok = mkt.get('spy_above_200', True)
     vix_close = mkt.get('vix_close', 0) or 0
@@ -1180,7 +1183,9 @@ def render_sidebar():
             if st.button("📊 Refresh Mkt", key="refresh_market_data",
                          help="Re-fetch SPY, VIX, sector rotation"):
                 st.session_state.pop('market_filter_data', None)
+                st.session_state.pop('_market_filter_ts', None)
                 st.session_state.pop('sector_rotation', None)
+                st.session_state.pop('_sector_rotation_ts', None)
                 st.session_state.pop('_research_market_cache', None)
                 st.session_state.pop('_research_market_cache_ts', None)
                 st.session_state.pop('_position_prices', None)
@@ -1326,6 +1331,7 @@ def _run_scan(mode='all'):
             from data_fetcher import fetch_sector_rotation
             sector_rotation = fetch_sector_rotation()
             st.session_state['sector_rotation'] = sector_rotation
+            st.session_state['_sector_rotation_ts'] = time.time()
         except Exception as e:
             print(f"Sector rotation error: {e}")
 
@@ -1447,6 +1453,7 @@ def _run_scan(mode='all'):
         jm.save_scan_results(summary)
         st.session_state['scan_results_summary'] = summary
         st.session_state['scan_timestamp'] = datetime.now().isoformat()
+        st.session_state['_scan_run_ts'] = time.time()
         # Save per-watchlist scan cache (for switching + restart)
         _active_wl_id = bridge.manager.get_active_watchlist().get("id", "")
         if _active_wl_id:
@@ -5866,6 +5873,168 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
 
 
 # =============================================================================
+# EXECUTIVE DASHBOARD
+# =============================================================================
+
+def _fmt_last_update(ts: float, fallback: str = "Never") -> str:
+    """Format epoch timestamp to local date/time + age."""
+    if not ts:
+        return fallback
+    dt = datetime.fromtimestamp(ts)
+    age_sec = max(0, int(time.time() - ts))
+    if age_sec < 60:
+        age = f"{age_sec}s ago"
+    elif age_sec < 3600:
+        age = f"{age_sec // 60}m ago"
+    elif age_sec < 86400:
+        age = f"{age_sec // 3600}h ago"
+    else:
+        age = f"{age_sec // 86400}d ago"
+    return f"{dt.strftime('%Y-%m-%d %H:%M:%S')} ({age})"
+
+
+def _run_alert_check_now(jm: JournalManager) -> int:
+    """Evaluate pending conditionals immediately using current prices."""
+    conditionals = jm.get_pending_conditionals()
+    if not conditionals:
+        return 0
+
+    current_prices = {}
+    for cond in conditionals:
+        ticker = cond.get('ticker', '').upper().strip()
+        if ticker and ticker not in current_prices:
+            price = fetch_current_price(ticker)
+            if price and price > 0:
+                current_prices[ticker] = float(price)
+
+    triggered = jm.check_conditionals(current_prices, volume_ratios={})
+    if triggered:
+        st.session_state['triggered_alerts'] = triggered
+    return len(triggered)
+
+
+def _fast_refresh_dashboard() -> None:
+    """Fast refresh for dashboard metrics without running a full scan."""
+    from data_fetcher import fetch_sector_rotation
+
+    st.session_state['market_filter_data'] = fetch_market_filter()
+    st.session_state['_market_filter_ts'] = time.time()
+
+    st.session_state['sector_rotation'] = fetch_sector_rotation()
+    st.session_state['_sector_rotation_ts'] = time.time()
+
+    jm = get_journal()
+    open_trades = jm.get_open_trades()
+    prices = {}
+    for trade in open_trades:
+        t = trade.get('ticker', '').upper().strip()
+        if t:
+            prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+    st.session_state['_position_prices'] = prices
+    st.session_state['_position_prices_ts'] = time.time()
+
+    trig_count = _run_alert_check_now(jm)
+    st.session_state['_dashboard_last_refresh'] = time.time()
+    st.success(f"Fast refresh complete. Triggered alerts: {trig_count}")
+
+
+def render_executive_dashboard():
+    """Daily command center for actionable overview and refresh controls."""
+    jm = get_journal()
+    bridge = get_bridge()
+    summary = st.session_state.get('scan_results_summary', [])
+    scan_ts_iso = st.session_state.get('scan_timestamp', '')
+    scan_ts = st.session_state.get('_scan_run_ts', 0.0)
+    if (not scan_ts) and scan_ts_iso:
+        try:
+            scan_ts = datetime.fromisoformat(scan_ts_iso).timestamp()
+        except Exception:
+            scan_ts = 0.0
+
+    market_ts = float(st.session_state.get('_market_filter_ts', 0.0) or 0.0)
+    sector_ts = float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0)
+    pos_ts = float(st.session_state.get('_position_prices_ts', 0.0) or 0.0)
+    dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
+
+    st.subheader("Executive Dashboard")
+    st.caption(f"Now: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("⚡ Fast Refresh", key="exec_fast_refresh", type="primary", width="stretch"):
+            _fast_refresh_dashboard()
+            st.rerun()
+    with c2:
+        if st.button("🔍 Full Refresh (Scan All)", key="exec_full_refresh", width="stretch"):
+            _run_scan(mode='all')
+    with c3:
+        if st.button("🎯 Check Alerts Now", key="exec_alert_refresh", width="stretch"):
+            trig_count = _run_alert_check_now(jm)
+            st.success(f"Alert check complete. Triggered alerts: {trig_count}")
+            st.rerun()
+
+    st.caption(
+        f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
+        f"Scan: {_fmt_last_update(scan_ts)} | "
+        f"Market: {_fmt_last_update(market_ts)} | "
+        f"Sectors: {_fmt_last_update(sector_ts)} | "
+        f"Position prices: {_fmt_last_update(pos_ts)}"
+    )
+
+    watchlist = bridge.get_watchlist_tickers()
+    open_trades = jm.get_open_trades()
+    conditionals = jm.get_pending_conditionals()
+    triggered = st.session_state.get('triggered_alerts', [])
+
+    actionable = []
+    for s in summary:
+        rec = str(s.get('recommendation', '')).upper()
+        if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
+            actionable.append(s)
+    actionable = sorted(actionable, key=lambda x: x.get('conviction', 0), reverse=True)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Watchlist", len(watchlist))
+    m2.metric("Scanned", len(summary))
+    m3.metric("Actionable", len(actionable))
+    m4.metric("Open Positions", len(open_trades))
+    m5.metric("Alerts", len(conditionals), delta=f"{len(triggered)} triggered")
+
+    st.divider()
+    q1, q2 = st.columns(2)
+
+    with q1:
+        st.markdown("**Top Trade Candidates**")
+        if not actionable:
+            st.caption("No actionable entries in current scan.")
+        for row in actionable[:12]:
+            ticker = row.get('ticker', '?')
+            rec = row.get('recommendation', '?')
+            conv = row.get('conviction', 0)
+            if st.button(f"{ticker} | {rec} | Conviction {conv}", key=f"exec_pick_{ticker}", width="stretch"):
+                _load_ticker_for_view(ticker)
+
+    with q2:
+        st.markdown("**Open Positions Needing Attention**")
+        if not open_trades:
+            st.caption("No open positions.")
+        else:
+            pos_cache = st.session_state.get('_position_prices', {})
+            for trade in open_trades:
+                ticker = trade.get('ticker', '').upper().strip()
+                entry = float(trade.get('entry_price', 0) or 0)
+                stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+                current = float(pos_cache.get(ticker) or fetch_current_price(ticker) or entry)
+                pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+                at_stop = stop > 0 and current <= stop
+                if pnl_pct <= -2 or at_stop:
+                    icon = "🔴" if at_stop else "🟠"
+                    text = f"{icon} {ticker}  ${current:.2f} ({pnl_pct:+.1f}%)"
+                    if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
+                        _load_ticker_for_view(ticker)
+
+
+# =============================================================================
 # APP MAIN
 # =============================================================================
 
@@ -5874,12 +6043,15 @@ def main():
 
     jm = get_journal()
 
-    # Main content area — added Alerts tab
+    # Main content area
     conditionals = jm.get_pending_conditionals()
     alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
-    tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
-        "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+    tab_exec, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+        "📌 Executive Dashboard", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
     ])
+
+    with tab_exec:
+        render_executive_dashboard()
 
     with tab_scanner:
         render_scanner_table()
