@@ -1275,6 +1275,20 @@ def render_sidebar():
                      disabled=(new_count == 0)):
             _run_scan(mode='new_only')
 
+    all_watchlists = bridge.manager.get_all_watchlists() or []
+    all_watch_tickers = set()
+    for _wl in all_watchlists:
+        for _t in (_wl.get('tickers', []) or []):
+            if isinstance(_t, str) and _t.strip():
+                all_watch_tickers.add(_t.upper().strip())
+    if st.sidebar.button(
+        f"🧭 Find New Trades ({len(all_watch_tickers)})",
+        width="stretch",
+        help="Scan ALL watchlists and return a ranked list of new trade candidates.",
+        disabled=(len(all_watch_tickers) == 0),
+    ):
+        _run_find_new_trades()
+
     # ── Open Positions (clickable) ────────────────────────────────────
     open_trades = jm.get_open_trades()
     if open_trades:
@@ -1713,6 +1727,168 @@ def _run_scan(mode='all'):
     st.rerun()
 
 
+def _run_find_new_trades():
+    """
+    Scan the union of ALL watchlists and build a consolidated "new trades" report.
+    This does not replace active-watchlist scanner results.
+    """
+    jm = get_journal()
+    bridge = get_bridge()
+    all_watchlists = bridge.manager.get_all_watchlists() or []
+
+    # Build ticker -> source watchlists map.
+    ticker_sources: Dict[str, List[str]] = {}
+    for wl in all_watchlists:
+        wl_name = str(wl.get('name', 'Watchlist'))
+        for t in (wl.get('tickers', []) or []):
+            if not isinstance(t, str):
+                continue
+            ticker = t.upper().strip()
+            if not ticker:
+                continue
+            ticker_sources.setdefault(ticker, [])
+            if wl_name not in ticker_sources[ticker]:
+                ticker_sources[ticker].append(wl_name)
+
+    # Validate symbols before data fetch.
+    import re as _re
+    universe = []
+    rejected = []
+    for t in sorted(ticker_sources.keys()):
+        is_base = bool(_re.match(r'^[A-Z]{1,5}$', t))
+        class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+        is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+        is_index = t.startswith('^')
+        if is_base or is_class or is_index:
+            universe.append(t)
+        else:
+            rejected.append(t)
+
+    if rejected:
+        print(f"[find_new] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
+
+    if not universe:
+        st.sidebar.warning("No tickers found across watchlists.")
+        return
+
+    _start = time.time()
+    with st.spinner(f"Finding new trades across {len(universe)} tickers..."):
+        _append_audit_event(
+            "FIND_NEW_START",
+            f"watchlists={len(all_watchlists)} universe={len(universe)}",
+            source="find_new",
+        )
+
+        all_data = fetch_scan_data(universe)
+        results = scan_watchlist(all_data)
+
+        # Pull current supporting context.
+        sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+        try:
+            from data_fetcher import fetch_sector_rotation
+            sector_rotation = fetch_sector_rotation()
+            st.session_state['sector_rotation'] = sector_rotation
+            st.session_state['_sector_rotation_ts'] = time.time()
+        except Exception:
+            pass
+
+        earnings_flags = {}
+        try:
+            from data_fetcher import fetch_batch_earnings_flags
+            earnings_flags = fetch_batch_earnings_flags([r.ticker for r in results], days_ahead=60) or {}
+        except Exception:
+            earnings_flags = {}
+
+        ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+        try:
+            from data_fetcher import get_ticker_sector
+            for r in results:
+                if r.ticker not in ticker_sectors:
+                    sec = get_ticker_sector(r.ticker)
+                    if sec:
+                        ticker_sectors[r.ticker] = sec
+            st.session_state['ticker_sectors'] = ticker_sectors
+        except Exception:
+            pass
+
+        open_tickers = set(jm.get_open_tickers())
+        rows = []
+        candidates = []
+        for r in results:
+            rec = r.recommendation or {}
+            q = r.quality or {}
+            rec_text = str(rec.get('recommendation', 'SKIP'))
+            earn = earnings_flags.get(r.ticker, {}) or {}
+            sector_name = ticker_sectors.get(r.ticker, '')
+            sector_info = sector_rotation.get(sector_name, {}) if sector_name else {}
+
+            row = {
+                'ticker': r.ticker,
+                'recommendation': rec_text,
+                'conviction': int(rec.get('conviction', 0) or 0),
+                'quality_grade': q.get('quality_grade', '?'),
+                'price': float(r.current_price or 0),
+                'summary': rec.get('summary', ''),
+                'sector': sector_name,
+                'sector_phase': sector_info.get('phase', ''),
+                'earn_date': earn.get('next_earnings', ''),
+                'earn_days': int(earn.get('days_until', 999) or 999),
+                'is_open_position': r.ticker in open_tickers,
+                'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
+                'source_watchlists': ticker_sources.get(r.ticker, []),
+            }
+            rows.append(row)
+
+            rec_upper = rec_text.upper()
+            is_entry = ('BUY' in rec_upper or 'ENTRY' in rec_upper) and 'SKIP' not in rec_upper and 'AVOID' not in rec_upper
+            if is_entry and not row['is_open_position']:
+                score = _recommendation_score(row)
+                candidates.append({
+                    'ticker': row['ticker'],
+                    'recommendation': row['recommendation'],
+                    'conviction': row['conviction'],
+                    'quality_grade': row['quality_grade'],
+                    'price': row['price'],
+                    'sector': row['sector'],
+                    'sector_phase': row['sector_phase'],
+                    'earn_date': row['earn_date'],
+                    'earn_days': row['earn_days'],
+                    'watchlists': row['watchlists'],
+                    'score': round(score, 2),
+                })
+
+        candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+
+    elapsed = max(0.0, time.time() - _start)
+    report = {
+        'generated_at': time.time(),
+        'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'watchlists_count': len(all_watchlists),
+        'scan_universe': len(universe),
+        'results_count': len(rows),
+        'candidate_count': len(candidates),
+        'candidates': candidates,
+        'rows': rows,
+        'elapsed_sec': elapsed,
+    }
+    st.session_state['find_new_trades_report'] = report
+    st.session_state['_find_new_trades_ts'] = time.time()
+    _append_perf_metric({
+        'kind': 'find_new_trades',
+        'watchlists': len(all_watchlists),
+        'universe': len(universe),
+        'results': len(rows),
+        'candidates': len(candidates),
+        'sec': round(elapsed, 3),
+    })
+    _append_audit_event(
+        "FIND_NEW_DONE",
+        f"watchlists={len(all_watchlists)} universe={len(universe)} candidates={len(candidates)} sec={elapsed:.1f}",
+        source="find_new",
+    )
+    st.success(f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists.")
+
+
 # =============================================================================
 # MAIN CONTENT — Scanner Results Table
 # =============================================================================
@@ -1738,6 +1914,40 @@ def render_scanner_table():
                 f"(Volume: {t.get('triggered_volume_ratio', 0):.1f}x avg)"
             )
         st.session_state['triggered_alerts'] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    # CROSS-WATCHLIST "FIND NEW TRADES" REPORT
+    # ══════════════════════════════════════════════════════════════════
+    find_new = st.session_state.get('find_new_trades_report', {}) or {}
+    if find_new:
+        cands = find_new.get('candidates', []) or []
+        generated = find_new.get('generated_at_iso', '')
+        wl_count = int(find_new.get('watchlists_count', 0) or 0)
+        universe = int(find_new.get('scan_universe', 0) or 0)
+        elapsed = float(find_new.get('elapsed_sec', 0) or 0)
+        with st.expander(
+            f"🧭 Find New Trades Report — {len(cands)} candidate(s) from {universe} tickers ({wl_count} watchlists)",
+            expanded=True,
+        ):
+            st.caption(f"Generated: {generated} | Runtime: {elapsed:.1f}s")
+            if not cands:
+                st.info("No new buy candidates found in this run.")
+            else:
+                view_rows = []
+                for c in cands[:50]:
+                    view_rows.append({
+                        'Ticker': c.get('ticker', ''),
+                        'Rec': c.get('recommendation', ''),
+                        'Conv': c.get('conviction', 0),
+                        'Grade': c.get('quality_grade', ''),
+                        'Score': c.get('score', 0),
+                        'Price': f"${float(c.get('price', 0) or 0):.2f}",
+                        'Sector': c.get('sector', ''),
+                        'Phase': c.get('sector_phase', ''),
+                        'Earnings': c.get('earn_date', ''),
+                        'Watchlists': c.get('watchlists', ''),
+                    })
+                st.dataframe(pd.DataFrame(view_rows), hide_index=True, width='stretch')
 
     # ══════════════════════════════════════════════════════════════════
     # WATCHLIST EDITOR (collapsible)
@@ -6870,16 +7080,34 @@ def render_executive_dashboard():
 
     candidate_rows = []
     if gate.allow_new_trades:
-        for row in snap.scan_summary:
-            rec = str(row.get('recommendation', '')).upper()
-            if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
-                scored = _score_candidate_with_policy(row, snap)
-                if not scored['blocked']:
-                    candidate_rows.append({
-                        'row': row,
-                        'score': scored['score'],
-                        'reasons': scored['reasons'],
-                    })
+        find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        find_new_cands = find_new.get('candidates', []) or []
+        if find_new_cands:
+            for c in find_new_cands:
+                candidate_rows.append({
+                    'row': {
+                        'ticker': c.get('ticker', ''),
+                        'recommendation': c.get('recommendation', ''),
+                        'conviction': c.get('conviction', 0),
+                    },
+                    'score': float(c.get('score', 0) or 0),
+                    'reasons': [
+                        "Cross-watchlist candidate",
+                        f"Quality {c.get('quality_grade', '?')}",
+                        f"Sector {c.get('sector_phase', '')}".strip(),
+                    ],
+                })
+        else:
+            for row in snap.scan_summary:
+                rec = str(row.get('recommendation', '')).upper()
+                if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
+                    scored = _score_candidate_with_policy(row, snap)
+                    if not scored['blocked']:
+                        candidate_rows.append({
+                            'row': row,
+                            'score': scored['score'],
+                            'reasons': scored['reasons'],
+                        })
     candidate_rows = sorted(candidate_rows, key=lambda x: x['score'], reverse=True)
     actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
 
@@ -6984,6 +7212,12 @@ def render_executive_dashboard():
 
     with q2:
         st.markdown("**Top Trade Candidates**")
+        _find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        if _find_new.get('candidates'):
+            st.caption(
+                f"Source: Find New Trades ({int(_find_new.get('scan_universe', 0) or 0)} tickers, "
+                f"{int(_find_new.get('watchlists_count', 0) or 0)} watchlists)"
+            )
         if not gate.allow_new_trades:
             st.caption("New trade entries are blocked by current market gate.")
         elif not actionable:
