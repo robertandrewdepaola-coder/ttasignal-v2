@@ -6157,6 +6157,21 @@ def render_position_manager():
               f"${risk_summary['total_risk_dollars']:,.0f} at risk",
               delta_color=heat_color)
 
+    # Macro posture for managing EXISTING positions
+    try:
+        snap = _build_dashboard_snapshot()
+        gate = _evaluate_trade_gate(snap)
+        posture = _position_posture_summary(snap, gate)
+        if posture['severity'] == "danger":
+            st.error(f"{posture['headline']} — {posture['summary']}")
+        elif posture['severity'] == "warning":
+            st.warning(f"{posture['headline']} — {posture['summary']}")
+        else:
+            st.success(f"{posture['headline']} — {posture['summary']}")
+        st.caption(f"Derived from Unified Regime {snap.regime} ({snap.regime_confidence}%) and Trade Gate {gate.status}.")
+    except Exception:
+        pass
+
     st.divider()
 
     # ── Position Table with AI Advice ─────────────────────────────────
@@ -6547,6 +6562,58 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
     )
 
 
+def _position_posture_summary(snap: DashboardSnapshot, gate: TradeGateDecision) -> Dict[str, Any]:
+    """
+    Clear macro guidance for EXISTING positions, separate from new-entry gate status.
+    """
+    stop_breaches = 0
+    drawdown_count = 0
+    for trade in (snap.open_trades or []):
+        ticker = str(trade.get('ticker', '')).upper().strip()
+        entry = float(trade.get('entry_price', 0) or 0)
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+        current = float(st.session_state.get('_position_prices', {}).get(ticker) or entry)
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        if stop > 0 and current <= stop:
+            stop_breaches += 1
+        elif pnl_pct <= -3:
+            drawdown_count += 1
+
+    vix = float(snap.market_filter.get('vix_close', 0) or 0)
+    severe_macro = snap.regime == "RISK_OFF" or vix >= 30
+
+    if gate.status == "NO_TRADE":
+        if severe_macro:
+            headline = "🛑 Macro Posture: Defensive hold/reduce risk"
+            summary = "No new trades. Keep winners with disciplined stops; reduce weakest positions into strength."
+            severity = "danger"
+        else:
+            headline = "🛡️ Macro Posture: Hold existing positions only"
+            summary = "No new trades. Manage open positions with stops; do not exit everything just because entry gate is closed."
+            severity = "warning"
+    elif gate.status == "TRADE_LIGHT":
+        headline = "🟡 Macro Posture: Hold and be selective"
+        summary = "Maintain current positions; add risk only on top-quality setups and smaller size."
+        severity = "warning"
+    else:
+        headline = "🟢 Macro Posture: Market supports holding and selective adds"
+        summary = "Trend backdrop is supportive. Hold existing positions and allow new entries that meet rules."
+        severity = "success"
+
+    if stop_breaches > 0:
+        summary += f" Immediate action: {stop_breaches} position(s) at/below stop."
+    elif drawdown_count > 0:
+        summary += f" Watchlist: {drawdown_count} position(s) in >3% drawdown."
+
+    return {
+        "headline": headline,
+        "summary": summary,
+        "severity": severity,
+        "stop_breaches": stop_breaches,
+        "drawdowns": drawdown_count,
+    }
+
+
 def _fmt_last_update(ts: float, fallback: str = "Never") -> str:
     """Format epoch timestamp to local date/time + age."""
     if not ts:
@@ -6857,6 +6924,8 @@ def render_executive_dashboard():
     else:
         st.success(f"{gate.label} — {gate.reason}")
     st.caption(f"Execution Authority: Unified Trade Gate | Model alignment: {gate.model_alignment}")
+    posture = _position_posture_summary(snap, gate)
+    st.caption(f"Open-position posture: {posture['summary']}")
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Watchlist", len(snap.watchlist_tickers))
