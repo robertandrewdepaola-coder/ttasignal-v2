@@ -8079,6 +8079,8 @@ def render_executive_dashboard():
     with st.expander(f"⚡ Unified Action Queue ({len(action_queue)})", expanded=False):
         if not action_queue:
             st.caption("No queued actions.")
+        if '_queue_action_confirm' not in st.session_state:
+            st.session_state['_queue_action_confirm'] = {}
         for i, item in enumerate(action_queue[:30]):
             pri = int(item.get('priority', 0))
             msg = str(item.get('message', ''))
@@ -8106,26 +8108,55 @@ def render_executive_dashboard():
                 if action == 'planned_queued' and plan_id:
                     if st.button("Trigger", key=f"aq_trigger_{i}_{plan_id}", width="stretch"):
                         st.info(jm.update_planned_trade_status(plan_id, "TRIGGERED", notes="triggered from action queue"))
+                        _append_audit_event("QUEUE_ACTION", f"trigger plan_id={plan_id} ticker={ticker}", source="exec_queue")
                         st.rerun()
                 elif action == 'planned_triggered' and plan_id:
+                    confirm_key = f"entered_{plan_id}"
                     if st.button("Entered", key=f"aq_entered_{i}_{plan_id}", width="stretch"):
-                        st.info(jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue"))
-                        st.rerun()
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                        if st.button("Confirm Entered", key=f"aq_entered_confirm_{i}_{plan_id}", width="stretch"):
+                            st.info(jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue"))
+                            _append_audit_event("QUEUE_ACTION", f"entered plan_id={plan_id} ticker={ticker}", source="exec_queue")
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
                 elif action == 'risk_manage' and ticker and current > 0:
                     if st.button("Tighten +1%", key=f"aq_tighten_{i}_{ticker}", width="stretch"):
                         # quick risk action: move stop to 1% below current if this tightens risk
                         new_stop = round(max(stop, current * 0.99), 2) if stop > 0 else round(current * 0.99, 2)
+                        old_stop = stop
                         st.info(jm.update_stop(ticker, new_stop))
+                        _append_audit_event(
+                            "QUEUE_ACTION",
+                            f"tighten_stop ticker={ticker} old_stop={old_stop:.2f} new_stop={new_stop:.2f} current={current:.2f}",
+                            source="exec_queue",
+                        )
                         st.rerun()
             with c3:
                 if action in {'planned_queued', 'planned_triggered'} and plan_id:
+                    confirm_key = f"cancel_{plan_id}"
                     if st.button("Cancel", key=f"aq_cancel_{i}_{plan_id}", width="stretch"):
-                        st.info(jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue"))
-                        st.rerun()
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                        if st.button("Confirm Cancel", key=f"aq_cancel_confirm_{i}_{plan_id}", width="stretch"):
+                            st.info(jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue"))
+                            _append_audit_event("QUEUE_ACTION", f"cancel plan_id={plan_id} ticker={ticker}", source="exec_queue")
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
                 elif action == 'risk_manage' and ticker and current > 0:
+                    confirm_key = f"close_{ticker}_{i}"
                     if st.button("Close Now", key=f"aq_close_{i}_{ticker}", width="stretch"):
-                        st.info(jm.close_trade(ticker, current, exit_reason='manual', notes='Closed from action queue'))
-                        st.rerun()
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    if st.session_state['_queue_action_confirm'].get(confirm_key):
+                        if st.button("Confirm Close", key=f"aq_close_confirm_{i}_{ticker}", width="stretch"):
+                            st.info(jm.close_trade(ticker, current, exit_reason='manual', notes='Closed from action queue'))
+                            _append_audit_event(
+                                "QUEUE_ACTION",
+                                f"close_now ticker={ticker} price={current:.2f}",
+                                source="exec_queue",
+                            )
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
 
     st.divider()
     with st.expander("🗂️ Planned Trades Board", expanded=False):
