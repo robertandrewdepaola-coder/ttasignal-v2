@@ -1532,6 +1532,12 @@ def render_scanner_table():
         # ── Bulk Editor (for pasting 200 tickers) ─────────────────────
         with st.expander("📝 Bulk Edit (paste tickers)"):
             st.caption("Paste tickers separated by commas, spaces, or new lines.")
+            append_only = st.checkbox(
+                "Add/Merge only (recommended)",
+                value=True,
+                key="wl_bulk_append_only",
+                help="On: adds new tickers and keeps existing ones. Off: replaces watchlist with pasted list.",
+            )
 
             # PERSISTENCE FIX: Use dynamic key that resets when watchlist changes
             # This prevents stale text_area values from overwriting new additions
@@ -1572,6 +1578,9 @@ def render_scanner_table():
                         unique.append(t)
 
                     existing_set = set(watchlist_tickers)
+                    if append_only:
+                        # Merge mode (default): never remove existing tickers.
+                        unique = sorted(existing_set | set(unique))
                     new_set = set(unique)
                     removed = sorted(existing_set - new_set)
 
