@@ -329,6 +329,7 @@ from pathlib import Path as _Path
 
 _SCAN_CACHE_FILE = _Path("v2_scan_cache.json")
 _AUDIT_FILE = _Path("v2_watchlist_audit.json")
+_PERF_FILE = _Path("v2_perf_metrics.jsonl")
 _AUDIT_MAX_ENTRIES = 500
 
 def _load_scan_cache_file() -> dict:
@@ -425,6 +426,33 @@ def _clear_audit_events():
     """Clear all audit events."""
     st.session_state['_watchlist_audit_events'] = []
     _save_audit_file([])
+
+
+def _count_today_trade_entries() -> int:
+    """Count today's entered trades from audit trail."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    return sum(
+        1 for e in _get_audit_events()
+        if e.get('action') == 'ENTER_TRADE' and str(e.get('ts', '')).startswith(today)
+    )
+
+
+def _append_perf_metric(metric: Dict[str, Any]):
+    """Append performance telemetry row as JSONL."""
+    try:
+        row = {
+            "ts": datetime.now().isoformat(timespec='seconds'),
+            **metric,
+        }
+        with open(_PERF_FILE, "a") as f:
+            f.write(_json.dumps(row) + "\n")
+        try:
+            import github_backup
+            github_backup.mark_dirty(_PERF_FILE.name)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def save_scan_for_watchlist(wl_id: str):
@@ -658,6 +686,11 @@ def _render_factual_market_brief():
         st.session_state['market_filter_data'] = fetch_market_filter()
         st.session_state['_market_filter_ts'] = time.time()
     mkt = st.session_state['market_filter_data']
+    _sector_ctx = st.session_state.get('sector_rotation', {}) or {}
+    try:
+        _regime_u, _reg_conf = _infer_exec_regime(mkt, _sector_ctx)
+    except Exception:
+        _regime_u, _reg_conf = "UNKNOWN", 0
     spy_ok = mkt.get('spy_above_200', True)
     vix_close = mkt.get('vix_close', 0) or 0
 
@@ -682,6 +715,7 @@ def _render_factual_market_brief():
         st.sidebar.warning(f"**{spy_str} | {vix_str}**")
     else:
         st.sidebar.error(f"**{spy_str} | {vix_str}**")
+    st.sidebar.caption(f"Unified Regime: **{_regime_u}** ({_reg_conf}%)")
 
     # ── AI Narrative (if generated) ───────────────────────────────────
     narrative_data = st.session_state.get('morning_narrative')
@@ -1528,6 +1562,18 @@ def _run_scan(mode='all'):
         _scan_elapsed = max(0.0, time.time() - _scan_started)
         _timing['total_sec'] = _scan_elapsed
         st.session_state['_timing_last_scan'] = _timing
+        _append_perf_metric({
+            "kind": "scan_run",
+            "mode": mode,
+            "universe": _timing.get("universe", 0),
+            "to_scan": _timing.get("to_scan", 0),
+            "total_sec": round(_timing.get("total_sec", 0.0), 3),
+            "fetch_sec": round(_timing.get("fetch_scan_data_sec", 0.0), 3),
+            "analyze_sec": round(_timing.get("scan_watchlist_sec", 0.0), 3),
+            "sectors_sec": round(_timing.get("sector_refresh_sec", 0.0), 3),
+            "earnings_sec": round(_timing.get("earnings_refresh_sec", 0.0), 3),
+            "alerts_sec": round(_timing.get("alerts_check_sec", 0.0), 3),
+        })
         hist = st.session_state.get('_scan_duration_hist', [])
         hist.append(_scan_elapsed)
         st.session_state['_scan_duration_hist'] = hist[-30:]
@@ -5393,6 +5439,8 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     account_size = float(st.session_state.get('account_size', 100000.0))
     open_trades = jm.get_open_trades()
+    snap = _build_dashboard_snapshot()
+    policy = snap.risk_policy
     win_rate = jm.get_recent_win_rate(last_n=20)
     losing_streak = jm.get_current_losing_streak()
 
@@ -5402,6 +5450,17 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.warning(f"⚠️ On a {losing_streak}-trade losing streak — position sizes auto-reduced")
     if win_rate < 0.4 and jm.get_trade_history(last_n=5):
         st.warning(f"⚠️ Recent win rate: {win_rate:.0%} — consider reducing exposure")
+    st.caption(
+        f"Regime policy: {policy.regime} | "
+        f"Max new/day {policy.max_new_trades} | "
+        f"Size x{policy.position_size_multiplier:.2f} | "
+        f"Max open {policy.max_total_open_positions}"
+    )
+    if len(open_trades) >= policy.max_total_open_positions:
+        st.error(
+            f"New entries blocked by policy: open positions {len(open_trades)} >= "
+            f"max {policy.max_total_open_positions} for regime {policy.regime}."
+        )
 
     source_options = ["AI Recommended", "Technical"]
     default_source_key = f"sizer_default_source_{ticker}"
@@ -5470,7 +5529,7 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     with col4:
         max_risk = st.number_input(
             "Max Risk %",
-            value=1.5,
+            value=max(0.5, min(5.0, round(1.5 * policy.position_size_multiplier, 2))),
             min_value=0.5,
             max_value=5.0,
             step=0.25,
@@ -5562,7 +5621,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}"):
-        if confirm_entry <= 0 or confirm_shares <= 0:
+        trades_today = _count_today_trade_entries()
+        if len(open_trades) >= policy.max_total_open_positions:
+            st.error(f"Blocked by regime policy: max open positions reached ({policy.max_total_open_positions}).")
+        elif trades_today >= policy.max_new_trades:
+            st.error(f"Blocked by regime policy: max new trades today reached ({policy.max_new_trades}).")
+        elif confirm_entry <= 0 or confirm_shares <= 0:
             st.error("Set entry price and shares first")
         elif confirm_stop <= 0:
             st.error("Set a stop loss — never trade without a stop")
@@ -5604,6 +5668,15 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             )
             result = jm.enter_trade(trade)
             st.success(result)
+            _append_audit_event(
+                "ENTER_TRADE",
+                (
+                    f"{ticker} entry={confirm_entry:.2f} stop={confirm_stop:.2f} "
+                    f"target={confirm_target:.2f} shares={confirm_shares} "
+                    f"regime={policy.regime}"
+                ),
+                source="trade_entry",
+            )
             st.rerun()
 
 
@@ -6384,6 +6457,7 @@ def _run_alert_check_now(jm: JournalManager) -> int:
 
 def _fast_refresh_dashboard() -> None:
     """Fast refresh for dashboard metrics without running a full scan."""
+    _t0 = time.time()
     from data_fetcher import fetch_sector_rotation
 
     st.session_state['market_filter_data'] = fetch_market_filter()
@@ -6409,6 +6483,12 @@ def _fast_refresh_dashboard() -> None:
         f"positions={len(open_trades)} alerts_triggered={trig_count}",
         source="exec_dashboard",
     )
+    _append_perf_metric({
+        "kind": "fast_refresh",
+        "sec": round(time.time() - _t0, 3),
+        "positions": len(open_trades),
+        "alerts_triggered": trig_count,
+    })
     st.success(f"Fast refresh complete. Triggered alerts: {trig_count}")
 
 
@@ -6430,6 +6510,7 @@ def _run_daily_workflow() -> Dict[str, float]:
 
 def render_executive_dashboard():
     """Daily command center for actionable overview and refresh controls."""
+    _render_started = time.time()
     jm = get_journal()
     snap = _build_dashboard_snapshot()
     dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
@@ -6605,6 +6686,20 @@ def render_executive_dashboard():
                     text = f"{icon} {ticker}  ${current:.2f} ({pnl_pct:+.1f}%)"
                     if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
                         _load_ticker_for_view(ticker)
+
+    # Render telemetry (throttled)
+    now_ts = time.time()
+    if (now_ts - float(st.session_state.get('_last_exec_render_log_ts', 0.0))) > 60:
+        st.session_state['_last_exec_render_log_ts'] = now_ts
+        _append_perf_metric({
+            "kind": "dashboard_render",
+            "sec": round(now_ts - _render_started, 3),
+            "stale_streams": stale_count,
+            "regime": snap.regime,
+            "actionable": len(actionable),
+            "open_positions": len(snap.open_trades),
+            "alerts": len(snap.pending_alerts),
+        })
 
 
 # =============================================================================
