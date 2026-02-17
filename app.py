@@ -1985,6 +1985,54 @@ def _calc_rr(entry: float, stop: float, target: float) -> float:
     return round(reward / risk, 2)
 
 
+def _trade_quality_settings() -> Dict[str, Any]:
+    """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
+    if 'trade_min_rr_threshold' not in st.session_state:
+        st.session_state['trade_min_rr_threshold'] = 2.0
+    if 'trade_earnings_block_days' not in st.session_state:
+        st.session_state['trade_earnings_block_days'] = 7
+    if 'trade_require_ready' not in st.session_state:
+        st.session_state['trade_require_ready'] = True
+    return {
+        'min_rr': float(st.session_state.get('trade_min_rr_threshold', 2.0) or 2.0),
+        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
+        'require_ready': bool(st.session_state.get('trade_require_ready', True)),
+    }
+
+
+def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    """Shared candidate quality filter."""
+    min_rr = float(settings.get('min_rr', 2.0) or 2.0)
+    earn_block_days = int(settings.get('earn_block_days', 7) or 7)
+    require_ready = bool(settings.get('require_ready', True))
+
+    entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
+    stop = float(row.get('suggested_stop_loss', 0) or 0)
+    target = float(row.get('suggested_target', 0) or 0)
+    rr = float(row.get('risk_reward', 0) or 0)
+    if rr <= 0:
+        rr = _calc_rr(entry, stop, target)
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return False
+    if not (stop < entry < target):
+        return False
+    if rr < min_rr:
+        return False
+    ai_buy = str(row.get('ai_buy_recommendation', '') or '').strip()
+    if ai_buy not in {"Strong Buy", "Buy"}:
+        return False
+
+    earn_days = int(row.get('earn_days', 999) or 999)
+    if 0 <= earn_days <= earn_block_days:
+        return False
+
+    if require_ready:
+        card = row.get('decision_card', {}) or {}
+        if str(card.get('execution_readiness', '')).upper() != "READY":
+            return False
+    return True
+
+
 def _heuristic_trade_finder_ai(candidate: Dict[str, Any]) -> Dict[str, Any]:
     """Fallback AI recommendation when Grok is unavailable."""
     price = float(candidate.get('price', 0) or 0)
@@ -2167,6 +2215,7 @@ def _run_trade_finder_workflow() -> None:
             'ticker': ticker,
             'company_name': company_name,
             'price': float(c.get('price', 0) or 0),
+            'earn_days': int(c.get('earn_days', 999) or 999),
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
@@ -2251,15 +2300,45 @@ def render_trade_finder_tab():
         st.info("Click Find New Trades to generate ranked candidates.")
         return
 
+    settings = _trade_quality_settings()
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        st.number_input(
+            "Min R:R",
+            min_value=0.5,
+            max_value=5.0,
+            step=0.1,
+            format="%.1f",
+            key="trade_min_rr_threshold",
+            help="Candidates below this risk/reward are excluded from Ready-to-Enter list.",
+        )
+    with fc2:
+        st.number_input(
+            "Block if earnings <= days",
+            min_value=0,
+            max_value=30,
+            step=1,
+            key="trade_earnings_block_days",
+            help="Candidates with earnings inside this window are excluded by default.",
+        )
+    with fc3:
+        st.checkbox(
+            "Require READY",
+            key="trade_require_ready",
+            help="Only include decision-card READY candidates.",
+        )
+    settings = _trade_quality_settings()
+    qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
+
     st.caption(
         f"Generated: {results.get('generated_at_iso', '')} | "
-        f"Candidates: {len(rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
+        f"Candidates: {len(rows)} | Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
         f"Provider: {results.get('provider', 'system')}"
     )
     st.caption("Snapshot is saved daily and restored after app restart.")
 
     table_rows = []
-    for r in rows:
+    for r in qualified_rows:
         card = r.get('decision_card', {}) or {}
         table_rows.append({
             'Ticker': r.get('ticker', ''),
@@ -2270,15 +2349,45 @@ def render_trade_finder_tab():
             'Suggested Stop Loss': f"${float(r.get('suggested_stop_loss', 0) or 0):.2f}",
             'Suggested Target': f"${float(r.get('suggested_target', 0) or 0):.2f}",
             'Risk/Reward': f"{float(r.get('risk_reward', 0) or 0):.2f}:1",
+            'Earn Days': int(r.get('earn_days', 999) or 999),
             'AI Rationale': r.get('ai_rationale', ''),
             'Rank': f"{float(r.get('rank_score', 0) or 0):.2f}",
             'Readiness': card.get('execution_readiness', ''),
             'Regime Fit': card.get('regime_fit_score', ''),
         })
-    st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+    if table_rows:
+        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
+    else:
+        st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
 
     st.markdown("### Open In New Trade")
-    for i, r in enumerate(rows[:25]):
+    sb1, sb2 = st.columns([1, 1])
+    with sb1:
+        stage_n = st.number_input("Stage Best N", min_value=1, max_value=20, value=5, step=1, key="tf_stage_best_n")
+    with sb2:
+        if st.button("🗂️ Stage Top Qualified", key="tf_stage_top_qualified", width="stretch"):
+            staged = 0
+            for r in qualified_rows[:int(stage_n)]:
+                plan = PlannedTrade(
+                    plan_id='',
+                    ticker=str(r.get('ticker', '')).upper().strip(),
+                    status='PLANNED',
+                    source='trade_finder',
+                    entry=float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
+                    stop=float(r.get('suggested_stop_loss', 0) or 0),
+                    target=float(r.get('suggested_target', 0) or 0),
+                    risk_reward=float(r.get('risk_reward', 0) or 0),
+                    ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
+                    rank_score=float(r.get('rank_score', 0) or 0),
+                    reason=str(r.get('reason', '') or ''),
+                    notes=str(r.get('ai_rationale', '') or ''),
+                )
+                jm.add_planned_trade(plan)
+                staged += 1
+            st.success(f"Staged {staged} qualified trade(s).")
+            st.rerun()
+
+    for i, r in enumerate(qualified_rows[:25]):
         ticker = r.get('ticker', '')
         card = r.get('decision_card', {}) or {}
         label = (
@@ -2296,6 +2405,7 @@ def render_trade_finder_tab():
                     'target': float(r.get('suggested_target', 0) or 0),
                     'ai_buy_recommendation': r.get('ai_buy_recommendation', ''),
                     'risk_reward': float(r.get('risk_reward', 0) or 0),
+                    'earn_days': int(r.get('earn_days', 999) or 999),
                     'reason': r.get('reason', ''),
                     'ai_rationale': r.get('ai_rationale', ''),
                     'provider': r.get('provider', 'system'),
@@ -6529,12 +6639,47 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         st.session_state[finder_note_applied_key] = True
     notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=notes_key)
     attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
+    quality_settings = _trade_quality_settings()
+    min_rr_required = float(quality_settings.get('min_rr', 2.0) or 2.0)
+    earnings_block_days = int(quality_settings.get('earn_block_days', 7) or 7)
+    confirm_rr = _calc_rr(float(confirm_entry or 0), float(confirm_stop or 0), float(confirm_target or 0))
+
+    ticker_earn_days = 999
+    try:
+        ef = st.session_state.get('earnings_flags', {}).get(ticker, {}) or {}
+        ticker_earn_days = int(ef.get('days_until', ef.get('days_until_earnings', 999)) or 999)
+    except Exception:
+        ticker_earn_days = 999
+    finder_earn_days = int(finder_for_ticker.get('earn_days', 999) or 999) if finder_for_ticker else 999
+    effective_earn_days = min(ticker_earn_days, finder_earn_days)
+
+    st.caption(
+        f"Entry guards: min R:R {min_rr_required:.1f} | block earnings <= {earnings_block_days}d | "
+        f"current R:R {confirm_rr:.2f}"
+    )
+    earnings_override = st.checkbox(
+        f"Override earnings window block (earnings <= {earnings_block_days}d)",
+        value=False,
+        key=f"earnings_override_{ticker}",
+        help="Allows entry despite imminent earnings. Use only for intentional earnings plays.",
+    )
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}", disabled=hard_block_stale):
         trades_today = _count_today_trade_entries()
         if hard_block_stale:
             st.error(
                 "Blocked: critical stale data streams. Run Fast Refresh and recheck before entering."
+            )
+        elif confirm_stop <= 0 or confirm_stop >= confirm_entry:
+            st.error("Blocked: stop must be below entry and greater than 0.")
+        elif confirm_target <= confirm_entry:
+            st.error("Blocked: target must be above entry.")
+        elif confirm_rr < min_rr_required:
+            st.error(f"Blocked: R:R {confirm_rr:.2f} is below minimum {min_rr_required:.1f}.")
+        elif 0 <= effective_earn_days <= earnings_block_days and not earnings_override:
+            st.error(
+                f"Blocked: earnings in {effective_earn_days} day(s). "
+                "Enable override only if this is an intentional earnings trade."
             )
         elif not gate.allow_new_trades:
             st.error(f"Blocked: {gate.label}. {gate.reason}")
@@ -8119,15 +8264,20 @@ def render_executive_dashboard():
 
     with q2:
         st.markdown("**Top Trade Candidates**")
-        tf_ranked = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        settings = _trade_quality_settings()
+        tf_ranked_all = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        tf_ranked = [r for r in tf_ranked_all if _trade_candidate_is_qualified(r, settings)]
         _find_new = st.session_state.get('find_new_trades_report', {}) or {}
         if _find_new.get('candidates'):
             st.caption(
                 f"Source: Find New Trades ({int(_find_new.get('scan_universe', 0) or 0)} tickers, "
                 f"{int(_find_new.get('watchlists_count', 0) or 0)} watchlists)"
             )
-        if tf_ranked:
-            st.caption("Source: Trade Finder ranked list")
+        if tf_ranked_all:
+            st.caption(
+                f"Source: Trade Finder ranked list (qualified {len(tf_ranked)}/{len(tf_ranked_all)} "
+                f"| min R:R {settings['min_rr']:.1f} | earnings>{settings['earn_block_days']}d)"
+            )
         if not gate.allow_new_trades:
             st.caption("New trade entries are blocked by current market gate.")
         elif not actionable and not tf_ranked:
@@ -8150,6 +8300,7 @@ def render_executive_dashboard():
                         'target': float(tr.get('suggested_target', 0) or 0),
                         'ai_buy_recommendation': ai_rec,
                         'risk_reward': rr,
+                        'earn_days': int(tr.get('earn_days', 999) or 999),
                         'reason': str(tr.get('reason', '') or ''),
                         'ai_rationale': str(tr.get('ai_rationale', '') or ''),
                         'provider': str(tr.get('provider', 'system') or 'system'),
