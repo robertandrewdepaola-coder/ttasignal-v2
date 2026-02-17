@@ -1587,6 +1587,9 @@ def render_scanner_table():
                                 bridge.add_to_watchlist(WatchlistItem(ticker=t))
                                 existing_set.add(t)
                                 added_count += 1
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
                         st.session_state['wl_version'] += 1
                         msg = f"✅ Added {added_count} ticker(s) | Total: {len(existing_set)}"
                         if rejected:
@@ -1620,6 +1623,9 @@ def render_scanner_table():
             with wl_col2:
                 if st.button("🗑️ Clear All", width="stretch", key="wl_clear"):
                     bridge.clear_watchlist()
+                    st.session_state.pop('wl_bulk_pending_unique', None)
+                    st.session_state.pop('wl_bulk_pending_rejected', None)
+                    st.session_state.pop('wl_bulk_pending_removed', None)
                     st.session_state['wl_version'] += 1
                     st.session_state['scan_results'] = []
                     st.session_state['scan_results_summary'] = []
