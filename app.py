@@ -2583,6 +2583,32 @@ def render_trade_finder_tab():
 
         primary_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() in {"Strong Buy", "Buy"}]
         watch_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() not in {"Strong Buy", "Buy"}]
+        view_mode = st.radio(
+            "View Mode",
+            ["Cards", "Table"],
+            horizontal=True,
+            key="tf_view_mode",
+        )
+
+        def _stage_candidate(_r: Dict[str, Any], _price: float, _rr: float, _rank: float, _reason: str, _notes: str):
+            _ticker = str(_r.get('ticker', '')).upper().strip()
+            plan = PlannedTrade(
+                plan_id='',
+                ticker=_ticker,
+                status='PLANNED',
+                source='trade_finder',
+                entry=float(_r.get('suggested_entry', _price) or _price or 0),
+                stop=float(_r.get('suggested_stop_loss', 0) or 0),
+                target=float(_r.get('suggested_target', 0) or 0),
+                risk_reward=_rr,
+                ai_recommendation=str(_r.get('ai_buy_recommendation', '') or ''),
+                rank_score=_rank,
+                trade_finder_run_id=str(_r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
+                reason=_reason,
+                notes=_notes,
+            )
+            st.success(jm.add_planned_trade(plan))
+            st.rerun()
 
         for group_label, group_rows, expanded in [
             ("🚀 Actionable Signals", primary_rows, True),
@@ -2591,6 +2617,16 @@ def render_trade_finder_tab():
             with st.expander(f"{group_label} ({len(group_rows)})", expanded=expanded):
                 if not group_rows:
                     st.caption("None in this group.")
+                if view_mode == "Table":
+                    h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([1.0, 2.2, 1.0, 1.4, 0.9, 0.8, 0.9, 2.4])
+                    h1.caption("Ticker")
+                    h2.caption("Company")
+                    h3.caption("Price")
+                    h4.caption("Verdict")
+                    h5.caption("R:R")
+                    h6.caption("Score")
+                    h7.caption("Earn")
+                    h8.caption("Actions")
                 for i, r in enumerate(group_rows[:40]):
                     ticker = str(r.get('ticker', '')).upper().strip()
                     company = str(r.get('company_name', '') or '').strip() or "Unknown company"
@@ -2603,50 +2639,58 @@ def render_trade_finder_tab():
                     rationale = str(r.get('ai_rationale', '') or str(r.get('scanner_summary', '') or '')).strip()
                     warnings = list(r.get('consistency_warnings', []) or [])
 
-                    with st.container(border=True):
-                        st.markdown(f"**{ticker} — {company}**")
-                        st.caption(
-                            f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
-                            f"Signal Score: {rank:.2f} | Earnings: {earn_days}d | "
-                            f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
-                        )
-                        st.caption(
-                            f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
-                            f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
-                            f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
-                            f"R:R {rr:.2f}:1"
-                        )
-                        st.caption(f"Signal Context: {signal_reason}")
-                        if rationale:
-                            st.caption(f"Analysis Note: {rationale}")
-                        for w in warnings[:3]:
-                            st.warning(f"Consistency warning: {w}")
-                        a1, a2, a3 = st.columns(3)
+                    if view_mode == "Table":
+                        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 2.2, 1.0, 1.4, 0.9, 0.8, 0.9, 2.4])
+                        c1.write(ticker)
+                        c2.write(company)
+                        c3.write(f"${price:.2f}")
+                        c4.write(ai_buy or "N/A")
+                        c5.write(f"{rr:.2f}:1")
+                        c6.write(f"{rank:.2f}")
+                        c7.write(f"{earn_days}d")
+                        a1, a2, a3 = c8.columns(3)
                         with a1:
-                            if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
+                            if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=1)
                         with a2:
-                            if st.button("✅ Place Trade", key=f"tf_trade_{group_label}_{i}_{ticker}", width="stretch"):
+                            if st.button("✅", key=f"tf_tbl_trade_{group_label}_{i}_{ticker}", help="Place Trade", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=4)
                         with a3:
-                            if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
-                                plan = PlannedTrade(
-                                    plan_id='',
-                                    ticker=ticker,
-                                    status='PLANNED',
-                                    source='trade_finder',
-                                    entry=float(r.get('suggested_entry', price) or price or 0),
-                                    stop=float(r.get('suggested_stop_loss', 0) or 0),
-                                    target=float(r.get('suggested_target', 0) or 0),
-                                    risk_reward=rr,
-                                    ai_recommendation=ai_buy,
-                                    rank_score=rank,
-                                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-                                    reason=signal_reason,
-                                    notes=rationale,
-                                )
-                                st.success(jm.add_planned_trade(plan))
-                                st.rerun()
+                            if st.button("🗂️", key=f"tf_tbl_stage_{group_label}_{i}_{ticker}", help="Stage Ticket", width="stretch"):
+                                _stage_candidate(r, price, rr, rank, signal_reason, rationale)
+                        if signal_reason:
+                            st.caption(f"{ticker}: {signal_reason}")
+                        for w in warnings[:2]:
+                            st.caption(f"⚠ {w}")
+                    else:
+                        with st.container(border=True):
+                            st.markdown(f"**{ticker} — {company}**")
+                            st.caption(
+                                f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
+                                f"Signal Score: {rank:.2f} | Earnings: {earn_days}d | "
+                                f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
+                            )
+                            st.caption(
+                                f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
+                                f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
+                                f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
+                                f"R:R {rr:.2f}:1"
+                            )
+                            st.caption(f"Signal Context: {signal_reason}")
+                            if rationale:
+                                st.caption(f"Analysis Note: {rationale}")
+                            for w in warnings[:3]:
+                                st.warning(f"Consistency warning: {w}")
+                            a1, a2, a3 = st.columns(3)
+                            with a1:
+                                if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _open_candidate_for_action(r, detail_tab=1)
+                            with a2:
+                                if st.button("✅ Place Trade", key=f"tf_trade_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _open_candidate_for_action(r, detail_tab=4)
+                            with a3:
+                                if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _stage_candidate(r, price, rr, rank, signal_reason, rationale)
 
     st.markdown("### Open In New Trade")
     sb1, sb2 = st.columns([1, 1])
