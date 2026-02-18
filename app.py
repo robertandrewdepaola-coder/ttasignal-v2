@@ -1394,7 +1394,7 @@ def render_sidebar():
         )
         st.session_state['exec_dashboard_beta_enabled'] = beta_enabled
 
-        s1, s2 = st.columns(2)
+        s1, s2, s3 = st.columns(3)
         with s1:
             if st.button("🔑 Reset API", key="reset_api_cache",
                          help="Clear cached API key status after updating secrets"):
@@ -1421,6 +1421,33 @@ def render_sidebar():
                 for k in [k for k in list(st.session_state.keys()) if k.startswith('_apex_cache_')]:
                     st.session_state.pop(k, None)
                 st.toast("✅ Market data will refresh on next load.")
+        with s3:
+            if st.button("☁ Restore WL", key="restore_watchlists_from_backup",
+                         help="Force-restore watchlist files from GitHub backup branch."):
+                try:
+                    import os
+                    import github_backup
+                    # Force restore by removing local watchlist files first.
+                    for fn in ["v2_multi_watchlist.json", "v2_watchlist.json"]:
+                        try:
+                            if os.path.exists(fn):
+                                os.remove(fn)
+                        except Exception:
+                            pass
+                    restored = github_backup.restore_all() or {}
+
+                    # Reinitialize watchlist manager/bridge in current session.
+                    _wm = WatchlistManager()
+                    st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, get_journal())
+                    _active = _wm.get_active_watchlist()
+                    if _active and _active.get("id"):
+                        load_scan_for_watchlist(_active["id"])
+
+                    restored_count = sum(1 for v in restored.values() if v)
+                    st.toast(f"✅ Restore complete ({restored_count} file(s) restored).")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Restore failed: {str(e)[:180]}")
 
         # Key diagnostic
         try:
