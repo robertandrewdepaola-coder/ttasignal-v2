@@ -2089,6 +2089,38 @@ def _extract_rr_from_text(text: str) -> Optional[float]:
         return None
 
 
+def _lookup_company_name_for_trade_finder(ticker: str) -> str:
+    """
+    Best-effort company-name lookup for Trade Finder rows.
+
+    Uses cached fundamental profile by ticker. Never infers names from ticker string.
+    """
+    t = str(ticker or '').upper().strip()
+    if not t:
+        return "Unknown company"
+
+    cache = st.session_state.get('_tf_company_name_cache')
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state['_tf_company_name_cache'] = cache
+    if t in cache:
+        return str(cache.get(t, "Unknown company") or "Unknown company")
+
+    name = ""
+    try:
+        from data_fetcher import fetch_fundamental_profile
+        profile = fetch_fundamental_profile(t) or {}
+        name = str(profile.get('name', '') or '').strip()
+    except Exception:
+        name = ""
+
+    if not name:
+        name = "Unknown company"
+    cache[t] = name
+    st.session_state['_tf_company_name_cache'] = cache
+    return name
+
+
 def _normalize_gold_ai_contract(
     ticker: str,
     row: Dict[str, Any],
@@ -2367,8 +2399,9 @@ def _run_trade_finder_workflow() -> None:
     _t0 = time.time()
     for c in base_candidates:
         ticker = str(c.get('ticker', '')).upper().strip()
-        # Strict rule: do not infer company from ticker/price/external lookup.
-        company_name = str(c.get('company_name', '') or '').strip() or "Unknown company"
+        company_name = str(c.get('company_name', '') or '').strip()
+        if not company_name:
+            company_name = _lookup_company_name_for_trade_finder(ticker)
 
         ai_rec = _grok_trade_finder_assessment(c, ai_clients)
         entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
