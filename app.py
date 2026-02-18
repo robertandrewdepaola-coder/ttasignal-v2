@@ -1990,18 +1990,18 @@ def _calc_rr(entry: float, stop: float, target: float) -> float:
 def _trade_quality_settings() -> Dict[str, Any]:
     """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
     if 'trade_min_rr_threshold' not in st.session_state:
-        st.session_state['trade_min_rr_threshold'] = 2.0
+        st.session_state['trade_min_rr_threshold'] = 1.2
     if 'trade_earnings_block_days' not in st.session_state:
-        st.session_state['trade_earnings_block_days'] = 7
+        st.session_state['trade_earnings_block_days'] = 3
     if 'trade_require_ready' not in st.session_state:
-        st.session_state['trade_require_ready'] = True
+        st.session_state['trade_require_ready'] = False
     if 'trade_include_watch_only' not in st.session_state:
-        st.session_state['trade_include_watch_only'] = False
+        st.session_state['trade_include_watch_only'] = True
     return {
-        'min_rr': float(st.session_state.get('trade_min_rr_threshold', 2.0) or 2.0),
-        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
-        'require_ready': bool(st.session_state.get('trade_require_ready', True)),
-        'include_watch_only': bool(st.session_state.get('trade_include_watch_only', False)),
+        'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
+        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 3) or 3),
+        'require_ready': bool(st.session_state.get('trade_require_ready', False)),
+        'include_watch_only': bool(st.session_state.get('trade_include_watch_only', True)),
     }
 
 
