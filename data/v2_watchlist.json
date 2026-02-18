@@ -5612,5 +5612,19 @@
     "notes": "",
     "is_favorite": false,
     "focus_label": ""
+  },
+  {
+    "ticker": "CVX",
+    "added_date": "2026-02-18",
+    "signal_type": "",
+    "quality_grade": "",
+    "recommendation": "",
+    "conviction": 0,
+    "entry_zone_low": 0,
+    "entry_zone_high": 0,
+    "stop_price": 0,
+    "notes": "",
+    "is_favorite": false,
+    "focus_label": ""
   }
 ]
