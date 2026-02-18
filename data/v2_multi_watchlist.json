@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "93a4b8f1-a1e4-43c6-bff5-4132cf755b6e",
+  "active_watchlist_id": "9770d065-fe66-4261-86de-304c885e184d",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -419,6 +419,41 @@
       ],
       "created_at": "2026-02-18T19:20:31.789018",
       "last_updated": "2026-02-18T19:20:48.665252"
+    },
+    {
+      "id": "9770d065-fe66-4261-86de-304c885e184d",
+      "name": "Rising Profit",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "ADSK",
+        "AGI",
+        "ANET",
+        "APH",
+        "BMRN",
+        "CLS",
+        "CRS",
+        "CYD",
+        "EPAC",
+        "EXPE",
+        "FICO",
+        "FIX",
+        "HWM",
+        "MOD",
+        "NBIX",
+        "NFLX",
+        "NVMI",
+        "PLNT",
+        "PLTR",
+        "PRL",
+        "RCL",
+        "SIS",
+        "STRL",
+        "TAYD",
+        "WWD"
+      ],
+      "created_at": "2026-02-18T19:21:05.166324",
+      "last_updated": "2026-02-18T19:21:26.066670"
     }
   ]
 }
