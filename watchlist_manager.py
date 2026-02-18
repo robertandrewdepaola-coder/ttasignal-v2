@@ -462,7 +462,15 @@ class WatchlistManager:
         """
         meta = self.data.get("metadata", {})
         if meta.get("migrated_from_journal"):
-            return False, "Already migrated"
+            # Self-heal path:
+            # If multi-watchlist storage is effectively empty, allow re-migration from legacy journal.
+            total_tickers = 0
+            for w in self.data.get("watchlists", []):
+                total_tickers += len(w.get("tickers", []) or [])
+            if total_tickers > 0:
+                return False, "Already migrated"
+            meta["migrated_from_journal"] = False
+            self.data["metadata"] = meta
 
         try:
             master = self._find(MASTER_ID)
