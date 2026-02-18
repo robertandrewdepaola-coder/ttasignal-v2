@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "24514e8e-836e-4311-84d1-7e014cd7b4f6",
+  "active_watchlist_id": "a452853c-0bbe-4ce9-905b-1d5c5c8a6cc5",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -644,6 +644,15 @@
       ],
       "created_at": "2026-02-18T19:34:49.418467",
       "last_updated": "2026-02-18T19:35:13.243901"
+    },
+    {
+      "id": "a452853c-0bbe-4ce9-905b-1d5c5c8a6cc5",
+      "name": "Consumer Discretionary",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-18T19:35:37.503115",
+      "last_updated": "2026-02-18T19:35:37.503115"
     }
   ]
 }
