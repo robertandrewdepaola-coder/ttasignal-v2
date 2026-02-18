@@ -30,5 +30,21 @@
     "created_date": "2026-02-18",
     "expires_date": "2026-03-20",
     "status": "PENDING"
+  },
+  {
+    "ticker": "CRS",
+    "condition_type": "breakout_volume",
+    "trigger_price": 390.7,
+    "volume_multiplier": 1.5,
+    "stop_price": 333.96,
+    "target_price": 456.72,
+    "position_size_pct": 12.5,
+    "notes": "AI: Overhead resistance at $390.70 (52-week high, 4.2% above) is a concern. Wait for a breakout above $3",
+    "conviction": 10,
+    "signal_type": "",
+    "quality_grade": "B",
+    "created_date": "2026-02-18",
+    "expires_date": "2026-03-20",
+    "status": "PENDING"
   }
 ]
