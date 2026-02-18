@@ -55,6 +55,9 @@ from watchlist_bridge import WatchlistBridge
 from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
 from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
+from backup_health import get_backup_health_status, run_backup_now
+from system_self_test import run_system_self_test
+from trade_finder_helpers import build_planned_trade, build_trade_finder_selection
 
 
 # =============================================================================
@@ -1451,8 +1454,9 @@ def render_sidebar():
 
         # Backup health (watchlist persistence confidence)
         try:
-            import github_backup
-            _b = github_backup.status()
+            _b = get_backup_health_status()
+            if not _b.get("available", False):
+                raise RuntimeError(str(_b.get("last_error", "backup status unavailable")))
             _enabled = bool(_b.get("enabled", False))
             _pending = int(_b.get("pending_count", 0) or 0)
             _last_ok = float(_b.get("last_success_epoch", 0.0) or 0.0)
@@ -1470,15 +1474,30 @@ def render_sidebar():
             if _enabled:
                 if st.button("☁ Backup Now", key="force_backup_now", width="stretch"):
                     try:
-                        pushed = int(github_backup.flush() or 0)
-                        if pushed <= 0:
-                            pushed = int(github_backup.force_backup_all() or 0)
+                        pushed = int(run_backup_now() or 0)
                         st.toast(f"✅ Backup complete ({pushed} file(s) pushed).")
                         st.rerun()
                     except Exception as _be:
                         st.error(f"Backup flush failed: {str(_be)[:180]}")
         except Exception:
             st.caption("☁ Backup status unavailable")
+
+        if st.button("🧪 Run System Self-Test", key="run_system_self_test", width="stretch"):
+            _health = st.session_state.get('_system_health_snapshot') or _compute_system_health(force=True)
+            _backup = get_backup_health_status()
+            _report = run_system_self_test(_health, _backup)
+            st.session_state['_latest_system_self_test'] = _report
+            if _report.get('overall_ok'):
+                st.toast("🟢 System self-test passed.")
+            else:
+                st.toast(f"🔴 System self-test failed ({len(_report.get('failures', []))} issues).")
+            st.rerun()
+        _last_self_test = st.session_state.get('_latest_system_self_test') or {}
+        if _last_self_test:
+            _summary = str(_last_self_test.get('summary', '') or '').strip()
+            st.caption(f"🧪 Self-test: {_summary}")
+            for _f in (_last_self_test.get('failures', []) or [])[:2]:
+                st.caption(f"• {str(_f.get('name', 'check'))}: {str(_f.get('detail', ''))[:110]}")
 
         # Key diagnostic
         try:
@@ -2562,20 +2581,11 @@ def render_trade_finder_tab():
 
         def _open_candidate_for_action(_r: Dict[str, Any], detail_tab: int):
             _ticker = str(_r.get('ticker', '')).upper().strip()
-            st.session_state['trade_finder_selected_trade'] = {
-                'ticker': _ticker,
-                'entry': float(_r.get('suggested_entry', _r.get('price', 0)) or _r.get('price', 0) or 0),
-                'stop': float(_r.get('suggested_stop_loss', 0) or 0),
-                'target': float(_r.get('suggested_target', 0) or 0),
-                'ai_buy_recommendation': _r.get('ai_buy_recommendation', ''),
-                'risk_reward': float(_r.get('risk_reward', 0) or 0),
-                'earn_days': int(_r.get('earn_days', 999) or 999),
-                'reason': _r.get('reason', ''),
-                'ai_rationale': _r.get('ai_rationale', ''),
-                'provider': _r.get('provider', 'system'),
-                'generated_at_iso': results.get('generated_at_iso', ''),
-                'trade_finder_run_id': str(_r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-            }
+            st.session_state['trade_finder_selected_trade'] = build_trade_finder_selection(
+                _r,
+                generated_at_iso=str(results.get('generated_at_iso', '') or ''),
+                run_id=str(results.get('run_id', '') or ''),
+            )
             st.session_state['default_detail_tab'] = detail_tab
             st.session_state['_switch_to_scanner_tab'] = True
             _load_ticker_for_view(_ticker)
@@ -2591,22 +2601,14 @@ def render_trade_finder_tab():
         )
 
         def _stage_candidate(_r: Dict[str, Any], _price: float, _rr: float, _rank: float, _reason: str, _notes: str):
-            _ticker = str(_r.get('ticker', '')).upper().strip()
-            plan = PlannedTrade(
-                plan_id='',
-                ticker=_ticker,
-                status='PLANNED',
-                source='trade_finder',
-                entry=float(_r.get('suggested_entry', _price) or _price or 0),
-                stop=float(_r.get('suggested_stop_loss', 0) or 0),
-                target=float(_r.get('suggested_target', 0) or 0),
-                risk_reward=_rr,
-                ai_recommendation=str(_r.get('ai_buy_recommendation', '') or ''),
-                rank_score=_rank,
-                trade_finder_run_id=str(_r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-                reason=_reason,
-                notes=_notes,
-            )
+            # Canonical builder keeps staging payload consistent with New Trade prefill.
+            _tmp = dict(_r)
+            _tmp['price'] = _price
+            _tmp['risk_reward'] = _rr
+            _tmp['rank_score'] = _rank
+            _tmp['reason'] = _reason
+            _tmp['ai_rationale'] = _notes
+            plan = build_planned_trade(_tmp, run_id=str(results.get('run_id', '') or ''))
             st.success(jm.add_planned_trade(plan))
             st.rerun()
 
@@ -2700,21 +2702,7 @@ def render_trade_finder_tab():
         if st.button("🗂️ Stage Top Qualified", key="tf_stage_top_qualified", width="stretch"):
             staged = 0
             for r in qualified_rows[:int(stage_n)]:
-                plan = PlannedTrade(
-                    plan_id='',
-                    ticker=str(r.get('ticker', '')).upper().strip(),
-                    status='PLANNED',
-                    source='trade_finder',
-                    entry=float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
-                    stop=float(r.get('suggested_stop_loss', 0) or 0),
-                    target=float(r.get('suggested_target', 0) or 0),
-                    risk_reward=float(r.get('risk_reward', 0) or 0),
-                    ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
-                    rank_score=float(r.get('rank_score', 0) or 0),
-                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-                    reason=str(r.get('reason', '') or ''),
-                    notes=str(r.get('ai_rationale', '') or ''),
-                )
+                plan = build_planned_trade(r, run_id=str(results.get('run_id', '') or ''))
                 jm.add_planned_trade(plan)
                 staged += 1
             st.success(f"Staged {staged} qualified trade(s).")
