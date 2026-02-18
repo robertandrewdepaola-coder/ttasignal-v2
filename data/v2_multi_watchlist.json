@@ -314,6 +314,15 @@
       ],
       "created_at": "2026-02-18T09:13:36.664419",
       "last_updated": "2026-02-18T09:14:13.021183"
+    },
+    {
+      "id": "eb6090c1-2427-4603-81f0-89fac6d58ce9",
+      "name": "Five Star",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-18T19:19:54.060111",
+      "last_updated": "2026-02-18T19:19:54.060111"
     }
   ]
 }
