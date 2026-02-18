@@ -1999,6 +1999,82 @@ def _calc_rr(entry: float, stop: float, target: float) -> float:
     return round(reward / risk, 2)
 
 
+def _extract_rr_from_text(text: str) -> Optional[float]:
+    """Extract first R:R-like token (e.g. 1.8:1) from model text."""
+    if not text:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*:\s*1\b", str(text))
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
+def _normalize_gold_ai_contract(
+    ticker: str,
+    row: Dict[str, Any],
+    *,
+    fallback_ai_buy: str,
+    fallback_rank_score: float,
+) -> Dict[str, Any]:
+    """
+    Unified AI recommendation contract.
+    Gold source: Ask AI cached analysis (ai_result_<ticker>) when available.
+    """
+    entry = float(row.get('entry', row.get('price', 0)) or 0)
+    stop = float(row.get('stop', 0) or 0)
+    target = float(row.get('target', 0) or 0)
+    level_rr = _calc_rr(entry, stop, target)
+
+    ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
+    action_text = str(ai_result.get('action', ai_result.get('timing', '')) or '').upper()
+    raw_text = str(ai_result.get('raw_text', '') or '')
+    conv = int(ai_result.get('conviction', 0) or 0)
+    pos_size = str(ai_result.get('position_sizing', '') or '').lower()
+    provider = str(ai_result.get('provider', 'system') or 'system')
+
+    verdict = fallback_ai_buy if fallback_ai_buy in {"Strong Buy", "Buy", "Watch Only", "Skip"} else "Watch Only"
+    if action_text:
+        if any(k in action_text for k in ["PASS", "SKIP"]):
+            verdict = "Skip"
+        elif "HOLD" in action_text:
+            verdict = "Watch Only"
+        elif "BUY" in action_text:
+            verdict = "Strong Buy" if conv >= 8 else "Buy"
+
+    rr_from_text = _extract_rr_from_text(raw_text)
+    rr = rr_from_text if rr_from_text and rr_from_text > 0 else level_rr
+
+    size_adj = 0.0
+    if "full" in pos_size:
+        size_adj = 1.0
+    elif "reduced" in pos_size:
+        size_adj = 0.4
+    elif "small" in pos_size:
+        size_adj = 0.15
+    elif "skip" in pos_size:
+        size_adj = -0.6
+
+    verdict_adj = {"Strong Buy": 1.1, "Buy": 0.5, "Watch Only": -0.2, "Skip": -1.0}.get(verdict, 0.0)
+    conv_adj = max(-0.5, min(0.9, (conv - 5) * 0.1))
+    rr_adj = max(-0.5, min(1.2, (rr - 1.5) * 0.35))
+    unified_score = round(float(fallback_rank_score or 0) + verdict_adj + conv_adj + rr_adj + size_adj, 2)
+
+    note = str(ai_result.get('why_moving', '') or ai_result.get('smart_money', '') or '')[:180]
+    return {
+        'verdict': verdict,
+        'confidence': conv,
+        'risk_reward': round(rr, 2),
+        'provider': provider,
+        'position_sizing': ai_result.get('position_sizing', ''),
+        'unified_rank_score': unified_score,
+        'note': note,
+        'is_gold_source': bool(ai_result),
+    }
+
+
 def _trade_quality_settings() -> Dict[str, Any]:
     """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
     if 'trade_min_rr_threshold' not in st.session_state:
@@ -2232,6 +2308,17 @@ def _run_trade_finder_workflow() -> None:
         hinted_earn_days = _extract_earn_days_hint(rationale)
         if hinted_earn_days is not None and abs(hinted_earn_days - earn_days) > 1:
             warnings.append(f"Model note earnings hint ({hinted_earn_days}d) conflicts with signal ({earn_days}d)")
+        gold = _normalize_gold_ai_contract(
+            ticker,
+            {
+                'entry': entry,
+                'stop': stop,
+                'target': target,
+                'price': float(c.get('price', 0) or 0),
+            },
+            fallback_ai_buy=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
+            fallback_rank_score=float(ai_rec.get('rank_score', 0) or 0),
+        )
         rows.append({
             'ticker': ticker,
             'trade_finder_run_id': run_id,
@@ -2241,38 +2328,41 @@ def _run_trade_finder_workflow() -> None:
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
-            'ai_buy_recommendation': ai_rec.get('ai_buy_recommendation', 'Watch Only'),
+            'ai_buy_recommendation': gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')),
             'suggested_entry': round(entry, 2),
             'suggested_stop_loss': round(stop, 2),
             'suggested_target': round(target, 2),
-            'risk_reward': round(rr, 2),
+            'risk_reward': round(float(gold.get('risk_reward', rr) or rr), 2),
             'ai_reported_rr': round(ai_rr, 2),
-            'rank_score': float(ai_rec.get('rank_score', 0) or 0),
+            'rank_score': float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
             'ai_rationale': rationale,
+            'ai_confidence': int(gold.get('confidence', 0) or 0),
+            'ai_position_sizing': str(gold.get('position_sizing', '') or ''),
+            'gold_source': bool(gold.get('is_gold_source', False)),
             'consistency_warnings': warnings,
-            'provider': ai_rec.get('provider', 'system'),
+            'provider': gold.get('provider', ai_rec.get('provider', 'system')),
             'decision_card': build_trade_decision_card(
                 ticker=ticker,
                 source="trade_finder",
                 recommendation=str(c.get('recommendation', '') or ''),
-                ai_buy_recommendation=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
-                conviction=int(c.get('conviction', 0) or 0),
+                ai_buy_recommendation=str(gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')) or 'Watch Only'),
+                conviction=max(int(c.get('conviction', 0) or 0), int(gold.get('confidence', 0) or 0)),
                 quality_grade=str(c.get('quality_grade', '?') or '?'),
                 entry=entry,
                 stop=stop,
                 target=target,
-                rank_score=float(ai_rec.get('rank_score', 0) or 0),
+                rank_score=float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
                 regime=snap.regime,
                 gate_status=gate.status,
                 reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
-                ai_rationale=str(ai_rec.get('rationale', '') or ''),
+                ai_rationale=str(gold.get('note', '') or ai_rec.get('rationale', '') or ''),
                 sector_phase=str(c.get('sector_phase', '') or ''),
                 earn_days=earn_days,
                 explainability_bits=[
                     f"rec={str(c.get('recommendation', '') or '')}",
                     f"conv={int(c.get('conviction', 0) or 0)}",
                     f"phase={str(c.get('sector_phase', '') or '')}",
-                    f"rr={rr:.2f}",
+                    f"rr={float(gold.get('risk_reward', rr) or rr):.2f}",
                 ],
             ).to_dict(),
         })
@@ -2459,7 +2549,8 @@ def render_trade_finder_tab():
                         st.markdown(f"**{ticker} — {company}**")
                         st.caption(
                             f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
-                            f"Signal Score: {rank:.2f} | Earnings: {earn_days}d"
+                            f"Signal Score: {rank:.2f} | Earnings: {earn_days}d | "
+                            f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                         )
                         st.caption(
                             f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
@@ -2469,7 +2560,7 @@ def render_trade_finder_tab():
                         )
                         st.caption(f"Signal Context: {signal_reason}")
                         if rationale:
-                            st.caption(f"Model Note: {rationale}")
+                            st.caption(f"Analysis Note: {rationale}")
                         for w in warnings[:3]:
                             st.warning(f"Consistency warning: {w}")
                         a1, a2, a3 = st.columns(3)
