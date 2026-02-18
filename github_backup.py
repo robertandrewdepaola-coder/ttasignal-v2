@@ -41,7 +41,7 @@ BACKUP_FILES = [
 ]
 
 BACKUP_BRANCH = "data-backup"
-DEBOUNCE_SECONDS = 30  # Minimum seconds between pushes per file
+DEBOUNCE_SECONDS = 120  # Minimum seconds between pushes per file
 GITHUB_API = "https://api.github.com"
 
 
@@ -324,25 +324,44 @@ class GitHubBackup:
         if sha:
             payload["sha"] = sha
 
-        resp = requests.put(url, headers=self.headers, json=payload, timeout=15)
+        for attempt in range(2):
+            resp = requests.put(url, headers=self.headers, json=payload, timeout=15)
 
-        if resp.status_code in (200, 201):
-            # Update SHA cache
-            new_sha = resp.json().get("content", {}).get("sha")
-            if new_sha:
-                self._sha_cache[github_path] = new_sha
-            self._last_error = ""
-            self._last_error_code = 0
-            return True
-        else:
-            error_msg = resp.json().get("message", "unknown error")
-            self._last_error = error_msg
+            if resp.status_code in (200, 201):
+                # Update SHA cache
+                try:
+                    new_sha = (resp.json() or {}).get("content", {}).get("sha")
+                except Exception:
+                    new_sha = None
+                if new_sha:
+                    self._sha_cache[github_path] = new_sha
+                self._last_error = ""
+                self._last_error_code = 0
+                return True
+
+            # Best-effort parse; GitHub can return non-JSON on transient upstream errors.
+            try:
+                error_msg = (resp.json() or {}).get("message", "unknown error")
+            except Exception:
+                error_msg = (resp.text or "unknown error")[:180]
+
+            # If SHA mismatch (409), refresh SHA and retry once.
+            if resp.status_code == 409 and attempt == 0:
+                self._sha_cache.pop(github_path, None)
+                refreshed_sha = self._get_remote_sha(github_path)
+                if refreshed_sha:
+                    payload["sha"] = refreshed_sha
+                else:
+                    payload.pop("sha", None)
+                time.sleep(0.2)
+                continue
+
+            self._last_error = str(error_msg)
             self._last_error_code = int(resp.status_code or 0)
             print(f"[backup] GitHub push error for {filename}: {resp.status_code} — {error_msg}")
-            # If SHA mismatch (409), clear cache and retry once
-            if resp.status_code == 409:
-                self._sha_cache.pop(github_path, None)
             return False
+
+        return False
 
     def _restore_file(self, filename: str) -> bool:
         """Pull a single file from GitHub and write locally."""

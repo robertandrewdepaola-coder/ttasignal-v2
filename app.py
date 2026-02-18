@@ -21,7 +21,7 @@ import pandas as pd
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -909,7 +909,7 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
     price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
 
     ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    ts_utc = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    ts_utc = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
     now_et = datetime.now(ZoneInfo("America/New_York"))
     market_open = (
         now_et.weekday() < 5
@@ -1064,11 +1064,29 @@ def render_sidebar():
             # Save current watchlist's scan results before switching
             save_scan_for_watchlist(active_wl["id"])
             # Switch active watchlist
-            _wm.set_active_watchlist(selected_id)
+            ok, msg = _wm.set_active_watchlist(selected_id)
+            if not ok:
+                st.sidebar.error(f"Watchlist switch failed: {msg}")
+                # Self-heal stale in-memory manager state by reloading from disk.
+                _wm = WatchlistManager()
+                st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, get_journal())
+                ok, msg = _wm.set_active_watchlist(selected_id)
+                if not ok:
+                    st.sidebar.error(f"Watchlist recovery failed: {msg}")
+                    st.rerun()
             # Load target watchlist's scan results
             load_scan_for_watchlist(selected_id)
             st.session_state['ticker_data_cache'] = {}
+            st.session_state['selected_analysis'] = None
+            st.session_state['selected_ticker'] = None
             st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1
+            # Verify active watchlist actually switched (guards stale bridge/session references).
+            _active_post = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+            if str(_active_post.get("id", "")) != str(selected_id):
+                _wm2 = WatchlistManager()
+                st.session_state['watchlist_bridge'] = WatchlistBridge(_wm2, get_journal())
+                _wm2.set_active_watchlist(selected_id)
+                load_scan_for_watchlist(selected_id)
             st.rerun()
     else:
         # Single watchlist — just show create button
@@ -1541,24 +1559,55 @@ def render_sidebar():
             st.caption("🔑 Could not read secrets")
 
 
-def _load_ticker_for_view(ticker: str):
+def _load_ticker_for_view(ticker: str) -> bool:
     """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.).
     
     NOTE: No st.rerun() needed here. Button clicks already trigger a Streamlit rerun.
     Setting session state is enough — render_detail_view() runs later in the same pass
     and picks up the new state. Avoiding rerun eliminates a full double-repaint of the
     200+ ticker scanner table.
+    Returns:
+        bool: True when ticker analysis is available for detail/chart rendering.
     """
     ticker = ticker.upper().strip()
+    st.session_state.pop('_ticker_load_error', None)
+
+    def _ensure_chart_cache(_ticker: str) -> bool:
+        """Guarantee daily/weekly/monthly data exists for chart rendering."""
+        cache = st.session_state.get('ticker_data_cache', {}) or {}
+        _cached = cache.get(_ticker, {}) if isinstance(cache, dict) else {}
+        if _cached and _cached.get('daily') is not None:
+            return True
+        # Prefer data already fetched by Trade Finder scan run.
+        tf_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+        _tf = tf_cache.get(_ticker, {}) if isinstance(tf_cache, dict) else {}
+        if _tf and _tf.get('daily') is not None:
+            cache[_ticker] = _tf
+            st.session_state['ticker_data_cache'] = cache
+            return True
+        try:
+            _data = fetch_all_ticker_data(_ticker)
+            if _data.get('daily') is None:
+                return False
+            cache[_ticker] = _data
+            st.session_state['ticker_data_cache'] = cache
+            return True
+        except Exception:
+            return False
 
     # Check if we already have analysis from a scan (instant — no API call)
     results = st.session_state.get('scan_results', [])
     for r in results:
         if r.ticker == ticker:
+            if not _ensure_chart_cache(ticker):
+                msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+                st.session_state['_ticker_load_error'] = msg
+                st.sidebar.error(msg)
+                return False
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
             st.session_state['scroll_to_detail'] = True
-            return  # No rerun — current pass will render detail view
+            return True  # No rerun — current pass will render detail view
 
     # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
     try:
@@ -1575,10 +1624,17 @@ def _load_ticker_for_view(ticker: str):
             # Clear stale APEX cache (new data = needs re-detection)
             st.session_state.pop(f'_apex_cache_{ticker}', None)
             # No rerun — current pass will render detail view
+            return True
         else:
-            st.sidebar.error(f"No data for {ticker}")
+            msg = f"No data for {ticker}"
+            st.session_state['_ticker_load_error'] = msg
+            st.sidebar.error(msg)
+            return False
     except Exception as e:
-        st.sidebar.error(f"Error loading {ticker}: {e}")
+        msg = f"Error loading {ticker}: {e}"
+        st.session_state['_ticker_load_error'] = msg
+        st.sidebar.error(msg)
+        return False
 
 
 def _resolve_tickers_to_scan(full_list: List[str], existing_summary: List[Dict], mode: str) -> List[str]:
@@ -1762,10 +1818,10 @@ def _run_scan(mode='all'):
             elif vol_ratio >= 1.5:
                 vol_str = f"📈{vol_str}"
 
-            # Earnings data for persistence
-            earn = earnings_flags.get(r.ticker, {})
-            earn_date = earn.get('next_earnings', '')
-            earn_days = earn.get('days_until', 999)
+            # Earnings data for persistence (canonical resolver).
+            earn = resolve_earnings_for_ticker(r.ticker)
+            earn_date = str(earn.get('next_earnings', '') or '')
+            earn_days = int(earn.get('days_until', 999) or 999)
 
             # Re-entry recency (bars ago)
             reentry_bars_ago = 0
@@ -1779,10 +1835,15 @@ def _run_scan(mode='all'):
             sector_info = sector_rotation.get(sector_name, {})
             sector_phase = sector_info.get('phase', '')
 
+            rec_adj = _adjust_recommendation_for_sector(
+                str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+                int(rec.get('conviction', 0) or 0),
+                sector_phase,
+            )
             summary.append({
                 'ticker': r.ticker,
-                'recommendation': rec.get('recommendation', 'SKIP'),
-                'conviction': rec.get('conviction', 0),
+                'recommendation': rec_adj.get('recommendation', rec.get('recommendation', 'SKIP')),
+                'conviction': rec_adj.get('conviction', rec.get('conviction', 0)),
                 'quality_grade': q.get('quality_grade', '?'),
                 'price': r.current_price,
                 'summary': rec.get('summary', ''),
@@ -1928,6 +1989,23 @@ def _run_find_new_trades():
 
         all_data = fetch_scan_data(universe)
         results = scan_watchlist(all_data)
+        # Reuse scan-time price history for Trade Finder chart opens to avoid
+        # per-click refetch/rate-limit failures.
+        tf_data_cache: Dict[str, Dict[str, Any]] = {}
+        for _t, _d in (all_data or {}).items():
+            if not isinstance(_d, dict):
+                continue
+            _daily = _d.get('daily')
+            if _daily is None:
+                continue
+            tf_data_cache[_t] = {
+                'ticker': _t,
+                'daily': _daily,
+                'weekly': _d.get('weekly'),
+                'monthly': _d.get('monthly'),
+                'current_price': _d.get('current_price'),
+            }
+        st.session_state['_find_new_ticker_data_cache'] = tf_data_cache
 
         # Pull current supporting context.
         sector_rotation = st.session_state.get('sector_rotation', {}) or {}
@@ -1964,21 +2042,28 @@ def _run_find_new_trades():
         for r in results:
             rec = r.recommendation or {}
             q = r.quality or {}
-            rec_text = str(rec.get('recommendation', 'SKIP'))
-            earn = earnings_flags.get(r.ticker, {}) or {}
+            earn = resolve_earnings_for_ticker(r.ticker)
             sector_name = ticker_sectors.get(r.ticker, '')
             sector_info = sector_rotation.get(sector_name, {}) if sector_name else {}
+            sector_phase = str(sector_info.get('phase', '') or '')
+            rec_adj = _adjust_recommendation_for_sector(
+                str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+                int(rec.get('conviction', 0) or 0),
+                sector_phase,
+            )
+            rec_text = str(rec_adj.get('recommendation', 'SKIP') or 'SKIP')
+            conv_adj = int(rec_adj.get('conviction', int(rec.get('conviction', 0) or 0)) or 0)
 
             row = {
                 'ticker': r.ticker,
                 'recommendation': rec_text,
-                'conviction': int(rec.get('conviction', 0) or 0),
+                'conviction': conv_adj,
                 'quality_grade': q.get('quality_grade', '?'),
                 'price': float(r.current_price or 0),
                 'summary': rec.get('summary', ''),
                 'sector': sector_name,
-                'sector_phase': sector_info.get('phase', ''),
-                'earn_date': earn.get('next_earnings', ''),
+                'sector_phase': sector_phase,
+                'earn_date': str(earn.get('next_earnings', '') or ''),
                 'earn_days': int(earn.get('days_until', 999) or 999),
                 'is_open_position': r.ticker in open_tickers,
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
@@ -2084,6 +2169,145 @@ def _extract_earn_days_hint(text: str) -> Optional[int]:
         return None
 
 
+def _parse_earnings_date(value: Any) -> Optional[datetime.date]:
+    """Parse YYYY-MM-DD earnings date safely."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], '%Y-%m-%d').date()
+    except Exception:
+        return None
+
+
+def _normalize_earnings_days(next_earnings: str, raw_days: Any) -> Optional[int]:
+    """Prefer a fresh date-derived days-until value over stale cached counters."""
+    d = _parse_earnings_date(next_earnings)
+    if d is not None:
+        return max(0, (d - datetime.now().date()).days)
+    try:
+        return max(0, int(raw_days))
+    except Exception:
+        return None
+
+
+def resolve_earnings_for_ticker(
+    ticker: str,
+    *,
+    persisted_date: str = "",
+    persisted_days: Optional[int] = None,
+    verify_with_fetch: bool = False,
+) -> Dict[str, Any]:
+    """
+    Canonical earnings resolver used by scanner and AI paths.
+    Priority: session earnings_flags -> persisted scan snapshot -> optional live fetch.
+    """
+    t = str(ticker or "").upper().strip()
+    empty = {'next_earnings': '', 'days_until': None, 'source': '', 'confidence': ''}
+    if not t:
+        return empty
+
+    earnings_flags = st.session_state.get('earnings_flags', {}) or {}
+    session_rec = earnings_flags.get(t, {}) if isinstance(earnings_flags, dict) else {}
+
+    sess_date = str(session_rec.get('next_earnings', '') or '').strip()
+    sess_days = _normalize_earnings_days(
+        sess_date,
+        session_rec.get('days_until', session_rec.get('days_until_earnings')),
+    )
+
+    per_date = str(persisted_date or '').strip()
+    per_days = _normalize_earnings_days(per_date, persisted_days)
+
+    if sess_date:
+        resolved = {
+            'next_earnings': sess_date,
+            'days_until': sess_days,
+            'source': str(session_rec.get('source', 'TTA Scanner') or 'TTA Scanner'),
+            'confidence': str(session_rec.get('confidence', '') or ''),
+        }
+    elif per_date:
+        resolved = {
+            'next_earnings': per_date,
+            'days_until': per_days,
+            'source': 'Scan Snapshot',
+            'confidence': '',
+        }
+    else:
+        resolved = dict(empty)
+
+    # Optional live verification (single-ticker, AI/research path only).
+    conflict = bool(sess_date and per_date and sess_date != per_date)
+    if verify_with_fetch and (not resolved.get('next_earnings') or conflict):
+        try:
+            from data_fetcher import fetch_earnings_date
+            fetched = fetch_earnings_date(t) or {}
+            fetch_date = str(fetched.get('next_earnings', '') or '').strip()
+            if fetch_date:
+                fetch_days = _normalize_earnings_days(fetch_date, fetched.get('days_until_earnings'))
+                resolved = {
+                    'next_earnings': fetch_date,
+                    'days_until': fetch_days,
+                    'source': str(fetched.get('source', 'Yahoo Finance') or 'Yahoo Finance'),
+                    'confidence': str(fetched.get('confidence', '') or ''),
+                }
+                # Keep scanner/session aligned after AI lookup.
+                earnings_flags[t] = {
+                    'next_earnings': fetch_date,
+                    'days_until': fetch_days,
+                    'within_window': bool(fetch_days is not None and fetch_days <= 60),
+                    'source': resolved['source'],
+                    'confidence': resolved['confidence'],
+                }
+                st.session_state['earnings_flags'] = earnings_flags
+        except Exception:
+            pass
+
+    return resolved
+
+
+def _adjust_recommendation_for_sector(
+    recommendation: str,
+    conviction: int,
+    sector_phase: str,
+) -> Dict[str, Any]:
+    """
+    Reconcile raw signal recommendation with current sector rotation regime.
+    Keeps signal engine output intact but applies UI-level execution context.
+    """
+    rec_raw = str(recommendation or "").strip()
+    rec_u = rec_raw.upper()
+    phase_u = str(sector_phase or "").upper()
+    conv = int(conviction or 0)
+    adjusted = rec_raw
+    reason = ""
+
+    if phase_u == "LAGGING":
+        if rec_u == "STRONG BUY":
+            adjusted = "BUY (SECTOR HEADWIND)"
+            conv = max(1, conv - 2)
+            reason = "Sector lagging"
+        elif ("BUY" in rec_u or "ENTRY" in rec_u) and "SKIP" not in rec_u:
+            adjusted = "WATCH (SECTOR)"
+            conv = max(1, conv - 2)
+            reason = "Sector lagging"
+    elif phase_u == "FADING":
+        if rec_u == "STRONG BUY":
+            adjusted = "BUY (CAUTION)"
+            conv = max(1, conv - 1)
+            reason = "Sector fading"
+        elif rec_u == "BUY":
+            adjusted = "BUY (CAUTION)"
+            conv = max(1, conv - 1)
+            reason = "Sector fading"
+
+    return {
+        "recommendation": adjusted,
+        "conviction": conv,
+        "adjusted": adjusted != rec_raw,
+        "reason": reason,
+    }
+
+
 def _calc_rr(entry: float, stop: float, target: float) -> float:
     """Compute reward/risk ratio with guardrails."""
     if entry <= 0 or stop <= 0 or target <= 0:
@@ -2155,6 +2379,7 @@ def _normalize_gold_ai_contract(
     *,
     fallback_ai_buy: str,
     fallback_rank_score: float,
+    sector_phase: str = "",
 ) -> Dict[str, Any]:
     """
     Unified AI recommendation contract.
@@ -2192,6 +2417,20 @@ def _normalize_gold_ai_contract(
     if "skip" in pos_size:
         verdict = "Skip"
 
+    # Sector-rotation guardrail: cap aggressiveness when sector is lagging/fading.
+    phase_u = str(sector_phase or "").upper()
+    sector_penalty = 0.0
+    if phase_u == "LAGGING":
+        if verdict == "Strong Buy":
+            verdict = "Buy"
+        elif verdict == "Buy" and conv < 9:
+            verdict = "Watch Only"
+        sector_penalty = -1.0
+    elif phase_u == "FADING":
+        if verdict == "Strong Buy":
+            verdict = "Buy"
+        sector_penalty = -0.5
+
     # Earnings risk guardrail: if AI mentions earnings/gap risk soon, do not keep buy verdict.
     earnings_risk_phrase = (
         "EARNINGS" in text_blob and
@@ -2216,7 +2455,7 @@ def _normalize_gold_ai_contract(
     verdict_adj = {"Strong Buy": 1.1, "Buy": 0.5, "Watch Only": -0.2, "Skip": -1.0}.get(verdict, 0.0)
     conv_adj = max(-0.5, min(0.9, (conv - 5) * 0.1))
     rr_adj = max(-0.5, min(1.2, (rr - 1.5) * 0.35))
-    unified_score = round(float(fallback_rank_score or 0) + verdict_adj + conv_adj + rr_adj + size_adj, 2)
+    unified_score = round(float(fallback_rank_score or 0) + verdict_adj + conv_adj + rr_adj + size_adj + sector_penalty, 2)
 
     note = str(
         ai_result.get('synthesized_recommendation', '')
@@ -2236,6 +2475,50 @@ def _normalize_gold_ai_contract(
         'note': note,
         'is_gold_source': bool(ai_result),
     }
+
+
+def _build_trade_finder_analysis_note(
+    *,
+    scanner_summary: str,
+    ai_note: str,
+    sector: str,
+    sector_phase: str,
+    earn_days: int,
+) -> str:
+    """Build consistent, trader-readable Trade Finder analysis note."""
+    parts: List[str] = []
+
+    base = str(ai_note or "").strip()
+    if base:
+        parts.append(base.rstrip("."))
+    else:
+        ss = str(scanner_summary or "").strip().replace("🔁", "Re-entry")
+        if ss:
+            parts.append(ss.rstrip("."))
+
+    sec = str(sector or "Sector").strip()
+    phase = str(sector_phase or "").upper().strip()
+    if phase == "LAGGING":
+        parts.append(f"Sector warning: {sec} is lagging (rotation headwind)")
+    elif phase == "FADING":
+        parts.append(f"Sector caution: {sec} is fading")
+    elif phase == "EMERGING":
+        parts.append(f"Sector tailwind building: {sec} is emerging")
+    elif phase == "LEADING":
+        parts.append(f"Sector tailwind: {sec} is leading")
+
+    d = int(earn_days or 999)
+    if d <= 7:
+        parts.append(f"Earnings risk high ({d}d)")
+    elif d <= 30:
+        parts.append(f"Earnings within {d}d; manage hold horizon")
+    elif d < 999:
+        parts.append(f"Earnings runway: {d}d")
+
+    note = ". ".join([p for p in parts if p]).strip()
+    if note and not note.endswith("."):
+        note += "."
+    return note[:320]
 
 
 def _trade_quality_settings() -> Dict[str, Any]:
@@ -2518,6 +2801,14 @@ def _run_trade_finder_workflow() -> None:
             },
             fallback_ai_buy=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
             fallback_rank_score=float(ai_rec.get('rank_score', 0) or 0),
+            sector_phase=str(c.get('sector_phase', '') or ''),
+        )
+        analysis_note = _build_trade_finder_analysis_note(
+            scanner_summary=str(c.get('summary', '') or ''),
+            ai_note=str(gold.get('note', '') or rationale or ''),
+            sector=str(c.get('sector', '') or ''),
+            sector_phase=str(c.get('sector_phase', '') or ''),
+            earn_days=earn_days,
         )
         rows.append({
             'ticker': ticker,
@@ -2536,6 +2827,7 @@ def _run_trade_finder_workflow() -> None:
             'ai_reported_rr': round(ai_rr, 2),
             'rank_score': float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
             'ai_rationale': str(gold.get('note', '') or rationale or ''),
+            'analysis_note': analysis_note,
             'ai_confidence': int(gold.get('confidence', 0) or 0),
             'ai_position_sizing': str(gold.get('position_sizing', '') or ''),
             'gold_source': bool(gold.get('is_gold_source', False)),
@@ -2689,6 +2981,9 @@ def render_trade_finder_tab():
         st.caption("Provider mix: " + ", ".join([f"{k}={v}" for k, v in sorted(_pc.items())]))
     if _fc:
         st.caption("AI fallback reasons: " + ", ".join([f"{k}={v}" for k, v in sorted(_fc.items())]) + f" | AI Top N={_pn}")
+    _tf_chart_err = str(st.session_state.get('trade_finder_chart_error', '') or '').strip()
+    if _tf_chart_err:
+        st.warning(f"Chart load blocked: {_tf_chart_err[:220]}")
 
     if not qualified_rows:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
@@ -2741,9 +3036,31 @@ def render_trade_finder_tab():
                 generated_at_iso=str(results.get('generated_at_iso', '') or ''),
                 run_id=str(results.get('run_id', '') or ''),
             )
-            st.session_state['default_detail_tab'] = detail_tab
-            st.session_state['_switch_to_scanner_tab'] = True
-            _load_ticker_for_view(_ticker)
+            st.session_state['trade_finder_last_action'] = 'chart' if int(detail_tab) == 1 else 'trade'
+            st.session_state['trade_finder_last_ticker'] = _ticker
+            if int(detail_tab) == 1:
+                st.session_state['trade_finder_inline_chart_ticker'] = _ticker
+                # Chart now opens inline in Trade Finder for deterministic UX.
+                st.session_state.pop('_switch_to_scanner_target_tab', None)
+            elif int(detail_tab) == 4:
+                st.session_state['_switch_to_scanner_target_tab'] = 'trade'
+            _loaded = _load_ticker_for_view(_ticker)
+            if not _loaded:
+                st.session_state['trade_finder_chart_error'] = str(
+                    st.session_state.get('_ticker_load_error', f"Unable to load data for {_ticker}.")
+                )
+                # Keep user on Trade Finder and show explicit blocker.
+                if int(detail_tab) != 1:
+                    st.session_state.pop('trade_finder_inline_chart_ticker', None)
+                st.rerun()
+                return
+            st.session_state.pop('trade_finder_chart_error', None)
+            if int(detail_tab) == 1:
+                st.session_state['default_detail_tab'] = 1
+                st.session_state.pop('_switch_to_scanner_tab', None)
+            else:
+                st.session_state['default_detail_tab'] = detail_tab
+                st.session_state['_switch_to_scanner_tab'] = True
             st.rerun()
 
         primary_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() in {"Strong Buy", "Buy"}]
@@ -2794,7 +3111,11 @@ def render_trade_finder_tab():
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
                     signal_reason = str(r.get('reason', '') or '')
-                    rationale = str(r.get('ai_rationale', '') or str(r.get('scanner_summary', '') or '')).strip()
+                    rationale = str(
+                        r.get('analysis_note', '')
+                        or r.get('ai_rationale', '')
+                        or str(r.get('scanner_summary', '') or '')
+                    ).strip()
                     warnings = list(r.get('consistency_warnings', []) or [])
                     fallback_reason = str(r.get('fallback_reason', '') or '')
                     fallback_error = str(r.get('fallback_error', '') or '')
@@ -2859,6 +3180,45 @@ def render_trade_finder_tab():
                             with a3:
                                 if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
                                     _stage_candidate(r, price, rr, rank, signal_reason, rationale)
+
+        # Fallback chart experience if Streamlit tab auto-switch fails on some clients.
+        _inline_chart_ticker = str(st.session_state.get('trade_finder_inline_chart_ticker', '') or '').upper().strip()
+        if _inline_chart_ticker:
+            st.divider()
+            st.markdown(f"### 📈 Chart Preview — {_inline_chart_ticker}")
+            st.caption("Chart opens directly here from Trade Finder.")
+            _sel = st.session_state.get('selected_analysis')
+            _sel_ticker = str(getattr(_sel, 'ticker', '') or '').upper().strip() if _sel is not None else ''
+            try:
+                _cache = st.session_state.get('ticker_data_cache', {}) or {}
+                _have_daily = bool((_cache.get(_inline_chart_ticker, {}) or {}).get('daily') is not None)
+                if not _have_daily:
+                    _find_new_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+                    _prefetched = _find_new_cache.get(_inline_chart_ticker, {}) if isinstance(_find_new_cache, dict) else {}
+                    if _prefetched and _prefetched.get('daily') is not None:
+                        _cache[_inline_chart_ticker] = _prefetched
+                        st.session_state['ticker_data_cache'] = _cache
+                        _have_daily = True
+                if not _have_daily:
+                    _tf_data_prefetch = fetch_all_ticker_data(_inline_chart_ticker)
+                    if _tf_data_prefetch.get('daily') is not None:
+                        _cache[_inline_chart_ticker] = _tf_data_prefetch
+                        st.session_state['ticker_data_cache'] = _cache
+                if _sel is not None and _sel_ticker == _inline_chart_ticker:
+                    _render_chart_tab(_inline_chart_ticker, _sel.signal)
+                else:
+                    _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
+                    _tf_analysis = _tf_cache.get(_inline_chart_ticker)
+                    if _tf_analysis is None:
+                        _tf_data = fetch_all_ticker_data(_inline_chart_ticker)
+                        _tf_analysis = analyze_ticker(_tf_data)
+                        _tf_cache[_inline_chart_ticker] = _tf_analysis
+                        st.session_state['_tf_inline_analysis_cache'] = _tf_cache
+                    st.session_state['selected_ticker'] = _inline_chart_ticker
+                    st.session_state['selected_analysis'] = _tf_analysis
+                    _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal)
+            except Exception as _e:
+                st.warning(f"Unable to load chart for {_inline_chart_ticker}: {str(_e)[:120]}")
 
     st.markdown("### Open In New Trade")
     sb1, sb2 = st.columns([1, 1])
@@ -3733,7 +4093,6 @@ def _build_rows_from_analysis(results, jm) -> list:
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
     sector_rotation = st.session_state.get('sector_rotation', {})
     ticker_sectors = st.session_state.get('ticker_sectors', {})
-    earnings_flags = st.session_state.get('earnings_flags', {})
 
     def _resolve_sector(_ticker: str) -> str:
         t = str(_ticker or '').upper().strip()
@@ -3786,10 +4145,10 @@ def _build_rows_from_analysis(results, jm) -> list:
         else:
             sector_dot = ""
 
-        # Earnings flag
-        earn = earnings_flags.get(r.ticker)
-        if earn:
-            _ed = earn['days_until']
+        # Earnings flag (canonical resolver to stay aligned with AI context).
+        earn_info = resolve_earnings_for_ticker(r.ticker)
+        _ed = earn_info.get('days_until')
+        if _ed is not None:
             if _ed <= 7:
                 earn_flag = f"⚡{_ed}d"
             elif _ed <= 14:
@@ -3819,18 +4178,21 @@ def _build_rows_from_analysis(results, jm) -> list:
             vol_str = f"📈{vol_str}"  # 1.5x+ above average
 
         # Earnings date
-        earn_date_str = ""
-        if earn:
-            days = earn['days_until']
-            earn_date_str = earn.get('next_earnings', '')
-            if days <= 7:
+        earn_date_str = str(earn_info.get('next_earnings', '') or '')
+        if earn_date_str and _ed is not None:
+            if _ed <= 7:
                 earn_date_str = f"⚡{earn_date_str}"
-            elif days <= 14:
+            elif _ed <= 14:
                 earn_date_str = f"⏰{earn_date_str}"
 
         # AO divergence + Apex indicators
         div_flag = " (D)" if r.ao_divergence_active else ""
         apex_flag = "🎯" if r.apex_buy else ""
+        rec_adj = _adjust_recommendation_for_sector(
+            str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+            int(rec.get('conviction', 0) or 0),
+            sector_phase,
+        )
 
         # Re-entry recency (for color coding)
         reentry_bars_ago = 0
@@ -3846,8 +4208,8 @@ def _build_rows_from_analysis(results, jm) -> list:
             'SectorPhase': sector_phase,  # For filtering
             'Earn': earn_flag,
             'EarnDate': earn_date_str,
-            'Rec': rec.get('recommendation', 'SKIP'),
-            'Conv': f"{rec.get('conviction', 0)}/10",
+            'Rec': rec_adj.get('recommendation', rec.get('recommendation', 'SKIP')),
+            'Conv': f"{rec_adj.get('conviction', rec.get('conviction', 0))}/10",
             'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
             'AO': "✅" if sig and sig.ao.get('positive') else "❌",
             'Wkly': "✅" if sig and sig.weekly_macd.get('bullish') else "❌",
@@ -3869,7 +4231,6 @@ def _build_rows_from_summary(summary, jm) -> list:
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
     sector_rotation = st.session_state.get('sector_rotation', {})
     ticker_sectors = st.session_state.get('ticker_sectors', {})
-    earnings_flags = st.session_state.get('earnings_flags', {})
 
     def _resolve_sector(_ticker: str, _persisted_sector: str) -> str:
         sec = str(_persisted_sector or '').strip()
@@ -3924,35 +4285,39 @@ def _build_rows_from_summary(summary, jm) -> list:
         else:
             sector_dot = ""
 
-        # Earnings — prefer persisted data from summary, fallback to session state
-        earn = earnings_flags.get(ticker)
-        earn_date = s.get('earn_date', '')
-        earn_days = s.get('earn_days', 999)
-
-        # If persisted data exists, use it; otherwise try session state
-        if earn_date:
-            earn_flag = f"⚡{earn_days}d" if earn_days <= 14 else ""
-            earn_date_str = earn_date
-            if earn_days <= 7:
-                earn_date_str = f"⚡{earn_date}"
-            elif earn_days <= 14:
-                earn_date_str = f"⏰{earn_date}"
-        elif earn:
-            earn_flag = f"⚡{earn['days_until']}d"
-            earn_date_str = earn.get('next_earnings', '')
-            if earn['days_until'] <= 7:
-                earn_date_str = f"⚡{earn_date_str}"
-            elif earn['days_until'] <= 14:
-                earn_date_str = f"⏰{earn_date_str}"
-        else:
+        # Earnings (canonical resolver). Prefer session values over stale persisted snapshots.
+        earn_info = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=s.get('earn_date', ''),
+            persisted_days=s.get('earn_days'),
+        )
+        earn_days = earn_info.get('days_until')
+        earn_date_str = str(earn_info.get('next_earnings', '') or '')
+        if earn_days is None:
             earn_flag = ""
-            earn_date_str = ""
+        elif earn_days <= 7:
+            earn_flag = f"⚡{earn_days}d"
+            if earn_date_str:
+                earn_date_str = f"⚡{earn_date_str}"
+        elif earn_days <= 14:
+            earn_flag = f"⏰{earn_days}d"
+            if earn_date_str:
+                earn_date_str = f"⏰{earn_date_str}"
+        elif earn_days <= 30:
+            earn_flag = f"📅{earn_days}d"
+        else:
+            earn_flag = f"{earn_days}d"
 
         # Volume from persisted data
         vol_str = s.get('volume_str', '')
         div_flag = " (D)" if s.get('ao_divergence_active') else ""
         apex_flag = "🎯" if s.get('apex_buy') else ""
         reentry_bars_ago = s.get('reentry_bars_ago', 0)
+        rec_adj = _adjust_recommendation_for_sector(
+            str(s.get('recommendation', 'SKIP') or 'SKIP'),
+            int(s.get('conviction', 0) or 0),
+            sector_phase,
+        )
 
         rows.append({
             'Ticker': ticker,
@@ -3961,8 +4326,8 @@ def _build_rows_from_summary(summary, jm) -> list:
             'SectorPhase': sector_phase,
             'Earn': earn_flag,
             'EarnDate': earn_date_str,
-            'Rec': s.get('recommendation', 'SKIP'),
-            'Conv': f"{s.get('conviction', 0)}/10",
+            'Rec': rec_adj.get('recommendation', s.get('recommendation', 'SKIP')),
+            'Conv': f"{rec_adj.get('conviction', s.get('conviction', 0))}/10",
             'MACD': "✅" if s.get('macd_bullish') else "❌",
             'AO': "✅" if s.get('ao_positive') else "❌",
             'Wkly': "✅" if s.get('weekly_bullish') else "❌",
@@ -5596,21 +5961,21 @@ def _build_internal_context(ticker: str, signal: EntrySignal, rec: Dict,
     else:
         lines.append(f"\n═══ SECTOR: Unknown (check Yahoo data in external research for sector) ═══")
 
-    # ═══ EARNINGS (from app session — MANDATORY for AI to discuss) ═══
-    earn = st.session_state.get('earnings_flags', {}).get(ticker)
-    if earn:
-        days = earn.get('days_until', 999)
+    # ═══ EARNINGS (canonical resolver — keeps AI + scanner aligned) ═══
+    earn = resolve_earnings_for_ticker(ticker, verify_with_fetch=True)
+    if earn.get('next_earnings'):
+        days = earn.get('days_until')
         lines.append(f"\n═══ EARNINGS (MANDATORY — you MUST address this in your analysis) ═══")
         lines.append(f"  Next Earnings Date: {earn.get('next_earnings', '?')}")
         lines.append(f"  Days Until: {days}")
-        if days <= 7:
+        if days is not None and days <= 7:
             lines.append(f"  ⚠️ CRITICAL: EARNINGS IN {days} DAYS — EXTREME RISK")
-        elif days <= 14:
+        elif days is not None and days <= 14:
             lines.append(f"  ⚠️ WARNING: EARNINGS IN {days} DAYS — HIGH RISK, limited trading window")
-        elif days <= 30:
+        elif days is not None and days <= 30:
             lines.append(f"  ⚠️ CAUTION: EARNINGS WITHIN 30 DAYS — affects hold duration")
         else:
-            lines.append(f"  ✅ Clear runway: {days} days before earnings")
+            lines.append(f"  ✅ Clear runway: {days if days is not None else '?'} days before earnings")
     else:
         lines.append(f"\n═══ EARNINGS: Date not available from app — CHECK Yahoo data in external research ═══")
 
@@ -5731,37 +6096,25 @@ def _fetch_external_research(ticker: str) -> str:
     earnings_found = False
     earnings_date_str = None
     earnings_days = None
+    earn_result = {}
 
-    # Source 1: App session (batch scanner — instant, no API call)
-    earn_flag = st.session_state.get('earnings_flags', {}).get(ticker)
-    if earn_flag:
-        earnings_date_str = earn_flag.get('next_earnings')
-        earnings_days = earn_flag.get('days_until')
-        earnings_found = True
-        lines.append(f"  Source: TTA Scanner")
-        lines.append(f"  Next Earnings: {earnings_date_str}")
-        lines.append(f"  Days Until: {earnings_days}")
-
-    # Source 2: fetch_earnings_date() — 4-method cascade (calendar → info → earnings_dates → pattern)
-    if not earnings_found:
-        try:
-            from data_fetcher import fetch_earnings_date
-            earn_result = fetch_earnings_date(ticker)
-            if earn_result.get('next_earnings'):
-                earnings_date_str = earn_result['next_earnings']
-                earnings_days = earn_result.get('days_until_earnings')
-                earnings_found = True
-                _src = earn_result.get('source', 'Yahoo Finance')
-                _conf = earn_result.get('confidence', 'MEDIUM')
+    # Canonical resolution for this ticker; verify against live 4-method fetch on conflict.
+    try:
+        earn_result = resolve_earnings_for_ticker(ticker, verify_with_fetch=True)
+        if earn_result.get('next_earnings'):
+            earnings_date_str = earn_result.get('next_earnings')
+            earnings_days = earn_result.get('days_until')
+            earnings_found = True
+            _src = earn_result.get('source', 'TTA Scanner')
+            _conf = earn_result.get('confidence', '')
+            if _conf:
                 lines.append(f"  Source: {_src} (confidence: {_conf})")
-                lines.append(f"  Next Earnings: {earnings_date_str}")
-                lines.append(f"  Days Until: {earnings_days}")
-                if earn_result.get('next_eps_estimate'):
-                    lines.append(f"  EPS Estimate: ${earn_result['next_eps_estimate']:.2f}")
-                if earn_result.get('last_earnings'):
-                    lines.append(f"  Last Earnings: {earn_result['last_earnings']}")
-        except Exception as e:
-            lines.append(f"  Earnings fetch error: {str(e)[:100]}")
+            else:
+                lines.append(f"  Source: {_src}")
+            lines.append(f"  Next Earnings: {earnings_date_str}")
+            lines.append(f"  Days Until: {earnings_days}")
+    except Exception as e:
+        lines.append(f"  Earnings fetch error: {str(e)[:100]}")
 
     if not earnings_found:
         lines.append(f"  ⚠️ EARNINGS DATE NOT FOUND after 4-method cascade")
@@ -6850,23 +7203,9 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     gate = _evaluate_trade_gate(snap)
     win_rate = jm.get_recent_win_rate(last_n=20)
     losing_streak = jm.get_current_losing_streak()
-    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)
-    stale_market = _is_stale(snap.market_ts, 30 * 60)
-    stale_sector = _is_stale(snap.sector_ts, 60 * 60)
-    stale_positions = _is_stale(snap.pos_ts, 10 * 60)
-    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)
-    stale_tags = []
-    if stale_scan:
-        stale_tags.append("scan")
-    if stale_market:
-        stale_tags.append("market")
-    if stale_sector:
-        stale_tags.append("sectors")
-    if stale_positions:
-        stale_tags.append("positions")
-    if stale_alerts:
-        stale_tags.append("alerts")
-    stale_count = len(stale_tags)
+    stale = _stale_stream_status(snap)
+    stale_tags = list(stale["tags"])
+    stale_count = int(stale["count"])
     hard_block_stale = stale_count >= 3
 
     st.subheader(f"📐 Position Sizer — {ticker}")
@@ -6928,6 +7267,8 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     stop_key = f"sizer_stop_{ticker}"
     target_key = f"sizer_target_{ticker}"
     stop_dist_key = f"sizer_stop_dist_pct_{ticker}"
+    pending_stop_key = f"{stop_key}_pending"
+    pending_stop_dist_key = f"{stop_dist_key}_pending"
     stop_dist_prev_key = f"sizer_stop_dist_pct_prev_{ticker}"
     stop_prev_key = f"sizer_stop_prev_{ticker}"
     confirm_entry_key = f"confirm_entry_{ticker}"
@@ -6950,6 +7291,17 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     if stop_prev_key not in st.session_state:
         st.session_state[stop_prev_key] = float(st.session_state.get(stop_key, selected_stop) or selected_stop or 0.0)
 
+    # Apply deferred widget-sync updates before number_input widgets are instantiated.
+    if pending_stop_key in st.session_state:
+        _pending_stop = float(st.session_state.pop(pending_stop_key) or 0.0)
+        st.session_state[stop_key] = _pending_stop
+        st.session_state[confirm_stop_key] = _pending_stop
+        st.session_state[stop_prev_key] = _pending_stop
+    if pending_stop_dist_key in st.session_state:
+        _pending_dist = float(st.session_state.pop(pending_stop_dist_key) or 0.0)
+        st.session_state[stop_dist_key] = _pending_dist
+        st.session_state[stop_dist_prev_key] = _pending_dist
+
     prev_source = st.session_state.get(prev_source_key)
     if prev_source != selected_source:
         st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
@@ -6961,10 +7313,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         _entry = float(st.session_state.get(entry_key, 0) or 0)
         _stop = float(st.session_state.get(stop_key, 0) or 0)
         _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
-        st.session_state[stop_dist_key] = round(max(0.0, _dist), 2)
-        st.session_state[stop_dist_prev_key] = float(st.session_state[stop_dist_key])
+        _dist_val = round(max(0.0, _dist), 2)
+        st.session_state[pending_stop_dist_key] = _dist_val
+        st.session_state[stop_dist_prev_key] = float(_dist_val)
         st.session_state[stop_prev_key] = float(_stop)
         st.session_state[prev_source_key] = selected_source
+        st.rerun()
 
     if st.button("↺ Apply Selected Defaults", key=f"apply_defaults_{ticker}"):
         st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
@@ -6976,8 +7330,9 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         _entry = float(st.session_state.get(entry_key, 0) or 0)
         _stop = float(st.session_state.get(stop_key, 0) or 0)
         _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
-        st.session_state[stop_dist_key] = round(max(0.0, _dist), 2)
-        st.session_state[stop_dist_prev_key] = float(st.session_state[stop_dist_key])
+        _dist_val = round(max(0.0, _dist), 2)
+        st.session_state[pending_stop_dist_key] = _dist_val
+        st.session_state[stop_dist_prev_key] = float(_dist_val)
         st.session_state[stop_prev_key] = float(_stop)
         st.rerun()
 
@@ -7014,9 +7369,8 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     prev_stop_dist_pct = float(st.session_state.get(stop_dist_prev_key, stop_dist_pct) or 0.0)
     if abs(stop_dist_pct - prev_stop_dist_pct) > 1e-9 and entry_price > 0:
         new_stop_from_pct = max(0.01, entry_price * (1 - (stop_dist_pct / 100.0)))
-        st.session_state[stop_key] = round(new_stop_from_pct, 2)
-        st.session_state[confirm_stop_key] = round(new_stop_from_pct, 2)
-        st.session_state[stop_prev_key] = float(st.session_state[stop_key])
+        new_stop_val = round(new_stop_from_pct, 2)
+        st.session_state[pending_stop_key] = new_stop_val
         st.session_state[stop_dist_prev_key] = float(stop_dist_pct)
         st.rerun()
 
@@ -7024,9 +7378,10 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     if abs(stop_price - prev_stop_price) > 1e-9 and entry_price > 0:
         derived_stop_dist_pct = ((entry_price - stop_price) / entry_price * 100.0) if stop_price > 0 else 0.0
         derived_stop_dist_pct = round(max(0.0, derived_stop_dist_pct), 2)
-        st.session_state[stop_dist_key] = derived_stop_dist_pct
+        st.session_state[pending_stop_dist_key] = derived_stop_dist_pct
         st.session_state[stop_dist_prev_key] = float(derived_stop_dist_pct)
         st.session_state[stop_prev_key] = float(stop_price)
+        st.rerun()
 
     if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
         result = calculate_position_size(
@@ -8118,12 +8473,8 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
     vix = float(snap.market_filter.get('vix_close', 0) or 0)
     spy_ok = bool(snap.market_filter.get('spy_above_200', True))
 
-    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)
-    stale_market = _is_stale(snap.market_ts, 30 * 60)
-    stale_sector = _is_stale(snap.sector_ts, 60 * 60)
-    stale_positions = _is_stale(snap.pos_ts, 10 * 60)
-    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)
-    stale_count = sum([stale_scan, stale_market, stale_sector, stale_positions, stale_alerts])
+    stale = _stale_stream_status(snap)
+    stale_count = int(stale["count"])
 
     deep_score = 0
     deep = st.session_state.get('deep_market_analysis') or {}
@@ -8274,6 +8625,40 @@ def _is_stale(ts: float, max_age_sec: int) -> bool:
     if not ts:
         return True
     return (time.time() - ts) > max_age_sec
+
+
+def _stale_stream_status(snap: DashboardSnapshot) -> Dict[str, Any]:
+    """
+    Compute stale stream status with relevance gating.
+    Positions/alerts only count as stale when they are actively in use.
+    """
+    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)
+    stale_market = _is_stale(snap.market_ts, 30 * 60)
+    stale_sector = _is_stale(snap.sector_ts, 60 * 60)
+    stale_positions = bool(snap.open_trades) and _is_stale(snap.pos_ts, 10 * 60)
+    stale_alerts = bool(snap.pending_alerts) and _is_stale(snap.alert_ts, 5 * 60)
+
+    tags = []
+    if stale_scan:
+        tags.append("scan")
+    if stale_market:
+        tags.append("market")
+    if stale_sector:
+        tags.append("sectors")
+    if stale_positions:
+        tags.append("positions")
+    if stale_alerts:
+        tags.append("alerts")
+
+    return {
+        "scan": stale_scan,
+        "market": stale_market,
+        "sector": stale_sector,
+        "positions": stale_positions,
+        "alerts": stale_alerts,
+        "tags": tags,
+        "count": len(tags),
+    }
 
 
 def _scan_health_snapshot() -> Dict[str, float]:
@@ -8687,25 +9072,11 @@ def render_executive_dashboard():
     actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
 
     # SLO freshness checks
-    stale_scan = _is_stale(snap.scan_ts, 3 * 3600)      # target: <3h old
-    stale_market = _is_stale(snap.market_ts, 30 * 60)   # target: <30m old
-    stale_sector = _is_stale(snap.sector_ts, 60 * 60)   # target: <60m old
-    stale_positions = _is_stale(snap.pos_ts, 10 * 60)   # target: <10m old
-    stale_alerts = _is_stale(snap.alert_ts, 5 * 60)     # target: <5m old
-    stale_count = sum([stale_scan, stale_market, stale_sector, stale_positions, stale_alerts])
+    stale = _stale_stream_status(snap)
+    stale_count = int(stale["count"])
+    stale_tags = list(stale["tags"])
 
     if stale_count > 0:
-        stale_tags = []
-        if stale_scan:
-            stale_tags.append("scan")
-        if stale_market:
-            stale_tags.append("market")
-        if stale_sector:
-            stale_tags.append("sectors")
-        if stale_positions:
-            stale_tags.append("positions")
-        if stale_alerts:
-            stale_tags.append("alerts")
         st.warning(f"Stale data detected: {', '.join(stale_tags)}")
     else:
         st.success("All core data streams are fresh.")
@@ -9410,20 +9781,48 @@ def main():
             render_performance()
 
     if st.session_state.pop('_switch_to_scanner_tab', False):
+        _target_detail_tab = str(st.session_state.pop('_switch_to_scanner_target_tab', '') or '').strip().lower()
         import streamlit.components.v1 as components
-        components.html(
+        _target_js = ""
+        if _target_detail_tab == "chart":
+            _target_js = """
+              setTimeout(function() {
+                const tabs = Array.from(doc.querySelectorAll('button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'));
+                const chartTab = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes('Chart'));
+                if (chartTab) {
+                  chartTab.click();
+                  chartTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                }
+              }, 140);
             """
+        elif _target_detail_tab == "trade":
+            _target_js = """
+              setTimeout(function() {
+                const tabs = Array.from(doc.querySelectorAll('button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'));
+                const tradeTab = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes('Trade'));
+                if (tradeTab) {
+                  tradeTab.click();
+                  tradeTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                }
+              }, 140);
+            """
+        _switch_js = """
             <script>
             setTimeout(function() {
               const doc = window.parent.document;
-              const buttons = Array.from(doc.querySelectorAll('button[role="tab"], [data-baseweb="tab"] button'));
-              const scanner = buttons.find(b => (b.innerText || '').includes('Scanner'));
-              if (scanner) scanner.click();
+              const candidates = Array.from(doc.querySelectorAll(
+                'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'
+              ));
+              const scanner = candidates.find(el => ((el.innerText || el.textContent || '') + '').includes('Scanner'));
+              if (scanner) {
+                scanner.click();
+                scanner.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+              }
+              __TARGET_JS__
             }, 80);
             </script>
-            """,
-            height=0,
-        )
+        """
+        components.html(_switch_js.replace("__TARGET_JS__", _target_js), height=0)
 
 
 def _render_alerts_panel():
