@@ -46,8 +46,23 @@ except KeyError:
     fetch_weekly = _df.fetch_weekly
     fetch_monthly = _df.fetch_monthly
     clear_cache = _df.clear_cache
-from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
-from ai_analysis import analyze as run_ai_analysis
+try:
+    from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
+except KeyError:
+    # Streamlit Cloud hot-reload can leave transient stale sys.modules entries.
+    import importlib as _importlib
+    _se = _importlib.import_module("scanner_engine")
+    analyze_ticker = _se.analyze_ticker
+    scan_watchlist = _se.scan_watchlist
+    TickerAnalysis = _se.TickerAnalysis
+
+try:
+    from ai_analysis import analyze as run_ai_analysis
+except KeyError:
+    # Same hot-reload race protection as data_fetcher/scanner_engine imports.
+    import importlib as _importlib
+    _ai = _importlib.import_module("ai_analysis")
+    run_ai_analysis = _ai.analyze
 from chart_engine import render_tv_chart, render_mtf_chart
 from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry, PlannedTrade
 from watchlist_manager import WatchlistManager
