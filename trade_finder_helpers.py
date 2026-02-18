@@ -46,3 +46,32 @@ def build_planned_trade(row: Dict[str, Any], run_id: str) -> PlannedTrade:
         reason=str(row.get("reason", "") or ""),
         notes=str(row.get("ai_rationale", row.get("scanner_summary", "")) or ""),
     )
+
+
+def compute_trade_score(row: Dict[str, Any]) -> float:
+    """
+    Execution-aware score for ranking candidates in Trade Finder.
+
+    Keeps model score but adjusts for practical execution quality:
+    - AI verdict quality
+    - Risk/reward
+    - Decision readiness
+    - Earnings proximity
+    """
+    base = float(row.get("rank_score", 0) or 0)
+    verdict = str(row.get("ai_buy_recommendation", "") or "").strip()
+    rr = float(row.get("risk_reward", 0) or 0)
+    earn_days = int(row.get("earn_days", 999) or 999)
+    readiness = str((row.get("decision_card", {}) or {}).get("execution_readiness", "") or "").upper()
+
+    verdict_adj = {
+        "Strong Buy": 1.5,
+        "Buy": 0.8,
+        "Watch Only": -0.4,
+        "Skip": -1.2,
+    }.get(verdict, 0.0)
+    rr_adj = max(-0.5, min(1.5, (rr - 1.5) * 0.4))
+    ready_adj = 0.6 if readiness == "READY" else -0.3
+    earn_adj = -0.8 if 0 <= earn_days <= 3 else (-0.3 if 4 <= earn_days <= 7 else 0.0)
+
+    return round(base + verdict_adj + rr_adj + ready_adj + earn_adj, 2)

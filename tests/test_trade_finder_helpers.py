@@ -1,6 +1,6 @@
 import unittest
 
-from trade_finder_helpers import build_planned_trade, build_trade_finder_selection
+from trade_finder_helpers import build_planned_trade, build_trade_finder_selection, compute_trade_score
 
 
 class TradeFinderHelperTests(unittest.TestCase):
@@ -41,6 +41,23 @@ class TradeFinderHelperTests(unittest.TestCase):
         self.assertEqual(plan.stop, 194)
         self.assertEqual(plan.trade_finder_run_id, "TF_2")
         self.assertEqual(plan.notes, "Weekly and monthly aligned")
+
+    def test_compute_trade_score_rewards_ready_high_rr(self):
+        strong = {
+            "rank_score": 8.0,
+            "ai_buy_recommendation": "Strong Buy",
+            "risk_reward": 2.4,
+            "earn_days": 20,
+            "decision_card": {"execution_readiness": "READY"},
+        }
+        weak = {
+            "rank_score": 8.0,
+            "ai_buy_recommendation": "Watch Only",
+            "risk_reward": 1.0,
+            "earn_days": 2,
+            "decision_card": {"execution_readiness": "WAIT"},
+        }
+        self.assertGreater(compute_trade_score(strong), compute_trade_score(weak))
 
 
 if __name__ == "__main__":

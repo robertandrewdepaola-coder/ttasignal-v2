@@ -57,7 +57,7 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
-from trade_finder_helpers import build_planned_trade, build_trade_finder_selection
+from trade_finder_helpers import build_planned_trade, build_trade_finder_selection, compute_trade_score
 
 
 # =============================================================================
@@ -2443,8 +2443,13 @@ def _run_trade_finder_workflow() -> None:
                 ],
             ).to_dict(),
         })
+        rows[-1]['trade_score'] = compute_trade_score(rows[-1])
 
-    rows = sorted(rows, key=lambda x: x.get('rank_score', 0), reverse=True)
+    rows = sorted(
+        rows,
+        key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+        reverse=True,
+    )
     elapsed = max(0.0, time.time() - _t0)
     st.session_state['trade_finder_results'] = {
         'run_id': run_id,
@@ -2635,6 +2640,7 @@ def render_trade_finder_tab():
                     ai_buy = str(r.get('ai_buy_recommendation', '') or '')
                     rr = float(r.get('risk_reward', 0) or 0)
                     rank = float(r.get('rank_score', 0) or 0)
+                    trade_score = float(r.get('trade_score', rank) or rank)
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
                     signal_reason = str(r.get('reason', '') or '')
@@ -2648,7 +2654,7 @@ def render_trade_finder_tab():
                         c3.write(f"${price:.2f}")
                         c4.write(ai_buy or "N/A")
                         c5.write(f"{rr:.2f}:1")
-                        c6.write(f"{rank:.2f}")
+                        c6.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
                         c7.write(f"{earn_days}d")
                         a1, a2, a3 = c8.columns(3)
                         with a1:
@@ -2669,7 +2675,7 @@ def render_trade_finder_tab():
                             st.markdown(f"**{ticker} — {company}**")
                             st.caption(
                                 f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
-                                f"Signal Score: {rank:.2f} | Earnings: {earn_days}d | "
+                                f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | Earnings: {earn_days}d | "
                                 f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                             )
                             st.caption(
@@ -7563,6 +7569,20 @@ def render_position_manager():
         st.caption(f"Derived from Unified Regime {snap.regime} ({snap.regime_confidence}%) and Trade Gate {gate.status}.")
     except Exception:
         pass
+    _last_exit_summary = st.session_state.get('_last_exit_analysis_summary', {}) or {}
+    if _last_exit_summary:
+        _cts = _last_exit_summary.get('action_counts', {}) or {}
+        _order = ['HOLD', 'TIGHTEN_STOP', 'TAKE_PARTIAL', 'CLOSE']
+        _parts = [f"{k}:{int(_cts.get(k, 0))}" for k in _order if int(_cts.get(k, 0)) > 0]
+        _parts_txt = " | ".join(_parts) if _parts else "No actions"
+        st.caption(
+            f"Last exit analysis {_last_exit_summary.get('ts', '')}: "
+            f"analyzed {int(_last_exit_summary.get('analyzed', 0))}/{int(_last_exit_summary.get('requested', 0))} "
+            f"| {_parts_txt} | system fallback {int(_last_exit_summary.get('fallback_count', 0))}"
+        )
+        _skipped = list(_last_exit_summary.get('skipped_tickers', []) or [])
+        if _skipped:
+            st.caption(f"Skipped (no live price): {', '.join(_skipped[:8])}")
 
     st.divider()
 
@@ -7670,10 +7690,30 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
                 ai_model=ai_model,
                 fallback_model=fallback_model,
             )
+            analyzed_tickers = {str(a.ticker or '').upper().strip() for a in advices}
+            requested_tickers = [str(t.get('ticker', '')).upper().strip() for t in open_trades if str(t.get('ticker', '')).strip()]
+            skipped_tickers = [t for t in requested_tickers if t and t not in analyzed_tickers]
 
             # Store results in session state for display
             for advice in advices:
                 st.session_state[f'exit_advice_{advice.ticker}'] = advice.to_dict()
+
+            # Store quick summary for Position Manager visibility.
+            action_counts: Dict[str, int] = {}
+            fallback_count = 0
+            for advice in advices:
+                a = str(getattr(advice, 'action', '') or 'UNKNOWN')
+                action_counts[a] = int(action_counts.get(a, 0) + 1)
+                if str(getattr(advice, 'provider', '') or '').lower() == 'system':
+                    fallback_count += 1
+            st.session_state['_last_exit_analysis_summary'] = {
+                'requested': len(requested_tickers),
+                'analyzed': len(advices),
+                'skipped_tickers': skipped_tickers,
+                'action_counts': action_counts,
+                'fallback_count': fallback_count,
+                'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
 
             # Save to audit log
             save_audit_batch(advices)
@@ -7695,6 +7735,11 @@ def _run_exit_analysis(open_trades: List, send_email: bool = False):
                     st.warning("Email not configured. Set SMTP_EMAIL, SMTP_PASSWORD, ALERT_EMAIL in Streamlit secrets.")
             else:
                 st.success(f"✅ Analyzed {len(advices)} positions")
+            if skipped_tickers:
+                st.warning(
+                    f"Skipped {len(skipped_tickers)} position(s) due to missing live price data: "
+                    f"{', '.join(skipped_tickers[:8])}"
+                )
 
             st.rerun()
 
