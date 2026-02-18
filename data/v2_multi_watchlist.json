@@ -489,6 +489,15 @@
       ],
       "created_at": "2026-02-18T19:21:52.213082",
       "last_updated": "2026-02-18T19:22:16.796214"
+    },
+    {
+      "id": "798ec300-ff3a-45d1-9015-6b971854382e",
+      "name": "Energy",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-18T19:27:49.871426",
+      "last_updated": "2026-02-18T19:27:49.871426"
     }
   ]
 }
