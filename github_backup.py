@@ -26,7 +26,7 @@ import os
 import json
 import base64
 import time
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, Any
 from pathlib import Path
 
 # ── Files to back up ────────────────────────────────────────────────────────
@@ -170,6 +170,15 @@ class GitHubBackup:
     @property
     def pending_count(self) -> int:
         return len(self._dirty)
+
+    @property
+    def last_success_epoch(self) -> float:
+        if not self._last_push:
+            return 0.0
+        try:
+            return float(max(self._last_push.values()))
+        except Exception:
+            return 0.0
 
     # ── Internal Methods ────────────────────────────────────────────────
 
@@ -375,3 +384,21 @@ def restore_all():
     if backup:
         return backup.restore_all()
     return {}
+
+
+def status() -> Dict[str, Any]:
+    """Return backup health info for UI diagnostics."""
+    backup = get_backup()
+    if not backup:
+        return {
+            "enabled": False,
+            "pending_count": 0,
+            "last_success_epoch": 0.0,
+            "branch": BACKUP_BRANCH,
+        }
+    return {
+        "enabled": bool(backup.is_enabled),
+        "pending_count": int(backup.pending_count),
+        "last_success_epoch": float(backup.last_success_epoch),
+        "branch": BACKUP_BRANCH,
+    }

@@ -1449,6 +1449,29 @@ def render_sidebar():
                 except Exception as e:
                     st.error(f"Restore failed: {str(e)[:180]}")
 
+        # Backup health (watchlist persistence confidence)
+        try:
+            import github_backup
+            _b = github_backup.status()
+            _enabled = bool(_b.get("enabled", False))
+            _pending = int(_b.get("pending_count", 0) or 0)
+            _last_ok = float(_b.get("last_success_epoch", 0.0) or 0.0)
+            _branch = str(_b.get("branch", "data-backup") or "data-backup")
+            _last_txt = datetime.fromtimestamp(_last_ok).strftime('%Y-%m-%d %H:%M:%S') if _last_ok > 0 else "never"
+            st.caption(
+                f"☁ Backup: {'enabled' if _enabled else 'disabled'} | "
+                f"Branch: {_branch} | Pending: {_pending} | Last success: {_last_txt}"
+            )
+            if _enabled and _pending > 0:
+                if st.button("☁ Backup Now", key="force_backup_now", width="stretch"):
+                    try:
+                        pushed = github_backup.flush()
+                        st.toast(f"✅ Backup flush complete ({int(pushed or 0)} file(s) pushed).")
+                    except Exception as _be:
+                        st.error(f"Backup flush failed: {str(_be)[:180]}")
+        except Exception:
+            st.caption("☁ Backup status unavailable")
+
         # Key diagnostic
         try:
             _diag_key = st.secrets.get("GROQ_API_KEY", "")
