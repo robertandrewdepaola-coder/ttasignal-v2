@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "9770d065-fe66-4261-86de-304c885e184d",
+  "active_watchlist_id": "49fd0864-41bc-437a-bb98-21e747e0d4dc",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -454,6 +454,17 @@
       ],
       "created_at": "2026-02-18T19:21:05.166324",
       "last_updated": "2026-02-18T19:21:26.066670"
+    },
+    {
+      "id": "49fd0864-41bc-437a-bb98-21e747e0d4dc",
+      "name": "Superior Returns",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "FIX"
+      ],
+      "created_at": "2026-02-18T19:21:52.213082",
+      "last_updated": "2026-02-18T19:22:14.985295"
     }
   ]
 }
