@@ -1457,11 +1457,16 @@ def render_sidebar():
             _pending = int(_b.get("pending_count", 0) or 0)
             _last_ok = float(_b.get("last_success_epoch", 0.0) or 0.0)
             _branch = str(_b.get("branch", "data-backup") or "data-backup")
+            _berr = str(_b.get("last_error", "") or "")
+            _berr_code = int(_b.get("last_error_code", 0) or 0)
             _last_txt = datetime.fromtimestamp(_last_ok).strftime('%Y-%m-%d %H:%M:%S') if _last_ok > 0 else "never"
             st.caption(
                 f"☁ Backup: {'enabled' if _enabled else 'disabled'} | "
                 f"Branch: {_branch} | Pending: {_pending} | Last success: {_last_txt}"
             )
+            if _enabled and _berr:
+                code_txt = f"{_berr_code} " if _berr_code else ""
+                st.caption(f"☁ Backup error: {code_txt}{_berr[:140]}")
             if _enabled:
                 if st.button("☁ Backup Now", key="force_backup_now", width="stretch"):
                     try:

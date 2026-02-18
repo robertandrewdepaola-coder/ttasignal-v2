@@ -72,6 +72,8 @@ class GitHubBackup:
         # Whether the data-backup branch has been verified/created
         self._branch_verified = False
         self._enabled = bool(token and repo)
+        self._last_error: str = ""
+        self._last_error_code: int = 0
 
         if not self._enabled:
             print("[backup] GitHub backup disabled — missing GITHUB_TOKEN or GITHUB_REPO")
@@ -101,8 +103,12 @@ class GitHubBackup:
                 restored = self._restore_file(filename)
                 results[filename] = restored
                 if restored:
+                    self._last_error = ""
+                    self._last_error_code = 0
                     print(f"[backup] Restored {filename} from GitHub")
             except Exception as e:
+                self._last_error = str(e)
+                self._last_error_code = 0
                 print(f"[backup] Failed to restore {filename}: {e}")
                 results[filename] = False
 
@@ -142,6 +148,8 @@ class GitHubBackup:
                     # Keep failed pushes queued; don't silently drop them.
                     still_dirty.add(filename)
             except Exception as e:
+                self._last_error = str(e)
+                self._last_error_code = 0
                 print(f"[backup] Push failed for {filename}: {e}")
                 still_dirty.add(filename)  # Retry next flush
 
@@ -163,7 +171,11 @@ class GitHubBackup:
                     if self._push_file(filename):
                         pushed += 1
                         self._last_push[filename] = time.time()
+                        self._last_error = ""
+                        self._last_error_code = 0
                 except Exception as e:
+                    self._last_error = str(e)
+                    self._last_error_code = 0
                     print(f"[backup] Force push failed for {filename}: {e}")
         return pushed
 
@@ -242,6 +254,8 @@ class GitHubBackup:
 
         if resp.status_code == 200:
             self._branch_verified = True
+            self._last_error = ""
+            self._last_error_code = 0
             return
 
         if resp.status_code == 404:
@@ -251,6 +265,8 @@ class GitHubBackup:
             main_url = f"{GITHUB_API}/repos/{self.repo}/git/refs/heads/main"
             main_resp = requests.get(main_url, headers=self.headers, timeout=10)
             if main_resp.status_code != 200:
+                self._last_error = f"Can't find main branch: {main_resp.status_code}"
+                self._last_error_code = int(main_resp.status_code or 0)
                 print(f"[backup] Can't find main branch: {main_resp.status_code}")
                 return
 
@@ -269,8 +285,15 @@ class GitHubBackup:
             if create_resp.status_code in (200, 201):
                 print(f"[backup] Created '{BACKUP_BRANCH}' branch ✓")
                 self._branch_verified = True
+                self._last_error = ""
+                self._last_error_code = 0
             else:
+                self._last_error = f"Failed to create branch: {create_resp.status_code}"
+                self._last_error_code = int(create_resp.status_code or 0)
                 print(f"[backup] Failed to create branch: {create_resp.status_code}")
+        else:
+            self._last_error = f"Branch check failed: {resp.status_code}"
+            self._last_error_code = int(resp.status_code or 0)
 
     def _push_file(self, filename: str) -> bool:
         """Push a single file to GitHub."""
@@ -308,9 +331,13 @@ class GitHubBackup:
             new_sha = resp.json().get("content", {}).get("sha")
             if new_sha:
                 self._sha_cache[github_path] = new_sha
+            self._last_error = ""
+            self._last_error_code = 0
             return True
         else:
             error_msg = resp.json().get("message", "unknown error")
+            self._last_error = error_msg
+            self._last_error_code = int(resp.status_code or 0)
             print(f"[backup] GitHub push error for {filename}: {resp.status_code} — {error_msg}")
             # If SHA mismatch (409), clear cache and retry once
             if resp.status_code == 409:
@@ -459,4 +486,6 @@ def status() -> Dict[str, Any]:
             backup.remote_last_success_epoch(),
         )),
         "branch": BACKUP_BRANCH,
+        "last_error": str(getattr(backup, "_last_error", "") or ""),
+        "last_error_code": int(getattr(backup, "_last_error_code", 0) or 0),
     }
