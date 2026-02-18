@@ -46,5 +46,21 @@
     "created_date": "2026-02-18",
     "expires_date": "2026-03-20",
     "status": "PENDING"
+  },
+  {
+    "ticker": "IAG",
+    "condition_type": "breakout_volume",
+    "trigger_price": 22.43,
+    "volume_multiplier": 1.5,
+    "stop_price": 17.69,
+    "target_price": 27.05,
+    "position_size_pct": 12.5,
+    "notes": "AI: Overhead resistance at $22.43 (7.8% above) is a concern but not immediate. Enter now with room to ru",
+    "conviction": 10,
+    "signal_type": "",
+    "quality_grade": "B",
+    "created_date": "2026-02-18",
+    "expires_date": "2026-03-20",
+    "status": "PENDING"
   }
 ]
