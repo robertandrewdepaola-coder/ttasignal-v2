@@ -1462,11 +1462,14 @@ def render_sidebar():
                 f"☁ Backup: {'enabled' if _enabled else 'disabled'} | "
                 f"Branch: {_branch} | Pending: {_pending} | Last success: {_last_txt}"
             )
-            if _enabled and _pending > 0:
+            if _enabled:
                 if st.button("☁ Backup Now", key="force_backup_now", width="stretch"):
                     try:
-                        pushed = github_backup.flush()
-                        st.toast(f"✅ Backup flush complete ({int(pushed or 0)} file(s) pushed).")
+                        pushed = int(github_backup.flush() or 0)
+                        if pushed <= 0:
+                            pushed = int(github_backup.force_backup_all() or 0)
+                        st.toast(f"✅ Backup complete ({pushed} file(s) pushed).")
+                        st.rerun()
                     except Exception as _be:
                         st.error(f"Backup flush failed: {str(_be)[:180]}")
         except Exception:

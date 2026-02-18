@@ -26,6 +26,7 @@ import os
 import json
 import base64
 import time
+from datetime import datetime
 from typing import Optional, Dict, Set, Any
 from pathlib import Path
 
@@ -137,6 +138,9 @@ class GitHubBackup:
                 if self._push_file(filename):
                     pushed += 1
                     self._last_push[filename] = now
+                else:
+                    # Keep failed pushes queued; don't silently drop them.
+                    still_dirty.add(filename)
             except Exception as e:
                 print(f"[backup] Push failed for {filename}: {e}")
                 still_dirty.add(filename)  # Retry next flush
@@ -179,6 +183,49 @@ class GitHubBackup:
             return float(max(self._last_push.values()))
         except Exception:
             return 0.0
+
+    def remote_last_success_epoch(self) -> float:
+        """
+        Best-effort timestamp of latest commit on backup branch for backed-up files.
+
+        This survives container restarts and gives UI a durable "last success".
+        """
+        if not self._enabled:
+            return 0.0
+        import requests
+
+        latest = 0.0
+        for filename in BACKUP_FILES:
+            try:
+                url = f"{GITHUB_API}/repos/{self.repo}/commits"
+                params = {
+                    "sha": BACKUP_BRANCH,
+                    "path": f"data/{filename}",
+                    "per_page": 1,
+                }
+                resp = requests.get(url, headers=self.headers, params=params, timeout=10)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                if not isinstance(data, list) or not data:
+                    continue
+                date_s = (
+                    data[0]
+                    .get("commit", {})
+                    .get("committer", {})
+                    .get("date", "")
+                )
+                if not date_s:
+                    continue
+                # GitHub ISO format: 2026-02-18T03:45:02Z
+                if date_s.endswith("Z"):
+                    date_s = date_s.replace("Z", "+00:00")
+                ts = datetime.fromisoformat(date_s).timestamp()
+                if ts > latest:
+                    latest = ts
+            except Exception:
+                continue
+        return float(latest)
 
     # ── Internal Methods ────────────────────────────────────────────────
 
@@ -378,6 +425,14 @@ def flush():
     return 0
 
 
+def force_backup_all():
+    """Convenience wrapper — force push all known backup files."""
+    backup = get_backup()
+    if backup:
+        return backup.force_backup_all()
+    return 0
+
+
 def restore_all():
     """Convenience wrapper — restores missing files on startup."""
     backup = get_backup()
@@ -399,6 +454,9 @@ def status() -> Dict[str, Any]:
     return {
         "enabled": bool(backup.is_enabled),
         "pending_count": int(backup.pending_count),
-        "last_success_epoch": float(backup.last_success_epoch),
+        "last_success_epoch": float(max(
+            backup.last_success_epoch,
+            backup.remote_last_success_epoch(),
+        )),
         "branch": BACKUP_BRANCH,
     }
