@@ -2132,6 +2132,14 @@ def _lookup_company_name_for_trade_finder(ticker: str) -> str:
         name = str(profile.get('name', '') or '').strip()
     except Exception:
         name = ""
+    if not name:
+        # Secondary fallback: yfinance chart metadata often has shortName/longName
+        try:
+            import yfinance as yf
+            meta = getattr(yf.Ticker(t), "history_metadata", {}) or {}
+            name = str(meta.get("longName") or meta.get("shortName") or "").strip()
+        except Exception:
+            name = ""
 
     if not name:
         name = "Unknown company"
@@ -2452,8 +2460,10 @@ def _run_trade_finder_workflow() -> None:
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
-    ai_top_n = int(st.session_state.get('trade_finder_ai_top_n', 12) or 12)
+    ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
+    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else ai_top_n_cfg
     rows = []
+    ai_eval_cache = st.session_state.get('_tf_ai_eval_cache', {}) or {}
     provider_counts: Dict[str, int] = {}
     fallback_counts: Dict[str, int] = {}
     _t0 = time.time()
@@ -2465,10 +2475,20 @@ def _run_trade_finder_workflow() -> None:
 
         if i < ai_top_n:
             ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+            # Cache successful model-backed evaluations for reuse on fallback runs.
+            if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
+                ai_eval_cache[ticker] = dict(ai_rec)
+            elif ticker in ai_eval_cache:
+                ai_rec = dict(ai_eval_cache.get(ticker, {}))
+                ai_rec['fallback_reason'] = 'cached_ai_eval'
         else:
-            ai_rec = _heuristic_trade_finder_ai(c)
-            ai_rec['provider'] = 'system'
-            ai_rec['fallback_reason'] = 'ai_top_n_limit'
+            if ticker in ai_eval_cache:
+                ai_rec = dict(ai_eval_cache.get(ticker, {}))
+                ai_rec['fallback_reason'] = 'cached_ai_eval'
+            else:
+                ai_rec = _heuristic_trade_finder_ai(c)
+                ai_rec['provider'] = 'system'
+                ai_rec['fallback_reason'] = 'ai_top_n_limit'
         entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
         stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
         target = float(ai_rec.get('suggested_target', 0) or 0)
@@ -2568,6 +2588,7 @@ def _run_trade_finder_workflow() -> None:
         'fallback_counts': fallback_counts,
         'ai_top_n': ai_top_n,
     }
+    st.session_state['_tf_ai_eval_cache'] = ai_eval_cache
     try:
         get_journal().save_trade_finder_snapshot({
             'generated_at_iso': st.session_state['trade_finder_results'].get('generated_at_iso', ''),
@@ -2638,13 +2659,15 @@ def render_trade_finder_tab():
         key="trade_include_watch_only",
         help="When enabled, Watch Only AI ratings are included if other gates pass.",
     )
+    if 'trade_finder_ai_top_n' not in st.session_state:
+        st.session_state['trade_finder_ai_top_n'] = 0  # 0 = all candidates
     st.number_input(
         "AI Rank Top N",
-        min_value=1,
+        min_value=0,
         max_value=100,
         step=1,
         key="trade_finder_ai_top_n",
-        help="Only top N candidates use live AI scoring to avoid rate-limit fallback; rest use system heuristic.",
+        help="0 = all candidates use live AI scoring. Set >0 to cap API usage and speed up runs.",
     )
     settings = _trade_quality_settings()
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
