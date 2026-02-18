@@ -139,6 +139,8 @@ class WatchlistManager:
             try:
                 import github_backup
                 github_backup.mark_dirty(os.path.basename(self.json_path))
+                # Best-effort immediate flush so crash/restart doesn't lose recent watchlist edits.
+                github_backup.flush()
             except ImportError:
                 pass
         except Exception as e:
