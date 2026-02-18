@@ -1441,6 +1441,58 @@
       },
       "manual_additions": [],
       "manual_exclusions": []
+    },
+    {
+      "id": "8b872625-6856-46d5-aee0-9fcee45c3855",
+      "name": "ARKX",
+      "type": "auto",
+      "is_system": false,
+      "tickers": [
+        "ACHR",
+        "AIR",
+        "AMD",
+        "AMZN",
+        "AVAV",
+        "BWXT",
+        "DASH",
+        "DE",
+        "ESLT",
+        "GOOG",
+        "HEI",
+        "HON",
+        "IRDM",
+        "JOBY",
+        "KTOS",
+        "LHX",
+        "LMT",
+        "LUNR",
+        "NVDA",
+        "PLTR",
+        "PRNT",
+        "SNPS",
+        "SRTA",
+        "TDY",
+        "TER",
+        "TRMB",
+        "TSM"
+      ],
+      "created_at": "2026-02-18T19:50:24.857001",
+      "last_updated": "2026-02-18T19:50:25.525268",
+      "source_type": "etf_shortcut",
+      "source": "arkx",
+      "provider": "direct",
+      "last_refresh": "2026-02-18T19:50:24.878655",
+      "refresh_schedule": "manual",
+      "last_backup": null,
+      "scraping_stats": {
+        "total_refreshes": 1,
+        "successful_refreshes": 1,
+        "failed_refreshes": 0,
+        "last_error": null,
+        "last_error_date": null
+      },
+      "manual_additions": [],
+      "manual_exclusions": []
     }
   ]
 }
