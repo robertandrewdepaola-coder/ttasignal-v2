@@ -2044,13 +2044,17 @@ def _extract_first_json_object(raw: str) -> Dict[str, Any]:
         return _json.loads(txt)
     except Exception:
         pass
-    m = re.search(r"\{[\s\S]*\}", txt)
-    if not m:
-        return {}
-    try:
-        return _json.loads(m.group(0))
-    except Exception:
-        return {}
+    decoder = _json.JSONDecoder()
+    for i, ch in enumerate(txt):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(txt[i:])
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return {}
 
 def _extract_earn_days_hint(text: str) -> Optional[int]:
     """Best-effort extract of 'earnings in X days' from freeform model text."""
@@ -2309,7 +2313,10 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
     fallback_model = ai_cfg.get('fallback_model', '')
 
     if openai_client is None:
-        return _heuristic_trade_finder_ai(candidate)
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = 'system'
+        out['fallback_reason'] = 'openai_client_unavailable'
+        return out
 
     payload = {
         "ticker": candidate.get('ticker', ''),
@@ -2337,6 +2344,7 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
     models = [m for m in [model, fallback_model] if m]
     raw_text = None
     provider = None
+    errors = []
     for m in models:
         try:
             resp = openai_client.chat.completions.create(
@@ -2352,18 +2360,24 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
             provider = m
             if raw_text:
                 break
-        except Exception:
+        except Exception as e:
+            errors.append(f"{m}:{str(e)[:120]}")
             continue
 
     if not raw_text:
         out = _heuristic_trade_finder_ai(candidate)
         out['provider'] = 'system'
+        out['fallback_reason'] = 'ai_call_failed'
+        if errors:
+            out['fallback_error'] = " | ".join(errors[:2])
         return out
 
     parsed = _extract_first_json_object(raw_text)
     if not parsed:
         out = _heuristic_trade_finder_ai(candidate)
         out['provider'] = provider or 'system'
+        out['fallback_reason'] = 'json_parse_failed'
+        out['fallback_error'] = str(raw_text)[:160]
         return out
 
     entry = float(parsed.get('suggested_entry', payload['price']) or payload['price'] or 0)
@@ -2397,6 +2411,8 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         'rank_score': round(rank_score, 2),
         'rationale': rationale,
         'provider': provider or 'system',
+        'fallback_reason': '',
+        'fallback_error': '',
     }
 
 
@@ -2421,15 +2437,23 @@ def _run_trade_finder_workflow() -> None:
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
+    ai_top_n = int(st.session_state.get('trade_finder_ai_top_n', 12) or 12)
     rows = []
+    provider_counts: Dict[str, int] = {}
+    fallback_counts: Dict[str, int] = {}
     _t0 = time.time()
-    for c in base_candidates:
+    for i, c in enumerate(base_candidates):
         ticker = str(c.get('ticker', '')).upper().strip()
         company_name = str(c.get('company_name', '') or '').strip()
         if not company_name:
             company_name = _lookup_company_name_for_trade_finder(ticker)
 
-        ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+        if i < ai_top_n:
+            ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+        else:
+            ai_rec = _heuristic_trade_finder_ai(c)
+            ai_rec['provider'] = 'system'
+            ai_rec['fallback_reason'] = 'ai_top_n_limit'
         entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
         stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
         target = float(ai_rec.get('suggested_target', 0) or 0)
@@ -2439,6 +2463,8 @@ def _run_trade_finder_workflow() -> None:
         earn_days = int(c.get('earn_days', 999) or 999)
         rationale = str(ai_rec.get('rationale', '') or '')
         warnings = []
+        fallback_reason = str(ai_rec.get('fallback_reason', '') or '')
+        fallback_error = str(ai_rec.get('fallback_error', '') or '')
         if ai_rr > 0 and abs(ai_rr - rr) > 0.15:
             warnings.append(f"AI R:R {ai_rr:.2f} differs from level-based R:R {rr:.2f}")
         hinted_earn_days = _extract_earn_days_hint(rationale)
@@ -2477,6 +2503,8 @@ def _run_trade_finder_workflow() -> None:
             'gold_source': bool(gold.get('is_gold_source', False)),
             'consistency_warnings': warnings,
             'provider': gold.get('provider', ai_rec.get('provider', 'system')),
+            'fallback_reason': fallback_reason,
+            'fallback_error': fallback_error,
             'decision_card': build_trade_decision_card(
                 ticker=ticker,
                 source="trade_finder",
@@ -2503,6 +2531,10 @@ def _run_trade_finder_workflow() -> None:
             ).to_dict(),
         })
         rows[-1]['trade_score'] = compute_trade_score(rows[-1])
+        _p = str(rows[-1].get('provider', 'system') or 'system')
+        provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
+        if fallback_reason:
+            fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
 
     rows = sorted(
         rows,
@@ -2517,6 +2549,9 @@ def _run_trade_finder_workflow() -> None:
         'provider': rows[0].get('provider', 'system') if rows else 'system',
         'elapsed_sec': elapsed,
         'input_candidates': len(base_candidates),
+        'provider_counts': provider_counts,
+        'fallback_counts': fallback_counts,
+        'ai_top_n': ai_top_n,
     }
     try:
         get_journal().save_trade_finder_snapshot({
@@ -2588,6 +2623,14 @@ def render_trade_finder_tab():
         key="trade_include_watch_only",
         help="When enabled, Watch Only AI ratings are included if other gates pass.",
     )
+    st.number_input(
+        "AI Rank Top N",
+        min_value=1,
+        max_value=100,
+        step=1,
+        key="trade_finder_ai_top_n",
+        help="Only top N candidates use live AI scoring to avoid rate-limit fallback; rest use system heuristic.",
+    )
     settings = _trade_quality_settings()
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
 
@@ -2598,6 +2641,13 @@ def render_trade_finder_tab():
         f"Provider: {results.get('provider', 'system')}"
     )
     st.caption("Snapshot is saved daily and restored after app restart.")
+    _pc = results.get('provider_counts', {}) or {}
+    _fc = results.get('fallback_counts', {}) or {}
+    _pn = int(results.get('ai_top_n', st.session_state.get('trade_finder_ai_top_n', 12)) or 12)
+    if _pc:
+        st.caption("Provider mix: " + ", ".join([f"{k}={v}" for k, v in sorted(_pc.items())]))
+    if _fc:
+        st.caption("AI fallback reasons: " + ", ".join([f"{k}={v}" for k, v in sorted(_fc.items())]) + f" | AI Top N={_pn}")
 
     if not qualified_rows:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
@@ -2705,6 +2755,8 @@ def render_trade_finder_tab():
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(r.get('ai_rationale', '') or str(r.get('scanner_summary', '') or '')).strip()
                     warnings = list(r.get('consistency_warnings', []) or [])
+                    fallback_reason = str(r.get('fallback_reason', '') or '')
+                    fallback_error = str(r.get('fallback_error', '') or '')
 
                     if view_mode == "Table":
                         c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 2.2, 1.0, 1.4, 0.9, 0.8, 0.9, 2.4])
@@ -2727,6 +2779,10 @@ def render_trade_finder_tab():
                                 _stage_candidate(r, price, rr, rank, signal_reason, rationale)
                         if signal_reason:
                             st.caption(f"{ticker} Scanner Context: {signal_reason}")
+                        if fallback_reason:
+                            st.caption(f"{ticker} AI fallback: {fallback_reason}")
+                            if fallback_error:
+                                st.caption(f"↳ {fallback_error[:140]}")
                         for w in warnings[:2]:
                             st.caption(f"⚠ {w}")
                     else:
@@ -2744,6 +2800,10 @@ def render_trade_finder_tab():
                                 f"R:R {rr:.2f}:1"
                             )
                             st.caption(f"Scanner Context: {signal_reason}")
+                            if fallback_reason:
+                                st.caption(f"AI fallback: {fallback_reason}")
+                                if fallback_error:
+                                    st.caption(f"↳ {fallback_error[:140]}")
                             if rationale:
                                 st.caption(f"Analysis Note: {rationale}")
                             for w in warnings[:3]:
