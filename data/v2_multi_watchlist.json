@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "8a2af189-8743-48a4-8f04-42cc54a865b8",
+  "active_watchlist_id": "6a4da989-eb33-420f-8863-79eea1b6eaec",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -1048,6 +1048,47 @@
       ],
       "created_at": "2026-02-18T19:40:19.249429",
       "last_updated": "2026-02-18T19:40:42.691767"
+    },
+    {
+      "id": "6a4da989-eb33-420f-8863-79eea1b6eaec",
+      "name": "Utilities",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "AEE",
+        "AEP",
+        "AES",
+        "ATO",
+        "AWK",
+        "CEG",
+        "CMS",
+        "CNP",
+        "D",
+        "DTE",
+        "DUK",
+        "ED",
+        "EIX",
+        "ES",
+        "ETR",
+        "EVRG",
+        "EXC",
+        "FE",
+        "LNT",
+        "NEE",
+        "NI",
+        "NRG",
+        "PCG",
+        "PEG",
+        "PNW",
+        "PPL",
+        "SO",
+        "SRE",
+        "VST",
+        "WEC",
+        "XEL"
+      ],
+      "created_at": "2026-02-18T19:41:08.964582",
+      "last_updated": "2026-02-18T19:41:28.881648"
     }
   ]
 }
