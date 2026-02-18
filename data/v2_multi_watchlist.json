@@ -1,0 +1,19 @@
+{
+  "metadata": {
+    "migrated_from_journal": true,
+    "migration_date": "2026-02-18T06:06:06.998428",
+    "schema_version": "2.0"
+  },
+  "active_watchlist_id": "system-master-00000",
+  "watchlists": [
+    {
+      "id": "system-master-00000",
+      "name": "Master Watchlist",
+      "type": "manual",
+      "is_system": true,
+      "tickers": [],
+      "created_at": "2026-02-18T06:06:04.886259",
+      "last_updated": "2026-02-18T06:06:04.886259"
+    }
+  ]
+}
