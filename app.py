@@ -3608,6 +3608,25 @@ def _build_rows_from_analysis(results, jm) -> list:
     ticker_sectors = st.session_state.get('ticker_sectors', {})
     earnings_flags = st.session_state.get('earnings_flags', {})
 
+    def _resolve_sector(_ticker: str) -> str:
+        t = str(_ticker or '').upper().strip()
+        if not t:
+            return ''
+        sec = str(ticker_sectors.get(t, '') or '').strip()
+        if sec:
+            return sec
+        # Lazy backfill when scan-time sector assignment missed this ticker.
+        try:
+            from data_fetcher import get_ticker_sector
+            sec = str(get_ticker_sector(t) or '').strip()
+            if sec:
+                ticker_sectors[t] = sec
+                st.session_state['ticker_sectors'] = ticker_sectors
+                return sec
+        except Exception:
+            pass
+        return ''
+
     rows = []
     for r in results:
         rec = r.recommendation or {}
@@ -3623,7 +3642,7 @@ def _build_rows_from_analysis(results, jm) -> list:
             status = "👀"
 
         # Sector rotation — use phase for color (LEADING/EMERGING/FADING/LAGGING)
-        sector = ticker_sectors.get(r.ticker, '')
+        sector = _resolve_sector(r.ticker)
         sector_info = sector_rotation.get(sector, {})
         sector_phase = sector_info.get('phase', '')
         sector_short = sector_info.get('short_name', sector[:4] if sector else '')
@@ -3722,7 +3741,29 @@ def _build_rows_from_summary(summary, jm) -> list:
     open_tickers = jm.get_open_tickers()
     conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
     sector_rotation = st.session_state.get('sector_rotation', {})
+    ticker_sectors = st.session_state.get('ticker_sectors', {})
     earnings_flags = st.session_state.get('earnings_flags', {})
+
+    def _resolve_sector(_ticker: str, _persisted_sector: str) -> str:
+        sec = str(_persisted_sector or '').strip()
+        if sec:
+            return sec
+        t = str(_ticker or '').upper().strip()
+        if not t:
+            return ''
+        sec = str(ticker_sectors.get(t, '') or '').strip()
+        if sec:
+            return sec
+        try:
+            from data_fetcher import get_ticker_sector
+            sec = str(get_ticker_sector(t) or '').strip()
+            if sec:
+                ticker_sectors[t] = sec
+                st.session_state['ticker_sectors'] = ticker_sectors
+                return sec
+        except Exception:
+            pass
+        return ''
 
     rows = []
     for s in summary:
@@ -3735,7 +3776,7 @@ def _build_rows_from_summary(summary, jm) -> list:
             status = "👀"
 
         # Sector rotation — prefer persisted phase, fallback to runtime lookup
-        sector = s.get('sector', '')
+        sector = _resolve_sector(ticker, s.get('sector', ''))
         sector_phase = s.get('sector_phase', '')  # Persisted from scan
         if not sector_phase:
             # Fallback to runtime sector_rotation (may be empty after page refresh)
