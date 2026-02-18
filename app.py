@@ -2142,7 +2142,8 @@ def _lookup_company_name_for_trade_finder(ticker: str) -> str:
             name = ""
 
     if not name:
-        name = "Unknown company"
+        # Do not cache unknown forever; retry on future runs.
+        return "Unknown company"
     cache[t] = name
     st.session_state['_tf_company_name_cache'] = cache
     return name
@@ -2461,7 +2462,8 @@ def _run_trade_finder_workflow() -> None:
     gate = _evaluate_trade_gate(snap)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
-    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else ai_top_n_cfg
+    # Full-quality mode: when 0, evaluate all candidates with AI.
+    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else min(ai_top_n_cfg, len(base_candidates))
     rows = []
     ai_eval_cache = st.session_state.get('_tf_ai_eval_cache', {}) or {}
     provider_counts: Dict[str, int] = {}
@@ -2482,6 +2484,7 @@ def _run_trade_finder_workflow() -> None:
                 ai_rec = dict(ai_eval_cache.get(ticker, {}))
                 ai_rec['fallback_reason'] = 'cached_ai_eval'
         else:
+            # Cap mode: still show best cached AI evaluation when available.
             if ticker in ai_eval_cache:
                 ai_rec = dict(ai_eval_cache.get(ticker, {}))
                 ai_rec['fallback_reason'] = 'cached_ai_eval'
