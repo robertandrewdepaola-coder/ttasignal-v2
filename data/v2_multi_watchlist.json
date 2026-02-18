@@ -21,10 +21,11 @@
       "type": "manual",
       "is_system": false,
       "tickers": [
-        "AAPL"
+        "AAPL",
+        "FIX"
       ],
       "created_at": "2026-02-18T06:24:24.471852",
-      "last_updated": "2026-02-18T06:24:37.409745"
+      "last_updated": "2026-02-18T08:16:34.973282"
     }
   ]
 }
