@@ -78,5 +78,21 @@
     "created_date": "2026-02-18",
     "expires_date": "2026-03-20",
     "status": "PENDING"
+  },
+  {
+    "ticker": "UCTT",
+    "condition_type": "breakout_volume",
+    "trigger_price": 58.7,
+    "volume_multiplier": 1.5,
+    "stop_price": 46.57,
+    "target_price": 70.63,
+    "position_size_pct": 12.5,
+    "notes": "AI: Overhead resistance at $58.70 (52-week high, 7.5% above) is a concern. Wait for a breakout above $58",
+    "conviction": 10,
+    "signal_type": "",
+    "quality_grade": "C",
+    "created_date": "2026-02-18",
+    "expires_date": "2026-03-20",
+    "status": "PENDING"
   }
 ]
