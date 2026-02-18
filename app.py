@@ -1975,6 +1975,18 @@ def _extract_first_json_object(raw: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def _extract_earn_days_hint(text: str) -> Optional[int]:
+    """Best-effort extract of 'earnings in X days' from freeform model text."""
+    if not text:
+        return None
+    m = re.search(r"earnings?\s+(?:in|within)\s+(\d{1,3})\s*days?", str(text).lower())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
 
 def _calc_rr(entry: float, stop: float, target: float) -> float:
     """Compute reward/risk ratio with guardrails."""
@@ -2105,6 +2117,8 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         "ai_buy_recommendation, suggested_entry, suggested_stop_loss, suggested_target, "
         "risk_reward, rank_score, rationale. "
         "ai_buy_recommendation must be one of: Strong Buy, Buy, Watch Only, Skip. "
+        "Do not change ticker identity. Do not infer or mention company names. "
+        "Do not invent earnings timing; use earn_days exactly as provided. "
         "Set stop below entry, target above entry. Keep rationale <= 180 chars.\n\n"
         f"Candidate:\n{_json.dumps(payload)}"
     )
@@ -2196,35 +2210,34 @@ def _run_trade_finder_workflow() -> None:
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
-    profile_cache = st.session_state.get('_trade_finder_profile_cache', {}) or {}
     rows = []
     _t0 = time.time()
     for c in base_candidates:
         ticker = str(c.get('ticker', '')).upper().strip()
-        company_name = profile_cache.get(ticker, "")
-        if not company_name:
-            try:
-                from data_fetcher import fetch_fundamental_profile
-                prof = fetch_fundamental_profile(ticker) or {}
-                company_name = str(prof.get('name', '') or '')
-                if company_name:
-                    profile_cache[ticker] = company_name
-            except Exception:
-                company_name = ""
+        # Strict rule: do not infer company from ticker/price/external lookup.
+        company_name = str(c.get('company_name', '') or '').strip() or "Unknown company"
 
         ai_rec = _grok_trade_finder_assessment(c, ai_clients)
         entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
         stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
         target = float(ai_rec.get('suggested_target', 0) or 0)
-        rr = float(ai_rec.get('risk_reward', 0) or 0)
-        if rr <= 0:
-            rr = _calc_rr(entry, stop, target)
+        ai_rr = float(ai_rec.get('risk_reward', 0) or 0)
+        # Canonical R:R is always derived from entry/stop/target levels.
+        rr = _calc_rr(entry, stop, target)
+        earn_days = int(c.get('earn_days', 999) or 999)
+        rationale = str(ai_rec.get('rationale', '') or '')
+        warnings = []
+        if ai_rr > 0 and abs(ai_rr - rr) > 0.15:
+            warnings.append(f"AI R:R {ai_rr:.2f} differs from level-based R:R {rr:.2f}")
+        hinted_earn_days = _extract_earn_days_hint(rationale)
+        if hinted_earn_days is not None and abs(hinted_earn_days - earn_days) > 1:
+            warnings.append(f"Model note earnings hint ({hinted_earn_days}d) conflicts with signal ({earn_days}d)")
         rows.append({
             'ticker': ticker,
             'trade_finder_run_id': run_id,
             'company_name': company_name,
             'price': float(c.get('price', 0) or 0),
-            'earn_days': int(c.get('earn_days', 999) or 999),
+            'earn_days': earn_days,
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
@@ -2233,8 +2246,10 @@ def _run_trade_finder_workflow() -> None:
             'suggested_stop_loss': round(stop, 2),
             'suggested_target': round(target, 2),
             'risk_reward': round(rr, 2),
+            'ai_reported_rr': round(ai_rr, 2),
             'rank_score': float(ai_rec.get('rank_score', 0) or 0),
-            'ai_rationale': str(ai_rec.get('rationale', '') or ''),
+            'ai_rationale': rationale,
+            'consistency_warnings': warnings,
             'provider': ai_rec.get('provider', 'system'),
             'decision_card': build_trade_decision_card(
                 ticker=ticker,
@@ -2252,7 +2267,7 @@ def _run_trade_finder_workflow() -> None:
                 reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
                 ai_rationale=str(ai_rec.get('rationale', '') or ''),
                 sector_phase=str(c.get('sector_phase', '') or ''),
-                earn_days=int(c.get('earn_days', 999) or 999),
+                earn_days=earn_days,
                 explainability_bits=[
                     f"rec={str(c.get('recommendation', '') or '')}",
                     f"conv={int(c.get('conviction', 0) or 0)}",
@@ -2262,7 +2277,6 @@ def _run_trade_finder_workflow() -> None:
             ).to_dict(),
         })
 
-    st.session_state['_trade_finder_profile_cache'] = profile_cache
     rows = sorted(rows, key=lambda x: x.get('rank_score', 0), reverse=True)
     elapsed = max(0.0, time.time() - _t0)
     st.session_state['trade_finder_results'] = {
@@ -2439,6 +2453,7 @@ def render_trade_finder_tab():
                     earn_days = int(r.get('earn_days', 999) or 999)
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(r.get('ai_rationale', '') or str(r.get('scanner_summary', '') or '')).strip()
+                    warnings = list(r.get('consistency_warnings', []) or [])
 
                     with st.container(border=True):
                         st.markdown(f"**{ticker} — {company}**")
@@ -2455,6 +2470,8 @@ def render_trade_finder_tab():
                         st.caption(f"Signal Context: {signal_reason}")
                         if rationale:
                             st.caption(f"Model Note: {rationale}")
+                        for w in warnings[:3]:
+                            st.warning(f"Consistency warning: {w}")
                         a1, a2, a3 = st.columns(3)
                         with a1:
                             if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
