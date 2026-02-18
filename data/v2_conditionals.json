@@ -1,0 +1,18 @@
+[
+  {
+    "ticker": "AGX",
+    "condition_type": "breakout_volume",
+    "trigger_price": 410.0,
+    "volume_multiplier": 1.5,
+    "stop_price": 354.74,
+    "target_price": 511.16,
+    "position_size_pct": 12.5,
+    "notes": "AI: Overhead resistance at $410 (0.8% above) is a near-term hurdle. Wait for a decisive break above $410",
+    "conviction": 10,
+    "signal_type": "",
+    "quality_grade": "B",
+    "created_date": "2026-02-18",
+    "expires_date": "2026-03-20",
+    "status": "PENDING"
+  }
+]
