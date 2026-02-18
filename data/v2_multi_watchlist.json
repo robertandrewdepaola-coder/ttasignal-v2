@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "798ec300-ff3a-45d1-9015-6b971854382e",
+  "active_watchlist_id": "181e9f19-4c6e-4698-b034-0ad4fd8e86b4",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -527,9 +527,36 @@
       "name": "Materials",
       "type": "manual",
       "is_system": false,
-      "tickers": [],
+      "tickers": [
+        "ALB",
+        "AMCR",
+        "APD",
+        "AVY",
+        "BALL",
+        "CF",
+        "CTVA",
+        "DD",
+        "DOW",
+        "ECL",
+        "EMN",
+        "FCX",
+        "IFF",
+        "IP",
+        "LIN",
+        "LYB",
+        "MLM",
+        "MOS",
+        "NEM",
+        "NUE",
+        "PKG",
+        "PPG",
+        "SHW",
+        "STLD",
+        "SW",
+        "VMC"
+      ],
       "created_at": "2026-02-18T19:34:07.571935",
-      "last_updated": "2026-02-18T19:34:07.571935"
+      "last_updated": "2026-02-18T19:34:28.559639"
     }
   ]
 }
