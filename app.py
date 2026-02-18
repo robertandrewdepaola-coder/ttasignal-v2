@@ -2297,7 +2297,7 @@ def _run_trade_finder_workflow() -> None:
 def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
     st.subheader("🧭 Trade Finder")
-    st.caption("Runs cross-watchlist scan, ranks candidates with Grok, and opens prefilled trade entry.")
+    st.caption("Runs cross-watchlist scan and ranks model/system trade signals with clear actions.")
     jm = get_journal()
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
@@ -2354,27 +2354,7 @@ def render_trade_finder_tab():
     )
     st.caption("Snapshot is saved daily and restored after app restart.")
 
-    table_rows = []
-    for r in qualified_rows:
-        card = r.get('decision_card', {}) or {}
-        table_rows.append({
-            'Ticker': r.get('ticker', ''),
-            'Company': r.get('company_name', ''),
-            'Price': f"${float(r.get('price', 0) or 0):.2f}",
-            'Reason': r.get('reason', ''),
-            'AI Buy Recommendation': r.get('ai_buy_recommendation', ''),
-            'Suggested Stop Loss': f"${float(r.get('suggested_stop_loss', 0) or 0):.2f}",
-            'Suggested Target': f"${float(r.get('suggested_target', 0) or 0):.2f}",
-            'Risk/Reward': f"{float(r.get('risk_reward', 0) or 0):.2f}:1",
-            'Earn Days': int(r.get('earn_days', 999) or 999),
-            'AI Rationale': r.get('ai_rationale', ''),
-            'Rank': f"{float(r.get('rank_score', 0) or 0):.2f}",
-            'Readiness': card.get('execution_readiness', ''),
-            'Regime Fit': card.get('regime_fit_score', ''),
-        })
-    if table_rows:
-        st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
-    else:
+    if not qualified_rows:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
         fail = {
             'ai_rating_filtered': 0,
@@ -2414,6 +2394,93 @@ def render_trade_finder_tab():
             if any(v > 0 for v in fail.values())
             else "Filter diagnostics: no hard failures detected (check data freshness)."
         )
+    else:
+        st.markdown("### Qualified Signals")
+        st.caption("Signal Verdict uses model/system scoring. Use actions to review chart or place trade.")
+
+        def _open_candidate_for_action(_r: Dict[str, Any], detail_tab: int):
+            _ticker = str(_r.get('ticker', '')).upper().strip()
+            st.session_state['trade_finder_selected_trade'] = {
+                'ticker': _ticker,
+                'entry': float(_r.get('suggested_entry', _r.get('price', 0)) or _r.get('price', 0) or 0),
+                'stop': float(_r.get('suggested_stop_loss', 0) or 0),
+                'target': float(_r.get('suggested_target', 0) or 0),
+                'ai_buy_recommendation': _r.get('ai_buy_recommendation', ''),
+                'risk_reward': float(_r.get('risk_reward', 0) or 0),
+                'earn_days': int(_r.get('earn_days', 999) or 999),
+                'reason': _r.get('reason', ''),
+                'ai_rationale': _r.get('ai_rationale', ''),
+                'provider': _r.get('provider', 'system'),
+                'generated_at_iso': results.get('generated_at_iso', ''),
+                'trade_finder_run_id': str(_r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
+            }
+            st.session_state['default_detail_tab'] = detail_tab
+            st.session_state['_switch_to_scanner_tab'] = True
+            _load_ticker_for_view(_ticker)
+            st.rerun()
+
+        primary_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() in {"Strong Buy", "Buy"}]
+        watch_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() not in {"Strong Buy", "Buy"}]
+
+        for group_label, group_rows, expanded in [
+            ("🚀 Actionable Signals", primary_rows, True),
+            ("👀 Watchlist Signals", watch_rows, False),
+        ]:
+            with st.expander(f"{group_label} ({len(group_rows)})", expanded=expanded):
+                if not group_rows:
+                    st.caption("None in this group.")
+                for i, r in enumerate(group_rows[:40]):
+                    ticker = str(r.get('ticker', '')).upper().strip()
+                    company = str(r.get('company_name', '') or '').strip() or "Unknown company"
+                    ai_buy = str(r.get('ai_buy_recommendation', '') or '')
+                    rr = float(r.get('risk_reward', 0) or 0)
+                    rank = float(r.get('rank_score', 0) or 0)
+                    price = float(r.get('price', 0) or 0)
+                    earn_days = int(r.get('earn_days', 999) or 999)
+                    signal_reason = str(r.get('reason', '') or '')
+                    rationale = str(r.get('ai_rationale', '') or str(r.get('scanner_summary', '') or '')).strip()
+
+                    with st.container(border=True):
+                        st.markdown(f"**{ticker} — {company}**")
+                        st.caption(
+                            f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
+                            f"Signal Score: {rank:.2f} | Earnings: {earn_days}d"
+                        )
+                        st.caption(
+                            f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
+                            f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
+                            f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
+                            f"R:R {rr:.2f}:1"
+                        )
+                        st.caption(f"Signal Context: {signal_reason}")
+                        if rationale:
+                            st.caption(f"Model Note: {rationale}")
+                        a1, a2, a3 = st.columns(3)
+                        with a1:
+                            if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
+                                _open_candidate_for_action(r, detail_tab=1)
+                        with a2:
+                            if st.button("✅ Place Trade", key=f"tf_trade_{group_label}_{i}_{ticker}", width="stretch"):
+                                _open_candidate_for_action(r, detail_tab=4)
+                        with a3:
+                            if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
+                                plan = PlannedTrade(
+                                    plan_id='',
+                                    ticker=ticker,
+                                    status='PLANNED',
+                                    source='trade_finder',
+                                    entry=float(r.get('suggested_entry', price) or price or 0),
+                                    stop=float(r.get('suggested_stop_loss', 0) or 0),
+                                    target=float(r.get('suggested_target', 0) or 0),
+                                    risk_reward=rr,
+                                    ai_recommendation=ai_buy,
+                                    rank_score=rank,
+                                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
+                                    reason=signal_reason,
+                                    notes=rationale,
+                                )
+                                st.success(jm.add_planned_trade(plan))
+                                st.rerun()
 
     st.markdown("### Open In New Trade")
     sb1, sb2 = st.columns([1, 1])
@@ -2443,60 +2510,10 @@ def render_trade_finder_tab():
             st.success(f"Staged {staged} qualified trade(s).")
             st.rerun()
 
-    for i, r in enumerate(qualified_rows[:25]):
-        ticker = r.get('ticker', '')
-        card = r.get('decision_card', {}) or {}
-        label = (
-            f"{ticker} | {r.get('ai_buy_recommendation', '')} | "
-            f"R:R {float(r.get('risk_reward', 0) or 0):.2f}:1 | "
-            f"Score {float(r.get('rank_score', 0) or 0):.2f} | {card.get('execution_readiness', '')}"
-        )
-        c_open, c_stage = st.columns([3, 1])
-        with c_open:
-            if st.button(label, key=f"tf_open_{i}_{ticker}", width="stretch"):
-                st.session_state['trade_finder_selected_trade'] = {
-                    'ticker': ticker,
-                    'entry': float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
-                    'stop': float(r.get('suggested_stop_loss', 0) or 0),
-                    'target': float(r.get('suggested_target', 0) or 0),
-                    'ai_buy_recommendation': r.get('ai_buy_recommendation', ''),
-                    'risk_reward': float(r.get('risk_reward', 0) or 0),
-                    'earn_days': int(r.get('earn_days', 999) or 999),
-                    'reason': r.get('reason', ''),
-                    'ai_rationale': r.get('ai_rationale', ''),
-                    'provider': r.get('provider', 'system'),
-                    'generated_at_iso': results.get('generated_at_iso', ''),
-                    'trade_finder_run_id': str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-                }
-                st.session_state['default_detail_tab'] = 4
-                st.session_state['_switch_to_scanner_tab'] = True
-                _load_ticker_for_view(ticker)
-                st.rerun()
-        with c_stage:
-            if st.button("🗂️ Stage", key=f"tf_stage_{i}_{ticker}", width="stretch"):
-                plan = PlannedTrade(
-                    plan_id='',
-                    ticker=ticker,
-                    status='PLANNED',
-                    source='trade_finder',
-                    entry=float(r.get('suggested_entry', r.get('price', 0)) or r.get('price', 0) or 0),
-                    stop=float(r.get('suggested_stop_loss', 0) or 0),
-                    target=float(r.get('suggested_target', 0) or 0),
-                    risk_reward=float(r.get('risk_reward', 0) or 0),
-                    ai_recommendation=str(r.get('ai_buy_recommendation', '') or ''),
-                    rank_score=float(r.get('rank_score', 0) or 0),
-                    trade_finder_run_id=str(r.get('trade_finder_run_id', '') or results.get('run_id', '') or ''),
-                    reason=str(r.get('reason', '') or ''),
-                    notes=str(r.get('ai_rationale', '') or ''),
-                )
-                msg = jm.add_planned_trade(plan)
-                st.success(msg)
-                st.rerun()
-
     planned = jm.get_planned_trades()
     if planned:
         st.divider()
-        st.markdown(f"### 🗂️ Planned Trades ({len(planned)})")
+        st.markdown(f"### 🗂️ Planned Trade Tickets ({len(planned)})")
         for p in planned[:30]:
             pid = str(p.get('plan_id', ''))
             pt = str(p.get('ticker', ''))
