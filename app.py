@@ -2138,20 +2138,39 @@ def _normalize_gold_ai_contract(
     level_rr = _calc_rr(entry, stop, target)
 
     ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
-    action_text = str(ai_result.get('action', ai_result.get('timing', '')) or '').upper()
+    action_text = str(
+        ai_result.get('action', '')
+        or ai_result.get('timing', '')
+        or ai_result.get('recommendation', '')
+        or ai_result.get('synthesized_recommendation', '')
+        or ''
+    ).upper()
     raw_text = str(ai_result.get('raw_text', '') or '')
+    analysis_text = str(ai_result.get('analysis', '') or '')
+    text_blob = " ".join([action_text, raw_text, analysis_text]).strip().upper()
     conv = int(ai_result.get('conviction', 0) or 0)
     pos_size = str(ai_result.get('position_sizing', '') or '').lower()
     provider = str(ai_result.get('provider', 'system') or 'system')
+    earn_days = int(row.get('earn_days', 999) or 999)
 
     verdict = fallback_ai_buy if fallback_ai_buy in {"Strong Buy", "Buy", "Watch Only", "Skip"} else "Watch Only"
-    if action_text:
-        if any(k in action_text for k in ["PASS", "SKIP"]):
+    if text_blob:
+        if any(k in text_blob for k in ["PASS", "SKIP", "ENTRY IS NOT ADVISED", "NOT ADVISED", "AVOID ENTRY"]):
             verdict = "Skip"
-        elif "HOLD" in action_text:
+        elif "HOLD" in text_blob:
             verdict = "Watch Only"
-        elif "BUY" in action_text:
+        elif "BUY" in text_blob:
             verdict = "Strong Buy" if conv >= 8 else "Buy"
+    if "skip" in pos_size:
+        verdict = "Skip"
+
+    # Earnings risk guardrail: if AI mentions earnings/gap risk soon, do not keep buy verdict.
+    earnings_risk_phrase = (
+        "EARNINGS" in text_blob and
+        any(k in text_blob for k in ["GAP RISK", "BINARY RISK", "NOT ADVISED", "PASS", "SKIP"])
+    )
+    if 0 <= earn_days <= 7 and earnings_risk_phrase and verdict in {"Strong Buy", "Buy"}:
+        verdict = "Skip"
 
     rr_from_text = _extract_rr_from_text(raw_text)
     rr = rr_from_text if rr_from_text and rr_from_text > 0 else level_rr
@@ -2171,7 +2190,14 @@ def _normalize_gold_ai_contract(
     rr_adj = max(-0.5, min(1.2, (rr - 1.5) * 0.35))
     unified_score = round(float(fallback_rank_score or 0) + verdict_adj + conv_adj + rr_adj + size_adj, 2)
 
-    note = str(ai_result.get('why_moving', '') or ai_result.get('smart_money', '') or '')[:180]
+    note = str(
+        ai_result.get('synthesized_recommendation', '')
+        or ai_result.get('analysis', '')
+        or ai_result.get('raw_text', '')
+        or ai_result.get('why_moving', '')
+        or ai_result.get('smart_money', '')
+        or ''
+    ).strip()[:220]
     return {
         'verdict': verdict,
         'confidence': conv,
@@ -2445,7 +2471,7 @@ def _run_trade_finder_workflow() -> None:
             'risk_reward': round(float(gold.get('risk_reward', rr) or rr), 2),
             'ai_reported_rr': round(ai_rr, 2),
             'rank_score': float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
-            'ai_rationale': rationale,
+            'ai_rationale': str(gold.get('note', '') or rationale or ''),
             'ai_confidence': int(gold.get('confidence', 0) or 0),
             'ai_position_sizing': str(gold.get('position_sizing', '') or ''),
             'gold_source': bool(gold.get('is_gold_source', False)),
@@ -2700,7 +2726,7 @@ def render_trade_finder_tab():
                             if st.button("🗂️", key=f"tf_tbl_stage_{group_label}_{i}_{ticker}", help="Stage Ticket", width="stretch"):
                                 _stage_candidate(r, price, rr, rank, signal_reason, rationale)
                         if signal_reason:
-                            st.caption(f"{ticker}: {signal_reason}")
+                            st.caption(f"{ticker} Scanner Context: {signal_reason}")
                         for w in warnings[:2]:
                             st.caption(f"⚠ {w}")
                     else:
@@ -2717,7 +2743,7 @@ def render_trade_finder_tab():
                                 f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
                                 f"R:R {rr:.2f}:1"
                             )
-                            st.caption(f"Signal Context: {signal_reason}")
+                            st.caption(f"Scanner Context: {signal_reason}")
                             if rationale:
                                 st.caption(f"Analysis Note: {rationale}")
                             for w in warnings[:3]:
