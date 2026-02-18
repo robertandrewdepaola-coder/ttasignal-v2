@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "f0401fd5-b7e2-47f7-a312-308725c7b92b",
+  "active_watchlist_id": "c5c29d7c-3af2-415c-9318-57381ffbae81",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -309,9 +309,11 @@
       "name": "Information Technology",
       "type": "manual",
       "is_system": false,
-      "tickers": [],
+      "tickers": [
+        "GOOGL"
+      ],
       "created_at": "2026-02-18T09:13:36.664419",
-      "last_updated": "2026-02-18T09:13:36.664419"
+      "last_updated": "2026-02-18T09:14:13.021183"
     }
   ]
 }
