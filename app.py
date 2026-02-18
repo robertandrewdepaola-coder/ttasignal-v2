@@ -1995,10 +1995,13 @@ def _trade_quality_settings() -> Dict[str, Any]:
         st.session_state['trade_earnings_block_days'] = 7
     if 'trade_require_ready' not in st.session_state:
         st.session_state['trade_require_ready'] = True
+    if 'trade_include_watch_only' not in st.session_state:
+        st.session_state['trade_include_watch_only'] = False
     return {
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 2.0) or 2.0),
         'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
         'require_ready': bool(st.session_state.get('trade_require_ready', True)),
+        'include_watch_only': bool(st.session_state.get('trade_include_watch_only', False)),
     }
 
 
@@ -2007,6 +2010,7 @@ def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any])
     min_rr = float(settings.get('min_rr', 2.0) or 2.0)
     earn_block_days = int(settings.get('earn_block_days', 7) or 7)
     require_ready = bool(settings.get('require_ready', True))
+    include_watch_only = bool(settings.get('include_watch_only', False))
 
     entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
     stop = float(row.get('suggested_stop_loss', 0) or 0)
@@ -2021,7 +2025,8 @@ def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any])
     if rr < min_rr:
         return False
     ai_buy = str(row.get('ai_buy_recommendation', '') or '').strip()
-    if ai_buy not in {"Strong Buy", "Buy"}:
+    allowed_ai = {"Strong Buy", "Buy"} | ({"Watch Only"} if include_watch_only else set())
+    if ai_buy not in allowed_ai:
         return False
 
     earn_days = int(row.get('earn_days', 999) or 999)
@@ -2333,6 +2338,11 @@ def render_trade_finder_tab():
             key="trade_require_ready",
             help="Only include decision-card READY candidates.",
         )
+    st.checkbox(
+        "Include Watch Only ideas",
+        key="trade_include_watch_only",
+        help="When enabled, Watch Only AI ratings are included if other gates pass.",
+    )
     settings = _trade_quality_settings()
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
 
@@ -2366,6 +2376,44 @@ def render_trade_finder_tab():
         st.dataframe(pd.DataFrame(table_rows), hide_index=True, width="stretch")
     else:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
+        fail = {
+            'ai_rating_filtered': 0,
+            'missing_levels': 0,
+            'invalid_level_order': 0,
+            'rr_below_threshold': 0,
+            'earnings_blocked': 0,
+            'not_ready': 0,
+        }
+        for r in rows:
+            entry = float(r.get('suggested_entry', r.get('price', 0)) or 0)
+            stop = float(r.get('suggested_stop_loss', 0) or 0)
+            target = float(r.get('suggested_target', 0) or 0)
+            rr = float(r.get('risk_reward', 0) or 0)
+            if rr <= 0:
+                rr = _calc_rr(entry, stop, target)
+            ai_buy = str(r.get('ai_buy_recommendation', '') or '').strip()
+            allowed_ai = {"Strong Buy", "Buy"} | ({"Watch Only"} if settings.get('include_watch_only') else set())
+            if ai_buy not in allowed_ai:
+                fail['ai_rating_filtered'] += 1
+            if not (entry > 0 and stop > 0 and target > 0):
+                fail['missing_levels'] += 1
+            if not (stop < entry < target):
+                fail['invalid_level_order'] += 1
+            if rr < float(settings.get('min_rr', 2.0)):
+                fail['rr_below_threshold'] += 1
+            earn_days = int(r.get('earn_days', 999) or 999)
+            if 0 <= earn_days <= int(settings.get('earn_block_days', 7)):
+                fail['earnings_blocked'] += 1
+            if settings.get('require_ready'):
+                card = r.get('decision_card', {}) or {}
+                if str(card.get('execution_readiness', '')).upper() != "READY":
+                    fail['not_ready'] += 1
+        st.caption(
+            "Filter diagnostics: "
+            + ", ".join([f"{k}={v}" for k, v in fail.items() if v > 0])
+            if any(v > 0 for v in fail.values())
+            else "Filter diagnostics: no hard failures detected (check data freshness)."
+        )
 
     st.markdown("### Open In New Trade")
     sb1, sb2 = st.columns([1, 1])
