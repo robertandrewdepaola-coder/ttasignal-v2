@@ -33,7 +33,7 @@ try:
         fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
         clear_cache, get_fetch_health_status,
     )
-except KeyError:
+except (KeyError, ImportError, AttributeError):
     # Streamlit Cloud can race module loading during hot-reload after git pulls.
     # Retry via importlib to recover from transient sys.modules inconsistencies.
     import importlib as _importlib
@@ -46,7 +46,7 @@ except KeyError:
     fetch_weekly = _df.fetch_weekly
     fetch_monthly = _df.fetch_monthly
     clear_cache = _df.clear_cache
-    get_fetch_health_status = _df.get_fetch_health_status
+    get_fetch_health_status = getattr(_df, "get_fetch_health_status", lambda: {})
 try:
     from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 except KeyError:
