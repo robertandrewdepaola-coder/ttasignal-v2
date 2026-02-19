@@ -3042,6 +3042,72 @@ def _sector_phase_display(sector_phase: str) -> Dict[str, str]:
     return {"label": "UNCLASSIFIED", "icon": "⚪", "color": "#94a3b8"}
 
 
+def _resolve_trade_finder_sector_fields(
+    row: Dict[str, Any],
+    rotation_ctx: Optional[Dict[str, Any]] = None,
+    ticker_sector_ctx: Optional[Dict[str, str]] = None,
+    scan_sector_map: Optional[Dict[str, str]] = None,
+    allow_fetch: bool = False,
+) -> Dict[str, str]:
+    """Resolve sector + rotation phase for a Trade Finder row with multi-source fallbacks."""
+    ticker = str(row.get('ticker', '')).upper().strip()
+    rotation_ctx = rotation_ctx or {}
+    ticker_sector_ctx = ticker_sector_ctx or {}
+    scan_sector_map = scan_sector_map or {}
+
+    sector_name = _canonicalize_sector_name(str(row.get('sector', '') or '').strip(), rotation_ctx)
+    sector_phase = str(row.get('sector_phase', '') or '').upper().strip()
+
+    if not sector_name and ticker:
+        sector_name = _canonicalize_sector_name(str(ticker_sector_ctx.get(ticker, '') or '').strip(), rotation_ctx)
+    if not sector_name and ticker:
+        sector_name = _canonicalize_sector_name(str(scan_sector_map.get(ticker, '') or '').strip(), rotation_ctx)
+
+    text_blob = " ".join([
+        str(row.get('scanner_summary', '') or ''),
+        str(row.get('reason', '') or ''),
+        str(row.get('analysis_note', '') or ''),
+        str(row.get('ai_rationale', '') or ''),
+    ]).strip()
+    if not sector_name:
+        sector_name = _canonicalize_sector_name(_infer_sector_from_text(text_blob), rotation_ctx)
+
+    # Last-resort lookup: try profile/sector endpoint once per ticker and cache it.
+    if allow_fetch and ticker and not sector_name:
+        cache = st.session_state.get('_tf_sector_lookup_cache')
+        if not isinstance(cache, dict):
+            cache = {}
+        cached = str(cache.get(ticker, '') or '')
+        if not cached:
+            fetched = ""
+            try:
+                from data_fetcher import get_ticker_sector, fetch_fundamental_profile
+                fetched = str(get_ticker_sector(ticker) or '').strip()
+                if not fetched:
+                    profile = fetch_fundamental_profile(ticker) or {}
+                    fetched = str(profile.get('sector', '') or '').strip()
+            except Exception:
+                fetched = ""
+            cache[ticker] = fetched if fetched else "__MISS__"
+            st.session_state['_tf_sector_lookup_cache'] = cache
+            cached = fetched
+        if cached and cached != "__MISS__":
+            sector_name = _canonicalize_sector_name(cached, rotation_ctx)
+            if sector_name:
+                ticker_sector_ctx[ticker] = sector_name
+                st.session_state['ticker_sectors'] = ticker_sector_ctx
+
+    if not sector_phase and sector_name:
+        sector_phase = str((rotation_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+    if not sector_phase:
+        sector_phase = _infer_sector_phase_from_text(text_blob)
+
+    return {
+        'sector': str(sector_name or "").strip(),
+        'sector_phase': str(sector_phase or "").upper().strip(),
+    }
+
+
 def _earnings_badge(earn_days: int) -> Dict[str, str]:
     """Color-coded earnings horizon badge for Trade Finder rows."""
     d = int(earn_days or 999)
@@ -3703,6 +3769,35 @@ def render_trade_finder_tab():
 
     results = st.session_state.get('trade_finder_results', {}) or {}
     rows = results.get('rows', []) or []
+    # Backfill sector/phase on loaded snapshots so cards don't show unknown labels.
+    _rot_ctx = st.session_state.get('sector_rotation', {}) or {}
+    _ticker_sector_ctx = st.session_state.get('ticker_sectors', {}) or {}
+    _scan_sector_map: Dict[str, str] = {}
+    for _s in (st.session_state.get('scan_results_summary', []) or []):
+        _t = str(_s.get('ticker', '') or '').upper().strip()
+        _sec = str(_s.get('sector', '') or '').strip()
+        if _t and _sec:
+            _scan_sector_map[_t] = _sec
+    _rows_touched = False
+    for _r in rows:
+        _resolved = _resolve_trade_finder_sector_fields(
+            _r,
+            rotation_ctx=_rot_ctx,
+            ticker_sector_ctx=_ticker_sector_ctx,
+            scan_sector_map=_scan_sector_map,
+            allow_fetch=True,
+        )
+        _sec_new = str(_resolved.get('sector', '') or '').strip()
+        _phase_new = str(_resolved.get('sector_phase', '') or '').strip()
+        if _sec_new and _sec_new != str(_r.get('sector', '') or '').strip():
+            _r['sector'] = _sec_new
+            _rows_touched = True
+        if _phase_new and _phase_new != str(_r.get('sector_phase', '') or '').strip():
+            _r['sector_phase'] = _phase_new
+            _rows_touched = True
+    if _rows_touched:
+        st.session_state['trade_finder_results'] = results
+
     if not rows:
         _find_new = st.session_state.get('find_new_trades_report', {}) or {}
         if _find_new:
@@ -4007,6 +4102,19 @@ def render_trade_finder_tab():
                     h11.caption("Actions")
                 for i, r in enumerate(group_rows[:40]):
                     ticker = str(r.get('ticker', '')).upper().strip()
+                    _resolved_sector = _resolve_trade_finder_sector_fields(
+                        r,
+                        rotation_ctx=st.session_state.get('sector_rotation', {}) or {},
+                        ticker_sector_ctx=st.session_state.get('ticker_sectors', {}) or {},
+                        scan_sector_map={},
+                        allow_fetch=False,
+                    )
+                    _sec_new = str(_resolved_sector.get('sector', '') or '').strip()
+                    _phase_new = str(_resolved_sector.get('sector_phase', '') or '').strip()
+                    if _sec_new and _sec_new != str(r.get('sector', '') or '').strip():
+                        r['sector'] = _sec_new
+                    if _phase_new and _phase_new != str(r.get('sector_phase', '') or '').strip():
+                        r['sector_phase'] = _phase_new
                     company = str(r.get('company_name', '') or '').strip() or "Unknown company"
                     has_alert = ticker in alert_tickers
                     ai_buy = str(r.get('ai_buy_recommendation', '') or '')
@@ -4015,7 +4123,7 @@ def render_trade_finder_tab():
                     trade_score = float(r.get('trade_score', rank) or rank)
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
-                    sector_name = str(r.get('sector', '') or '').strip() or "-"
+                    sector_name = str(r.get('sector', '') or '').strip() or "Unknown sector"
                     sector_phase = str(r.get('sector_phase', '') or '').strip()
                     sector_disp = _sector_phase_display(sector_phase)
                     earn_disp = _earnings_badge(earn_days)
