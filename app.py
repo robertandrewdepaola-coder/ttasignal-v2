@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from zoneinfo import ZoneInfo
 
 # Backend imports
@@ -2021,7 +2021,7 @@ def _run_scan(mode='all'):
     st.rerun()
 
 
-def _run_find_new_trades():
+def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = None):
     """
     Scan the union of ALL watchlists and build a consolidated "new trades" report.
     This does not replace active-watchlist scanner results.
@@ -2143,15 +2143,23 @@ def _run_find_new_trades():
         )
         return
 
-    _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
+    _progress = None
+    if not callable(progress_cb):
+        _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
 
     def _set_find_progress(pct: int, text: str):
         _pct = max(0, min(100, int(pct)))
-        try:
-            _progress.progress(_pct, text=text)
-        except TypeError:
-            _progress.progress(_pct)
-            st.sidebar.caption(text)
+        if callable(progress_cb):
+            try:
+                progress_cb(_pct, text)
+            except Exception:
+                pass
+        if _progress is not None:
+            try:
+                _progress.progress(_pct, text=text)
+            except TypeError:
+                _progress.progress(_pct)
+                st.sidebar.caption(text)
 
     _start = time.time()
     with st.spinner(f"Finding new trades across {len(universe)} tickers..."):
@@ -3008,7 +3016,10 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
     }
 
 
-def _run_trade_finder_workflow() -> None:
+def _run_trade_finder_workflow(
+    find_progress_cb: Optional[Callable[[int, str], None]] = None,
+    ai_progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> None:
     """
     Executes scanner candidate discovery + Grok scoring.
     Reuses existing find-new logic, then enriches/ranks candidates.
@@ -3018,7 +3029,7 @@ def _run_trade_finder_workflow() -> None:
         'message': 'Running Find New Trades and AI ranking...',
         'ts': time.time(),
     }
-    _run_find_new_trades()
+    _run_find_new_trades(progress_cb=find_progress_cb)
     report = st.session_state.get('find_new_trades_report', {}) or {}
     base_candidates = report.get('candidates', []) or []
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
@@ -3043,6 +3054,11 @@ def _run_trade_finder_workflow() -> None:
                 ),
                 'ts': time.time(),
             }
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(100, "AI ranking complete: no candidates passed scanner gates.")
+            except Exception:
+                pass
         return
 
     ai_clients = _get_ai_clients()
@@ -3056,14 +3072,28 @@ def _run_trade_finder_workflow() -> None:
     provider_counts: Dict[str, int] = {}
     fallback_counts: Dict[str, int] = {}
     _t0 = time.time()
-    _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(base_candidates)}")
+    _tf_progress = None
+    if not callable(ai_progress_cb):
+        _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(base_candidates)}")
+    elif callable(ai_progress_cb):
+        try:
+            ai_progress_cb(0, f"Scoring candidates with AI: 0/{len(base_candidates)}")
+        except Exception:
+            pass
 
     def _set_tf_progress(i: int, total: int, ticker: str):
         pct = int((max(0, i) / max(1, total)) * 100)
-        try:
-            _tf_progress.progress(pct, text=f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker}")
-        except TypeError:
-            _tf_progress.progress(pct)
+        _txt = f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker}"
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(pct, _txt)
+            except Exception:
+                pass
+        if _tf_progress is not None:
+            try:
+                _tf_progress.progress(pct, text=_txt)
+            except TypeError:
+                _tf_progress.progress(pct)
 
     for i, c in enumerate(base_candidates):
         ticker = str(c.get('ticker', '')).upper().strip()
@@ -3182,10 +3212,11 @@ def _run_trade_finder_workflow() -> None:
         provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
         if fallback_reason:
             fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
-    try:
-        _tf_progress.empty()
-    except Exception:
-        pass
+    if _tf_progress is not None:
+        try:
+            _tf_progress.empty()
+        except Exception:
+            pass
 
     rows = sorted(
         rows,
@@ -3233,6 +3264,14 @@ def _run_trade_finder_workflow() -> None:
         ),
         'ts': time.time(),
     }
+    if callable(ai_progress_cb):
+        try:
+            ai_progress_cb(
+                100,
+                f"AI ranking complete: {len(rows)} ranked from {len(base_candidates)} candidate(s).",
+            )
+        except Exception:
+            pass
 
 
 def render_trade_finder_tab():
@@ -3298,8 +3337,29 @@ def render_trade_finder_tab():
         st.caption("Active scope: " + " | ".join(_scope_bits))
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
-        with st.spinner("Running trade finder and AI ranking..."):
-            _run_trade_finder_workflow()
+        st.markdown("**Progress**")
+        _find_bar = st.progress(0, text="Find New: preparing scope...")
+        _ai_bar = st.progress(0, text="AI ranking: waiting for scanner candidates...")
+
+        def _find_progress_cb(pct: int, text: str) -> None:
+            try:
+                _find_bar.progress(int(max(0, min(100, pct))), text=text)
+            except TypeError:
+                _find_bar.progress(int(max(0, min(100, pct))))
+
+        def _ai_progress_cb(pct: int, text: str) -> None:
+            try:
+                _ai_bar.progress(int(max(0, min(100, pct))), text=text)
+            except TypeError:
+                _ai_bar.progress(int(max(0, min(100, pct))))
+
+        _run_trade_finder_workflow(
+            find_progress_cb=_find_progress_cb,
+            ai_progress_cb=_ai_progress_cb,
+        )
+        _find_bar.progress(100, text="Find New: complete.")
+        _rows_done = len((st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or [])
+        _ai_bar.progress(100, text=f"AI ranking: complete ({_rows_done} ranked).")
         st.rerun()
 
     _last_status = st.session_state.get('trade_finder_last_status', {}) or {}
