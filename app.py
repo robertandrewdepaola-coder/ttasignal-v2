@@ -9381,27 +9381,39 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
 
     deep_score = 0
     deep = st.session_state.get('deep_market_analysis') or {}
-    if isinstance(deep, dict):
-        deep_score = int(deep.get('score', 0) or 0)
+    deep_date = str(st.session_state.get('deep_analysis_date', '') or '')
     brief = st.session_state.get('morning_narrative') or {}
-    brief_regime = _normalize_brief_regime(brief.get('regime', ''))
+    brief_date = str(st.session_state.get('morning_narrative_date', '') or '')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    has_deep = isinstance(deep, dict) and bool(deep) and deep_date == today and ('score' in deep)
+    has_brief = isinstance(brief, dict) and bool(brief) and brief_date == today and bool(str(brief.get('regime', '')).strip())
+
+    if has_deep:
+        deep_score = int(deep.get('score', 0) or 0)
+    brief_regime = _normalize_brief_regime(brief.get('regime', '')) if has_brief else "UNKNOWN"
 
     aligned = 0
-    if brief_regime == "UNKNOWN":
-        aligned += 0
-    elif brief_regime == snap.regime:
-        aligned += 1
-    if (deep_score >= 1 and snap.regime == "RISK_ON") or (deep_score <= -1 and snap.regime == "RISK_OFF"):
-        aligned += 1
-    elif deep_score == 0 and snap.regime in {"TRANSITION", "DEFENSIVE"}:
-        aligned += 1
+    compared = 0
+    if has_brief and brief_regime != "UNKNOWN":
+        compared += 1
+        if brief_regime == snap.regime:
+            aligned += 1
+    if has_deep:
+        compared += 1
+        if (deep_score >= 1 and snap.regime == "RISK_ON") or (deep_score <= -1 and snap.regime == "RISK_OFF"):
+            aligned += 1
+        elif deep_score == 0 and snap.regime in {"TRANSITION", "DEFENSIVE"}:
+            aligned += 1
 
-    if aligned >= 2:
+    if compared == 0:
+        model_alignment = "UNAVAILABLE"
+    elif aligned == compared:
         model_alignment = "ALIGNED"
-    elif aligned == 1:
-        model_alignment = "PARTIAL"
-    else:
+    elif aligned == 0:
         model_alignment = "DIVERGENT"
+    else:
+        model_alignment = "PARTIAL"
 
     # Base decision from unified regime + volatility
     if stale_count >= 3:
