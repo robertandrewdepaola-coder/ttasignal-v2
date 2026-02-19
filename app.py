@@ -2955,6 +2955,11 @@ def render_trade_finder_tab():
             "Trade Finder is running in partial-data mode using cache/fallbacks."
         )
     jm = get_journal()
+    alert_tickers = {
+        str(c.get('ticker', '')).upper().strip()
+        for c in (jm.get_pending_conditionals() or [])
+        if str(c.get('status', 'PENDING')).upper() == "PENDING" and str(c.get('ticker', '')).strip()
+    }
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
         with st.spinner("Running trade finder and AI ranking..."):
@@ -3137,24 +3142,28 @@ def render_trade_finder_tab():
                 if not group_rows:
                     st.caption("None in this group.")
                 if view_mode == "Table":
-                    h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([1.0, 2.2, 1.0, 1.4, 0.9, 0.8, 0.9, 2.4])
-                    h1.caption("Ticker")
-                    h2.caption("Company")
-                    h3.caption("Price")
-                    h4.caption("Verdict")
-                    h5.caption("R:R")
-                    h6.caption("Score")
-                    h7.caption("Earn")
-                    h8.caption("Actions")
+                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10 = st.columns([0.8, 1.0, 2.0, 1.0, 0.9, 1.3, 0.9, 0.8, 0.8, 2.3])
+                    h1.caption("Alert")
+                    h2.caption("Ticker")
+                    h3.caption("Company")
+                    h4.caption("Sector")
+                    h5.caption("Price")
+                    h6.caption("Verdict")
+                    h7.caption("R:R")
+                    h8.caption("Score")
+                    h9.caption("Earn")
+                    h10.caption("Actions")
                 for i, r in enumerate(group_rows[:40]):
                     ticker = str(r.get('ticker', '')).upper().strip()
                     company = str(r.get('company_name', '') or '').strip() or "Unknown company"
+                    has_alert = ticker in alert_tickers
                     ai_buy = str(r.get('ai_buy_recommendation', '') or '')
                     rr = float(r.get('risk_reward', 0) or 0)
                     rank = float(r.get('rank_score', 0) or 0)
                     trade_score = float(r.get('trade_score', rank) or rank)
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
+                    sector_name = str(r.get('sector', '') or '').strip() or "-"
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(
                         r.get('analysis_note', '')
@@ -3166,15 +3175,17 @@ def render_trade_finder_tab():
                     fallback_error = str(r.get('fallback_error', '') or '')
 
                     if view_mode == "Table":
-                        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.0, 2.2, 1.0, 1.4, 0.9, 0.8, 0.9, 2.4])
-                        c1.write(ticker)
-                        c2.write(company)
-                        c3.write(f"${price:.2f}")
-                        c4.write(ai_buy or "N/A")
-                        c5.write(f"{rr:.2f}:1")
-                        c6.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
-                        c7.write(f"{earn_days}d")
-                        a1, a2, a3 = c8.columns(3)
+                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns([0.8, 1.0, 2.0, 1.0, 0.9, 1.3, 0.9, 0.8, 0.8, 2.3])
+                        c1.write("🎯 Set" if has_alert else "—")
+                        c2.write(ticker)
+                        c3.write(company)
+                        c4.write(sector_name)
+                        c5.write(f"${price:.2f}")
+                        c6.write(ai_buy or "N/A")
+                        c7.write(f"{rr:.2f}:1")
+                        c8.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
+                        c9.write(f"{earn_days}d")
+                        a1, a2, a3 = c10.columns(3)
                         with a1:
                             if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=1)
@@ -3184,6 +3195,11 @@ def render_trade_finder_tab():
                         with a3:
                             if st.button("🗂️", key=f"tf_tbl_stage_{group_label}_{i}_{ticker}", help="Stage Ticket", width="stretch"):
                                 _stage_candidate(r, price, rr, rank, signal_reason, rationale)
+                        st.caption(
+                            f"{ticker} Levels: E ${float(r.get('suggested_entry', price) or price):.2f} | "
+                            f"S ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
+                            f"T ${float(r.get('suggested_target', 0) or 0):.2f}"
+                        )
                         if signal_reason:
                             st.caption(f"{ticker} Scanner Context: {signal_reason}")
                         if fallback_reason:
@@ -3194,12 +3210,14 @@ def render_trade_finder_tab():
                             st.caption(f"⚠ {w}")
                     else:
                         with st.container(border=True):
-                            st.markdown(f"**{ticker} — {company}**")
+                            alert_badge = " | 🎯 Alert Set" if has_alert else ""
+                            st.markdown(f"**{ticker}{alert_badge} — {company}**")
                             st.caption(
                                 f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
                                 f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | Earnings: {earn_days}d | "
                                 f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                             )
+                            st.caption(f"Sector: {sector_name}")
                             st.caption(
                                 f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
                                 f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
@@ -3250,7 +3268,7 @@ def render_trade_finder_tab():
                         _cache[_inline_chart_ticker] = _tf_data_prefetch
                         st.session_state['ticker_data_cache'] = _cache
                 if _sel is not None and _sel_ticker == _inline_chart_ticker:
-                    _render_chart_tab(_inline_chart_ticker, _sel.signal)
+                    _render_chart_tab(_inline_chart_ticker, _sel.signal, key_ns="tf_inline")
                 else:
                     _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
                     _tf_analysis = _tf_cache.get(_inline_chart_ticker)
@@ -3261,7 +3279,7 @@ def render_trade_finder_tab():
                         st.session_state['_tf_inline_analysis_cache'] = _tf_cache
                     st.session_state['selected_ticker'] = _inline_chart_ticker
                     st.session_state['selected_analysis'] = _tf_analysis
-                    _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal)
+                    _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal, key_ns="tf_inline")
             except Exception as _e:
                 st.warning(f"Unable to load chart for {_inline_chart_ticker}: {str(_e)[:120]}")
 
@@ -4608,7 +4626,7 @@ def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
         c3.metric("Golden Cross", "Yes ✅" if kl.get('golden_cross') else "No ❌")
 
 
-def _render_chart_tab(ticker: str, signal: EntrySignal):
+def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     """Interactive TradingView-style chart with APEX MTF signal overlay."""
     data_cache = st.session_state.get('ticker_data_cache', {})
     ticker_data = data_cache.get(ticker, {})
@@ -4624,7 +4642,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
     monthly = ticker_data.get('monthly')
 
     # ── APEX Signal Detection (cached per ticker) ──────────────────
-    show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{ticker}")
+    show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{key_ns}_{ticker}")
 
     apex_markers = []
     apex_signals_list = []
@@ -4669,7 +4687,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
     # ── Render Chart ──────────────────────────────────────────────
     render_tv_chart(daily, ticker, signal=signal, height=750,
                     zoom_level=200, extra_markers=apex_markers,
-                    key=f"tv_{ticker}")
+                    key=f"tv_{key_ns}_{ticker}")
 
     # ── APEX Signal Panel ─────────────────────────────────────────
     if apex_signals_list:
@@ -4758,7 +4776,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal):
     # ── MTF chart ─────────────────────────────────────────────────
     if weekly is not None and monthly is not None:
         with st.expander("Multi-Timeframe View"):
-            render_mtf_chart(daily, weekly, monthly, ticker, height=400)
+            render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_")
 
 
 def _render_ai_tab(ticker: str, signal: EntrySignal,
