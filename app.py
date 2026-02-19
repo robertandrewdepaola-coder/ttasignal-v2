@@ -2351,6 +2351,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'sector_phase': sector_phase,
                 'earn_date': str(earn.get('next_earnings', '') or ''),
                 'earn_days': int(earn.get('days_until', 999) or 999),
+                'earn_source': str(earn.get('source', '') or ''),
                 'is_open_position': r.ticker in open_tickers,
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
                 'source_watchlists': ticker_sources.get(r.ticker, []),
@@ -2372,6 +2373,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'sector_phase': row['sector_phase'],
                     'earn_date': row['earn_date'],
                     'earn_days': row['earn_days'],
+                    'earn_source': row.get('earn_source', ''),
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
@@ -2396,9 +2398,11 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 if _t in row_by_ticker:
                     row_by_ticker[_t]['earn_date'] = _date2
                     row_by_ticker[_t]['earn_days'] = _days2
+                    row_by_ticker[_t]['earn_source'] = str(_earn2.get('source', '') or '')
                 if _t in cand_by_ticker:
                     cand_by_ticker[_t]['earn_date'] = _date2
                     cand_by_ticker[_t]['earn_days'] = _days2
+                    cand_by_ticker[_t]['earn_source'] = str(_earn2.get('source', '') or '')
 
         candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
         _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
@@ -3120,6 +3124,63 @@ def _earnings_badge(earn_days: int) -> Dict[str, str]:
     return {"text": f"{d}d", "color": "#22c55e", "icon": "🟢"}
 
 
+def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: int = 20) -> int:
+    """Fill missing Trade Finder earnings fields using canonical resolver with capped verified fetches."""
+    touched = 0
+    verify_used = 0
+    for row in rows:
+        ticker = str(row.get('ticker', '')).upper().strip()
+        if not ticker:
+            continue
+
+        persisted_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+        persisted_days = row.get('earn_days', row.get('days_until_earnings'))
+        earn = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=persisted_date,
+            persisted_days=persisted_days,
+            verify_with_fetch=False,
+        )
+        earn_date = str(earn.get('next_earnings', '') or '').strip()
+        try:
+            earn_days = int(earn.get('days_until', 999) or 999)
+        except Exception:
+            earn_days = 999
+        earn_source = str(earn.get('source', '') or '').strip()
+
+        if earn_days == 999 and verify_used < max(0, int(verify_limit)):
+            verify_used += 1
+            earn_v = resolve_earnings_for_ticker(
+                ticker,
+                persisted_date=persisted_date,
+                persisted_days=persisted_days,
+                verify_with_fetch=True,
+            )
+            _date_v = str(earn_v.get('next_earnings', '') or '').strip()
+            if _date_v:
+                earn_date = _date_v
+                try:
+                    earn_days = int(earn_v.get('days_until', 999) or 999)
+                except Exception:
+                    earn_days = 999
+                earn_source = str(earn_v.get('source', '') or '').strip()
+
+        if earn_date and str(row.get('earn_date', '') or '').strip() != earn_date:
+            row['earn_date'] = earn_date
+            touched += 1
+        try:
+            _row_days = int(row.get('earn_days', 999) or 999)
+        except Exception:
+            _row_days = 999
+        if _row_days != int(earn_days):
+            row['earn_days'] = int(earn_days)
+            touched += 1
+        if earn_source and str(row.get('earn_source', '') or '').strip() != earn_source:
+            row['earn_source'] = earn_source
+            touched += 1
+    return touched
+
+
 def _trade_quality_settings() -> Dict[str, Any]:
     """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
     if 'trade_min_rr_threshold' not in st.session_state:
@@ -3440,6 +3501,34 @@ def _run_trade_finder_workflow(
         company_name = str(c.get('company_name', '') or '').strip()
         if not company_name:
             company_name = _lookup_company_name_for_trade_finder(ticker)
+        earn_resolved = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=str(c.get('earn_date', '') or ''),
+            persisted_days=c.get('earn_days', 999),
+            verify_with_fetch=False,
+        )
+        earn_date = str(earn_resolved.get('next_earnings', c.get('earn_date', '')) or c.get('earn_date', '') or '').strip()
+        try:
+            earn_days = int(earn_resolved.get('days_until', c.get('earn_days', 999)) or c.get('earn_days', 999) or 999)
+        except Exception:
+            earn_days = int(c.get('earn_days', 999) or 999)
+        earn_source = str(earn_resolved.get('source', c.get('earn_source', '')) or c.get('earn_source', '') or '').strip()
+        if earn_days == 999 and i < 20:
+            # Bounded verified fetch for top candidates to reduce false n/a badges.
+            earn_verified = resolve_earnings_for_ticker(
+                ticker,
+                persisted_date=earn_date,
+                persisted_days=earn_days,
+                verify_with_fetch=True,
+            )
+            _ev_date = str(earn_verified.get('next_earnings', '') or '').strip()
+            if _ev_date:
+                earn_date = _ev_date
+                try:
+                    earn_days = int(earn_verified.get('days_until', earn_days) or earn_days)
+                except Exception:
+                    pass
+                earn_source = str(earn_verified.get('source', earn_source) or earn_source)
         cand_sig = _trade_finder_candidate_signature(c)
         cache_entry = ai_eval_cache.get(ticker, {}) if isinstance(ai_eval_cache, dict) else {}
         cached_sig = str(cache_entry.get('signature', '') or '')
@@ -3457,7 +3546,7 @@ def _run_trade_finder_workflow(
                 ai_rec = dict(cached_ai)
                 ai_rec['fallback_reason'] = 'cached_ai_eval'
             else:
-                earn_days_now = int(c.get('earn_days', 999) or 999)
+                earn_days_now = int(earn_days or 999)
                 if 0 <= earn_days_now <= 7:
                     ai_rec = _heuristic_trade_finder_ai(c)
                     ai_rec['provider'] = 'system'
@@ -3495,7 +3584,6 @@ def _run_trade_finder_workflow(
         ai_rr = float(ai_rec.get('risk_reward', 0) or 0)
         # Canonical R:R is always derived from entry/stop/target levels.
         rr = _calc_rr(entry, stop, target)
-        earn_days = int(c.get('earn_days', 999) or 999)
         rationale = str(ai_rec.get('rationale', '') or '')
         warnings = []
         fallback_reason = str(ai_rec.get('fallback_reason', '') or '')
@@ -3552,7 +3640,9 @@ def _run_trade_finder_workflow(
             'trade_finder_run_id': run_id,
             'company_name': company_name,
             'price': float(c.get('price', 0) or 0),
+            'earn_date': earn_date,
             'earn_days': earn_days,
+            'earn_source': earn_source,
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
@@ -3795,6 +3885,9 @@ def render_trade_finder_tab():
         if _phase_new and _phase_new != str(_r.get('sector_phase', '') or '').strip():
             _r['sector_phase'] = _phase_new
             _rows_touched = True
+    _earn_touched = _backfill_trade_finder_earnings(rows, verify_limit=15)
+    if _earn_touched > 0:
+        _rows_touched = True
     if _rows_touched:
         st.session_state['trade_finder_results'] = results
 
@@ -4123,6 +4216,7 @@ def render_trade_finder_tab():
                     trade_score = float(r.get('trade_score', rank) or rank)
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
+                    earn_source = str(r.get('earn_source', '') or '').strip()
                     sector_name = str(r.get('sector', '') or '').strip() or "Unknown sector"
                     sector_phase = str(r.get('sector_phase', '') or '').strip()
                     sector_disp = _sector_phase_display(sector_phase)
@@ -4172,6 +4266,8 @@ def render_trade_finder_tab():
                         )
                         if signal_reason:
                             st.caption(f"{ticker} Scanner Context: {signal_reason}")
+                        if earn_source:
+                            st.caption(f"{ticker} Earnings source: {earn_source}")
                         if fallback_reason:
                             st.caption(f"{ticker} AI fallback: {fallback_reason}")
                             if fallback_error:
@@ -4191,9 +4287,11 @@ def render_trade_finder_tab():
                                 f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
                                 f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | "
                                 f"Earnings: {earn_disp['icon']} {earn_disp['text']} | "
-                                f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
+                                f"Signal source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                             )
                             st.caption(f"Sector: {sector_name} ({sector_phase or 'n/a'})")
+                            if earn_source:
+                                st.caption(f"Earnings source: {earn_source}")
                             st.caption(
                                 f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
                                 f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
