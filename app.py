@@ -31,7 +31,7 @@ try:
     from data_fetcher import (
         fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
         fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
-        clear_cache,
+        clear_cache, get_fetch_health_status,
     )
 except KeyError:
     # Streamlit Cloud can race module loading during hot-reload after git pulls.
@@ -46,6 +46,7 @@ except KeyError:
     fetch_weekly = _df.fetch_weekly
     fetch_monthly = _df.fetch_monthly
     clear_cache = _df.clear_cache
+    get_fetch_health_status = _df.get_fetch_health_status
 try:
     from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 except KeyError:
@@ -907,6 +908,9 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
 
     spy_px = fetch_current_price("SPY")
     price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
+    fetch_health = get_fetch_health_status() or {}
+    rate_limited = bool(fetch_health.get('rate_limited', False))
+    cooldown_sec = int(fetch_health.get('cooldown_remaining_sec', 0) or 0)
 
     ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ts_utc = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -920,12 +924,15 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
     market_et_time = now_et.strftime('%Y-%m-%d %H:%M:%S ET')
 
     issues = []
+    warnings = []
     if not ai_ok:
         issues.append("AI connection unavailable")
     if not price_feed_ok:
         issues.append("Price feed unavailable")
+    if rate_limited:
+        warnings.append(f"Data provider rate-limited ({cooldown_sec}s cooldown) — using cached/partial data")
 
-    overall_ok = len(issues) == 0
+    overall_ok = len(issues) == 0 and not rate_limited
     snapshot = {
         'ts_epoch': now,
         'ts_local': ts_local,
@@ -942,6 +949,11 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         'gemini_error': ai_clients.get('gemini_error'),
         'price_feed_ok': price_feed_ok,
         'spy_price': float(spy_px) if price_feed_ok else None,
+        'rate_limited': rate_limited,
+        'cooldown_sec': cooldown_sec,
+        'fetch_hits': int(fetch_health.get('hits', 0) or 0),
+        'fetch_last_error': str(fetch_health.get('last_error', '') or ''),
+        'warnings': warnings,
         'market_session': market_session,
         'market_et_time': market_et_time,
     }
@@ -955,6 +967,8 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
             "ok": overall_ok,
             "ai_ok": ai_ok,
             "price_feed_ok": price_feed_ok,
+            "rate_limited": rate_limited,
+            "rate_limit_cooldown_sec": cooldown_sec,
             "provider": snapshot['provider'],
             "model": snapshot['model'],
         })
@@ -968,11 +982,16 @@ def _render_system_status_panel():
     health = _compute_system_health(force=False)
 
     with st.sidebar.container(border=True):
+        has_warnings = bool(health.get('warnings'))
         if health.get('overall_ok'):
             st.sidebar.success("🟢 System Status: ALL SYSTEMS OPERATIONAL")
+        elif has_warnings and not health.get('issues'):
+            st.sidebar.warning("🟠 System Status: DEGRADED (PARTIAL DATA MODE)")
+            st.sidebar.warning("Alert: " + "; ".join(health.get('warnings', [])))
         else:
             st.sidebar.error("🔴 System Status: DEGRADED")
-            st.sidebar.error("Alert: " + "; ".join(health.get('issues', [])))
+            msg = "; ".join((health.get('issues', []) or []) + (health.get('warnings', []) or []))
+            st.sidebar.error("Alert: " + msg)
         prev_ok = st.session_state.get('_system_health_last_ok')
         now_ok = bool(health.get('overall_ok'))
         if prev_ok is None:
@@ -997,6 +1016,13 @@ def _render_system_status_panel():
                 f"Price Feed: {'OK' if health.get('price_feed_ok') else 'FAIL'} "
                 + (f"(SPY ${health.get('spy_price', 0):.2f})" if health.get('price_feed_ok') else "")
             )
+            if health.get('rate_limited'):
+                st.sidebar.caption(
+                    f"Data Fetch: DEGRADED (429 cooldown {int(health.get('cooldown_sec', 0) or 0)}s, "
+                    f"hits {int(health.get('fetch_hits', 0) or 0)})"
+                )
+            else:
+                st.sidebar.caption("Data Fetch: OK")
             st.sidebar.caption(
                 f"Market: {health.get('market_session', 'n/a')} | {health.get('market_et_time', '')}"
             )
@@ -1987,7 +2013,20 @@ def _run_find_new_trades():
             source="find_new",
         )
 
-        all_data = fetch_scan_data(universe)
+        # Reuse fresh scanner cache first; fetch only missing tickers.
+        all_data: Dict[str, Dict[str, Any]] = {}
+        scan_cache = st.session_state.get('ticker_data_cache', {}) or {}
+        scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
+        fresh_scan_cache = bool(scan_ts and (time.time() - scan_ts) <= (15 * 60))
+        if fresh_scan_cache and isinstance(scan_cache, dict):
+            for _t in universe:
+                _cached = scan_cache.get(_t, {})
+                if isinstance(_cached, dict) and _cached.get('daily') is not None:
+                    all_data[_t] = _cached
+        missing = [t for t in universe if t not in all_data]
+        if missing:
+            fetched = fetch_scan_data(missing)
+            all_data.update(fetched)
         results = scan_watchlist(all_data)
         # Reuse scan-time price history for Trade Finder chart opens to avoid
         # per-click refetch/rate-limit failures.
@@ -2909,6 +2948,12 @@ def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
     st.subheader("🧭 Trade Finder")
     st.caption("Runs cross-watchlist scan and ranks model/system trade signals with clear actions.")
+    _fh = get_fetch_health_status() or {}
+    if bool(_fh.get('rate_limited', False)):
+        st.warning(
+            f"Data provider is rate-limited ({int(_fh.get('cooldown_remaining_sec', 0) or 0)}s cooldown). "
+            "Trade Finder is running in partial-data mode using cache/fallbacks."
+        )
     jm = get_journal()
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
@@ -3292,6 +3337,12 @@ def render_scanner_table():
     timestamp = st.session_state.get('scan_timestamp', '')
     jm = get_journal()
     bridge = get_bridge()
+    _fh = get_fetch_health_status() or {}
+    if bool(_fh.get('rate_limited', False)):
+        st.warning(
+            f"Data provider is rate-limited ({int(_fh.get('cooldown_remaining_sec', 0) or 0)}s cooldown). "
+            "Scanner is using cached/partial data where live fetch is unavailable."
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # TRIGGERED ALERTS BANNER

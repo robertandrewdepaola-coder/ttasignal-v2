@@ -57,34 +57,34 @@ class DataCache:
     def __init__(self, ttl: int = 300):
         """ttl: cache lifetime in seconds (default 5 minutes)."""
         self._store: Dict[str, Any] = {}
-        self._timestamps: Dict[str, float] = {}
+        self._expiry: Dict[str, float] = {}
         self.ttl = ttl
     
     def get(self, key: str) -> Optional[Any]:
         if key in self._store:
-            age = time.time() - self._timestamps.get(key, 0)
-            if age < self.ttl:
+            if time.time() < self._expiry.get(key, 0):
                 return self._store[key]
             else:
                 # Expired
                 del self._store[key]
-                del self._timestamps[key]
+                self._expiry.pop(key, None)
         return None
     
-    def set(self, key: str, value: Any):
+    def set(self, key: str, value: Any, ttl_sec: Optional[int] = None):
         self._store[key] = value
-        self._timestamps[key] = time.time()
+        ttl = int(ttl_sec if ttl_sec is not None else self.ttl)
+        self._expiry[key] = time.time() + max(1, ttl)
     
     def clear(self):
         """Clear all cached data. Call at start of new scan."""
         self._store.clear()
-        self._timestamps.clear()
+        self._expiry.clear()
     
     def stats(self) -> Dict[str, int]:
+        now = time.time()
         return {
             'entries': len(self._store),
-            'expired': sum(1 for k in self._timestamps
-                          if time.time() - self._timestamps[k] >= self.ttl)
+            'expired': sum(1 for k in self._expiry if now >= self._expiry[k])
         }
 
 
@@ -92,14 +92,107 @@ class DataCache:
 _cache = DataCache(ttl=300)
 
 
-def clear_cache():
+def clear_cache(clear_rate_limits: bool = False):
     """Clear the data cache. Call at start of each scan."""
     _cache.clear()
+    if clear_rate_limits:
+        _rate_limit_scopes.clear()
+        _rate_limit_state['active_until'] = 0.0
+        _rate_limit_state['cooldown_remaining_sec'] = 0
 
 
 def get_cache_stats() -> Dict[str, int]:
     """Get cache statistics."""
     return _cache.stats()
+
+
+_rate_limit_scopes: Dict[str, float] = {}
+_rate_limit_state: Dict[str, Any] = {
+    'active_until': 0.0,
+    'hits': 0,
+    'last_error': '',
+    'last_rate_limit_ts': 0.0,
+    'last_success_ts': 0.0,
+    'cooldown_remaining_sec': 0,
+}
+_last_rate_limit_log_ts = 0.0
+
+
+def _is_rate_limit_error(error: Exception) -> bool:
+    err = str(error).lower()
+    return (
+        "too many requests" in err
+        or "rate limited" in err
+        or "rate limit" in err
+        or "429" in err
+        or "try after a while" in err
+    )
+
+
+def _is_scope_rate_limited(scope: str) -> bool:
+    """True when global or per-scope cooldown is active."""
+    global _last_rate_limit_log_ts
+    now = time.time()
+    global_until = float(_rate_limit_state.get('active_until', 0.0) or 0.0)
+    scope_until = float(_rate_limit_scopes.get(scope, 0.0) or 0.0)
+    until = max(global_until, scope_until)
+    if now < until:
+        remaining = int(until - now)
+        _rate_limit_state['cooldown_remaining_sec'] = remaining
+        # Throttle logs to avoid noise.
+        if (now - _last_rate_limit_log_ts) > 20:
+            _last_rate_limit_log_ts = now
+            print(f"[data_fetcher] Cooldown active ({remaining}s) — using cached/partial data")
+        return True
+    _rate_limit_state['cooldown_remaining_sec'] = 0
+    return False
+
+
+def _register_rate_limit(scope: str, error: Exception):
+    """Activate progressive cooldown after 429/rate-limit errors."""
+    now = time.time()
+    hits = int(_rate_limit_state.get('hits', 0) or 0) + 1
+    _rate_limit_state['hits'] = hits
+    _rate_limit_state['last_error'] = str(error)[:220]
+    _rate_limit_state['last_rate_limit_ts'] = now
+    # Progressive cooldown, capped.
+    cooldown = min(180, 20 + (hits * 6))
+    global_until = now + cooldown
+    scope_until = now + min(120, cooldown)
+    _rate_limit_state['active_until'] = max(float(_rate_limit_state.get('active_until', 0.0) or 0.0), global_until)
+    _rate_limit_scopes[scope] = max(float(_rate_limit_scopes.get(scope, 0.0) or 0.0), scope_until)
+    _rate_limit_state['cooldown_remaining_sec'] = int(_rate_limit_state['active_until'] - now)
+
+
+def _mark_fetch_success(scope: str):
+    """Track successful fetch and decay rate-limit pressure over time."""
+    now = time.time()
+    _rate_limit_state['last_success_ts'] = now
+    _rate_limit_scopes.pop(scope, None)
+    if now >= float(_rate_limit_state.get('active_until', 0.0) or 0.0):
+        _rate_limit_state['active_until'] = 0.0
+        _rate_limit_state['cooldown_remaining_sec'] = 0
+        _rate_limit_state['hits'] = max(0, int(_rate_limit_state.get('hits', 0) or 0) - 1)
+
+
+def get_fetch_health_status() -> Dict[str, Any]:
+    """Return provider health for UI/status panels."""
+    now = time.time()
+    active_until = float(_rate_limit_state.get('active_until', 0.0) or 0.0)
+    remaining = max(0, int(active_until - now))
+    if remaining <= 0:
+        _rate_limit_state['cooldown_remaining_sec'] = 0
+    else:
+        _rate_limit_state['cooldown_remaining_sec'] = remaining
+    return {
+        'rate_limited': remaining > 0,
+        'cooldown_remaining_sec': remaining,
+        'hits': int(_rate_limit_state.get('hits', 0) or 0),
+        'last_error': str(_rate_limit_state.get('last_error', '') or ''),
+        'last_rate_limit_ts': float(_rate_limit_state.get('last_rate_limit_ts', 0.0) or 0.0),
+        'last_success_ts': float(_rate_limit_state.get('last_success_ts', 0.0) or 0.0),
+        'cache_entries': int(get_cache_stats().get('entries', 0) or 0),
+    }
 
 
 # =============================================================================
@@ -220,10 +313,14 @@ def fetch_daily(ticker: str, period: str = DAILY_PERIOD) -> Optional[pd.DataFram
     
     Returns None on error. Auto-retries on crumb/auth failures.
     """
+    ticker = str(ticker).upper().strip()
     cache_key = f"{ticker}:daily:{period}"
+    scope = f"{ticker}:daily"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+    if _is_scope_rate_limited(scope):
+        return None
     
     for attempt in range(2):
         try:
@@ -234,10 +331,20 @@ def fetch_daily(ticker: str, period: str = DAILY_PERIOD) -> Optional[pd.DataFram
                 return None
             
             df = normalize_columns(df)
-            _cache.set(cache_key, df)
+            _cache.set(cache_key, df, ttl_sec=15 * 60)
+            _mark_fetch_success(scope)
             return df
             
         except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(scope, e)
+                if attempt == 0:
+                    time.sleep(0.25)
+                    if _is_scope_rate_limited(scope):
+                        return None
+                    continue
+                print(f"[data_fetcher] Error fetching daily {ticker}: {e}")
+                return None
             if _is_crumb_or_auth_error(e) and attempt == 0:
                 _force_yfinance_session_reset()
                 time.sleep(1)
@@ -248,10 +355,14 @@ def fetch_daily(ticker: str, period: str = DAILY_PERIOD) -> Optional[pd.DataFram
 
 def fetch_weekly(ticker: str, period: str = WEEKLY_PERIOD) -> Optional[pd.DataFrame]:
     """Fetch weekly OHLCV data. Auto-retries on crumb/auth failures."""
+    ticker = str(ticker).upper().strip()
     cache_key = f"{ticker}:weekly:{period}"
+    scope = f"{ticker}:weekly"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+    if _is_scope_rate_limited(scope):
+        return None
     
     for attempt in range(2):
         try:
@@ -262,10 +373,20 @@ def fetch_weekly(ticker: str, period: str = WEEKLY_PERIOD) -> Optional[pd.DataFr
                 return None
             
             df = normalize_columns(df)
-            _cache.set(cache_key, df)
+            _cache.set(cache_key, df, ttl_sec=2 * 60 * 60)
+            _mark_fetch_success(scope)
             return df
             
         except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(scope, e)
+                if attempt == 0:
+                    time.sleep(0.25)
+                    if _is_scope_rate_limited(scope):
+                        return None
+                    continue
+                print(f"[data_fetcher] Error fetching weekly {ticker}: {e}")
+                return None
             if _is_crumb_or_auth_error(e) and attempt == 0:
                 _force_yfinance_session_reset()
                 time.sleep(1)
@@ -276,10 +397,14 @@ def fetch_weekly(ticker: str, period: str = WEEKLY_PERIOD) -> Optional[pd.DataFr
 
 def fetch_monthly(ticker: str, period: str = MONTHLY_PERIOD) -> Optional[pd.DataFrame]:
     """Fetch monthly OHLCV data. Auto-retries on crumb/auth failures."""
+    ticker = str(ticker).upper().strip()
     cache_key = f"{ticker}:monthly:{period}"
+    scope = f"{ticker}:monthly"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+    if _is_scope_rate_limited(scope):
+        return None
     
     for attempt in range(2):
         try:
@@ -290,10 +415,20 @@ def fetch_monthly(ticker: str, period: str = MONTHLY_PERIOD) -> Optional[pd.Data
                 return None
             
             df = normalize_columns(df)
-            _cache.set(cache_key, df)
+            _cache.set(cache_key, df, ttl_sec=6 * 60 * 60)
+            _mark_fetch_success(scope)
             return df
             
         except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(scope, e)
+                if attempt == 0:
+                    time.sleep(0.25)
+                    if _is_scope_rate_limited(scope):
+                        return None
+                    continue
+                print(f"[data_fetcher] Error fetching monthly {ticker}: {e}")
+                return None
             if _is_crumb_or_auth_error(e) and attempt == 0:
                 _force_yfinance_session_reset()
                 time.sleep(1)
@@ -305,10 +440,14 @@ def fetch_monthly(ticker: str, period: str = MONTHLY_PERIOD) -> Optional[pd.Data
 def fetch_intraday(ticker: str, interval: str = '1h',
                    period: str = '5d') -> Optional[pd.DataFrame]:
     """Fetch intraday data (for 4h divergence checks etc)."""
+    ticker = str(ticker).upper().strip()
     cache_key = f"{ticker}:intraday:{interval}:{period}"
+    scope = f"{ticker}:intraday:{interval}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+    if _is_scope_rate_limited(scope):
+        return None
     
     try:
         stock = yf.Ticker(ticker)
@@ -318,10 +457,14 @@ def fetch_intraday(ticker: str, interval: str = '1h',
             return None
         
         df = normalize_columns(df)
-        _cache.set(cache_key, df)
+        _cache.set(cache_key, df, ttl_sec=3 * 60)
+        _mark_fetch_success(scope)
         return df
         
     except Exception as e:
+        if _is_rate_limit_error(e):
+            _register_rate_limit(scope, e)
+            return None
         print(f"[data_fetcher] Error fetching intraday {ticker}: {e}")
         return None
 
@@ -332,10 +475,14 @@ def fetch_history(ticker: str, start: str = None, end: str = None,
     Fetch historical data with explicit start/end dates.
     Used for backtesting with specific date ranges.
     """
+    ticker = str(ticker).upper().strip()
     cache_key = f"{ticker}:hist:{start}:{end}:{interval}"
+    scope = f"{ticker}:hist:{interval}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
+    if _is_scope_rate_limited(scope):
+        return None
     
     try:
         stock = yf.Ticker(ticker)
@@ -345,10 +492,14 @@ def fetch_history(ticker: str, start: str = None, end: str = None,
             return None
         
         df = normalize_columns(df)
-        _cache.set(cache_key, df)
+        _cache.set(cache_key, df, ttl_sec=30 * 60)
+        _mark_fetch_success(scope)
         return df
         
     except Exception as e:
+        if _is_rate_limit_error(e):
+            _register_rate_limit(scope, e)
+            return None
         print(f"[data_fetcher] Error fetching history {ticker}: {e}")
         return None
 
@@ -359,20 +510,34 @@ def fetch_history(ticker: str, start: str = None, end: str = None,
 
 def fetch_current_price(ticker: str) -> Optional[float]:
     """Fetch current/last close price. Fast single-value fetch."""
+    ticker = str(ticker).upper().strip()
     # Try to get from cached daily data first
     cache_key = f"{ticker}:daily:{DAILY_PERIOD}"
     cached = _cache.get(cache_key)
     if cached is not None and len(cached) > 0:
         return float(cached['Close'].iloc[-1])
+    price_cache_key = f"{ticker}:price"
+    cached_price = _cache.get(price_cache_key)
+    if cached_price is not None:
+        return float(cached_price)
+    scope = f"{ticker}:price"
+    if _is_scope_rate_limited(scope):
+        return None
     
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period='2d')
         if hist is not None and not hist.empty:
             hist = normalize_columns(hist)
-            return float(hist['Close'].iloc[-1])
+            px = float(hist['Close'].iloc[-1])
+            _cache.set(price_cache_key, px, ttl_sec=60)
+            _mark_fetch_success(scope)
+            return px
         return None
     except Exception as e:
+        if _is_rate_limit_error(e):
+            _register_rate_limit(scope, e)
+            return None
         print(f"[data_fetcher] Error fetching price {ticker}: {e}")
         return None
 
@@ -422,7 +587,8 @@ def fetch_market_filter() -> Dict[str, Any]:
     except Exception as e:
         print(f"[data_fetcher] Error fetching market filter: {e}")
     
-    _cache.set(cache_key, result)
+    ttl = 180 if (result.get('spy_close') and result.get('vix_close') is not None) else 45
+    _cache.set(cache_key, result, ttl_sec=ttl)
     return result
 
 
@@ -624,7 +790,7 @@ def fetch_sector_rotation() -> Dict[str, Dict]:
     except Exception as e:
         print(f"[data_fetcher] Sector rotation error: {e}")
 
-    _cache.set(cache_key, rotation)
+    _cache.set(cache_key, rotation, ttl_sec=10 * 60 if rotation else 60)
     return rotation
 
 
@@ -2144,7 +2310,7 @@ def fetch_all_ticker_data(ticker: str, include_fundamentals: bool = False) -> Di
     return data
 
 
-def fetch_scan_data(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+def fetch_scan_data(tickers: List[str], force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Batch fetch data for multiple tickers (scan mode).
     
@@ -2153,7 +2319,8 @@ def fetch_scan_data(tickers: List[str]) -> Dict[str, Dict[str, Any]]:
     
     Returns dict of ticker -> data dict.
     """
-    clear_cache()  # Fresh data for each scan
+    if force_refresh:
+        clear_cache(clear_rate_limits=False)
     
     # Pre-fetch shared data once
     spy_daily = fetch_spy_daily()
