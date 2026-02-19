@@ -1908,6 +1908,14 @@ def _run_scan(mode='all'):
             earn = resolve_earnings_for_ticker(r.ticker)
             earn_date = str(earn.get('next_earnings', '') or '')
             earn_days = int(earn.get('days_until', 999) or 999)
+            earn_source = str(earn.get('source', '') or '')
+            earn_confidence = str(earn.get('confidence', '') or '').upper()
+            earn_trusted = _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            )
 
             # Re-entry recency (bars ago)
             reentry_bars_ago = 0
@@ -1951,6 +1959,9 @@ def _run_scan(mode='all'):
                 'volume_ratio': vol_ratio,
                 'earn_date': earn_date,
                 'earn_days': earn_days,
+                'earn_source': earn_source,
+                'earn_confidence': earn_confidence,
+                'earn_trusted': bool(earn_trusted),
                 'reentry_bars_ago': reentry_bars_ago,
             })
         _timing['summary_build_sec'] = time.time() - _t
@@ -2258,6 +2269,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 scan_sector_map[_t] = _sec
             _ed = str(_s.get('earn_date', _s.get('earnings_date', '')) or '').strip()
             _days_raw = _s.get('earn_days', _s.get('days_to_earnings', _s.get('days_until_earnings', None)))
+            _src = str(_s.get('earn_source', '') or '').strip()
+            _conf = str(_s.get('earn_confidence', '') or '').strip()
             _days = None
             try:
                 if _days_raw is not None and str(_days_raw) != '':
@@ -2265,7 +2278,12 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             except Exception:
                 _days = None
             if _t and (_ed or _days is not None):
-                scan_earn_map[_t] = {'next_earnings': _ed, 'days_until': _days}
+                scan_earn_map[_t] = {
+                    'next_earnings': _ed,
+                    'days_until': _days,
+                    'source': _src,
+                    'confidence': _conf,
+                }
         try:
             _set_find_progress(88, "Resolving sectors...")
             from data_fetcher import get_ticker_sector, fetch_fundamental_profile
@@ -2307,19 +2325,37 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'days_until',
                 _batch_earn.get('days_until_earnings', _scan_earn.get('days_until', None)),
             )
+            _persisted_source = str(
+                _batch_earn.get('source', _scan_earn.get('source', '')) or ''
+            ).strip()
+            _persisted_conf = str(
+                _batch_earn.get('confidence', _scan_earn.get('confidence', '')) or ''
+            ).strip()
             earn = resolve_earnings_for_ticker(
                 r.ticker,
                 persisted_date=_persisted_date,
                 persisted_days=_persisted_days,
+                persisted_source=_persisted_source,
+                persisted_confidence=_persisted_conf,
                 verify_with_fetch=False,
             )
             if not str(earn.get('next_earnings', '') or '').strip() and _persisted_date:
                 earn = {
                     'next_earnings': _persisted_date,
                     'days_until': _normalize_earnings_days(_persisted_date, _persisted_days),
-                    'source': str(_batch_earn.get('source', 'Batch/Scanner Snapshot') or 'Batch/Scanner Snapshot'),
-                    'confidence': str(_batch_earn.get('confidence', '') or ''),
+                    'source': _persisted_source or 'Batch/Scanner Snapshot',
+                    'confidence': str(_persisted_conf or 'MEDIUM'),
                 }
+            earn_date = str(earn.get('next_earnings', '') or '')
+            earn_days = int(earn.get('days_until', 999) or 999)
+            earn_source = str(earn.get('source', '') or '')
+            earn_confidence = str(earn.get('confidence', '') or '').upper()
+            earn_trusted = _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            )
 
             sector_name = _canonicalize_sector_name(
                 ticker_sectors.get(r.ticker, scan_sector_map.get(r.ticker, '')),
@@ -2349,9 +2385,11 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'summary': rec.get('summary', ''),
                 'sector': sector_name,
                 'sector_phase': sector_phase,
-                'earn_date': str(earn.get('next_earnings', '') or ''),
-                'earn_days': int(earn.get('days_until', 999) or 999),
-                'earn_source': str(earn.get('source', '') or ''),
+                'earn_date': earn_date,
+                'earn_days': earn_days,
+                'earn_source': earn_source,
+                'earn_confidence': earn_confidence,
+                'earn_trusted': bool(earn_trusted),
                 'is_open_position': r.ticker in open_tickers,
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
                 'source_watchlists': ticker_sources.get(r.ticker, []),
@@ -2374,6 +2412,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'earn_date': row['earn_date'],
                     'earn_days': row['earn_days'],
                     'earn_source': row.get('earn_source', ''),
+                    'earn_confidence': row.get('earn_confidence', ''),
+                    'earn_trusted': bool(row.get('earn_trusted', False)),
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
@@ -2383,26 +2423,51 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         missing_candidate_tickers = [
             str(c.get('ticker', '')).upper().strip()
             for c in candidates
-            if int(c.get('earn_days', 999) or 999) == 999
+            if not _is_earnings_data_trusted(
+                int(c.get('earn_days', 999) or 999),
+                source=str(c.get('earn_source', '') or ''),
+                confidence=str(c.get('earn_confidence', '') or ''),
+                next_earnings=str(c.get('earn_date', '') or ''),
+            )
         ]
         if missing_candidate_tickers:
             _set_find_progress(96, "Backfilling missing earnings for top candidates...")
             row_by_ticker = {str(rw.get('ticker', '')).upper().strip(): rw for rw in rows}
             cand_by_ticker = {str(cd.get('ticker', '')).upper().strip(): cd for cd in candidates}
             for _t in missing_candidate_tickers[:25]:
-                _earn2 = resolve_earnings_for_ticker(_t, verify_with_fetch=True)
+                _row_seed = row_by_ticker.get(_t, {}) or {}
+                _earn2 = resolve_earnings_for_ticker(
+                    _t,
+                    persisted_date=str(_row_seed.get('earn_date', '') or ''),
+                    persisted_days=_row_seed.get('earn_days'),
+                    persisted_source=str(_row_seed.get('earn_source', '') or ''),
+                    persisted_confidence=str(_row_seed.get('earn_confidence', '') or ''),
+                    verify_with_fetch=True,
+                )
                 _date2 = str(_earn2.get('next_earnings', '') or '').strip()
                 if not _date2:
                     continue
                 _days2 = int(_earn2.get('days_until', 999) or 999)
+                _src2 = str(_earn2.get('source', '') or '')
+                _conf2 = str(_earn2.get('confidence', '') or '').upper()
+                _trusted2 = _is_earnings_data_trusted(
+                    _days2,
+                    source=_src2,
+                    confidence=_conf2,
+                    next_earnings=_date2,
+                )
                 if _t in row_by_ticker:
                     row_by_ticker[_t]['earn_date'] = _date2
                     row_by_ticker[_t]['earn_days'] = _days2
-                    row_by_ticker[_t]['earn_source'] = str(_earn2.get('source', '') or '')
+                    row_by_ticker[_t]['earn_source'] = _src2
+                    row_by_ticker[_t]['earn_confidence'] = _conf2
+                    row_by_ticker[_t]['earn_trusted'] = bool(_trusted2)
                 if _t in cand_by_ticker:
                     cand_by_ticker[_t]['earn_date'] = _date2
                     cand_by_ticker[_t]['earn_days'] = _days2
-                    cand_by_ticker[_t]['earn_source'] = str(_earn2.get('source', '') or '')
+                    cand_by_ticker[_t]['earn_source'] = _src2
+                    cand_by_ticker[_t]['earn_confidence'] = _conf2
+                    cand_by_ticker[_t]['earn_trusted'] = bool(_trusted2)
 
         candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
         _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
@@ -2545,7 +2610,10 @@ def _normalize_earnings_days(next_earnings: str, raw_days: Any) -> Optional[int]
     """Prefer a fresh date-derived days-until value over stale cached counters."""
     d = _parse_earnings_date(next_earnings)
     if d is not None:
-        return max(0, (d - datetime.now().date()).days)
+        days = (d - datetime.now().date()).days
+        if days < 0:
+            return None
+        return int(days)
     try:
         return max(0, int(raw_days))
     except Exception:
@@ -2557,6 +2625,8 @@ def resolve_earnings_for_ticker(
     *,
     persisted_date: str = "",
     persisted_days: Optional[int] = None,
+    persisted_source: str = "",
+    persisted_confidence: str = "",
     verify_with_fetch: bool = False,
 ) -> Dict[str, Any]:
     """
@@ -2580,19 +2650,25 @@ def resolve_earnings_for_ticker(
     per_date = str(persisted_date or '').strip()
     per_days = _normalize_earnings_days(per_date, persisted_days)
 
+    # Treat stale past dates as missing so fallback sources can repair them.
+    if sess_date and sess_days is None:
+        sess_date = ""
+    if per_date and per_days is None:
+        per_date = ""
+
     if sess_date:
         resolved = {
             'next_earnings': sess_date,
             'days_until': sess_days,
             'source': str(session_rec.get('source', 'TTA Scanner') or 'TTA Scanner'),
-            'confidence': str(session_rec.get('confidence', '') or ''),
+            'confidence': str(session_rec.get('confidence', persisted_confidence) or persisted_confidence or ''),
         }
     elif per_date:
         resolved = {
             'next_earnings': per_date,
             'days_until': per_days,
-            'source': 'Scan Snapshot',
-            'confidence': '',
+            'source': str(persisted_source or 'Scan Snapshot'),
+            'confidence': str(persisted_confidence or ''),
         }
     else:
         resolved = dict(empty)
@@ -2677,7 +2753,75 @@ def resolve_earnings_for_ticker(
         except Exception:
             pass
 
+    # Normalize metadata so downstream gates can consistently trust/reject rows.
+    if resolved.get('next_earnings'):
+        _src = str(resolved.get('source', '') or '').strip() or 'TTA Scanner'
+        _conf = str(resolved.get('confidence', '') or '').strip().upper()
+        _src_l = _src.lower()
+        _estimated = (
+            "estimated" in _src_l
+            or "historical + 91d" in _src_l
+            or "last + 91d" in _src_l
+        )
+        if not _conf:
+            _conf = 'LOW' if _estimated else 'MEDIUM'
+        resolved['source'] = _src
+        resolved['confidence'] = _conf
+    else:
+        resolved['source'] = str(resolved.get('source', '') or '')
+        resolved['confidence'] = str(resolved.get('confidence', '') or '')
+
     return resolved
+
+
+def _earnings_confidence_rank(confidence: str) -> int:
+    c = str(confidence or '').upper().strip()
+    if c in {"HIGH", "MEDIUM-HIGH", "MEDIUM_HIGH"}:
+        return 3
+    if c == "MEDIUM":
+        return 2
+    if c == "LOW":
+        return 1
+    return 0
+
+
+def _is_estimated_earnings_source(source: str) -> bool:
+    s = str(source or '').lower()
+    return "estimated" in s or "historical + 91d" in s or "last + 91d" in s
+
+
+def _is_earnings_data_trusted(
+    earn_days: Any,
+    source: str = "",
+    confidence: str = "",
+    next_earnings: str = "",
+) -> bool:
+    try:
+        d = int(earn_days)
+    except Exception:
+        return False
+    if d < 0 or d >= 999 or d > 400:
+        return False
+    if next_earnings:
+        dt = _parse_earnings_date(next_earnings)
+        if dt is None:
+            return False
+        if (dt - datetime.now().date()).days < 0:
+            return False
+    if _is_estimated_earnings_source(source):
+        return False
+    conf_rank = _earnings_confidence_rank(confidence)
+    if conf_rank >= 2:
+        return True
+    if conf_rank == 1:
+        return False
+    src = str(source or '').strip().lower()
+    if not src:
+        return False
+    weak_src_tokens = ("fundamental profile", "earnings history", "unknown", "n/a")
+    if any(tok in src for tok in weak_src_tokens):
+        return False
+    return True
 
 
 def _adjust_recommendation_for_sector(
@@ -2921,6 +3065,7 @@ def _build_trade_finder_analysis_note(
     sector: str,
     sector_phase: str,
     earn_days: int,
+    earn_trusted: bool = True,
     fallback_reason: str = "",
     is_gold_source: bool = False,
 ) -> str:
@@ -2945,6 +3090,8 @@ def _build_trade_finder_analysis_note(
         for s in base_sentences:
             s_l = s.lower()
             if (not str(sector or "").strip()) and ("sector" in s_l or "rotation" in s_l):
+                continue
+            if (not bool(earn_trusted)) and "earn" in s_l:
                 continue
             if d == 999 and ("earn" in s_l and (re.search(r"\b\d+\s*d\b", s_l) or "day" in s_l)):
                 continue
@@ -2971,7 +3118,9 @@ def _build_trade_finder_analysis_note(
     elif sec:
         parts.append(f"Sector: {sec}")
 
-    if d == 999:
+    if not bool(earn_trusted):
+        parts.append("Earnings data unverified — refresh earnings before entry")
+    elif d == 999:
         parts.append("Earnings date unavailable")
     elif d <= 7:
         parts.append(f"Earnings risk high ({d}d) — avoid new entries pre-event")
@@ -3112,11 +3261,24 @@ def _resolve_trade_finder_sector_fields(
     }
 
 
-def _earnings_badge(earn_days: int) -> Dict[str, str]:
+def _earnings_badge(
+    earn_days: int,
+    source: str = "",
+    confidence: str = "",
+    earn_date: str = "",
+) -> Dict[str, str]:
     """Color-coded earnings horizon badge for Trade Finder rows."""
+    trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=source,
+        confidence=confidence,
+        next_earnings=earn_date,
+    )
     d = int(earn_days or 999)
-    if d == 999:
-        return {"text": "n/a", "color": "#64748b", "icon": "⚪"}
+    if not trusted:
+        if 0 <= d < 999:
+            return {"text": f"{d}d?", "color": "#ef4444", "icon": "🔴"}
+        return {"text": "unverified", "color": "#ef4444", "icon": "🔴"}
     if d <= 7:
         return {"text": f"{d}d", "color": "#ef4444", "icon": "🔴"}
     if d <= 14:
@@ -3139,6 +3301,8 @@ def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: in
             ticker,
             persisted_date=persisted_date,
             persisted_days=persisted_days,
+            persisted_source=str(row.get('earn_source', '') or ''),
+            persisted_confidence=str(row.get('earn_confidence', '') or ''),
             verify_with_fetch=False,
         )
         earn_date = str(earn.get('next_earnings', '') or '').strip()
@@ -3147,13 +3311,22 @@ def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: in
         except Exception:
             earn_days = 999
         earn_source = str(earn.get('source', '') or '').strip()
+        earn_confidence = str(earn.get('confidence', '') or '').strip().upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
 
-        if earn_days == 999 and verify_used < max(0, int(verify_limit)):
+        if (earn_days == 999 or not earn_trusted) and verify_used < max(0, int(verify_limit)):
             verify_used += 1
             earn_v = resolve_earnings_for_ticker(
                 ticker,
                 persisted_date=persisted_date,
                 persisted_days=persisted_days,
+                persisted_source=str(row.get('earn_source', '') or ''),
+                persisted_confidence=str(row.get('earn_confidence', '') or ''),
                 verify_with_fetch=True,
             )
             _date_v = str(earn_v.get('next_earnings', '') or '').strip()
@@ -3164,6 +3337,13 @@ def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: in
                 except Exception:
                     earn_days = 999
                 earn_source = str(earn_v.get('source', '') or '').strip()
+                earn_confidence = str(earn_v.get('confidence', '') or '').strip().upper()
+                earn_trusted = _is_earnings_data_trusted(
+                    earn_days,
+                    source=earn_source,
+                    confidence=earn_confidence,
+                    next_earnings=earn_date,
+                )
 
         if earn_date and str(row.get('earn_date', '') or '').strip() != earn_date:
             row['earn_date'] = earn_date
@@ -3177,6 +3357,18 @@ def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: in
             touched += 1
         if earn_source and str(row.get('earn_source', '') or '').strip() != earn_source:
             row['earn_source'] = earn_source
+            touched += 1
+        if earn_confidence != str(row.get('earn_confidence', '') or '').strip().upper():
+            row['earn_confidence'] = earn_confidence
+            touched += 1
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+        if bool(row.get('earn_trusted', False)) != bool(earn_trusted):
+            row['earn_trusted'] = bool(earn_trusted)
             touched += 1
     return touched
 
@@ -3224,6 +3416,16 @@ def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any])
         return False
 
     earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+    if not _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    ):
+        return False
     if 0 <= earn_days <= earn_block_days:
         return False
 
@@ -3281,6 +3483,8 @@ def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
         "sector": str(candidate.get('sector', '') or ''),
         "sector_phase": str(candidate.get('sector_phase', '') or ''),
         "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "earn_source": str(candidate.get('earn_source', '') or ''),
+        "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
         "watchlists": str(candidate.get('watchlists', '') or ''),
     }
     try:
@@ -3317,6 +3521,8 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         "sector": candidate.get('sector', ''),
         "sector_phase": candidate.get('sector_phase', ''),
         "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "earn_source": str(candidate.get('earn_source', '') or ''),
+        "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
         "watchlists": candidate.get('watchlists', ''),
     }
     prompt = (
@@ -3326,6 +3532,7 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         "ai_buy_recommendation must be one of: Strong Buy, Buy, Watch Only, Skip. "
         "Do not change ticker identity. Do not infer or mention company names. "
         "Do not invent earnings timing; use earn_days exactly as provided. "
+        "Treat unknown/low-confidence earnings data as a risk and reduce aggressiveness. "
         "If earn_days <= 7, default to Skip unless recommendation is explicitly post-earnings. "
         "Treat LAGGING/FADING sector_phase as a headwind and reduce conviction. "
         "Set stop below entry, target above entry. "
@@ -3505,6 +3712,8 @@ def _run_trade_finder_workflow(
             ticker,
             persisted_date=str(c.get('earn_date', '') or ''),
             persisted_days=c.get('earn_days', 999),
+            persisted_source=str(c.get('earn_source', '') or ''),
+            persisted_confidence=str(c.get('earn_confidence', '') or ''),
             verify_with_fetch=False,
         )
         earn_date = str(earn_resolved.get('next_earnings', c.get('earn_date', '')) or c.get('earn_date', '') or '').strip()
@@ -3513,12 +3722,21 @@ def _run_trade_finder_workflow(
         except Exception:
             earn_days = int(c.get('earn_days', 999) or 999)
         earn_source = str(earn_resolved.get('source', c.get('earn_source', '')) or c.get('earn_source', '') or '').strip()
-        if earn_days == 999 and i < 20:
+        earn_confidence = str(earn_resolved.get('confidence', c.get('earn_confidence', '')) or c.get('earn_confidence', '') or '').strip().upper()
+        _needs_verify = not _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+        if _needs_verify and i < 20:
             # Bounded verified fetch for top candidates to reduce false n/a badges.
             earn_verified = resolve_earnings_for_ticker(
                 ticker,
                 persisted_date=earn_date,
                 persisted_days=earn_days,
+                persisted_source=earn_source,
+                persisted_confidence=earn_confidence,
                 verify_with_fetch=True,
             )
             _ev_date = str(earn_verified.get('next_earnings', '') or '').strip()
@@ -3529,6 +3747,13 @@ def _run_trade_finder_workflow(
                 except Exception:
                     pass
                 earn_source = str(earn_verified.get('source', earn_source) or earn_source)
+                earn_confidence = str(earn_verified.get('confidence', earn_confidence) or earn_confidence).strip().upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
         cand_sig = _trade_finder_candidate_signature(c)
         cache_entry = ai_eval_cache.get(ticker, {}) if isinstance(ai_eval_cache, dict) else {}
         cached_sig = str(cache_entry.get('signature', '') or '')
@@ -3553,6 +3778,12 @@ def _run_trade_finder_workflow(
                     ai_rec['ai_buy_recommendation'] = 'Skip'
                     ai_rec['fallback_reason'] = 'earnings_hard_block'
                     ai_rec['rationale'] = f"PASS due to earnings in {earn_days_now}d; avoid pre-event gap risk."
+                elif not earn_trusted:
+                    ai_rec = _heuristic_trade_finder_ai(c)
+                    ai_rec['provider'] = 'system'
+                    ai_rec['ai_buy_recommendation'] = 'Watch Only'
+                    ai_rec['fallback_reason'] = 'earnings_unverified'
+                    ai_rec['rationale'] = "Earnings date unverified; refresh earnings sources before considering entry."
                 elif ai_deadline_ts and time.time() > ai_deadline_ts:
                     ai_rec = _heuristic_trade_finder_ai(c)
                     ai_rec['provider'] = 'system'
@@ -3632,6 +3863,7 @@ def _run_trade_finder_workflow(
             sector=sector_name,
             sector_phase=sector_phase,
             earn_days=earn_days,
+            earn_trusted=bool(earn_trusted),
             fallback_reason=fallback_reason,
             is_gold_source=bool(gold.get('is_gold_source', False)),
         )
@@ -3643,6 +3875,8 @@ def _run_trade_finder_workflow(
             'earn_date': earn_date,
             'earn_days': earn_days,
             'earn_source': earn_source,
+            'earn_confidence': earn_confidence,
+            'earn_trusted': bool(earn_trusted),
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
@@ -4078,6 +4312,7 @@ def render_trade_finder_tab():
             'missing_levels': 0,
             'invalid_level_order': 0,
             'rr_below_threshold': 0,
+            'earnings_untrusted': 0,
             'earnings_blocked': 0,
             'not_ready': 0,
         }
@@ -4099,6 +4334,16 @@ def render_trade_finder_tab():
             if rr < float(settings.get('min_rr', 2.0)):
                 fail['rr_below_threshold'] += 1
             earn_days = int(r.get('earn_days', 999) or 999)
+            earn_source = str(r.get('earn_source', '') or '').strip()
+            earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
+            earn_date = str(r.get('earn_date', r.get('earnings_date', '')) or '').strip()
+            if not _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            ):
+                fail['earnings_untrusted'] += 1
             if 0 <= earn_days <= int(settings.get('earn_block_days', 7)):
                 fail['earnings_blocked'] += 1
             if settings.get('require_ready'):
@@ -4217,10 +4462,16 @@ def render_trade_finder_tab():
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
                     earn_source = str(r.get('earn_source', '') or '').strip()
+                    earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
                     sector_name = str(r.get('sector', '') or '').strip() or "Unknown sector"
                     sector_phase = str(r.get('sector_phase', '') or '').strip()
                     sector_disp = _sector_phase_display(sector_phase)
-                    earn_disp = _earnings_badge(earn_days)
+                    earn_disp = _earnings_badge(
+                        earn_days,
+                        source=earn_source,
+                        confidence=earn_confidence,
+                        earn_date=str(r.get('earn_date', '') or ''),
+                    )
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(
                         r.get('analysis_note', '')
@@ -4267,7 +4518,8 @@ def render_trade_finder_tab():
                         if signal_reason:
                             st.caption(f"{ticker} Scanner Context: {signal_reason}")
                         if earn_source:
-                            st.caption(f"{ticker} Earnings source: {earn_source}")
+                            _ec = f" [{earn_confidence}]" if earn_confidence else ""
+                            st.caption(f"{ticker} Earnings source: {earn_source}{_ec}")
                         if fallback_reason:
                             st.caption(f"{ticker} AI fallback: {fallback_reason}")
                             if fallback_error:
@@ -4291,7 +4543,8 @@ def render_trade_finder_tab():
                             )
                             st.caption(f"Sector: {sector_name} ({sector_phase or 'n/a'})")
                             if earn_source:
-                                st.caption(f"Earnings source: {earn_source}")
+                                _ec = f" [{earn_confidence}]" if earn_confidence else ""
+                                st.caption(f"Earnings source: {earn_source}{_ec}")
                             st.caption(
                                 f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
                                 f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
@@ -5252,8 +5505,19 @@ def _build_rows_from_analysis(results, jm) -> list:
         # Earnings flag (canonical resolver to stay aligned with AI context).
         earn_info = resolve_earnings_for_ticker(r.ticker)
         _ed = earn_info.get('days_until')
+        _earn_src = str(earn_info.get('source', '') or '').strip()
+        _earn_conf = str(earn_info.get('confidence', '') or '').strip().upper()
+        _earn_dt = str(earn_info.get('next_earnings', '') or '').strip()
+        _earn_trusted = _is_earnings_data_trusted(
+            _ed if _ed is not None else 999,
+            source=_earn_src,
+            confidence=_earn_conf,
+            next_earnings=_earn_dt,
+        )
         if _ed is not None:
-            if _ed <= 7:
+            if not _earn_trusted:
+                earn_flag = "🔴?"
+            elif _ed <= 7:
                 earn_flag = f"⚡{_ed}d"
             elif _ed <= 14:
                 earn_flag = f"⏰{_ed}d"
@@ -5284,7 +5548,9 @@ def _build_rows_from_analysis(results, jm) -> list:
         # Earnings date
         earn_date_str = str(earn_info.get('next_earnings', '') or '')
         if earn_date_str and _ed is not None:
-            if _ed <= 7:
+            if not _earn_trusted:
+                earn_date_str = f"🔴{earn_date_str}"
+            elif _ed <= 7:
                 earn_date_str = f"⚡{earn_date_str}"
             elif _ed <= 14:
                 earn_date_str = f"⏰{earn_date_str}"
@@ -5394,10 +5660,24 @@ def _build_rows_from_summary(summary, jm) -> list:
             ticker,
             persisted_date=s.get('earn_date', ''),
             persisted_days=s.get('earn_days'),
+            persisted_source=s.get('earn_source', ''),
+            persisted_confidence=s.get('earn_confidence', ''),
         )
         earn_days = earn_info.get('days_until')
         earn_date_str = str(earn_info.get('next_earnings', '') or '')
-        if earn_days is None:
+        earn_source = str(earn_info.get('source', s.get('earn_source', '')) or s.get('earn_source', '') or '')
+        earn_confidence = str(earn_info.get('confidence', s.get('earn_confidence', '')) or s.get('earn_confidence', '') or '').upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days if earn_days is not None else 999,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date_str,
+        )
+        if not earn_trusted:
+            earn_flag = "🔴?"
+            if earn_date_str:
+                earn_date_str = f"🔴{earn_date_str}"
+        elif earn_days is None:
             earn_flag = ""
         elif earn_days <= 7:
             earn_flag = f"⚡{earn_days}d"
@@ -8590,24 +8870,38 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     earnings_block_days = int(quality_settings.get('earn_block_days', 7) or 7)
     confirm_rr = _calc_rr(float(confirm_entry or 0), float(confirm_stop or 0), float(confirm_target or 0))
 
-    ticker_earn_days = 999
-    try:
-        ef = st.session_state.get('earnings_flags', {}).get(ticker, {}) or {}
-        ticker_earn_days = int(ef.get('days_until', ef.get('days_until_earnings', 999)) or 999)
-    except Exception:
-        ticker_earn_days = 999
+    finder_earn_date = str(finder_for_ticker.get('earn_date', '') or '').strip() if finder_for_ticker else ''
     finder_earn_days = int(finder_for_ticker.get('earn_days', 999) or 999) if finder_for_ticker else 999
-    effective_earn_days = min(ticker_earn_days, finder_earn_days)
+    finder_earn_source = str(finder_for_ticker.get('earn_source', '') or '').strip() if finder_for_ticker else ''
+    finder_earn_conf = str(finder_for_ticker.get('earn_confidence', '') or '').strip() if finder_for_ticker else ''
+    entry_earn = resolve_earnings_for_ticker(
+        ticker,
+        persisted_date=finder_earn_date,
+        persisted_days=finder_earn_days,
+        persisted_source=finder_earn_source,
+        persisted_confidence=finder_earn_conf,
+        verify_with_fetch=False,
+    )
+    effective_earn_days = int(entry_earn.get('days_until', 999) or 999)
+    effective_earn_date = str(entry_earn.get('next_earnings', '') or '')
+    effective_earn_source = str(entry_earn.get('source', '') or '')
+    effective_earn_conf = str(entry_earn.get('confidence', '') or '').upper()
+    earnings_trusted = _is_earnings_data_trusted(
+        effective_earn_days,
+        source=effective_earn_source,
+        confidence=effective_earn_conf,
+        next_earnings=effective_earn_date,
+    )
 
     st.caption(
         f"Entry guards: min R:R {min_rr_required:.1f} | block earnings <= {earnings_block_days}d | "
-        f"current R:R {confirm_rr:.2f}"
+        f"current R:R {confirm_rr:.2f} | earnings {'trusted' if earnings_trusted else 'unverified'}"
     )
     earnings_override = st.checkbox(
-        f"Override earnings window block (earnings <= {earnings_block_days}d)",
+        f"Override earnings guard (window <= {earnings_block_days}d or unverified date)",
         value=False,
         key=f"earnings_override_{ticker}",
-        help="Allows entry despite imminent earnings. Use only for intentional earnings plays.",
+        help="Allows entry despite imminent/unverified earnings data. Use only for intentional earnings plays.",
     )
 
     if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}", disabled=hard_block_stale):
@@ -8622,6 +8916,11 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             st.error("Blocked: target must be above entry.")
         elif confirm_rr < min_rr_required:
             st.error(f"Blocked: R:R {confirm_rr:.2f} is below minimum {min_rr_required:.1f}.")
+        elif (not earnings_trusted) and not earnings_override:
+            st.error(
+                "Blocked: earnings date is unverified. Refresh earnings data (Scan All / Find New) "
+                "or enable override only for intentional high-risk entries."
+            )
         elif 0 <= effective_earn_days <= earnings_block_days and not earnings_override:
             st.error(
                 f"Blocked: earnings in {effective_earn_days} day(s). "
@@ -9822,6 +10121,15 @@ def _recommendation_score(row: Dict) -> float:
     grade = str(row.get('quality_grade', '')).upper()
     sector_phase = str(row.get('sector_phase', '')).lower()
     earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('next_earnings', '')) or '').strip()
+    earn_trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    )
 
     score = conv * 3 + min(vol_ratio, 4) * 2 + grade_rank.get(grade, 0)
     if "RE_ENTRY" in rec or "LATE_ENTRY" in rec:
@@ -9836,6 +10144,8 @@ def _recommendation_score(row: Dict) -> float:
         score -= 1.5
     if 0 <= earn_days <= 7:
         score -= 2.0
+    if not earn_trusted:
+        score -= 2.5
     return score
 
 
@@ -9847,6 +10157,15 @@ def _score_candidate_with_policy(row: Dict, snap: DashboardSnapshot) -> Dict[str
     conv = int(row.get('conviction', 0) or 0)
     phase = str(row.get('sector_phase', '')).lower()
     earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('next_earnings', '')) or '').strip()
+    earn_trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    )
 
     if conv >= 8:
         reasons.append("High conviction")
@@ -9862,7 +10181,9 @@ def _score_candidate_with_policy(row: Dict, snap: DashboardSnapshot) -> Dict[str
     elif phase == 'lagging':
         reasons.append("Lagging sector")
 
-    if earn_days <= 3:
+    if not earn_trusted:
+        reasons.append("Earnings unverified")
+    elif earn_days <= 3:
         reasons.append("Earnings very near")
     elif earn_days <= 7:
         reasons.append("Earnings near")
@@ -9888,6 +10209,9 @@ def _score_candidate_with_policy(row: Dict, snap: DashboardSnapshot) -> Dict[str
     if snap.regime == "RISK_OFF" and conv < 9:
         blocked = True
         reasons.append("Blocked by risk-off policy")
+    if not earn_trusted:
+        blocked = True
+        reasons.append("Blocked by earnings trust policy")
 
     return {
         'score': score,
@@ -10164,6 +10488,22 @@ def render_executive_dashboard():
         find_new_cands = find_new.get('candidates', []) or []
         if find_new_cands:
             for c in find_new_cands:
+                row_for_policy = {
+                    'ticker': c.get('ticker', ''),
+                    'recommendation': c.get('recommendation', ''),
+                    'conviction': c.get('conviction', 0),
+                    'quality_grade': c.get('quality_grade', '?'),
+                    'price': c.get('price', 0),
+                    'summary': c.get('summary', ''),
+                    'sector_phase': c.get('sector_phase', ''),
+                    'earn_days': int(c.get('earn_days', 999) or 999),
+                    'earn_date': str(c.get('earn_date', '') or ''),
+                    'earn_source': str(c.get('earn_source', '') or ''),
+                    'earn_confidence': str(c.get('earn_confidence', '') or ''),
+                }
+                scored = _score_candidate_with_policy(row_for_policy, snap)
+                if scored.get('blocked'):
+                    continue
                 entry = float(c.get('price', 0) or 0)
                 stop = float(c.get('price', 0) or 0) * 0.94 if entry > 0 else 0.0
                 target = float(c.get('price', 0) or 0) * 1.10 if entry > 0 else 0.0
@@ -10191,17 +10531,9 @@ def render_executive_dashboard():
                     ],
                 ).to_dict()
                 candidate_rows.append({
-                    'row': {
-                        'ticker': c.get('ticker', ''),
-                        'recommendation': c.get('recommendation', ''),
-                        'conviction': c.get('conviction', 0),
-                    },
-                    'score': float(c.get('score', 0) or 0),
-                    'reasons': [
-                        "Cross-watchlist candidate",
-                        f"Quality {c.get('quality_grade', '?')}",
-                        f"Sector {c.get('sector_phase', '')}".strip(),
-                    ],
+                    'row': row_for_policy,
+                    'score': float(max(float(c.get('score', 0) or 0), float(scored.get('score', 0) or 0))),
+                    'reasons': list(scored.get('reasons', []) or [])[:4],
                     'card': card,
                 })
         else:

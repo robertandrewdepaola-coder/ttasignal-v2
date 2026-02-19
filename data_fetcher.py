@@ -24,6 +24,7 @@ import re
 import requests as _requests_lib
 import logging
 import hashlib
+import os
 from earnings_utils import select_earnings_dates
 
 # ── Suppress noisy yfinance logging globally ────────────────────────────────
@@ -49,7 +50,7 @@ from signal_engine import (
 class DataCache:
     """
     Simple in-memory cache for yfinance data.
-    
+
     Keyed by (ticker, interval, period). Expires after `ttl` seconds.
     Call cache.clear() at the start of each scan to ensure fresh data.
     """
@@ -804,6 +805,67 @@ _ALT_EARNINGS_HEADERS = {
 }
 
 
+def _get_finnhub_api_key() -> str:
+    """Best-effort FINNHUB key lookup from env or Streamlit secrets."""
+    key = str(os.environ.get("FINNHUB_API_KEY", "") or "").strip()
+    if key:
+        return key
+    try:
+        import streamlit as st  # Optional dependency path.
+        key = str(st.secrets.get("FINNHUB_API_KEY", "") or "").strip()
+    except Exception:
+        key = ""
+    return key
+
+
+def _fetch_earnings_finnhub(ticker: str, today=None):
+    """
+    Strategy 4: Finnhub earnings calendar (independent, API-backed).
+    Endpoint: /api/v1/calendar/earnings
+    """
+    if today is None:
+        today = datetime.now().date()
+    key = _get_finnhub_api_key()
+    if not key:
+        return None
+    try:
+        from_date = today.strftime("%Y-%m-%d")
+        to_date = (today + timedelta(days=400)).strftime("%Y-%m-%d")
+        url = "https://finnhub.io/api/v1/calendar/earnings"
+        params = {
+            "symbol": ticker,
+            "from": from_date,
+            "to": to_date,
+            "token": key,
+        }
+        resp = _requests_lib.get(url, headers=_ALT_EARNINGS_HEADERS, params=params, timeout=8)
+        if resp.status_code != 200:
+            return None
+        data = resp.json() if resp.content else {}
+        rows = data.get("earningsCalendar") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return None
+
+        dates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dstr = str(row.get("date") or row.get("epsDate") or "").strip()
+            if not dstr:
+                continue
+            try:
+                d = datetime.strptime(dstr[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
+            if d >= today:
+                dates.append(d)
+        if dates:
+            return min(dates)
+    except Exception:
+        pass
+    return None
+
+
 def _fetch_earnings_nasdaq(ticker: str, today=None):
     """
     Strategy 4: Nasdaq API — independent source from Yahoo.
@@ -973,6 +1035,53 @@ def _fetch_earnings_stockanalysis(ticker: str, today=None):
     return None
 
 
+def _fetch_earnings_marketbeat(ticker: str, today=None):
+    """
+    Strategy 7: MarketBeat earnings page scrape (independent website fallback).
+    """
+    if today is None:
+        today = datetime.now().date()
+    t = str(ticker or "").upper().strip()
+    if not t:
+        return None
+    try:
+        urls = [
+            f"https://www.marketbeat.com/stocks/NASDAQ/{t}/earnings/",
+            f"https://www.marketbeat.com/stocks/NYSE/{t}/earnings/",
+            f"https://www.marketbeat.com/stocks/AMEX/{t}/earnings/",
+        ]
+        for url in urls:
+            try:
+                resp = _requests_lib.get(url, headers=_ALT_EARNINGS_HEADERS, timeout=8, allow_redirects=True)
+                if resp.status_code != 200:
+                    continue
+                html = resp.text or ""
+                patterns = [
+                    (r'(\w{3,9}\s+\d{1,2},\s*\d{4})', "%B %d, %Y"),
+                    (r'(\w{3}\s+\d{1,2},\s*\d{4})', "%b %d, %Y"),
+                    (r'(\d{4}-\d{2}-\d{2})', "%Y-%m-%d"),
+                    (r'(\d{1,2}/\d{1,2}/\d{4})', "%m/%d/%Y"),
+                ]
+                for pat, fmt in patterns:
+                    for m in re.finditer(pat, html):
+                        snippet_start = max(0, m.start() - 120)
+                        snippet_end = min(len(html), m.end() + 120)
+                        snippet = html[snippet_start:snippet_end].lower()
+                        if "earning" not in snippet:
+                            continue
+                        try:
+                            d = datetime.strptime(m.group(1).strip(), fmt).date()
+                        except Exception:
+                            continue
+                        if d >= today:
+                            return d
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str, Dict]:
     """
     Check earnings dates for a batch of tickers using parallel threading.
@@ -1023,6 +1132,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
             stock = yf.Ticker(ticker)
             earn_dt = None
             recent_past = None
+            source = ""
+            confidence = ""
 
             # Strategy 1: info dict (often has earningsTimestamp — fast, same API call)
             try:
@@ -1040,6 +1151,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                             days = (candidate - today).days
                             if days >= 0:
                                 earn_dt = candidate
+                                source = 'Yahoo batch (.info)'
+                                confidence = 'MEDIUM-HIGH'
                                 break
                             if -30 <= days < 0 and (recent_past is None or candidate > recent_past):
                                 recent_past = candidate
@@ -1055,6 +1168,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                                     days = (candidate - today).days
                                     if days >= 0:
                                         earn_dt = candidate
+                                        source = 'Yahoo batch (.info)'
+                                        confidence = 'MEDIUM-HIGH'
                                     elif -30 <= days < 0 and (recent_past is None or candidate > recent_past):
                                         recent_past = candidate
             except Exception:
@@ -1079,8 +1194,12 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                         if raw_date is not None:
                             if hasattr(raw_date, 'date') and callable(getattr(raw_date, 'date', None)):
                                 earn_dt = raw_date.date()
+                                source = 'Yahoo batch (.calendar)'
+                                confidence = 'HIGH'
                             elif isinstance(raw_date, str) and len(raw_date) >= 10:
                                 earn_dt = datetime.strptime(raw_date[:10], '%Y-%m-%d').date()
+                                source = 'Yahoo batch (.calendar)'
+                                confidence = 'HIGH'
                 except Exception:
                     pass
 
@@ -1092,6 +1211,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                         picks = select_earnings_dates(list(edates.index), today)
                         if picks.get('next') is not None:
                             earn_dt = picks['next']
+                            source = 'Yahoo batch (.earnings_dates)'
+                            confidence = 'MEDIUM-HIGH'
                         if picks.get('recent_past') is not None:
                             recent_past = picks['recent_past']
                 except Exception:
@@ -1104,6 +1225,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                         'next_earnings': earn_dt.strftime('%Y-%m-%d'),
                         'days_until': days_until,
                         'within_window': 0 <= days_until <= days_ahead,
+                        'source': source or 'Yahoo batch',
+                        'confidence': confidence or 'MEDIUM',
                     })
                 if -30 <= days_until < 0 and (recent_past is None or earn_dt > recent_past):
                     recent_past = earn_dt
@@ -1119,6 +1242,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                     'days_until': days_until,
                     'within_window': 0 <= days_until <= days_ahead,
                     'estimated': True,
+                    'source': 'Estimated (batch +91d)',
+                    'confidence': 'LOW',
                 })
 
             # All 3 yfinance strategies failed — mark for alt-source pass
@@ -1128,32 +1253,62 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
         return (ticker, None)
 
     def _fetch_one_alt_sources(ticker: str):
-        """Fetch earnings from alternative non-Yahoo sources (Strategies 4-6)."""
+        """Fetch earnings from alternative non-Yahoo sources (Strategies 4-7)."""
         earn_dt = None
+        source = ""
+        confidence = ""
 
-        # Strategy 4: Nasdaq API (completely independent from Yahoo)
+        # Strategy 4: Finnhub API (independent API source)
         try:
-            earn_dt = _fetch_earnings_nasdaq(ticker, today)
+            earn_dt = _fetch_earnings_finnhub(ticker, today)
             if earn_dt:
-                print(f"[earnings] {ticker}: found via Nasdaq API")
+                print(f"[earnings] {ticker}: found via Finnhub API")
+                source = 'Finnhub API'
+                confidence = 'HIGH'
         except Exception:
             pass
 
-        # Strategy 5: Yahoo earnings calendar HTML (different path than yfinance API)
+        # Strategy 5: Nasdaq API (completely independent from Yahoo)
+        try:
+            if earn_dt is None:
+                earn_dt = _fetch_earnings_nasdaq(ticker, today)
+                if earn_dt:
+                    source = 'Nasdaq API'
+                    confidence = 'MEDIUM'
+                    print(f"[earnings] {ticker}: found via Nasdaq API")
+        except Exception:
+            pass
+
+        # Strategy 6: Yahoo earnings calendar HTML (different path than yfinance API)
         if earn_dt is None:
             try:
                 earn_dt = _fetch_earnings_yahoo_html(ticker, today)
                 if earn_dt:
                     print(f"[earnings] {ticker}: found via Yahoo calendar HTML")
+                    source = 'Yahoo Calendar HTML'
+                    confidence = 'MEDIUM'
             except Exception:
                 pass
 
-        # Strategy 6: stockanalysis.com (fully independent)
+        # Strategy 7: stockanalysis.com (fully independent)
         if earn_dt is None:
             try:
                 earn_dt = _fetch_earnings_stockanalysis(ticker, today)
                 if earn_dt:
                     print(f"[earnings] {ticker}: found via stockanalysis.com")
+                    source = 'stockanalysis.com'
+                    confidence = 'MEDIUM'
+            except Exception:
+                pass
+
+        # Strategy 8: MarketBeat HTML fallback
+        if earn_dt is None:
+            try:
+                earn_dt = _fetch_earnings_marketbeat(ticker, today)
+                if earn_dt:
+                    print(f"[earnings] {ticker}: found via MarketBeat HTML")
+                    source = 'MarketBeat HTML'
+                    confidence = 'MEDIUM'
             except Exception:
                 pass
 
@@ -1165,6 +1320,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
                 'next_earnings': earn_dt.strftime('%Y-%m-%d'),
                 'days_until': days_until,
                 'within_window': 0 <= days_until <= days_ahead,
+                'source': source or 'Alternative source',
+                'confidence': confidence or 'MEDIUM',
             })
 
         return (ticker, None)
@@ -1858,37 +2015,15 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
             result['error'] = str(e)[:200]
             break
     
-    # ── METHOD 4: Historical pattern estimation ───────────────
-    if not result['next_earnings'] and result.get('last_earnings'):
+    # ── METHOD 4: Finnhub API (independent source) ───────────────
+    if not result['next_earnings']:
         try:
-            last_dt = datetime.strptime(result['last_earnings'], '%Y-%m-%d').date()
-            estimated = last_dt + timedelta(days=91)
-            while (estimated - today).days < -7:
-                estimated += timedelta(days=91)
-            result['next_earnings'] = estimated.strftime('%Y-%m-%d')
-            result['days_until_earnings'] = max(0, (estimated - today).days)
-            result['confidence'] = 'LOW'
-            result['source'] = 'Estimated (last + 91d pattern)'
-        except Exception:
-            pass
-    
-    # ── METHOD 4b: If no last_earnings either, try earnings_dates for any past date ──
-    if not result['next_earnings'] and not result.get('last_earnings'):
-        try:
-            stock = yf.Ticker(ticker)
-            edates = stock.earnings_dates
-            if edates is not None and len(edates) > 0:
-                picks = select_earnings_dates(list(edates.index), today)
-                recent = picks.get('recent_past') or picks.get('latest_any')
-                if recent is not None:
-                    result['last_earnings'] = recent.strftime('%Y-%m-%d')
-                    estimated = recent + timedelta(days=91)
-                    while (estimated - today).days < -7:
-                        estimated += timedelta(days=91)
-                    result['next_earnings'] = estimated.strftime('%Y-%m-%d')
-                    result['days_until_earnings'] = max(0, (estimated - today).days)
-                    result['confidence'] = 'LOW'
-                    result['source'] = 'Estimated (historical + 91d)'
+            earn_dt = _fetch_earnings_finnhub(ticker, today)
+            if earn_dt:
+                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (earn_dt - today).days)
+                result['confidence'] = 'HIGH'
+                result['source'] = 'Finnhub API'
         except Exception:
             pass
 
@@ -1926,6 +2061,52 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
                 result['days_until_earnings'] = max(0, (earn_dt - today).days)
                 result['confidence'] = 'MEDIUM'
                 result['source'] = 'stockanalysis.com'
+        except Exception:
+            pass
+
+    if not result['next_earnings']:
+        # Try MarketBeat HTML (independent site fallback)
+        try:
+            earn_dt = _fetch_earnings_marketbeat(ticker, today)
+            if earn_dt:
+                result['next_earnings'] = earn_dt.strftime('%Y-%m-%d')
+                result['days_until_earnings'] = max(0, (earn_dt - today).days)
+                result['confidence'] = 'MEDIUM'
+                result['source'] = 'MarketBeat HTML'
+        except Exception:
+            pass
+
+    # ── METHOD 6: Historical pattern estimation (last resort only) ─────────
+    if not result['next_earnings'] and result.get('last_earnings'):
+        try:
+            last_dt = datetime.strptime(result['last_earnings'], '%Y-%m-%d').date()
+            estimated = last_dt + timedelta(days=91)
+            while (estimated - today).days < -7:
+                estimated += timedelta(days=91)
+            result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+            result['days_until_earnings'] = max(0, (estimated - today).days)
+            result['confidence'] = 'LOW'
+            result['source'] = 'Estimated (last + 91d pattern)'
+        except Exception:
+            pass
+
+    # ── METHOD 6b: If no last_earnings either, infer from historical cadence ──
+    if not result['next_earnings'] and not result.get('last_earnings'):
+        try:
+            stock = yf.Ticker(ticker)
+            edates = stock.earnings_dates
+            if edates is not None and len(edates) > 0:
+                picks = select_earnings_dates(list(edates.index), today)
+                recent = picks.get('recent_past') or picks.get('latest_any')
+                if recent is not None:
+                    result['last_earnings'] = recent.strftime('%Y-%m-%d')
+                    estimated = recent + timedelta(days=91)
+                    while (estimated - today).days < -7:
+                        estimated += timedelta(days=91)
+                    result['next_earnings'] = estimated.strftime('%Y-%m-%d')
+                    result['days_until_earnings'] = max(0, (estimated - today).days)
+                    result['confidence'] = 'LOW'
+                    result['source'] = 'Estimated (historical + 91d)'
         except Exception:
             pass
     
