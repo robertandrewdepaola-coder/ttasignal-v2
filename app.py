@@ -2306,7 +2306,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 r.ticker,
                 persisted_date=_persisted_date,
                 persisted_days=_persisted_days,
-                verify_with_fetch=True,
+                verify_with_fetch=False,
             )
             if not str(earn.get('next_earnings', '') or '').strip() and _persisted_date:
                 earn = {
@@ -2370,6 +2370,30 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
+
+        # Candidate-focused earnings backfill:
+        # run slower per-ticker verification only for top candidates still missing dates.
+        missing_candidate_tickers = [
+            str(c.get('ticker', '')).upper().strip()
+            for c in candidates
+            if int(c.get('earn_days', 999) or 999) == 999
+        ]
+        if missing_candidate_tickers:
+            _set_find_progress(96, "Backfilling missing earnings for top candidates...")
+            row_by_ticker = {str(rw.get('ticker', '')).upper().strip(): rw for rw in rows}
+            cand_by_ticker = {str(cd.get('ticker', '')).upper().strip(): cd for cd in candidates}
+            for _t in missing_candidate_tickers[:25]:
+                _earn2 = resolve_earnings_for_ticker(_t, verify_with_fetch=True)
+                _date2 = str(_earn2.get('next_earnings', '') or '').strip()
+                if not _date2:
+                    continue
+                _days2 = int(_earn2.get('days_until', 999) or 999)
+                if _t in row_by_ticker:
+                    row_by_ticker[_t]['earn_date'] = _date2
+                    row_by_ticker[_t]['earn_days'] = _days2
+                if _t in cand_by_ticker:
+                    cand_by_ticker[_t]['earn_date'] = _date2
+                    cand_by_ticker[_t]['earn_days'] = _days2
 
         candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
         _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
@@ -2588,6 +2612,59 @@ def resolve_earnings_for_ticker(
                     'confidence': resolved['confidence'],
                 }
                 st.session_state['earnings_flags'] = earnings_flags
+            else:
+                # Secondary fallback sources for cases where primary earnings endpoint
+                # is empty/rate-limited but profile/history has a usable date.
+                try:
+                    from data_fetcher import fetch_fundamental_profile
+                    profile = fetch_fundamental_profile(t) or {}
+                    raw_prof_date = profile.get('next_earnings') or profile.get('earnings_date')
+                    prof_dt = _parse_earnings_date(raw_prof_date)
+                    if prof_dt is not None:
+                        prof_date = prof_dt.strftime('%Y-%m-%d')
+                        prof_days = _normalize_earnings_days(prof_date, None)
+                        resolved = {
+                            'next_earnings': prof_date,
+                            'days_until': prof_days,
+                            'source': 'Fundamental Profile',
+                            'confidence': 'LOW',
+                        }
+                        earnings_flags[t] = {
+                            'next_earnings': prof_date,
+                            'days_until': prof_days,
+                            'within_window': bool(prof_days is not None and prof_days <= 60),
+                            'source': resolved['source'],
+                            'confidence': resolved['confidence'],
+                        }
+                        st.session_state['earnings_flags'] = earnings_flags
+                except Exception:
+                    pass
+
+            if not resolved.get('next_earnings'):
+                try:
+                    from data_fetcher import fetch_earnings_history
+                    hist = fetch_earnings_history(t) or {}
+                    hist_date = str(hist.get('next_earnings', '') or '').strip()
+                    hist_dt = _parse_earnings_date(hist_date)
+                    if hist_dt is not None:
+                        hist_date = hist_dt.strftime('%Y-%m-%d')
+                        hist_days = _normalize_earnings_days(hist_date, hist.get('days_until_earnings'))
+                        resolved = {
+                            'next_earnings': hist_date,
+                            'days_until': hist_days,
+                            'source': str(hist.get('source', 'Earnings History') or 'Earnings History'),
+                            'confidence': str(hist.get('confidence', 'LOW') or 'LOW'),
+                        }
+                        earnings_flags[t] = {
+                            'next_earnings': hist_date,
+                            'days_until': hist_days,
+                            'within_window': bool(hist_days is not None and hist_days <= 60),
+                            'source': resolved['source'],
+                            'confidence': resolved['confidence'],
+                        }
+                        st.session_state['earnings_flags'] = earnings_flags
+                except Exception:
+                    pass
         except Exception:
             pass
 
