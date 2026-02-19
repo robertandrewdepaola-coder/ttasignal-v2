@@ -554,6 +554,8 @@ if 'scan_max_minutes' not in st.session_state:
     st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
 if 'find_new_max_minutes' not in st.session_state:
     st.session_state['find_new_max_minutes'] = 5.0
+if 'trade_finder_last_status' not in st.session_state:
+    st.session_state['trade_finder_last_status'] = {}
 
 
 def get_journal() -> JournalManager:
@@ -2051,7 +2053,13 @@ def _run_find_new_trades():
 
     _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
     _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
-    _filtered_counts = {"sector_filter": 0, "rotation_filter": 0, "unknown_sector": 0, "max_tickers": 0}
+    _filtered_counts = {
+        "sector_filter": 0,
+        "rotation_filter": 0,
+        "unknown_sector": 0,
+        "rotation_unknown_kept": 0,
+        "max_tickers": 0,
+    }
 
     # Validate symbols before data fetch.
     import re as _re
@@ -2068,12 +2076,17 @@ def _run_find_new_trades():
                 continue
         if _only_in_rotation:
             if not _sector_name:
+                # Keep unknown-sector tickers in universe; resolve sector after scan.
+                # Dropping here can cause false "no action" after reboot when sector cache is sparse.
                 _filtered_counts["unknown_sector"] += 1
-                continue
-            _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper()
-            if _phase not in {"LEADING", "EMERGING"}:
-                _filtered_counts["rotation_filter"] += 1
-                continue
+                _filtered_counts["rotation_unknown_kept"] += 1
+            else:
+                _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper()
+                if _phase and _phase not in {"LEADING", "EMERGING"}:
+                    _filtered_counts["rotation_filter"] += 1
+                    continue
+                if not _phase:
+                    _filtered_counts["rotation_unknown_kept"] += 1
 
         is_base = bool(_re.match(r'^[A-Z]{1,5}$', t))
         class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
@@ -2092,7 +2105,42 @@ def _run_find_new_trades():
         print(f"[find_new] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
 
     if not universe:
-        st.sidebar.warning("No tickers found across watchlists.")
+        report = {
+            'generated_at': time.time(),
+            'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'watchlists_count': len(all_watchlists),
+            'scan_universe': 0,
+            'results_count': 0,
+            'candidate_count': 0,
+            'candidates': [],
+            'rows': [],
+            'elapsed_sec': 0.0,
+            'scan_scope': {
+                'max_tickers': _max_tickers,
+                'only_in_rotation': _only_in_rotation,
+                'selected_sectors': sorted(list(_selected_sectors)),
+                'filtered_counts': _filtered_counts,
+                'requested_universe': len(ticker_sources),
+                'effective_universe': 0,
+            },
+        }
+        st.session_state['find_new_trades_report'] = report
+        st.session_state['_find_new_trades_ts'] = time.time()
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': (
+                f"No eligible tickers after scope filters "
+                f"(requested={len(ticker_sources)}, effective=0). "
+                "Relax Find New Scope and run again."
+            ),
+            'ts': time.time(),
+        }
+        st.sidebar.warning("No eligible tickers after scope filters.")
+        _append_audit_event(
+            "FIND_NEW_EMPTY",
+            f"requested={len(ticker_sources)} effective=0",
+            source="find_new",
+        )
         return
 
     _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
@@ -2283,6 +2331,14 @@ def _run_find_new_trades():
     }
     st.session_state['find_new_trades_report'] = report
     st.session_state['_find_new_trades_ts'] = time.time()
+    st.session_state['trade_finder_last_status'] = {
+        'level': 'success' if len(candidates) > 0 else 'info',
+        'message': (
+            f"Find New complete: scanned {len(universe)} ticker(s), "
+            f"scored {len(rows)} result(s), {len(candidates)} candidate(s)."
+        ),
+        'ts': time.time(),
+    }
     try:
         _existing_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
         get_journal().save_trade_finder_snapshot({
@@ -2957,22 +3013,41 @@ def _run_trade_finder_workflow() -> None:
     Executes scanner candidate discovery + Grok scoring.
     Reuses existing find-new logic, then enriches/ranks candidates.
     """
+    st.session_state['trade_finder_last_status'] = {
+        'level': 'info',
+        'message': 'Running Find New Trades and AI ranking...',
+        'ts': time.time(),
+    }
     _run_find_new_trades()
     report = st.session_state.get('find_new_trades_report', {}) or {}
     base_candidates = report.get('candidates', []) or []
+    run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
     if not base_candidates:
         st.session_state['trade_finder_results'] = {
+            'run_id': run_id,
             'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'rows': [],
             'provider': 'system',
             'elapsed_sec': 0.0,
+            'input_candidates': 0,
+            'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
         }
+        _scan_universe = int(report.get('scan_universe', 0) or 0) if isinstance(report, dict) else 0
+        _results_count = int(report.get('results_count', 0) or 0) if isinstance(report, dict) else 0
+        if _scan_universe > 0:
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': (
+                    f"Run complete: scanned {_scan_universe} ticker(s), analyzed {_results_count} result(s), "
+                    "but no entry candidates passed current gates."
+                ),
+                'ts': time.time(),
+            }
         return
 
     ai_clients = _get_ai_clients()
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
-    run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
     # Full-quality mode: when 0, evaluate all candidates with AI.
     ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else min(ai_top_n_cfg, len(base_candidates))
@@ -3150,6 +3225,14 @@ def _run_trade_finder_workflow() -> None:
         'sec': round(elapsed, 3),
         'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
     })
+    st.session_state['trade_finder_last_status'] = {
+        'level': 'success' if len(rows) > 0 else 'info',
+        'message': (
+            f"AI ranking complete: {len(rows)} ranked candidate(s) "
+            f"from {len(base_candidates)} scanner candidate(s)."
+        ),
+        'ts': time.time(),
+    }
 
 
 def render_trade_finder_tab():
@@ -3219,9 +3302,41 @@ def render_trade_finder_tab():
             _run_trade_finder_workflow()
         st.rerun()
 
+    _last_status = st.session_state.get('trade_finder_last_status', {}) or {}
+    _last_level = str(_last_status.get('level', 'info') or 'info').lower()
+    _last_message = str(_last_status.get('message', '') or '').strip()
+    if _last_message:
+        if _last_level == "success":
+            st.success(_last_message)
+        elif _last_level == "warning":
+            st.warning(_last_message)
+        elif _last_level == "error":
+            st.error(_last_message)
+        else:
+            st.info(_last_message)
+
     results = st.session_state.get('trade_finder_results', {}) or {}
     rows = results.get('rows', []) or []
     if not rows:
+        _find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        if _find_new:
+            _flt = ((_find_new.get('scan_scope', {}) or {}).get('filtered_counts', {}) or {})
+            st.caption(
+                f"Last run: {_find_new.get('generated_at_iso', '')} | "
+                f"Requested: {int((_find_new.get('scan_scope', {}) or {}).get('requested_universe', 0) or 0)} | "
+                f"Effective: {int((_find_new.get('scan_scope', {}) or {}).get('effective_universe', 0) or 0)} | "
+                f"Analyzed: {int(_find_new.get('results_count', 0) or 0)} | "
+                f"Candidates: {int(_find_new.get('candidate_count', 0) or 0)}"
+            )
+            if _flt:
+                st.caption(
+                    "Scope diagnostics: "
+                    f"sector_filtered={int(_flt.get('sector_filter', 0) or 0)}, "
+                    f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
+                    f"unknown_sector_seen={int(_flt.get('unknown_sector', 0) or 0)}, "
+                    f"rotation_unknown_kept={int(_flt.get('rotation_unknown_kept', 0) or 0)}, "
+                    f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}"
+                )
         st.info("Click Find New Trades to generate ranked candidates.")
         return
 
@@ -3294,6 +3409,7 @@ def render_trade_finder_tab():
             f"sector_filtered={int(_flt.get('sector_filter', 0) or 0)}, "
             f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
             f"unknown_sector_filtered={int(_flt.get('unknown_sector', 0) or 0)}, "
+            f"rotation_unknown_kept={int(_flt.get('rotation_unknown_kept', 0) or 0)}, "
             f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}"
         )
     _tf_chart_err = str(st.session_state.get('trade_finder_chart_error', '') or '').strip()
