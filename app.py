@@ -556,6 +556,8 @@ if 'find_new_max_minutes' not in st.session_state:
     st.session_state['find_new_max_minutes'] = 5.0
 if 'trade_finder_last_status' not in st.session_state:
     st.session_state['trade_finder_last_status'] = {}
+if 'trade_finder_ai_budget_sec' not in st.session_state:
+    st.session_state['trade_finder_ai_budget_sec'] = 30.0
 
 
 def get_journal() -> JournalManager:
@@ -3058,6 +3060,28 @@ def _heuristic_trade_finder_ai(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
+    """Stable hash for AI-eval cache reuse across reruns."""
+    payload = {
+        "ticker": str(candidate.get('ticker', '') or '').upper().strip(),
+        "recommendation": str(candidate.get('recommendation', '') or ''),
+        "conviction": int(candidate.get('conviction', 0) or 0),
+        "quality_grade": str(candidate.get('quality_grade', '?') or '?'),
+        "price": round(float(candidate.get('price', 0) or 0), 4),
+        "summary": str(candidate.get('summary', '') or ''),
+        "sector": str(candidate.get('sector', '') or ''),
+        "sector_phase": str(candidate.get('sector_phase', '') or ''),
+        "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "watchlists": str(candidate.get('watchlists', '') or ''),
+    }
+    try:
+        import hashlib
+        blob = _json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    except Exception:
+        return str(payload)
+
+
 def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ask Grok/OpenAI-compatible provider for trade-finder scoring and risk levels.
@@ -3112,8 +3136,9 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
                     {"role": "system", "content": "Return strict JSON only."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=260,
+                max_tokens=190,
                 temperature=0.2,
+                timeout=20,
             )
             raw_text = resp.choices[0].message.content
             provider = m
@@ -3230,6 +3255,9 @@ def _run_trade_finder_workflow(
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
     # Full-quality mode: when 0, evaluate all candidates with AI.
     ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else min(ai_top_n_cfg, len(base_candidates))
+    ai_budget_sec = float(st.session_state.get('trade_finder_ai_budget_sec', 30.0) or 0.0)
+    ai_deadline_ts = (time.time() + ai_budget_sec) if ai_budget_sec > 0 else 0.0
+    ai_cache_ttl_sec = 6 * 60 * 60
     rows = []
     ai_eval_cache = st.session_state.get('_tf_ai_eval_cache', {}) or {}
     provider_counts: Dict[str, int] = {}
@@ -3264,19 +3292,50 @@ def _run_trade_finder_workflow(
         company_name = str(c.get('company_name', '') or '').strip()
         if not company_name:
             company_name = _lookup_company_name_for_trade_finder(ticker)
+        cand_sig = _trade_finder_candidate_signature(c)
+        cache_entry = ai_eval_cache.get(ticker, {}) if isinstance(ai_eval_cache, dict) else {}
+        cached_sig = str(cache_entry.get('signature', '') or '')
+        cached_ts = float(cache_entry.get('ts', 0) or 0.0)
+        cached_ai = cache_entry.get('ai_rec', {}) if isinstance(cache_entry, dict) else {}
+        cached_valid = bool(
+            isinstance(cached_ai, dict)
+            and cached_ai
+            and cached_sig == cand_sig
+            and (time.time() - cached_ts) <= ai_cache_ttl_sec
+        )
 
         if i < ai_top_n:
-            ai_rec = _grok_trade_finder_assessment(c, ai_clients)
-            # Cache successful model-backed evaluations for reuse on fallback runs.
-            if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
-                ai_eval_cache[ticker] = dict(ai_rec)
-            elif ticker in ai_eval_cache:
-                ai_rec = dict(ai_eval_cache.get(ticker, {}))
+            if cached_valid:
+                ai_rec = dict(cached_ai)
                 ai_rec['fallback_reason'] = 'cached_ai_eval'
+            else:
+                earn_days_now = int(c.get('earn_days', 999) or 999)
+                if 0 <= earn_days_now <= 7:
+                    ai_rec = _heuristic_trade_finder_ai(c)
+                    ai_rec['provider'] = 'system'
+                    ai_rec['ai_buy_recommendation'] = 'Skip'
+                    ai_rec['fallback_reason'] = 'earnings_hard_block'
+                    ai_rec['rationale'] = f"PASS due to earnings in {earn_days_now}d; avoid pre-event gap risk."
+                elif ai_deadline_ts and time.time() > ai_deadline_ts:
+                    ai_rec = _heuristic_trade_finder_ai(c)
+                    ai_rec['provider'] = 'system'
+                    ai_rec['fallback_reason'] = 'ai_time_budget'
+                else:
+                    ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+                    # Cache successful model-backed evaluations for fast reruns.
+                    if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
+                        ai_eval_cache[ticker] = {
+                            'signature': cand_sig,
+                            'ts': time.time(),
+                            'ai_rec': dict(ai_rec),
+                        }
+                    elif cached_valid:
+                        ai_rec = dict(cached_ai)
+                        ai_rec['fallback_reason'] = 'cached_ai_eval'
         else:
             # Cap mode: still show best cached AI evaluation when available.
-            if ticker in ai_eval_cache:
-                ai_rec = dict(ai_eval_cache.get(ticker, {}))
+            if cached_valid:
+                ai_rec = dict(cached_ai)
                 ai_rec['fallback_reason'] = 'cached_ai_eval'
             else:
                 ai_rec = _heuristic_trade_finder_ai(c)
@@ -3626,6 +3685,14 @@ def render_trade_finder_tab():
         step=1,
         key="trade_finder_ai_top_n",
         help="0 = all candidates use live AI scoring. Set >0 to cap API usage and speed up runs.",
+    )
+    st.number_input(
+        "AI max seconds",
+        min_value=0.0,
+        max_value=120.0,
+        step=5.0,
+        key="trade_finder_ai_budget_sec",
+        help="Runtime cap for live AI ranking. Remaining candidates fall back to fast model/system scoring.",
     )
     settings = _trade_quality_settings()
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
