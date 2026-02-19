@@ -129,5 +129,21 @@
     "created_date": "2026-02-18",
     "expires_date": "2026-03-20",
     "status": "PENDING"
+  },
+  {
+    "ticker": "ANET",
+    "condition_type": "breakout_volume",
+    "trigger_price": 141.41000366210938,
+    "volume_multiplier": 1.5,
+    "stop_price": 125.32,
+    "target_price": 167.98,
+    "position_size_pct": 12.5,
+    "notes": "AI: Overhead resistance at $141.41 is a concern, tested 5x previously. Wait for a decisive break above $",
+    "conviction": 10,
+    "signal_type": "",
+    "quality_grade": "A",
+    "created_date": "2026-02-19",
+    "expires_date": "2026-03-21",
+    "status": "PENDING"
   }
 ]
