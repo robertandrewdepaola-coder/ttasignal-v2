@@ -2619,6 +2619,7 @@ def _normalize_gold_ai_contract(
     row: Dict[str, Any],
     *,
     fallback_ai_buy: str,
+    fallback_confidence: int = 0,
     fallback_rank_score: float,
     sector_phase: str = "",
 ) -> Dict[str, Any]:
@@ -2642,7 +2643,9 @@ def _normalize_gold_ai_contract(
     raw_text = str(ai_result.get('raw_text', '') or '')
     analysis_text = str(ai_result.get('analysis', '') or '')
     text_blob = " ".join([action_text, raw_text, analysis_text]).strip().upper()
-    conv = int(ai_result.get('conviction', 0) or 0)
+    conv_raw = int(ai_result.get('conviction', 0) or 0)
+    fallback_conv = max(0, min(10, int(fallback_confidence or 0)))
+    conv = conv_raw if conv_raw > 0 else fallback_conv
     pos_size = str(ai_result.get('position_sizing', '') or '').lower()
     provider = str(ai_result.get('provider', 'system') or 'system')
     earn_days = int(row.get('earn_days', 999) or 999)
@@ -2657,6 +2660,17 @@ def _normalize_gold_ai_contract(
             verdict = "Strong Buy" if conv >= 8 else "Buy"
     if "skip" in pos_size:
         verdict = "Skip"
+
+    # Ensure confidence is coherent with verdict in model/fallback paths.
+    if conv <= 0:
+        if verdict == "Strong Buy":
+            conv = max(8, fallback_conv)
+        elif verdict == "Buy":
+            conv = max(6, fallback_conv)
+        elif verdict == "Watch Only":
+            conv = max(4, fallback_conv)
+        else:
+            conv = max(2, fallback_conv)
 
     # Sector-rotation guardrail: cap aggressiveness when sector is lagging/fading.
     phase_u = str(sector_phase or "").upper()
@@ -2734,16 +2748,35 @@ def _build_trade_finder_analysis_note(
     sector_phase: str,
     earn_days: int,
     fallback_reason: str = "",
+    is_gold_source: bool = False,
 ) -> str:
     """Build consistent, trader-readable Trade Finder decision note."""
     parts: List[str] = []
 
     verdict = str(ai_verdict or "").strip().upper()
     conf = int(ai_confidence or 0)
+    d = int(earn_days or 999)
     if verdict:
-        parts.append(f"AI decision: {verdict} ({conf}/10 confidence)")
+        source_label = "AI decision" if bool(is_gold_source) else "Model decision"
+        if conf > 0:
+            parts.append(f"{source_label}: {verdict} ({conf}/10 confidence)")
+        else:
+            parts.append(f"{source_label}: {verdict}")
 
     base = str(ai_note or "").strip()
+    if base:
+        # Avoid contradiction: don't keep sector/earnings claims when core fields are unavailable.
+        base_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', base) if s.strip()]
+        filtered_sentences: List[str] = []
+        for s in base_sentences:
+            s_l = s.lower()
+            if (not str(sector or "").strip()) and ("sector" in s_l or "rotation" in s_l):
+                continue
+            if d == 999 and ("earn" in s_l and (re.search(r"\b\d+\s*d\b", s_l) or "day" in s_l)):
+                continue
+            filtered_sentences.append(s)
+        base = " ".join(filtered_sentences).strip() or base
+
     if base:
         parts.append(base.rstrip("."))
     else:
@@ -2751,20 +2784,19 @@ def _build_trade_finder_analysis_note(
         if ss:
             parts.append(ss.rstrip("."))
 
-    sec = str(sector or "Sector").strip()
+    sec = str(sector or "").strip()
     phase = str(sector_phase or "").upper().strip()
     if phase == "LAGGING":
-        parts.append(f"Sector status: OUT OF ROTATION ({sec} lagging)")
+        parts.append(f"Sector status: OUT OF ROTATION ({sec} lagging)" if sec else "Sector status: OUT OF ROTATION")
     elif phase == "FADING":
-        parts.append(f"Sector status: TRANSITION ({sec} fading)")
+        parts.append(f"Sector status: TRANSITION ({sec} fading)" if sec else "Sector status: TRANSITION")
     elif phase == "EMERGING":
-        parts.append(f"Sector status: IN ROTATION ({sec} emerging)")
+        parts.append(f"Sector status: IN ROTATION ({sec} emerging)" if sec else "Sector status: IN ROTATION")
     elif phase == "LEADING":
-        parts.append(f"Sector status: IN ROTATION ({sec} leading)")
-    elif sec and sec != "Sector":
+        parts.append(f"Sector status: IN ROTATION ({sec} leading)" if sec else "Sector status: IN ROTATION")
+    elif sec:
         parts.append(f"Sector: {sec}")
 
-    d = int(earn_days or 999)
     if d == 999:
         parts.append("Earnings date unavailable")
     elif d <= 7:
@@ -2781,6 +2813,51 @@ def _build_trade_finder_analysis_note(
     if note and not note.endswith("."):
         note += "."
     return note[:320]
+
+
+def _infer_sector_from_text(text: str) -> str:
+    """Infer canonical sector label from model/scanner text when direct sector lookup is unavailable."""
+    txt = str(text or "").lower()
+    if not txt:
+        return ""
+    sector_aliases = [
+        ("Industrials", ["industrials", "industrial"]),
+        ("Technology", ["technology", "tech"]),
+        ("Financial Services", ["financial services", "financials", "finance"]),
+        ("Energy", ["energy"]),
+        ("Utilities", ["utilities", "utility"]),
+        ("Health Care", ["health care", "healthcare", "health"]),
+        ("Basic Materials", ["basic materials", "materials"]),
+        ("Real Estate", ["real estate"]),
+        ("Communication Services", ["communication services", "communications"]),
+        ("Consumer Defensive", ["consumer defensive", "consumer staples", "constap"]),
+        ("Consumer Cyclical", ["consumer cyclical", "consumer discretionary", "condisc"]),
+    ]
+    for canonical, aliases in sector_aliases:
+        for alias in aliases:
+            if re.search(rf"\b{re.escape(alias)}\b", txt):
+                return canonical
+    return ""
+
+
+def _infer_sector_phase_from_text(text: str) -> str:
+    """Infer rotation phase from model/scanner text when explicit phase is missing."""
+    txt = str(text or "").lower()
+    if not txt:
+        return ""
+    if "out of rotation" in txt or re.search(r"\blagging\b", txt):
+        return "LAGGING"
+    if re.search(r"\bfading\b", txt) or "transition" in txt:
+        return "FADING"
+    if "in rotation" in txt and re.search(r"\bleading\b", txt):
+        return "LEADING"
+    if "in rotation" in txt and re.search(r"\bemerging\b", txt):
+        return "EMERGING"
+    if re.search(r"\bleading\b", txt):
+        return "LEADING"
+    if re.search(r"\bemerging\b", txt):
+        return "EMERGING"
+    return ""
 
 
 def _sector_phase_display(sector_phase: str) -> Dict[str, str]:
@@ -3144,18 +3221,38 @@ def _run_trade_finder_workflow(
                 'price': float(c.get('price', 0) or 0),
             },
             fallback_ai_buy=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
+            fallback_confidence=int(c.get('conviction', 0) or 0),
             fallback_rank_score=float(ai_rec.get('rank_score', 0) or 0),
             sector_phase=str(c.get('sector_phase', '') or ''),
         )
+        sector_name = str(c.get('sector', '') or '').strip()
+        sector_phase = str(c.get('sector_phase', '') or '').strip()
+        if not sector_name or not sector_phase:
+            _ctx_text = " ".join([
+                str(c.get('summary', '') or ''),
+                rationale,
+                str(gold.get('note', '') or ''),
+            ]).strip()
+            if not sector_name:
+                sector_name = _infer_sector_from_text(_ctx_text)
+            if not sector_phase:
+                sector_phase = _infer_sector_phase_from_text(_ctx_text)
+        if sector_name and not sector_phase:
+            _rot = st.session_state.get('sector_rotation', {}) or {}
+            _phase = str((_rot.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+            if _phase:
+                sector_phase = _phase
+
         analysis_note = _build_trade_finder_analysis_note(
             scanner_summary=str(c.get('summary', '') or ''),
             ai_note=str(gold.get('note', '') or rationale or ''),
             ai_verdict=str(gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')) or 'Watch Only'),
             ai_confidence=int(gold.get('confidence', 0) or 0),
-            sector=str(c.get('sector', '') or ''),
-            sector_phase=str(c.get('sector_phase', '') or ''),
+            sector=sector_name,
+            sector_phase=sector_phase,
             earn_days=earn_days,
             fallback_reason=fallback_reason,
+            is_gold_source=bool(gold.get('is_gold_source', False)),
         )
         rows.append({
             'ticker': ticker,
@@ -3182,6 +3279,8 @@ def _run_trade_finder_workflow(
             'provider': gold.get('provider', ai_rec.get('provider', 'system')),
             'fallback_reason': fallback_reason,
             'fallback_error': fallback_error,
+            'sector': sector_name,
+            'sector_phase': sector_phase,
             'decision_card': build_trade_decision_card(
                 ticker=ticker,
                 source="trade_finder",
@@ -3197,12 +3296,12 @@ def _run_trade_finder_workflow(
                 gate_status=gate.status,
                 reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
                 ai_rationale=str(gold.get('note', '') or ai_rec.get('rationale', '') or ''),
-                sector_phase=str(c.get('sector_phase', '') or ''),
+                sector_phase=sector_phase,
                 earn_days=earn_days,
                 explainability_bits=[
                     f"rec={str(c.get('recommendation', '') or '')}",
                     f"conv={int(c.get('conviction', 0) or 0)}",
-                    f"phase={str(c.get('sector_phase', '') or '')}",
+                    f"phase={sector_phase}",
                     f"rr={float(gold.get('risk_reward', rr) or rr):.2f}",
                 ],
             ).to_dict(),
