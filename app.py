@@ -2232,32 +2232,57 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             _set_find_progress(80, "Refreshing earnings data...")
             from data_fetcher import fetch_batch_earnings_flags
             earnings_flags = fetch_batch_earnings_flags([r.ticker for r in results], days_ahead=60) or {}
+            if earnings_flags:
+                _existing_earn = st.session_state.get('earnings_flags', {}) or {}
+                _existing_earn.update(earnings_flags)
+                earnings_flags = _existing_earn
+                st.session_state['earnings_flags'] = _existing_earn
         except Exception:
             earnings_flags = {}
 
         ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
         # Fallback sector map from latest scanner summary (often fresher than live sector calls).
         scan_sector_map: Dict[str, str] = {}
+        scan_earn_map: Dict[str, Dict[str, Any]] = {}
         for _s in (st.session_state.get('scan_results_summary', []) or []):
             _t = str(_s.get('ticker', '') or '').upper().strip()
             _sec = str(_s.get('sector', '') or '').strip()
             if _t and _sec:
                 scan_sector_map[_t] = _sec
+            _ed = str(_s.get('earn_date', _s.get('earnings_date', '')) or '').strip()
+            _days_raw = _s.get('earn_days', _s.get('days_to_earnings', _s.get('days_until_earnings', None)))
+            _days = None
+            try:
+                if _days_raw is not None and str(_days_raw) != '':
+                    _days = int(_days_raw)
+            except Exception:
+                _days = None
+            if _t and (_ed or _days is not None):
+                scan_earn_map[_t] = {'next_earnings': _ed, 'days_until': _days}
         try:
             _set_find_progress(88, "Resolving sectors...")
-            from data_fetcher import get_ticker_sector
+            from data_fetcher import get_ticker_sector, fetch_fundamental_profile
             for r in results:
-                if r.ticker not in ticker_sectors:
-                    sec = get_ticker_sector(r.ticker)
-                    if sec:
-                        ticker_sectors[r.ticker] = sec
-                    elif r.ticker in scan_sector_map:
-                        ticker_sectors[r.ticker] = scan_sector_map[r.ticker]
+                _existing_sec = _canonicalize_sector_name(str(ticker_sectors.get(r.ticker, '') or ''), sector_rotation)
+                if _existing_sec:
+                    ticker_sectors[r.ticker] = _existing_sec
+                    continue
+                sec = _canonicalize_sector_name(str(get_ticker_sector(r.ticker) or ''), sector_rotation)
+                if not sec:
+                    try:
+                        profile = fetch_fundamental_profile(r.ticker) or {}
+                        sec = _canonicalize_sector_name(str(profile.get('sector', '') or ''), sector_rotation)
+                    except Exception:
+                        sec = ''
+                if not sec and r.ticker in scan_sector_map:
+                    sec = _canonicalize_sector_name(scan_sector_map[r.ticker], sector_rotation)
+                if sec:
+                    ticker_sectors[r.ticker] = sec
             st.session_state['ticker_sectors'] = ticker_sectors
         except Exception:
             # Keep a usable sector label even when provider is rate-limited.
             for _t, _sec in scan_sector_map.items():
-                ticker_sectors.setdefault(_t, _sec)
+                ticker_sectors.setdefault(_t, _canonicalize_sector_name(_sec, sector_rotation))
 
         open_tickers = set(jm.get_open_tickers())
         rows = []
@@ -2266,8 +2291,38 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         for r in results:
             rec = r.recommendation or {}
             q = r.quality or {}
-            earn = resolve_earnings_for_ticker(r.ticker, verify_with_fetch=True)
-            sector_name = ticker_sectors.get(r.ticker, scan_sector_map.get(r.ticker, ''))
+            _batch_earn = earnings_flags.get(r.ticker, {}) if isinstance(earnings_flags, dict) else {}
+            _scan_earn = scan_earn_map.get(r.ticker, {}) if isinstance(scan_earn_map, dict) else {}
+            _persisted_date = str(
+                _batch_earn.get('next_earnings', _scan_earn.get('next_earnings', '')) or ''
+            ).strip()
+            _persisted_days = _batch_earn.get(
+                'days_until',
+                _batch_earn.get('days_until_earnings', _scan_earn.get('days_until', None)),
+            )
+            earn = resolve_earnings_for_ticker(
+                r.ticker,
+                persisted_date=_persisted_date,
+                persisted_days=_persisted_days,
+                verify_with_fetch=True,
+            )
+            if not str(earn.get('next_earnings', '') or '').strip() and _persisted_date:
+                earn = {
+                    'next_earnings': _persisted_date,
+                    'days_until': _normalize_earnings_days(_persisted_date, _persisted_days),
+                    'source': str(_batch_earn.get('source', 'Batch/Scanner Snapshot') or 'Batch/Scanner Snapshot'),
+                    'confidence': str(_batch_earn.get('confidence', '') or ''),
+                }
+
+            sector_name = _canonicalize_sector_name(
+                ticker_sectors.get(r.ticker, scan_sector_map.get(r.ticker, '')),
+                sector_rotation,
+            )
+            if not sector_name:
+                sector_name = _canonicalize_sector_name(
+                    _infer_sector_from_text(str(rec.get('summary', '') or '')),
+                    sector_rotation,
+                )
             sector_info = sector_rotation.get(sector_name, {}) if sector_name else {}
             sector_phase = str(sector_info.get('phase', '') or '')
             rec_adj = _adjust_recommendation_for_sector(
@@ -2408,6 +2463,37 @@ def _extract_earn_days_hint(text: str) -> Optional[int]:
         return int(m.group(1))
     except Exception:
         return None
+
+
+def _canonicalize_sector_name(sector_name: str, rotation_ctx: Optional[Dict[str, Any]] = None) -> str:
+    """Normalize sector labels to canonical names used by rotation context."""
+    s = str(sector_name or "").strip()
+    if not s:
+        return ""
+    aliases = {
+        "health care": "Healthcare",
+        "healthcare": "Healthcare",
+        "financials": "Financial Services",
+        "financial": "Financial Services",
+        "communications": "Communication Services",
+        "communication": "Communication Services",
+        "consumer staples": "Consumer Defensive",
+        "consumer discretionary": "Consumer Cyclical",
+        "basic materials": "Materials",
+    }
+    s_alias = aliases.get(s.lower(), s)
+
+    if not isinstance(rotation_ctx, dict) or not rotation_ctx:
+        return s_alias
+    if s_alias in rotation_ctx:
+        return s_alias
+
+    lower_map = {str(k).lower(): str(k) for k in rotation_ctx.keys()}
+    if s_alias.lower() in lower_map:
+        return lower_map[s_alias.lower()]
+    if s.lower() in lower_map:
+        return lower_map[s.lower()]
+    return s_alias
 
 
 def _parse_earnings_date(value: Any) -> Optional[datetime.date]:
@@ -2826,8 +2912,8 @@ def _infer_sector_from_text(text: str) -> str:
         ("Financial Services", ["financial services", "financials", "finance"]),
         ("Energy", ["energy"]),
         ("Utilities", ["utilities", "utility"]),
-        ("Health Care", ["health care", "healthcare", "health"]),
-        ("Basic Materials", ["basic materials", "materials"]),
+        ("Healthcare", ["health care", "healthcare", "health"]),
+        ("Materials", ["basic materials", "materials"]),
         ("Real Estate", ["real estate"]),
         ("Communication Services", ["communication services", "communications"]),
         ("Consumer Defensive", ["consumer defensive", "consumer staples", "constap"]),
@@ -3225,7 +3311,8 @@ def _run_trade_finder_workflow(
             fallback_rank_score=float(ai_rec.get('rank_score', 0) or 0),
             sector_phase=str(c.get('sector_phase', '') or ''),
         )
-        sector_name = str(c.get('sector', '') or '').strip()
+        _rot_ctx = st.session_state.get('sector_rotation', {}) or {}
+        sector_name = _canonicalize_sector_name(str(c.get('sector', '') or '').strip(), _rot_ctx)
         sector_phase = str(c.get('sector_phase', '') or '').strip()
         if not sector_name or not sector_phase:
             _ctx_text = " ".join([
@@ -3234,12 +3321,11 @@ def _run_trade_finder_workflow(
                 str(gold.get('note', '') or ''),
             ]).strip()
             if not sector_name:
-                sector_name = _infer_sector_from_text(_ctx_text)
+                sector_name = _canonicalize_sector_name(_infer_sector_from_text(_ctx_text), _rot_ctx)
             if not sector_phase:
                 sector_phase = _infer_sector_phase_from_text(_ctx_text)
         if sector_name and not sector_phase:
-            _rot = st.session_state.get('sector_rotation', {}) or {}
-            _phase = str((_rot.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+            _phase = str((_rot_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
             if _phase:
                 sector_phase = _phase
 
