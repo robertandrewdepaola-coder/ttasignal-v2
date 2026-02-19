@@ -4776,7 +4776,12 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     # ── MTF chart ─────────────────────────────────────────────────
     if weekly is not None and monthly is not None:
         with st.expander("Multi-Timeframe View"):
-            render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_")
+            try:
+                render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_")
+            except TypeError:
+                # Backward compatibility when Streamlit Cloud hot-reload has an older
+                # chart_engine module version in memory without key_prefix support.
+                render_mtf_chart(daily, weekly, monthly, ticker, height=400)
 
 
 def _render_ai_tab(ticker: str, signal: EntrySignal,
