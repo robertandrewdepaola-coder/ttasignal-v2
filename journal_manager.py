@@ -175,8 +175,14 @@ class ConditionalEntry:
     signal_type: str = ''
     quality_grade: str = ''
     created_date: str = ''
+    created_at: str = ''
+    updated_at: str = ''
     expires_date: str = ''
     status: str = 'PENDING'
+    triggered_date: str = ''
+    triggered_at: str = ''
+    triggered_price: float = 0
+    triggered_volume_ratio: float = 0
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -962,12 +968,21 @@ class JournalManager:
         """Add a conditional entry (breakout alert)."""
         ticker = entry.ticker.upper().strip()
         entry.ticker = ticker
+        now_iso = now_utc_str()
         entry.created_date = entry.created_date or today_utc_str()
+        entry.created_at = entry.created_at or now_iso
+        entry.updated_at = now_iso
         entry.status = 'PENDING'
 
         existing = [c for c in self.conditionals
                     if c['ticker'] == ticker and c['status'] == 'PENDING']
         if existing:
+            existing_cond = existing[0]
+            # Preserve original placement timestamp/date when updating.
+            if existing_cond.get('created_date'):
+                entry.created_date = str(existing_cond.get('created_date', entry.created_date))
+            if existing_cond.get('created_at'):
+                entry.created_at = str(existing_cond.get('created_at', entry.created_at))
             for i, c in enumerate(self.conditionals):
                 if c['ticker'] == ticker and c['status'] == 'PENDING':
                     self.conditionals[i] = entry.to_dict()
@@ -991,6 +1006,15 @@ class JournalManager:
 
     def get_pending_conditionals(self) -> List[Dict]:
         return [c for c in self.conditionals if c.get('status') == 'PENDING']
+
+    def get_triggered_conditionals(self, limit: int = 50) -> List[Dict]:
+        """Return recently triggered conditionals (most recent first)."""
+        out = [c for c in self.conditionals if c.get('status') == 'TRIGGERED']
+        out.sort(
+            key=lambda c: str(c.get('triggered_at') or c.get('triggered_date') or c.get('created_at') or c.get('created_date') or ''),
+            reverse=True,
+        )
+        return out[:max(1, int(limit or 50))]
 
     def get_conditional(self, ticker: str) -> Optional[Dict]:
         ticker = ticker.upper().strip()
@@ -1044,6 +1068,8 @@ class JournalManager:
                 cond['status'] = 'TRIGGERED'
                 cond['triggered_price'] = price
                 cond['triggered_date'] = today_utc_str()
+                cond['triggered_at'] = now_utc_str()
+                cond['updated_at'] = now_utc_str()
                 cond['triggered_volume_ratio'] = vol_actual
                 triggered.append(cond)
                 changed = True
