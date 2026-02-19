@@ -545,15 +545,15 @@ if 'ticker_data_cache' not in st.session_state:
 
 # Find New / scan scope controls
 if 'find_new_max_tickers' not in st.session_state:
-    st.session_state['find_new_max_tickers'] = 0  # 0 = all
+    st.session_state['find_new_max_tickers'] = 250  # safer default; 0 = all
 if 'find_new_in_rotation_only' not in st.session_state:
-    st.session_state['find_new_in_rotation_only'] = False
+    st.session_state['find_new_in_rotation_only'] = True
 if 'find_new_selected_sectors' not in st.session_state:
     st.session_state['find_new_selected_sectors'] = []
 if 'scan_max_minutes' not in st.session_state:
     st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
 if 'find_new_max_minutes' not in st.session_state:
-    st.session_state['find_new_max_minutes'] = 0.0  # 0 = no runtime cap
+    st.session_state['find_new_max_minutes'] = 5.0
 
 
 def get_journal() -> JournalManager:
@@ -1417,50 +1417,6 @@ def render_sidebar():
         for _t in (_wl.get('tickers', []) or []):
             if isinstance(_t, str) and _t.strip():
                 all_watch_tickers.add(_t.upper().strip())
-
-    with st.sidebar.expander("🧭 Find New Scope", expanded=False):
-        st.number_input(
-            "Max tickers to scan (0 = all)",
-            min_value=0,
-            max_value=2000,
-            step=25,
-            key="find_new_max_tickers",
-            help="Cap scan size to reduce runtime and API stress. 0 scans full cross-watchlist universe.",
-        )
-        st.checkbox(
-            "Only in-rotation sectors (Leading/Emerging)",
-            key="find_new_in_rotation_only",
-            help="Excludes tickers in Fading/Lagging sectors before scan.",
-        )
-        _rotation = st.session_state.get('sector_rotation', {}) or {}
-        _sector_options = sorted([str(s) for s in _rotation.keys() if str(s)])
-        if _sector_options:
-            st.multiselect(
-                "Limit to sectors",
-                options=_sector_options,
-                key="find_new_selected_sectors",
-                help="Optional sector subset. Leave empty for all sectors.",
-            )
-        st.number_input(
-            "Max scan minutes (0 = no limit)",
-            min_value=0.0,
-            max_value=30.0,
-            step=0.5,
-            key="find_new_max_minutes",
-            help="Stops long scans once this runtime limit is hit (partial results are kept).",
-        )
-    _scope_bits = []
-    if int(st.session_state.get('find_new_max_tickers', 0) or 0) > 0:
-        _scope_bits.append(f"max {int(st.session_state.get('find_new_max_tickers', 0) or 0)}")
-    if bool(st.session_state.get('find_new_in_rotation_only', False)):
-        _scope_bits.append("in-rotation only")
-    _sel = st.session_state.get('find_new_selected_sectors', []) or []
-    if _sel:
-        _scope_bits.append(f"{len(_sel)} sectors")
-    if float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0) > 0:
-        _scope_bits.append(f"{float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0):.1f}m cap")
-    if _scope_bits:
-        st.sidebar.caption("Find New scope: " + " | ".join(_scope_bits))
 
     if st.sidebar.button(
         f"🧭 Find New Trades ({len(all_watch_tickers)})",
@@ -3212,6 +3168,51 @@ def render_trade_finder_tab():
         for c in (jm.get_pending_conditionals() or [])
         if str(c.get('status', 'PENDING')).upper() == "PENDING" and str(c.get('ticker', '')).strip()
     }
+
+    # Trade Finder scan scope controls (shown in-tab for visibility).
+    with st.expander("⚙️ Find New Scope", expanded=False):
+        st.number_input(
+            "Max tickers to scan (0 = all)",
+            min_value=0,
+            max_value=2000,
+            step=25,
+            key="find_new_max_tickers",
+            help="Cap scan size to reduce runtime and API stress. 0 scans full cross-watchlist universe.",
+        )
+        st.checkbox(
+            "Only in-rotation sectors (Leading/Emerging)",
+            key="find_new_in_rotation_only",
+            help="Excludes tickers in Fading/Lagging sectors before scan.",
+        )
+        _rotation = st.session_state.get('sector_rotation', {}) or {}
+        _sector_options = sorted([str(s) for s in _rotation.keys() if str(s)])
+        if _sector_options:
+            st.multiselect(
+                "Limit to sectors",
+                options=_sector_options,
+                key="find_new_selected_sectors",
+                help="Optional sector subset. Leave empty for all sectors.",
+            )
+        st.number_input(
+            "Max scan minutes (0 = no limit)",
+            min_value=0.0,
+            max_value=30.0,
+            step=0.5,
+            key="find_new_max_minutes",
+            help="Stops long scans once this runtime limit is hit (partial results are kept).",
+        )
+    _scope_bits = []
+    if int(st.session_state.get('find_new_max_tickers', 0) or 0) > 0:
+        _scope_bits.append(f"max {int(st.session_state.get('find_new_max_tickers', 0) or 0)}")
+    if bool(st.session_state.get('find_new_in_rotation_only', False)):
+        _scope_bits.append("in-rotation only")
+    _sel_scope = st.session_state.get('find_new_selected_sectors', []) or []
+    if _sel_scope:
+        _scope_bits.append(f"{len(_sel_scope)} sectors")
+    if float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0) > 0:
+        _scope_bits.append(f"{float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0):.1f}m cap")
+    if _scope_bits:
+        st.caption("Active scope: " + " | ".join(_scope_bits))
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
         with st.spinner("Running trade finder and AI ranking..."):
