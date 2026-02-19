@@ -2064,6 +2064,13 @@ def _run_find_new_trades():
             earnings_flags = {}
 
         ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+        # Fallback sector map from latest scanner summary (often fresher than live sector calls).
+        scan_sector_map: Dict[str, str] = {}
+        for _s in (st.session_state.get('scan_results_summary', []) or []):
+            _t = str(_s.get('ticker', '') or '').upper().strip()
+            _sec = str(_s.get('sector', '') or '').strip()
+            if _t and _sec:
+                scan_sector_map[_t] = _sec
         try:
             from data_fetcher import get_ticker_sector
             for r in results:
@@ -2071,9 +2078,13 @@ def _run_find_new_trades():
                     sec = get_ticker_sector(r.ticker)
                     if sec:
                         ticker_sectors[r.ticker] = sec
+                    elif r.ticker in scan_sector_map:
+                        ticker_sectors[r.ticker] = scan_sector_map[r.ticker]
             st.session_state['ticker_sectors'] = ticker_sectors
         except Exception:
-            pass
+            # Keep a usable sector label even when provider is rate-limited.
+            for _t, _sec in scan_sector_map.items():
+                ticker_sectors.setdefault(_t, _sec)
 
         open_tickers = set(jm.get_open_tickers())
         rows = []
@@ -2081,8 +2092,8 @@ def _run_find_new_trades():
         for r in results:
             rec = r.recommendation or {}
             q = r.quality or {}
-            earn = resolve_earnings_for_ticker(r.ticker)
-            sector_name = ticker_sectors.get(r.ticker, '')
+            earn = resolve_earnings_for_ticker(r.ticker, verify_with_fetch=True)
+            sector_name = ticker_sectors.get(r.ticker, scan_sector_map.get(r.ticker, ''))
             sector_info = sector_rotation.get(sector_name, {}) if sector_name else {}
             sector_phase = str(sector_info.get('phase', '') or '')
             rec_adj = _adjust_recommendation_for_sector(
@@ -2470,11 +2481,17 @@ def _normalize_gold_ai_contract(
             verdict = "Buy"
         sector_penalty = -0.5
 
-    # Earnings risk guardrail: if AI mentions earnings/gap risk soon, do not keep buy verdict.
+    # Earnings risk guardrail:
+    # - hard block aggressive entries inside 7d
+    # - also honor model text when it flags gap/binary risk
     earnings_risk_phrase = (
         "EARNINGS" in text_blob and
         any(k in text_blob for k in ["GAP RISK", "BINARY RISK", "NOT ADVISED", "PASS", "SKIP"])
     )
+    if 0 <= earn_days <= 7 and verdict in {"Strong Buy", "Buy"}:
+        verdict = "Skip"
+    elif 0 <= earn_days <= 14 and verdict == "Strong Buy":
+        verdict = "Buy"
     if 0 <= earn_days <= 7 and earnings_risk_phrase and verdict in {"Strong Buy", "Buy"}:
         verdict = "Skip"
 
@@ -2520,12 +2537,20 @@ def _build_trade_finder_analysis_note(
     *,
     scanner_summary: str,
     ai_note: str,
+    ai_verdict: str,
+    ai_confidence: int,
     sector: str,
     sector_phase: str,
     earn_days: int,
+    fallback_reason: str = "",
 ) -> str:
-    """Build consistent, trader-readable Trade Finder analysis note."""
+    """Build consistent, trader-readable Trade Finder decision note."""
     parts: List[str] = []
+
+    verdict = str(ai_verdict or "").strip().upper()
+    conf = int(ai_confidence or 0)
+    if verdict:
+        parts.append(f"AI decision: {verdict} ({conf}/10 confidence)")
 
     base = str(ai_note or "").strip()
     if base:
@@ -2538,26 +2563,57 @@ def _build_trade_finder_analysis_note(
     sec = str(sector or "Sector").strip()
     phase = str(sector_phase or "").upper().strip()
     if phase == "LAGGING":
-        parts.append(f"Sector warning: {sec} is lagging (rotation headwind)")
+        parts.append(f"Sector status: OUT OF ROTATION ({sec} lagging)")
     elif phase == "FADING":
-        parts.append(f"Sector caution: {sec} is fading")
+        parts.append(f"Sector status: TRANSITION ({sec} fading)")
     elif phase == "EMERGING":
-        parts.append(f"Sector tailwind building: {sec} is emerging")
+        parts.append(f"Sector status: IN ROTATION ({sec} emerging)")
     elif phase == "LEADING":
-        parts.append(f"Sector tailwind: {sec} is leading")
+        parts.append(f"Sector status: IN ROTATION ({sec} leading)")
+    elif sec and sec != "Sector":
+        parts.append(f"Sector: {sec}")
 
     d = int(earn_days or 999)
-    if d <= 7:
-        parts.append(f"Earnings risk high ({d}d)")
+    if d == 999:
+        parts.append("Earnings date unavailable")
+    elif d <= 7:
+        parts.append(f"Earnings risk high ({d}d) — avoid new entries pre-event")
     elif d <= 30:
         parts.append(f"Earnings within {d}d; manage hold horizon")
-    elif d < 999:
+    elif d >= 0:
         parts.append(f"Earnings runway: {d}d")
+
+    if fallback_reason:
+        parts.append(f"AI mode: fallback ({fallback_reason})")
 
     note = ". ".join([p for p in parts if p]).strip()
     if note and not note.endswith("."):
         note += "."
     return note[:320]
+
+
+def _sector_phase_display(sector_phase: str) -> Dict[str, str]:
+    """Map sector phase to trader-facing rotation badge."""
+    phase_u = str(sector_phase or "").upper().strip()
+    if phase_u in {"LEADING", "EMERGING"}:
+        return {"label": "IN ROTATION", "icon": "🟢", "color": "#22c55e"}
+    if phase_u == "FADING":
+        return {"label": "TRANSITION", "icon": "🟡", "color": "#f59e0b"}
+    if phase_u == "LAGGING":
+        return {"label": "OUT OF ROTATION", "icon": "🔴", "color": "#ef4444"}
+    return {"label": "UNCLASSIFIED", "icon": "⚪", "color": "#94a3b8"}
+
+
+def _earnings_badge(earn_days: int) -> Dict[str, str]:
+    """Color-coded earnings horizon badge for Trade Finder rows."""
+    d = int(earn_days or 999)
+    if d == 999:
+        return {"text": "n/a", "color": "#64748b", "icon": "⚪"}
+    if d <= 7:
+        return {"text": f"{d}d", "color": "#ef4444", "icon": "🔴"}
+    if d <= 14:
+        return {"text": f"{d}d", "color": "#f59e0b", "icon": "🟡"}
+    return {"text": f"{d}d", "color": "#22c55e", "icon": "🟢"}
 
 
 def _trade_quality_settings() -> Dict[str, Any]:
@@ -2677,13 +2733,16 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         "watchlists": candidate.get('watchlists', ''),
     }
     prompt = (
-        "You are scoring swing-trade candidates. Return ONLY valid JSON with keys: "
+        "You are scoring swing-trade candidates for execution TODAY. Return ONLY valid JSON with keys: "
         "ai_buy_recommendation, suggested_entry, suggested_stop_loss, suggested_target, "
         "risk_reward, rank_score, rationale. "
         "ai_buy_recommendation must be one of: Strong Buy, Buy, Watch Only, Skip. "
         "Do not change ticker identity. Do not infer or mention company names. "
         "Do not invent earnings timing; use earn_days exactly as provided. "
-        "Set stop below entry, target above entry. Keep rationale <= 180 chars.\n\n"
+        "If earn_days <= 7, default to Skip unless recommendation is explicitly post-earnings. "
+        "Treat LAGGING/FADING sector_phase as a headwind and reduce conviction. "
+        "Set stop below entry, target above entry. "
+        "Rationale must be execution-focused, not generic, and <= 220 chars.\n\n"
         f"Candidate:\n{_json.dumps(payload)}"
     )
 
@@ -2744,9 +2803,13 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
     ai_buy = str(parsed.get('ai_buy_recommendation', '') or '').strip() or "Watch Only"
     if ai_buy not in {"Strong Buy", "Buy", "Watch Only", "Skip"}:
         ai_buy = "Watch Only"
-    rationale = str(parsed.get('rationale', '') or '').strip()[:180]
+    rationale = str(parsed.get('rationale', '') or '').strip()[:220]
     if not rationale:
         rationale = payload.get('summary') or "AI-ranked candidate."
+    earn_days = int(payload.get('earn_days', 999) or 999)
+    if 0 <= earn_days <= 7 and ai_buy in {"Strong Buy", "Buy"}:
+        ai_buy = "Skip"
+        rationale = f"PASS due to earnings in {earn_days}d; avoid pre-event gap risk."
 
     return {
         'ai_buy_recommendation': ai_buy,
@@ -2845,9 +2908,12 @@ def _run_trade_finder_workflow() -> None:
         analysis_note = _build_trade_finder_analysis_note(
             scanner_summary=str(c.get('summary', '') or ''),
             ai_note=str(gold.get('note', '') or rationale or ''),
+            ai_verdict=str(gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')) or 'Watch Only'),
+            ai_confidence=int(gold.get('confidence', 0) or 0),
             sector=str(c.get('sector', '') or ''),
             sector_phase=str(c.get('sector_phase', '') or ''),
             earn_days=earn_days,
+            fallback_reason=fallback_reason,
         )
         rows.append({
             'ticker': ticker,
@@ -3034,6 +3100,79 @@ def render_trade_finder_tab():
     _tf_chart_err = str(st.session_state.get('trade_finder_chart_error', '') or '').strip()
     if _tf_chart_err:
         st.warning(f"Chart load blocked: {_tf_chart_err[:220]}")
+    _inline_chart_ticker = str(st.session_state.get('trade_finder_inline_chart_ticker', '') or '').upper().strip()
+    _chart_focus = bool(st.session_state.get('trade_finder_chart_focus', False))
+
+    def _render_trade_finder_inline_chart_panel():
+        if not _inline_chart_ticker:
+            return
+        st.divider()
+        st.markdown("### 📈 Chart Focus")
+        ctrl1, ctrl2 = st.columns([1, 5])
+        with ctrl1:
+            if st.button("⬅ Back", key="tf_chart_back_top", width="stretch", help="Return to Trade Finder list"):
+                st.session_state.pop('trade_finder_inline_chart_ticker', None)
+                st.session_state['trade_finder_chart_focus'] = False
+                st.session_state.pop('trade_finder_scroll_to_chart', None)
+                st.rerun()
+        with ctrl2:
+            st.caption(f"Focused chart: {_inline_chart_ticker} | Use Back to return to the candidate list.")
+
+        st.markdown('<div id="tf_chart_focus_anchor"></div>', unsafe_allow_html=True)
+        if st.session_state.pop('trade_finder_scroll_to_chart', False):
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <script>
+                setTimeout(function() {
+                  var doc = window.parent.document;
+                  var el = doc.getElementById('tf_chart_focus_anchor');
+                  if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+                }, 60);
+                </script>
+                """,
+                height=0,
+            )
+
+        _sel = st.session_state.get('selected_analysis')
+        _sel_ticker = str(getattr(_sel, 'ticker', '') or '').upper().strip() if _sel is not None else ''
+        try:
+            _cache = st.session_state.get('ticker_data_cache', {}) or {}
+            _have_daily = bool((_cache.get(_inline_chart_ticker, {}) or {}).get('daily') is not None)
+            if not _have_daily:
+                _find_new_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+                _prefetched = _find_new_cache.get(_inline_chart_ticker, {}) if isinstance(_find_new_cache, dict) else {}
+                if _prefetched and _prefetched.get('daily') is not None:
+                    _cache[_inline_chart_ticker] = _prefetched
+                    st.session_state['ticker_data_cache'] = _cache
+                    _have_daily = True
+            if not _have_daily:
+                _tf_data_prefetch = fetch_all_ticker_data(_inline_chart_ticker)
+                if _tf_data_prefetch.get('daily') is not None:
+                    _cache[_inline_chart_ticker] = _tf_data_prefetch
+                    st.session_state['ticker_data_cache'] = _cache
+            if _sel is not None and _sel_ticker == _inline_chart_ticker:
+                _render_chart_tab(_inline_chart_ticker, _sel.signal, key_ns="tf_inline")
+            else:
+                _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
+                _tf_analysis = _tf_cache.get(_inline_chart_ticker)
+                if _tf_analysis is None:
+                    _tf_data = fetch_all_ticker_data(_inline_chart_ticker)
+                    _tf_analysis = analyze_ticker(_tf_data)
+                    _tf_cache[_inline_chart_ticker] = _tf_analysis
+                    st.session_state['_tf_inline_analysis_cache'] = _tf_cache
+                st.session_state['selected_ticker'] = _inline_chart_ticker
+                st.session_state['selected_analysis'] = _tf_analysis
+                _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal, key_ns="tf_inline")
+        except Exception as _e:
+            st.warning(f"Unable to load chart for {_inline_chart_ticker}: {str(_e)[:120]}")
+
+    if _inline_chart_ticker:
+        _render_trade_finder_inline_chart_panel()
+        if _chart_focus:
+            st.divider()
+            st.info("Chart focus mode is active. Click Back to return to Trade Finder candidates.")
+            return
 
     if not qualified_rows:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
@@ -3090,9 +3229,12 @@ def render_trade_finder_tab():
             st.session_state['trade_finder_last_ticker'] = _ticker
             if int(detail_tab) == 1:
                 st.session_state['trade_finder_inline_chart_ticker'] = _ticker
+                st.session_state['trade_finder_chart_focus'] = True
+                st.session_state['trade_finder_scroll_to_chart'] = True
                 # Chart now opens inline in Trade Finder for deterministic UX.
                 st.session_state.pop('_switch_to_scanner_target_tab', None)
             elif int(detail_tab) == 4:
+                st.session_state['trade_finder_chart_focus'] = False
                 st.session_state['_switch_to_scanner_target_tab'] = 'trade'
             _loaded = _load_ticker_for_view(_ticker)
             if not _loaded:
@@ -3142,17 +3284,18 @@ def render_trade_finder_tab():
                 if not group_rows:
                     st.caption("None in this group.")
                 if view_mode == "Table":
-                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10 = st.columns([0.8, 1.0, 2.0, 1.0, 0.9, 1.3, 0.9, 0.8, 0.8, 2.3])
+                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11 = st.columns([0.7, 0.9, 1.8, 1.2, 1.3, 0.9, 1.2, 0.8, 0.8, 0.8, 2.1])
                     h1.caption("Alert")
                     h2.caption("Ticker")
                     h3.caption("Company")
                     h4.caption("Sector")
-                    h5.caption("Price")
-                    h6.caption("Verdict")
-                    h7.caption("R:R")
-                    h8.caption("Score")
-                    h9.caption("Earn")
-                    h10.caption("Actions")
+                    h5.caption("Rotation")
+                    h6.caption("Price")
+                    h7.caption("Verdict")
+                    h8.caption("R:R")
+                    h9.caption("Score")
+                    h10.caption("Earn")
+                    h11.caption("Actions")
                 for i, r in enumerate(group_rows[:40]):
                     ticker = str(r.get('ticker', '')).upper().strip()
                     company = str(r.get('company_name', '') or '').strip() or "Unknown company"
@@ -3164,6 +3307,9 @@ def render_trade_finder_tab():
                     price = float(r.get('price', 0) or 0)
                     earn_days = int(r.get('earn_days', 999) or 999)
                     sector_name = str(r.get('sector', '') or '').strip() or "-"
+                    sector_phase = str(r.get('sector_phase', '') or '').strip()
+                    sector_disp = _sector_phase_display(sector_phase)
+                    earn_disp = _earnings_badge(earn_days)
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(
                         r.get('analysis_note', '')
@@ -3175,17 +3321,24 @@ def render_trade_finder_tab():
                     fallback_error = str(r.get('fallback_error', '') or '')
 
                     if view_mode == "Table":
-                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 = st.columns([0.8, 1.0, 2.0, 1.0, 0.9, 1.3, 0.9, 0.8, 0.8, 2.3])
+                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns([0.7, 0.9, 1.8, 1.2, 1.3, 0.9, 1.2, 0.8, 0.8, 0.8, 2.1])
                         c1.write("🎯 Set" if has_alert else "—")
                         c2.write(ticker)
                         c3.write(company)
                         c4.write(sector_name)
-                        c5.write(f"${price:.2f}")
-                        c6.write(ai_buy or "N/A")
-                        c7.write(f"{rr:.2f}:1")
-                        c8.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
-                        c9.write(f"{earn_days}d")
-                        a1, a2, a3 = c10.columns(3)
+                        c5.markdown(
+                            f"<span style='color:{sector_disp['color']};font-weight:700'>{sector_disp['icon']} {sector_disp['label']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        c6.write(f"${price:.2f}")
+                        c7.write(ai_buy or "N/A")
+                        c8.write(f"{rr:.2f}:1")
+                        c9.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
+                        c10.markdown(
+                            f"<span style='color:{earn_disp['color']};font-weight:700'>{earn_disp['icon']} {earn_disp['text']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        a1, a2, a3 = c11.columns(3)
                         with a1:
                             if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=1)
@@ -3212,12 +3365,18 @@ def render_trade_finder_tab():
                         with st.container(border=True):
                             alert_badge = " | 🎯 Alert Set" if has_alert else ""
                             st.markdown(f"**{ticker}{alert_badge} — {company}**")
+                            st.markdown(
+                                f"<span style='color:{sector_disp['color']};font-weight:700'>"
+                                f"{sector_disp['icon']} {sector_disp['label']}</span>",
+                                unsafe_allow_html=True,
+                            )
                             st.caption(
                                 f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
-                                f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | Earnings: {earn_days}d | "
+                                f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | "
+                                f"Earnings: {earn_disp['icon']} {earn_disp['text']} | "
                                 f"Source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                             )
-                            st.caption(f"Sector: {sector_name}")
+                            st.caption(f"Sector: {sector_name} ({sector_phase or 'n/a'})")
                             st.caption(
                                 f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
                                 f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
@@ -3243,45 +3402,6 @@ def render_trade_finder_tab():
                             with a3:
                                 if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
                                     _stage_candidate(r, price, rr, rank, signal_reason, rationale)
-
-        # Fallback chart experience if Streamlit tab auto-switch fails on some clients.
-        _inline_chart_ticker = str(st.session_state.get('trade_finder_inline_chart_ticker', '') or '').upper().strip()
-        if _inline_chart_ticker:
-            st.divider()
-            st.markdown(f"### 📈 Chart Preview — {_inline_chart_ticker}")
-            st.caption("Chart opens directly here from Trade Finder.")
-            _sel = st.session_state.get('selected_analysis')
-            _sel_ticker = str(getattr(_sel, 'ticker', '') or '').upper().strip() if _sel is not None else ''
-            try:
-                _cache = st.session_state.get('ticker_data_cache', {}) or {}
-                _have_daily = bool((_cache.get(_inline_chart_ticker, {}) or {}).get('daily') is not None)
-                if not _have_daily:
-                    _find_new_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
-                    _prefetched = _find_new_cache.get(_inline_chart_ticker, {}) if isinstance(_find_new_cache, dict) else {}
-                    if _prefetched and _prefetched.get('daily') is not None:
-                        _cache[_inline_chart_ticker] = _prefetched
-                        st.session_state['ticker_data_cache'] = _cache
-                        _have_daily = True
-                if not _have_daily:
-                    _tf_data_prefetch = fetch_all_ticker_data(_inline_chart_ticker)
-                    if _tf_data_prefetch.get('daily') is not None:
-                        _cache[_inline_chart_ticker] = _tf_data_prefetch
-                        st.session_state['ticker_data_cache'] = _cache
-                if _sel is not None and _sel_ticker == _inline_chart_ticker:
-                    _render_chart_tab(_inline_chart_ticker, _sel.signal, key_ns="tf_inline")
-                else:
-                    _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
-                    _tf_analysis = _tf_cache.get(_inline_chart_ticker)
-                    if _tf_analysis is None:
-                        _tf_data = fetch_all_ticker_data(_inline_chart_ticker)
-                        _tf_analysis = analyze_ticker(_tf_data)
-                        _tf_cache[_inline_chart_ticker] = _tf_analysis
-                        st.session_state['_tf_inline_analysis_cache'] = _tf_cache
-                    st.session_state['selected_ticker'] = _inline_chart_ticker
-                    st.session_state['selected_analysis'] = _tf_analysis
-                    _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal, key_ns="tf_inline")
-            except Exception as _e:
-                st.warning(f"Unable to load chart for {_inline_chart_ticker}: {str(_e)[:120]}")
 
     st.markdown("### Open In New Trade")
     sb1, sb2 = st.columns([1, 1])
