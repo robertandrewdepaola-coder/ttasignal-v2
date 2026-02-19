@@ -1936,7 +1936,12 @@ def _run_scan(mode='all'):
                 'macd_bullish': sig.macd.get('bullish', False) if sig else False,
                 'ao_positive': sig.ao.get('positive', False) if sig else False,
                 'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
-                'monthly_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
+                'monthly_bullish': (
+                    bool(sig.monthly_macd.get('bullish', False) and sig.monthly_ao.get('positive', False))
+                    if sig else False
+                ),
+                'monthly_macd_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
+                'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
                 'is_open_position': r.ticker in open_tickers,
                 'sector': sector_name,
                 'sector_phase': sector_phase,
@@ -5106,7 +5111,7 @@ def _build_rows_from_analysis(results, jm) -> list:
             'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
             'AO': "✅" if sig and sig.ao.get('positive') else "❌",
             'Wkly': "✅" if sig and sig.weekly_macd.get('bullish') else "❌",
-            'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') else "❌",
+            'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') and sig.monthly_ao.get('positive') else "❌",
             'Quality': q.get('quality_grade', '?'),
             'Price': f"${r.current_price:.2f}" if r.current_price else "?",
             'Volume': vol_str,

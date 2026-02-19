@@ -616,8 +616,14 @@ def generate_recommendation(signal: EntrySignal,
     grade = quality.get('quality_grade', 'N/A')
     q_score = quality.get('quality_score', 0)  # 0-100 for fine-tuning
     weekly_bullish = signal.weekly_macd.get('bullish', False)
-    monthly_bullish = signal.monthly_macd.get('bullish', True)
-    monthly_warning = " ⚠️ Monthly bearish headwind!" if not monthly_bullish else ""
+    monthly_macd_bullish = signal.monthly_macd.get('bullish', True)
+    monthly_ao_positive = signal.monthly_ao.get('positive', True)
+    monthly_bullish = bool(monthly_macd_bullish and monthly_ao_positive)
+    monthly_warning = ""
+    if not monthly_macd_bullish:
+        monthly_warning += " ⚠️ Monthly MACD bearish headwind!"
+    if not monthly_ao_positive:
+        monthly_warning += " ⚠️ Monthly AO negative headwind!"
 
     result = {
         'signal_type': None,
@@ -630,6 +636,33 @@ def generate_recommendation(signal: EntrySignal,
     # e.g. _q_refine(7, 10, q_score) → 7.0 to 10.0 based on quality_score 0-100
     def _q_refine(low, high, qs):
         return int(round(low + (high - low) * min(qs, 100) / 100))
+
+    def _apply_monthly_ao_guard(out: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Hard guardrail: if monthly AO is negative, do not allow bullish entry recommendations.
+        This enforces consistency with multi-timeframe momentum rules.
+        """
+        if bool(monthly_ao_positive):
+            return out
+        rec_u = str(out.get('recommendation', '') or '').upper()
+        is_bullish_entry = (
+            ('BUY' in rec_u or 'ENTRY' in rec_u)
+            and 'WATCH' not in rec_u
+            and 'WAIT' not in rec_u
+            and 'SKIP' not in rec_u
+            and 'AVOID' not in rec_u
+        )
+        if is_bullish_entry:
+            base = str(out.get('summary', '') or '').strip()
+            out['recommendation'] = 'WAIT (M-AO)'
+            out['summary'] = (
+                (base + " " if base else "")
+                + "⚠️ Monthly AO negative headwind — no new bullish entries."
+            )
+            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 1), 4)
+            out['monthly_ao_downgrade'] = True
+            out['monthly_ao_value'] = signal.monthly_ao.get('value')
+        return out
 
     # --- PRIMARY SIGNAL ---
     if signal.is_valid:
@@ -659,7 +692,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'SKIP'
             result['summary'] = f"❌ Entry valid but Quality {grade}"
             result['conviction'] = 1
-        return result
+        return _apply_monthly_ao_guard(result)
 
     # --- AO CONFIRMATION ---
     if ao_confirm and ao_confirm.get('is_valid'):
@@ -678,7 +711,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'SKIP'
             result['summary'] = f"⚠️ AO Confirmation but weak"
             result['conviction'] = 2
-        return result
+        return _apply_monthly_ao_guard(result)
 
     # --- RE-ENTRY ---
     if reentry and reentry.get('is_valid'):
@@ -697,7 +730,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🟡 Re-Entry but Quality {grade}"
             result['conviction'] = _q_refine(2, 4, q_score)
-        return result
+        return _apply_monthly_ao_guard(result)
 
     # --- LATE ENTRY ---
     if late_entry and late_entry.get('is_valid'):
@@ -713,7 +746,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
             result['conviction'] = _q_refine(2, 3, q_score)
-        return result
+        return _apply_monthly_ao_guard(result)
 
     # --- NO SIGNAL ---
     if signal.is_valid_relaxed:
@@ -732,7 +765,7 @@ def generate_recommendation(signal: EntrySignal,
         result['summary'] = f"❌ {', '.join(failed)}" if failed else "❌ No signal"
         result['conviction'] = 0
 
-    return result
+    return _apply_monthly_ao_guard(result)
 
 
 # =============================================================================
