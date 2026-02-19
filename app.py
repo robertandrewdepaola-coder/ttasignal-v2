@@ -543,6 +543,18 @@ if 'selected_analysis' not in st.session_state:
 if 'ticker_data_cache' not in st.session_state:
     st.session_state['ticker_data_cache'] = {}
 
+# Find New / scan scope controls
+if 'find_new_max_tickers' not in st.session_state:
+    st.session_state['find_new_max_tickers'] = 0  # 0 = all
+if 'find_new_in_rotation_only' not in st.session_state:
+    st.session_state['find_new_in_rotation_only'] = False
+if 'find_new_selected_sectors' not in st.session_state:
+    st.session_state['find_new_selected_sectors'] = []
+if 'scan_max_minutes' not in st.session_state:
+    st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
+if 'find_new_max_minutes' not in st.session_state:
+    st.session_state['find_new_max_minutes'] = 0.0  # 0 = no runtime cap
+
 
 def get_journal() -> JournalManager:
     return st.session_state['journal']
@@ -1390,6 +1402,14 @@ def render_sidebar():
         if st.button(btn_label, width="stretch",
                      disabled=(new_count == 0)):
             _run_scan(mode='new_only')
+    st.sidebar.number_input(
+        "Scan max minutes (0 = no limit)",
+        min_value=0.0,
+        max_value=30.0,
+        step=0.5,
+        key="scan_max_minutes",
+        help="Stops long watchlist scans when runtime cap is reached.",
+    )
 
     all_watchlists = bridge.manager.get_all_watchlists() or []
     all_watch_tickers = set()
@@ -1397,6 +1417,51 @@ def render_sidebar():
         for _t in (_wl.get('tickers', []) or []):
             if isinstance(_t, str) and _t.strip():
                 all_watch_tickers.add(_t.upper().strip())
+
+    with st.sidebar.expander("🧭 Find New Scope", expanded=False):
+        st.number_input(
+            "Max tickers to scan (0 = all)",
+            min_value=0,
+            max_value=2000,
+            step=25,
+            key="find_new_max_tickers",
+            help="Cap scan size to reduce runtime and API stress. 0 scans full cross-watchlist universe.",
+        )
+        st.checkbox(
+            "Only in-rotation sectors (Leading/Emerging)",
+            key="find_new_in_rotation_only",
+            help="Excludes tickers in Fading/Lagging sectors before scan.",
+        )
+        _rotation = st.session_state.get('sector_rotation', {}) or {}
+        _sector_options = sorted([str(s) for s in _rotation.keys() if str(s)])
+        if _sector_options:
+            st.multiselect(
+                "Limit to sectors",
+                options=_sector_options,
+                key="find_new_selected_sectors",
+                help="Optional sector subset. Leave empty for all sectors.",
+            )
+        st.number_input(
+            "Max scan minutes (0 = no limit)",
+            min_value=0.0,
+            max_value=30.0,
+            step=0.5,
+            key="find_new_max_minutes",
+            help="Stops long scans once this runtime limit is hit (partial results are kept).",
+        )
+    _scope_bits = []
+    if int(st.session_state.get('find_new_max_tickers', 0) or 0) > 0:
+        _scope_bits.append(f"max {int(st.session_state.get('find_new_max_tickers', 0) or 0)}")
+    if bool(st.session_state.get('find_new_in_rotation_only', False)):
+        _scope_bits.append("in-rotation only")
+    _sel = st.session_state.get('find_new_selected_sectors', []) or []
+    if _sel:
+        _scope_bits.append(f"{len(_sel)} sectors")
+    if float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0) > 0:
+        _scope_bits.append(f"{float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0):.1f}m cap")
+    if _scope_bits:
+        st.sidebar.caption("Find New scope: " + " | ".join(_scope_bits))
+
     if st.sidebar.button(
         f"🧭 Find New Trades ({len(all_watch_tickers)})",
         width="stretch",
@@ -1721,6 +1786,18 @@ def _run_scan(mode='all'):
         return
 
     _scan_started = time.time()
+    _max_scan_min = float(st.session_state.get('scan_max_minutes', 0.0) or 0.0)
+    _deadline_ts = (_scan_started + (_max_scan_min * 60.0)) if _max_scan_min > 0 else 0.0
+    _progress = st.sidebar.progress(0, text=f"Preparing scan ({len(tickers_to_scan)} tickers)")
+
+    def _set_scan_progress(pct: int, text: str):
+        _pct = max(0, min(100, int(pct)))
+        try:
+            _progress.progress(_pct, text=text)
+        except TypeError:
+            _progress.progress(_pct)
+            st.sidebar.caption(text)
+
     with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
         _timing = {
             'mode': mode,
@@ -1740,11 +1817,30 @@ def _run_scan(mode='all'):
             f"mode={mode} universe={len(full_list)} scan_count={len(tickers_to_scan)}",
             source=f"scan:{mode}",
         )
+        _set_scan_progress(5, f"Scan started: {len(tickers_to_scan)} tickers")
         _t = time.time()
-        all_data = fetch_scan_data(tickers_to_scan)
+        def _scan_progress_cb(i: int, total: int, ticker: str) -> bool:
+            if _deadline_ts and time.time() > _deadline_ts:
+                return False
+            pct = 5 + int((max(1, i) / max(1, total)) * 45)
+            _set_scan_progress(pct, f"Fetching {i}/{total} ({pct}%) — {ticker}")
+            return True
+
+        all_data = fetch_scan_data(tickers_to_scan, progress_cb=_scan_progress_cb)
         _timing['fetch_scan_data_sec'] = time.time() - _t
+        if len(all_data) < len(tickers_to_scan):
+            st.warning(
+                f"Scan fetch stopped early: fetched {len(all_data)}/{len(tickers_to_scan)} tickers. "
+                "Results below are partial."
+            )
+            _append_audit_event(
+                "SCAN_FETCH_PARTIAL",
+                f"mode={mode} fetched={len(all_data)} requested={len(tickers_to_scan)}",
+                source=f"scan:{mode}",
+            )
 
         _t = time.time()
+        _set_scan_progress(55, "Analyzing signals...")
         new_results = scan_watchlist(all_data)
         _timing['scan_watchlist_sec'] = time.time() - _t
 
@@ -1755,6 +1851,7 @@ def _run_scan(mode='all'):
         # Fetch sector rotation (independent — failure doesn't block earnings)
         try:
             _t = time.time()
+            _set_scan_progress(68, "Refreshing sector rotation...")
             from data_fetcher import fetch_sector_rotation
             sector_rotation = fetch_sector_rotation()
             st.session_state['sector_rotation'] = sector_rotation
@@ -1766,6 +1863,7 @@ def _run_scan(mode='all'):
         # Fetch earnings flags (independent — failure doesn't block sectors)
         try:
             _t = time.time()
+            _set_scan_progress(78, "Refreshing earnings calendar...")
             from data_fetcher import fetch_batch_earnings_flags
             all_scan_tickers = [r.ticker for r in new_results]
             earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=60)
@@ -1783,6 +1881,7 @@ def _run_scan(mode='all'):
         # Fetch sectors for scanned tickers (independent)
         try:
             _t = time.time()
+            _set_scan_progress(86, "Resolving ticker sectors...")
             from data_fetcher import get_ticker_sector
             ticker_sectors = st.session_state.get('ticker_sectors', {})
             for r in new_results:
@@ -1823,6 +1922,7 @@ def _run_scan(mode='all'):
         ticker_sectors = st.session_state.get('ticker_sectors', {})
 
         _t = time.time()
+        _set_scan_progress(92, "Building summary & saving...")
         summary = []
         for r in results_for_summary:
             rec = r.recommendation or {}
@@ -1913,6 +2013,7 @@ def _run_scan(mode='all'):
                         volume_ratios[ticker] = float(daily['Volume'].iloc[-1] / avg_vol)
 
         _t = time.time()
+        _set_scan_progress(97, "Checking alerts...")
         triggered = jm.check_conditionals(current_prices, volume_ratios)
         _timing['alerts_check_sec'] = time.time() - _t
         if triggered:
@@ -1923,6 +2024,7 @@ def _run_scan(mode='all'):
             f"mode={mode} scanned={len(tickers_to_scan)} results={len(summary)} triggered={len(triggered)}",
             source=f"scan:{mode}",
         )
+        _set_scan_progress(100, f"Scan complete: {len(summary)} results")
 
         # Telemetry: runtime history + daily workflow finalize
         _scan_elapsed = max(0.0, time.time() - _scan_started)
@@ -1984,11 +2086,39 @@ def _run_find_new_trades():
             if wl_name not in ticker_sources[ticker]:
                 ticker_sources[ticker].append(wl_name)
 
+    # Scope controls (from sidebar) to limit scan size/load.
+    _max_tickers = int(st.session_state.get('find_new_max_tickers', 0) or 0)
+    _only_in_rotation = bool(st.session_state.get('find_new_in_rotation_only', False))
+    _selected_sectors = set([str(x) for x in (st.session_state.get('find_new_selected_sectors', []) or []) if str(x)])
+    _max_minutes = float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0)
+    _deadline_ts = (time.time() + (_max_minutes * 60.0)) if _max_minutes > 0 else 0.0
+
+    _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
+    _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+    _filtered_counts = {"sector_filter": 0, "rotation_filter": 0, "unknown_sector": 0, "max_tickers": 0}
+
     # Validate symbols before data fetch.
     import re as _re
     universe = []
     rejected = []
     for t in sorted(ticker_sources.keys()):
+        _sector_name = str(_ticker_sectors.get(t, '') or '').strip()
+        if _selected_sectors:
+            if not _sector_name:
+                _filtered_counts["unknown_sector"] += 1
+                continue
+            if _sector_name not in _selected_sectors:
+                _filtered_counts["sector_filter"] += 1
+                continue
+        if _only_in_rotation:
+            if not _sector_name:
+                _filtered_counts["unknown_sector"] += 1
+                continue
+            _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper()
+            if _phase not in {"LEADING", "EMERGING"}:
+                _filtered_counts["rotation_filter"] += 1
+                continue
+
         is_base = bool(_re.match(r'^[A-Z]{1,5}$', t))
         class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
         is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
@@ -1998,6 +2128,10 @@ def _run_find_new_trades():
         else:
             rejected.append(t)
 
+    if _max_tickers > 0 and len(universe) > _max_tickers:
+        _filtered_counts["max_tickers"] = len(universe) - _max_tickers
+        universe = universe[:_max_tickers]
+
     if rejected:
         print(f"[find_new] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
 
@@ -2005,14 +2139,24 @@ def _run_find_new_trades():
         st.sidebar.warning("No tickers found across watchlists.")
         return
 
+    _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
+
+    def _set_find_progress(pct: int, text: str):
+        _pct = max(0, min(100, int(pct)))
+        try:
+            _progress.progress(_pct, text=text)
+        except TypeError:
+            _progress.progress(_pct)
+            st.sidebar.caption(text)
+
     _start = time.time()
     with st.spinner(f"Finding new trades across {len(universe)} tickers..."):
         _append_audit_event(
             "FIND_NEW_START",
-            f"watchlists={len(all_watchlists)} universe={len(universe)}",
+            f"watchlists={len(all_watchlists)} universe={len(universe)} in_rotation_only={_only_in_rotation} sectors={len(_selected_sectors)} max={_max_tickers}",
             source="find_new",
         )
-
+        _set_find_progress(5, f"Scope ready: {len(universe)} tickers")
         # Reuse fresh scanner cache first; fetch only missing tickers.
         all_data: Dict[str, Dict[str, Any]] = {}
         scan_cache = st.session_state.get('ticker_data_cache', {}) or {}
@@ -2024,9 +2168,23 @@ def _run_find_new_trades():
                 if isinstance(_cached, dict) and _cached.get('daily') is not None:
                     all_data[_t] = _cached
         missing = [t for t in universe if t not in all_data]
+        if all_data:
+            _set_find_progress(15, f"Reused cache for {len(all_data)}/{len(universe)} tickers")
         if missing:
-            fetched = fetch_scan_data(missing)
+            def _find_progress_cb(i: int, total: int, ticker: str) -> bool:
+                if _deadline_ts and time.time() > _deadline_ts:
+                    return False
+                pct = 15 + int((max(1, i) / max(1, total)) * 45)
+                _set_find_progress(pct, f"Fetching {i}/{total} ({pct}%) — {ticker}")
+                return True
+            fetched = fetch_scan_data(missing, progress_cb=_find_progress_cb)
             all_data.update(fetched)
+            if len(fetched) < len(missing):
+                st.warning(
+                    f"Find New fetch stopped early: fetched {len(fetched)}/{len(missing)} missing tickers. "
+                    "Using partial results."
+                )
+        _set_find_progress(63, "Analyzing trade candidates...")
         results = scan_watchlist(all_data)
         # Reuse scan-time price history for Trade Finder chart opens to avoid
         # per-click refetch/rate-limit failures.
@@ -2049,6 +2207,7 @@ def _run_find_new_trades():
         # Pull current supporting context.
         sector_rotation = st.session_state.get('sector_rotation', {}) or {}
         try:
+            _set_find_progress(72, "Refreshing sector rotation...")
             from data_fetcher import fetch_sector_rotation
             sector_rotation = fetch_sector_rotation()
             st.session_state['sector_rotation'] = sector_rotation
@@ -2058,6 +2217,7 @@ def _run_find_new_trades():
 
         earnings_flags = {}
         try:
+            _set_find_progress(80, "Refreshing earnings data...")
             from data_fetcher import fetch_batch_earnings_flags
             earnings_flags = fetch_batch_earnings_flags([r.ticker for r in results], days_ahead=60) or {}
         except Exception:
@@ -2072,6 +2232,7 @@ def _run_find_new_trades():
             if _t and _sec:
                 scan_sector_map[_t] = _sec
         try:
+            _set_find_progress(88, "Resolving sectors...")
             from data_fetcher import get_ticker_sector
             for r in results:
                 if r.ticker not in ticker_sectors:
@@ -2089,6 +2250,7 @@ def _run_find_new_trades():
         open_tickers = set(jm.get_open_tickers())
         rows = []
         candidates = []
+        _set_find_progress(92, "Scoring opportunities...")
         for r in results:
             rec = r.recommendation or {}
             q = r.quality or {}
@@ -2141,6 +2303,7 @@ def _run_find_new_trades():
                 })
 
         candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+        _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
 
     elapsed = max(0.0, time.time() - _start)
     report = {
@@ -2153,6 +2316,14 @@ def _run_find_new_trades():
         'candidates': candidates,
         'rows': rows,
         'elapsed_sec': elapsed,
+        'scan_scope': {
+            'max_tickers': _max_tickers,
+            'only_in_rotation': _only_in_rotation,
+            'selected_sectors': sorted(list(_selected_sectors)),
+            'filtered_counts': _filtered_counts,
+            'requested_universe': len(ticker_sources),
+            'effective_universe': len(universe),
+        },
     }
     st.session_state['find_new_trades_report'] = report
     st.session_state['_find_new_trades_ts'] = time.time()
@@ -2854,8 +3025,18 @@ def _run_trade_finder_workflow() -> None:
     provider_counts: Dict[str, int] = {}
     fallback_counts: Dict[str, int] = {}
     _t0 = time.time()
+    _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(base_candidates)}")
+
+    def _set_tf_progress(i: int, total: int, ticker: str):
+        pct = int((max(0, i) / max(1, total)) * 100)
+        try:
+            _tf_progress.progress(pct, text=f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker}")
+        except TypeError:
+            _tf_progress.progress(pct)
+
     for i, c in enumerate(base_candidates):
         ticker = str(c.get('ticker', '')).upper().strip()
+        _set_tf_progress(i + 1, len(base_candidates), ticker)
         company_name = str(c.get('company_name', '') or '').strip()
         if not company_name:
             company_name = _lookup_company_name_for_trade_finder(ticker)
@@ -2970,6 +3151,10 @@ def _run_trade_finder_workflow() -> None:
         provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
         if fallback_reason:
             fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
+    try:
+        _tf_progress.empty()
+    except Exception:
+        pass
 
     rows = sorted(
         rows,
@@ -2987,6 +3172,7 @@ def _run_trade_finder_workflow() -> None:
         'provider_counts': provider_counts,
         'fallback_counts': fallback_counts,
         'ai_top_n': ai_top_n,
+        'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
     }
     st.session_state['_tf_ai_eval_cache'] = ai_eval_cache
     try:
@@ -3097,6 +3283,18 @@ def render_trade_finder_tab():
         st.caption("Provider mix: " + ", ".join([f"{k}={v}" for k, v in sorted(_pc.items())]))
     if _fc:
         st.caption("AI fallback reasons: " + ", ".join([f"{k}={v}" for k, v in sorted(_fc.items())]) + f" | AI Top N={_pn}")
+    _scope = results.get('scan_scope', {}) or {}
+    if _scope:
+        _flt = _scope.get('filtered_counts', {}) or {}
+        st.caption(
+            "Scan scope: "
+            f"requested={int(_scope.get('requested_universe', 0) or 0)}, "
+            f"effective={int(_scope.get('effective_universe', 0) or 0)}, "
+            f"sector_filtered={int(_flt.get('sector_filter', 0) or 0)}, "
+            f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
+            f"unknown_sector_filtered={int(_flt.get('unknown_sector', 0) or 0)}, "
+            f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}"
+        )
     _tf_chart_err = str(st.session_state.get('trade_finder_chart_error', '') or '').strip()
     if _tf_chart_err:
         st.warning(f"Chart load blocked: {_tf_chart_err[:220]}")

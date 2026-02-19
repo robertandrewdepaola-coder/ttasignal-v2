@@ -18,7 +18,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Callable
 import time
 import re
 import requests as _requests_lib
@@ -2310,7 +2310,11 @@ def fetch_all_ticker_data(ticker: str, include_fundamentals: bool = False) -> Di
     return data
 
 
-def fetch_scan_data(tickers: List[str], force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+def fetch_scan_data(
+    tickers: List[str],
+    force_refresh: bool = False,
+    progress_cb: Optional[Callable[[int, int, str], bool]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     Batch fetch data for multiple tickers (scan mode).
     
@@ -2327,7 +2331,16 @@ def fetch_scan_data(tickers: List[str], force_refresh: bool = False) -> Dict[str
     market_filter = fetch_market_filter()
     
     results = {}
-    for ticker in tickers:
+    total = len(tickers)
+    for idx, ticker in enumerate(tickers, start=1):
+        if progress_cb is not None:
+            try:
+                should_continue = progress_cb(idx, total, str(ticker))
+                if should_continue is False:
+                    print(f"[data_fetcher] Scan fetch interrupted at {idx-1}/{total}")
+                    break
+            except Exception:
+                pass
         data = {
             'ticker': ticker,
             'daily': fetch_daily(ticker),
