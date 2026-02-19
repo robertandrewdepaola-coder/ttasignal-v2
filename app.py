@@ -9712,6 +9712,53 @@ def _run_alert_check_now(jm: JournalManager) -> int:
     return len(triggered)
 
 
+def _build_pending_alert_rows(conditionals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build pending alert rows with live readiness state."""
+    rows: List[Dict[str, Any]] = []
+    if not conditionals:
+        return rows
+
+    for cond in conditionals:
+        ticker = str(cond.get('ticker', '')).upper().strip()
+        if not ticker:
+            continue
+        trigger = float(cond.get('trigger_price', 0) or 0)
+        cond_type = str(cond.get('condition_type', 'breakout_above') or 'breakout_above')
+        current = float(fetch_current_price(ticker) or 0)
+
+        is_ready = False
+        if cond_type in {'breakout_above', 'breakout_volume'} and trigger > 0 and current >= trigger:
+            is_ready = True
+        elif cond_type == 'pullback_to' and trigger > 0 and current <= trigger:
+            is_ready = True
+
+        delta_pct = ((current - trigger) / trigger * 100) if trigger > 0 else 0.0
+        if is_ready:
+            state_label = "🟢 READY TO TRADE"
+        elif cond_type == 'pullback_to':
+            state_label = "🟡 ABOVE ALERT (waiting)"
+        else:
+            state_label = "🟡 BELOW ALERT (waiting)"
+
+        rows.append({
+            'ticker': ticker,
+            'trigger': trigger,
+            'condition_type': cond_type,
+            'current': current,
+            'delta_pct': delta_pct,
+            'is_ready': is_ready,
+            'state_label': state_label,
+            'created_at': cond.get('created_at') or cond.get('created_date'),
+            'raw': cond,
+        })
+
+    ready = [r for r in rows if bool(r.get('is_ready'))]
+    waiting = [r for r in rows if not bool(r.get('is_ready'))]
+    ready = sorted(ready, key=lambda r: abs(float(r.get('delta_pct', 0) or 0)), reverse=True)
+    waiting = sorted(waiting, key=lambda r: abs(float(r.get('delta_pct', 0) or 0)))
+    return ready + waiting
+
+
 def _run_auto_exit_engine(jm: JournalManager, current_prices: Dict[str, float], source: str = "manual") -> Dict[str, Any]:
     """
     Evaluate open positions against stop/target and auto-close breaches.
@@ -9833,6 +9880,8 @@ def render_executive_dashboard():
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
     dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
+    pending_alert_rows = _build_pending_alert_rows(snap.pending_alerts)
+    ready_pending_alerts = [r for r in pending_alert_rows if bool(r.get('is_ready'))]
 
     st.subheader("Executive Dashboard")
     st.caption(f"Now: {snap.generated_at_iso}")
@@ -10021,7 +10070,7 @@ def render_executive_dashboard():
     m2.metric("Scanned", len(snap.scan_summary))
     m3.metric("Actionable", len(actionable))
     m4.metric("Open Positions", len(snap.open_trades))
-    m5.metric("Alerts", len(snap.pending_alerts), delta=f"{len(snap.triggered_alerts)} triggered")
+    m5.metric("Alerts", len(snap.pending_alerts), delta=f"{len(ready_pending_alerts)} ready | {len(snap.triggered_alerts)} triggered")
     m6.metric("Stale Streams", stale_count, delta=f"Last scan {health['last_scan_mode'] or 'n/a'}")
 
     t1, t2, t3 = st.columns(3)
@@ -10062,6 +10111,15 @@ def render_executive_dashboard():
                 'priority': 55, 'category': 'planned', 'ticker': pticker, 'plan_id': plan_id,
                 'message': f"Planned queued: {pticker}", 'action': 'planned_queued'
             })
+    for r in ready_pending_alerts:
+        ticker = str(r.get('ticker', '')).upper().strip()
+        if not ticker:
+            continue
+        must_act.append((97, f"🟢 Alert ready: {ticker} (can take trade)", ticker))
+        action_queue.append({
+            'priority': 97, 'category': 'alert', 'ticker': ticker,
+            'message': f"Alert ready: {ticker}", 'action': 'open_trade'
+        })
     for t in snap.triggered_alerts:
         ticker = t.get('ticker', '')
         must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
@@ -10742,7 +10800,6 @@ def main():
 
 def _render_alerts_panel():
     """Dedicated alerts panel — moved from sidebar."""
-    from data_fetcher import fetch_current_price
     jm = get_journal()
 
     def _fmt_ts(raw: Any) -> str:
@@ -10758,42 +10815,47 @@ def _render_alerts_panel():
         except Exception:
             return s[:19]
 
+    def _open_chart_for_ticker(ticker: str):
+        st.session_state['default_detail_tab'] = 1
+        st.session_state['_switch_to_scanner_tab'] = True
+        st.session_state['_switch_to_scanner_target_tab'] = "chart"
+        _load_ticker_for_view(ticker)
+        st.rerun()
+
     def _open_trade_for_ticker(ticker: str):
         st.session_state['default_detail_tab'] = 4
         st.session_state['_switch_to_scanner_tab'] = True
+        st.session_state['_switch_to_scanner_target_tab'] = "trade"
         _load_ticker_for_view(ticker)
         st.rerun()
 
     conditionals = jm.get_pending_conditionals() or []
+    pending_rows = _build_pending_alert_rows(conditionals)
+    ready_rows = [r for r in pending_rows if bool(r.get('is_ready'))]
+    waiting_rows = [r for r in pending_rows if not bool(r.get('is_ready'))]
     triggered_hist = jm.get_triggered_conditionals(limit=20) or []
 
-    if not conditionals and not triggered_hist:
+    if not pending_rows and not triggered_hist:
         st.info("No alerts yet. Set alerts from the trade tab when analyzing a ticker.")
         return
 
-    st.subheader(f"🎯 Active Alerts ({len(conditionals)})")
-    if conditionals:
-        st.caption("Status key: 🟢 READY TO TRADE (trigger reached) | 🟡 BELOW ALERT (waiting)")
-        for cond in conditionals:
-            ticker = str(cond.get('ticker', '')).upper().strip()
-            trigger = float(cond.get('trigger_price', 0) or 0)
-            cond_type = str(cond.get('condition_type', 'breakout_above') or 'breakout_above')
-            current = float(fetch_current_price(ticker) or 0)
-
-            is_ready = False
-            if cond_type in {'breakout_above', 'breakout_volume'} and trigger > 0 and current >= trigger:
-                is_ready = True
-            elif cond_type == 'pullback_to' and trigger > 0 and current <= trigger:
-                is_ready = True
-
-            delta_pct = ((current - trigger) / trigger * 100) if trigger > 0 else 0.0
-            state_label = "🟢 READY TO TRADE" if is_ready else "🟡 BELOW ALERT"
-            placed_text = _fmt_ts(cond.get('created_at') or cond.get('created_date'))
+    st.subheader(f"🎯 Active Alerts ({len(pending_rows)})")
+    if pending_rows:
+        st.caption("Status key: 🟢 READY TO TRADE (trigger reached) | 🟡 WAITING")
+    if ready_rows:
+        st.success(f"Ready to trade now: {len(ready_rows)}")
+        for row in ready_rows:
+            ticker = str(row.get('ticker', '')).upper().strip()
+            trigger = float(row.get('trigger', 0) or 0)
+            cond_type = str(row.get('condition_type', 'breakout_above') or 'breakout_above')
+            current = float(row.get('current', 0) or 0)
+            delta_pct = float(row.get('delta_pct', 0) or 0)
+            placed_text = _fmt_ts(row.get('created_at'))
 
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([2.0, 1.3, 1.7, 0.8])
                 with c1:
-                    st.markdown(f"**{ticker}**  \n{state_label}")
+                    st.markdown(f"**{ticker}**  \n🟢 READY TO TRADE")
                 with c2:
                     st.caption(f"Trigger: ${trigger:.2f}")
                     st.caption(f"Type: {cond_type}")
@@ -10801,41 +10863,73 @@ def _render_alerts_panel():
                     st.caption(f"Current: ${current:.2f} ({delta_pct:+.1f}%)")
                     st.caption(f"Placed: {placed_text}")
                 with c4:
-                    if st.button("📊", key=f"alert_view_{ticker}", help="View chart", width="stretch"):
-                        _load_ticker_for_view(ticker)
-                    if st.button("✅", key=f"alert_trade_{ticker}", help="Open trade tab", width="stretch", disabled=not is_ready):
+                    if st.button("📊", key=f"alert_view_ready_{ticker}", help="View chart", width="stretch"):
+                        _open_chart_for_ticker(ticker)
+                    if st.button("✅", key=f"alert_trade_ready_{ticker}", help="Open trade tab", width="stretch"):
                         _open_trade_for_ticker(ticker)
-                    if st.button("✕", key=f"rm_alert_{ticker}", help="Remove alert", width="stretch"):
+                    if st.button("✕", key=f"rm_alert_ready_{ticker}", help="Remove alert", width="stretch"):
                         jm.remove_conditional(ticker)
                         st.rerun()
     else:
-        st.info("No pending alerts.")
+        st.info("No alerts are trade-ready right now.")
+
+    if waiting_rows:
+        with st.expander(f"🗂️ Waiting Alerts ({len(waiting_rows)})", expanded=True):
+            for row in waiting_rows:
+                ticker = str(row.get('ticker', '')).upper().strip()
+                trigger = float(row.get('trigger', 0) or 0)
+                cond_type = str(row.get('condition_type', 'breakout_above') or 'breakout_above')
+                current = float(row.get('current', 0) or 0)
+                delta_pct = float(row.get('delta_pct', 0) or 0)
+                state_label = str(row.get('state_label', '🟡 WAITING'))
+                placed_text = _fmt_ts(row.get('created_at'))
+
+                with st.container(border=True):
+                    c1, c2, c3, c4 = st.columns([2.0, 1.3, 1.7, 0.8])
+                    with c1:
+                        st.markdown(f"**{ticker}**  \n{state_label}")
+                    with c2:
+                        st.caption(f"Trigger: ${trigger:.2f}")
+                        st.caption(f"Type: {cond_type}")
+                    with c3:
+                        st.caption(f"Current: ${current:.2f} ({delta_pct:+.1f}%)")
+                        st.caption(f"Placed: {placed_text}")
+                    with c4:
+                        if st.button("📊", key=f"alert_view_wait_{ticker}", help="View chart", width="stretch"):
+                            _open_chart_for_ticker(ticker)
+                        if st.button("✅", key=f"alert_trade_wait_{ticker}", help="Open trade tab", width="stretch", disabled=True):
+                            _open_trade_for_ticker(ticker)
+                        if st.button("✕", key=f"rm_alert_wait_{ticker}", help="Remove alert", width="stretch"):
+                            jm.remove_conditional(ticker)
+                            st.rerun()
+    else:
+        st.caption("No waiting alerts.")
 
     st.divider()
-    st.markdown(f"### ✅ Triggered Alerts (recent {len(triggered_hist)})")
-    if not triggered_hist:
-        st.caption("No triggered alerts recorded yet.")
-    else:
-        for idx, cond in enumerate(triggered_hist):
-            ticker = str(cond.get('ticker', '')).upper().strip()
-            trigger = float(cond.get('trigger_price', 0) or 0)
-            triggered_price = float(cond.get('triggered_price', 0) or 0)
-            placed_text = _fmt_ts(cond.get('created_at') or cond.get('created_date'))
-            triggered_text = _fmt_ts(cond.get('triggered_at') or cond.get('triggered_date'))
-            move_pct = ((triggered_price - trigger) / trigger * 100) if trigger > 0 and triggered_price > 0 else 0.0
+    with st.expander(f"✅ Triggered Alerts (recent {len(triggered_hist)})", expanded=False):
+        if not triggered_hist:
+            st.caption("No triggered alerts recorded yet.")
+        else:
+            for idx, cond in enumerate(triggered_hist):
+                ticker = str(cond.get('ticker', '')).upper().strip()
+                trigger = float(cond.get('trigger_price', 0) or 0)
+                triggered_price = float(cond.get('triggered_price', 0) or 0)
+                placed_text = _fmt_ts(cond.get('created_at') or cond.get('created_date'))
+                triggered_text = _fmt_ts(cond.get('triggered_at') or cond.get('triggered_date'))
+                move_pct = ((triggered_price - trigger) / trigger * 100) if trigger > 0 and triggered_price > 0 else 0.0
 
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([2.2, 2.0, 1.0])
-                with c1:
-                    st.markdown(f"**{ticker}**  \n🟢 TRIGGERED — eligible to take trade")
-                with c2:
-                    st.caption(f"Trigger: ${trigger:.2f} | Triggered: ${triggered_price:.2f} ({move_pct:+.1f}%)")
-                    st.caption(f"Placed: {placed_text} | Triggered: {triggered_text}")
-                with c3:
-                    if st.button("📊", key=f"trig_view_{ticker}_{idx}", help="View chart", width="stretch"):
-                        _load_ticker_for_view(ticker)
-                    if st.button("✅", key=f"trig_trade_{ticker}_{idx}", help="Open trade tab", width="stretch"):
-                        _open_trade_for_ticker(ticker)
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([2.2, 2.0, 1.0])
+                    with c1:
+                        st.markdown(f"**{ticker}**  \n🟢 TRIGGERED — eligible to take trade")
+                    with c2:
+                        st.caption(f"Trigger: ${trigger:.2f} | Triggered: ${triggered_price:.2f} ({move_pct:+.1f}%)")
+                        st.caption(f"Placed: {placed_text} | Triggered: {triggered_text}")
+                    with c3:
+                        if st.button("📊", key=f"trig_view_{ticker}_{idx}", help="View chart", width="stretch"):
+                            _open_chart_for_ticker(ticker)
+                        if st.button("✅", key=f"trig_trade_{ticker}_{idx}", help="Open trade tab", width="stretch"):
+                            _open_trade_for_ticker(ticker)
 
 
 if __name__ == "__main__":
