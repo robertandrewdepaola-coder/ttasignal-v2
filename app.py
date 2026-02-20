@@ -4689,8 +4689,29 @@ def _render_green_on_red_sector_finder(
 
 def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
+    _pending_gate = st.session_state.pop('trade_gate_pending_apply', None)
+    if isinstance(_pending_gate, dict) and _pending_gate:
+        try:
+            st.session_state['trade_breakout_max_dist_pct'] = float(
+                _pending_gate.get('trade_breakout_max_dist_pct', st.session_state.get('trade_breakout_max_dist_pct', 4.0))
+            )
+            st.session_state['trade_monthly_near_macd_pct'] = float(
+                _pending_gate.get('trade_monthly_near_macd_pct', st.session_state.get('trade_monthly_near_macd_pct', 0.08))
+            )
+            st.session_state['trade_monthly_near_ao_floor'] = float(
+                _pending_gate.get('trade_monthly_near_ao_floor', st.session_state.get('trade_monthly_near_ao_floor', -0.25))
+            )
+        except Exception:
+            pass
+        _pending_reason = str(_pending_gate.get('_reason', '') or '').strip()
+        if _pending_reason:
+            st.session_state['trade_gate_pending_notice'] = _pending_reason
+
     st.subheader("🧭 Trade Finder")
     st.caption("Runs cross-watchlist scan and ranks model/system trade signals with clear actions.")
+    _pending_notice = str(st.session_state.pop('trade_gate_pending_notice', '') or '').strip()
+    if _pending_notice:
+        st.success(_pending_notice)
     _fh = get_fetch_health_status() or {}
     if bool(_fh.get('rate_limited', False)):
         st.warning(
@@ -4948,15 +4969,17 @@ def render_trade_finder_tab():
                 st.session_state['trade_gate_tuning_last'] = _tuning
                 if bool(_tuning.get('updated', False)):
                     _s = _tuning.get('suggested', {}) or {}
-                    st.session_state['trade_breakout_max_dist_pct'] = float(_s.get('breakout_max_dist_pct', _curr.get('breakout_max_dist_pct', 4.0)) or _curr.get('breakout_max_dist_pct', 4.0))
-                    st.session_state['trade_monthly_near_macd_pct'] = float(_s.get('monthly_near_macd_pct', _curr.get('monthly_near_macd_pct', 0.08)) or _curr.get('monthly_near_macd_pct', 0.08))
-                    st.session_state['trade_monthly_near_ao_floor'] = float(_s.get('monthly_near_ao_floor', _curr.get('monthly_near_ao_floor', -0.25)) or _curr.get('monthly_near_ao_floor', -0.25))
+                    st.session_state['trade_gate_pending_apply'] = {
+                        'trade_breakout_max_dist_pct': float(_s.get('breakout_max_dist_pct', _curr.get('breakout_max_dist_pct', 4.0)) or _curr.get('breakout_max_dist_pct', 4.0)),
+                        'trade_monthly_near_macd_pct': float(_s.get('monthly_near_macd_pct', _curr.get('monthly_near_macd_pct', 0.08)) or _curr.get('monthly_near_macd_pct', 0.08)),
+                        'trade_monthly_near_ao_floor': float(_s.get('monthly_near_ao_floor', _curr.get('monthly_near_ao_floor', -0.25)) or _curr.get('monthly_near_ao_floor', -0.25)),
+                        '_reason': str(_tuning.get('reason', 'Hard gate auto-calibrated.')),
+                    }
                     _ai_note = _ai_tuning_note(len(_rows_for_tune), _tuning, _curr)
                     if _ai_note:
                         st.session_state['trade_gate_tuning_ai_note'] = _ai_note
                     else:
                         st.session_state.pop('trade_gate_tuning_ai_note', None)
-                    st.success(str(_tuning.get('reason', 'Hard gate auto-calibrated.')))
                     st.rerun()
                 else:
                     st.info(str(_tuning.get('reason', 'Gate already within target selectivity band.')))
