@@ -11160,6 +11160,19 @@ def render_executive_dashboard():
     if snap.workflow_sec > 0:
         st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
 
+    with st.expander("🔥 Market Heat Map", expanded=False):
+        heatmap_url = "https://stockanalysis.com/markets/heatmap/"
+        st.caption("Live market heat map embedded from Stock Analysis.")
+        st.markdown(f"[Open heat map in new tab]({heatmap_url})")
+        try:
+            import streamlit.components.v1 as components
+            components.iframe(heatmap_url, height=620, scrolling=True)
+        except Exception as e:
+            st.info(
+                "Heat map embed is unavailable in this browser/session. "
+                f"Use the link above. ({str(e)[:120]})"
+            )
+
     candidate_rows = []
     if gate.allow_new_trades:
         find_new = st.session_state.get('find_new_trades_report', {}) or {}
