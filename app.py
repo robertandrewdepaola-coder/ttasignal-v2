@@ -4433,6 +4433,7 @@ def _run_trade_finder_workflow(
         key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
         reverse=True,
     )
+    qualified_count = sum(1 for _r in rows if _trade_candidate_is_qualified(_r, quality_settings))
     elapsed = max(0.0, time.time() - _t0)
     st.session_state['trade_finder_results'] = {
         'run_id': run_id,
@@ -4445,6 +4446,7 @@ def _run_trade_finder_workflow(
         'hard_gate_fail_count': int(max(0, len(base_candidates) - hard_gate_pass_count)),
         'hard_gate_fail_counts': hard_gate_fail_counts,
         'hard_gate_relaxed_pass_count': int(hard_gate_relaxed_pass_count),
+        'qualified_count': int(qualified_count),
         'ai_ranked_count': int(ai_ranked_count),
         'provider_counts': provider_counts,
         'fallback_counts': fallback_counts,
@@ -4477,8 +4479,8 @@ def _run_trade_finder_workflow(
         'level': 'success' if len(rows) > 0 else 'info',
         'message': (
             f"Trade Finder complete: {hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
-            f"AI ranked {ai_ranked_count}; {len(rows)} row(s) ready for review. "
-            f"Relaxed-profile passers: {hard_gate_relaxed_pass_count}."
+            f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
+            f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
         ),
         'ts': time.time(),
     }
@@ -4487,7 +4489,8 @@ def _run_trade_finder_workflow(
             ai_progress_cb(
                 100,
                 f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(base_candidates)}, "
-                f"AI ranked {ai_ranked_count}, relaxed-profile passers {hard_gate_relaxed_pass_count}.",
+                f"qualified {qualified_count}, AI ranked {ai_ranked_count}, "
+                f"relaxed-profile passers {hard_gate_relaxed_pass_count}.",
             )
         except Exception:
             pass
