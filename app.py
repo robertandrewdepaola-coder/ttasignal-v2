@@ -11846,9 +11846,72 @@ def render_executive_dashboard():
         fn_rows = (st.session_state.get('find_new_trades_report', {}) or {}).get('candidates', []) or []
         scan_rows = snap.scan_summary or []
 
-        source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else scan_rows)
-        source_name = "Trade Finder" if source_rows is tf_rows else ("Find New" if source_rows is fn_rows else "Scanner")
-        st.caption(f"Data source: {source_name} ({len(source_rows)} rows)")
+        _active_watchlist = [str(t).upper().strip() for t in (snap.watchlist_tickers or []) if str(t).strip()]
+        _active_watchlist_set = set(_active_watchlist)
+        _ticker_sector_map = st.session_state.get('ticker_sectors', {}) or {}
+        _rotation_map = st.session_state.get('sector_rotation', {}) or {}
+
+        def _row_richness(_row: Dict[str, Any]) -> int:
+            _score = 0
+            for _k in (
+                'sector', 'sector_phase', 'price', 'volume_ratio',
+                'recommendation', 'ai_buy_recommendation', 'conviction',
+                'weekly_bullish', 'monthly_bullish', 'monthly_macd_bullish',
+                'ao_positive', 'daily_ao_positive',
+            ):
+                _v = _row.get(_k)
+                if _v is None:
+                    continue
+                if isinstance(_v, str):
+                    if _v.strip():
+                        _score += 1
+                else:
+                    _score += 1
+            _ai = str(_row.get('ai_buy_recommendation', _row.get('recommendation', '')) or '').upper()
+            if "STRONG BUY" in _ai:
+                _score += 2
+            elif "BUY" in _ai:
+                _score += 1
+            return _score
+
+        # Build best-available row per ticker from all sources, then project full active watchlist.
+        _best_by_ticker: Dict[str, Dict[str, Any]] = {}
+        for _src_rows in (tf_rows, fn_rows, scan_rows):
+            for _r in _src_rows:
+                _t = str(_r.get('ticker', '') or '').upper().strip()
+                if not _t:
+                    continue
+                if _active_watchlist_set and _t not in _active_watchlist_set:
+                    continue
+                _prev = _best_by_ticker.get(_t)
+                if _prev is None or _row_richness(_r) > _row_richness(_prev):
+                    _best_by_ticker[_t] = dict(_r)
+
+        if _active_watchlist:
+            source_rows = []
+            for _t in _active_watchlist:
+                _row = dict(_best_by_ticker.get(_t, {}))
+                if not _row:
+                    _row = {'ticker': _t, '_heatmap_placeholder': True}
+                _row.setdefault('ticker', _t)
+                _sector = str(_row.get('sector', '') or '').strip()
+                if not _sector:
+                    _sector = str(_ticker_sector_map.get(_t, '') or '').strip()
+                    if _sector:
+                        _row['sector'] = _sector
+                _phase = str(_row.get('sector_phase', '') or '').strip().upper()
+                if not _phase and _sector:
+                    _phase = str((_rotation_map.get(_sector, {}) or {}).get('phase', '') or '').strip().upper()
+                    if _phase:
+                        _row['sector_phase'] = _phase
+                source_rows.append(_row)
+            _covered = sum(1 for _r in source_rows if not bool(_r.get('_heatmap_placeholder')))
+            source_name = f"Active Watchlist ({len(_active_watchlist)} tickers)"
+            st.caption(f"Data source: {source_name} | coverage: {_covered}/{len(source_rows)} with scan/model data")
+        else:
+            source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else scan_rows)
+            source_name = "Trade Finder" if source_rows is tf_rows else ("Find New" if source_rows is fn_rows else "Scanner")
+            st.caption(f"Data source: {source_name} ({len(source_rows)} rows)")
 
         if not source_rows:
             st.info("No data available yet. Run Find New Trades or Scan All first.")
