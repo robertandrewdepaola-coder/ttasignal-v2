@@ -568,15 +568,17 @@ if 'ticker_data_cache' not in st.session_state:
 
 # Find New / scan scope controls
 if 'find_new_max_tickers' not in st.session_state:
-    st.session_state['find_new_max_tickers'] = 0  # 0 = full cross-watchlist universe
+    st.session_state['find_new_max_tickers'] = 250  # speed default; user can set 0 for full universe
 if 'find_new_in_rotation_only' not in st.session_state:
     st.session_state['find_new_in_rotation_only'] = True
+if 'find_new_include_unknown_sector' not in st.session_state:
+    st.session_state['find_new_include_unknown_sector'] = False
 if 'find_new_selected_sectors' not in st.session_state:
     st.session_state['find_new_selected_sectors'] = []
 if 'scan_max_minutes' not in st.session_state:
     st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
 if 'find_new_max_minutes' not in st.session_state:
-    st.session_state['find_new_max_minutes'] = 0.0
+    st.session_state['find_new_max_minutes'] = 5.0
 if 'trade_finder_last_status' not in st.session_state:
     st.session_state['trade_finder_last_status'] = {}
 if 'trade_finder_ai_budget_sec' not in st.session_state:
@@ -2120,12 +2122,19 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
     # Scope controls (from sidebar) to limit scan size/load.
     _max_tickers = int(st.session_state.get('find_new_max_tickers', 0) or 0)
     _only_in_rotation = bool(st.session_state.get('find_new_in_rotation_only', False))
+    _include_unknown_sector = bool(st.session_state.get('find_new_include_unknown_sector', False))
     _selected_sectors = set([str(x) for x in (st.session_state.get('find_new_selected_sectors', []) or []) if str(x)])
     _max_minutes = float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0)
     _deadline_ts = (time.time() + (_max_minutes * 60.0)) if _max_minutes > 0 else 0.0
 
     _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
     _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+    _scan_sector_map: Dict[str, str] = {}
+    for _s in (st.session_state.get('scan_results_summary', []) or []):
+        _t = str(_s.get('ticker', '') or '').upper().strip()
+        _sec = str(_s.get('sector', '') or '').strip()
+        if _t and _sec:
+            _scan_sector_map[_t] = _sec
     _filtered_counts = {
         "sector_filter": 0,
         "rotation_filter": 0,
@@ -2139,7 +2148,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
     universe = []
     rejected = []
     for t in sorted(ticker_sources.keys()):
-        _sector_name = str(_ticker_sectors.get(t, '') or '').strip()
+        _sector_name = str(_ticker_sectors.get(t, '') or _scan_sector_map.get(t, '') or '').strip()
         if _selected_sectors:
             if not _sector_name:
                 _filtered_counts["unknown_sector"] += 1
@@ -2149,10 +2158,11 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 continue
         if _only_in_rotation:
             if not _sector_name:
-                # Keep unknown-sector tickers in universe; resolve sector after scan.
-                # Dropping here can cause false "no action" after reboot when sector cache is sparse.
                 _filtered_counts["unknown_sector"] += 1
-                _filtered_counts["rotation_unknown_kept"] += 1
+                if _include_unknown_sector:
+                    _filtered_counts["rotation_unknown_kept"] += 1
+                else:
+                    continue
             else:
                 _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper()
                 if _phase and _phase not in {"LEADING", "EMERGING"}:
@@ -2238,7 +2248,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
     with st.spinner(f"Finding new trades across {len(universe)} tickers..."):
         _append_audit_event(
             "FIND_NEW_START",
-            f"watchlists={len(all_watchlists)} universe={len(universe)} in_rotation_only={_only_in_rotation} sectors={len(_selected_sectors)} max={_max_tickers}",
+            f"watchlists={len(all_watchlists)} universe={len(universe)} in_rotation_only={_only_in_rotation} "
+            f"include_unknown={_include_unknown_sector} sectors={len(_selected_sectors)} max={_max_tickers}",
             source="find_new",
         )
         _set_find_progress(5, f"Scope ready: {len(universe)} tickers")
@@ -4749,6 +4760,11 @@ def render_trade_finder_tab():
             key="find_new_in_rotation_only",
             help="Excludes tickers in Fading/Lagging sectors before scan.",
         )
+        st.checkbox(
+            "Include unknown-sector tickers (slower)",
+            key="find_new_include_unknown_sector",
+            help="When off, unknown-sector symbols are skipped for faster, stricter in-rotation scans.",
+        )
         _rotation = st.session_state.get('sector_rotation', {}) or {}
         _sector_options = sorted([str(s) for s in _rotation.keys() if str(s)])
         if _sector_options:
@@ -4771,6 +4787,8 @@ def render_trade_finder_tab():
         _scope_bits.append(f"max {int(st.session_state.get('find_new_max_tickers', 0) or 0)}")
     if bool(st.session_state.get('find_new_in_rotation_only', False)):
         _scope_bits.append("in-rotation only")
+    if bool(st.session_state.get('find_new_include_unknown_sector', False)):
+        _scope_bits.append("unknown sectors included")
     _sel_scope = st.session_state.get('find_new_selected_sectors', []) or []
     if _sel_scope:
         _scope_bits.append(f"{len(_sel_scope)} sectors")
@@ -5199,6 +5217,61 @@ def render_trade_finder_tab():
 
     if not qualified_rows:
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
+        _hard_pass_rows = [r for r in rows if bool(r.get('hard_gate_pass', False))]
+        _not_ready_rows = []
+        if bool(settings.get('require_ready', True)):
+            for _r in _hard_pass_rows:
+                _card = _r.get('decision_card', {}) or {}
+                if str(_card.get('execution_readiness', '')).upper() != "READY":
+                    _not_ready_rows.append(_r)
+        if _hard_pass_rows:
+            st.info(
+                f"{len(_hard_pass_rows)} ticker(s) passed hard gate but failed final filters. "
+                "You can expose them immediately without rescanning."
+            )
+            if bool(settings.get('require_ready', True)) and _not_ready_rows:
+                if st.button("👁 Show Hard-Gate Passers (disable READY, no rescan)", key="tf_show_hard_passers", width="stretch"):
+                    st.session_state['trade_require_ready'] = False
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': f"READY filter disabled. Showing {len(_hard_pass_rows)} hard-gate passer(s) from current scan.",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with st.expander(f"🔎 Hard-Gate Passers ({len(_hard_pass_rows)})", expanded=False):
+                for _i, _r in enumerate(_hard_pass_rows[:20]):
+                    _t = str(_r.get('ticker', '')).upper().strip()
+                    _ai = str(_r.get('ai_buy_recommendation', '') or 'n/a')
+                    _rr = float(_r.get('risk_reward', 0) or 0)
+                    if _rr <= 0:
+                        _rr = _calc_rr(
+                            float(_r.get('suggested_entry', _r.get('price', 0)) or 0),
+                            float(_r.get('suggested_stop_loss', 0) or 0),
+                            float(_r.get('suggested_target', 0) or 0),
+                        )
+                    _ed = _earnings_badge(
+                        int(_r.get('earn_days', 999) or 999),
+                        source=str(_r.get('earn_source', '') or ''),
+                        confidence=str(_r.get('earn_confidence', '') or ''),
+                        earn_date=str(_r.get('earn_date', '') or ''),
+                    )
+                    _card = _r.get('decision_card', {}) or {}
+                    _ready = str(_card.get('execution_readiness', '') or 'N/A')
+                    _why = str(_r.get('reason', '') or '')
+                    _c1, _c2 = st.columns([4, 1])
+                    with _c1:
+                        st.caption(
+                            f"{_t} | AI: {_ai} | R:R {_rr:.2f}:1 | Ready: {_ready} | "
+                            f"Earnings: {_ed['icon']} {_ed['text']} | {_why[:120]}"
+                        )
+                    with _c2:
+                        if st.button("📈 Chart", key=f"tf_hardpass_chart_{_i}_{_t}", width="stretch"):
+                            st.session_state['trade_finder_inline_chart_ticker'] = _t
+                            st.session_state['trade_finder_chart_focus'] = True
+                            st.session_state['trade_finder_scroll_to_chart'] = True
+                            _load_ticker_for_view(_t)
+                            st.rerun()
+
         fail = {
             'ai_rating_filtered': 0,
             'missing_levels': 0,
