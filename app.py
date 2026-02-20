@@ -11814,6 +11814,20 @@ def render_executive_dashboard():
         st.markdown("**Universe Heatmap (native)**")
         st.caption("Built from your latest universe data: Trade Finder > Find New > Scanner (fallback order).")
 
+        def _open_from_heatmap(_ticker: str, _target: str = "chart"):
+            _tk = str(_ticker or "").upper().strip()
+            if not _tk:
+                st.warning("Select a ticker first.")
+                return
+            st.session_state['default_detail_tab'] = 1 if _target == "chart" else 4
+            st.session_state['_switch_to_scanner_tab'] = True
+            st.session_state['_switch_to_scanner_target_tab'] = "chart" if _target == "chart" else "trade"
+            _loaded = _load_ticker_for_view(_tk)
+            if not _loaded:
+                st.warning(f"Unable to load {_tk} right now.")
+                return
+            st.rerun()
+
         def _safe_float(v: Any, default: float = 0.0) -> float:
             try:
                 f = float(v)
@@ -11848,6 +11862,30 @@ def render_executive_dashboard():
 
         _active_watchlist = [str(t).upper().strip() for t in (snap.watchlist_tickers or []) if str(t).strip()]
         _active_watchlist_set = set(_active_watchlist)
+        _bridge = get_watchlist_bridge()
+        _all_watchlists = (_bridge.manager.get_all_watchlists() if _bridge else []) or []
+        _all_watchlist_tickers: List[str] = []
+        _seen_all: set[str] = set()
+        for _wl in _all_watchlists:
+            for _tk in (_wl.get('tickers', []) or []):
+                _tku = str(_tk or '').upper().strip()
+                if _tku and _tku not in _seen_all:
+                    _all_watchlist_tickers.append(_tku)
+                    _seen_all.add(_tku)
+
+        _scope_opts = ["Active Watchlist", "All Watchlists (Universe)"]
+        _scope_default = 1 if _all_watchlist_tickers and len(_all_watchlist_tickers) > len(_active_watchlist) else 0
+        _scope = st.radio(
+            "Universe Scope",
+            _scope_opts,
+            index=int(st.session_state.get('exec_heatmap_scope_idx', _scope_default)),
+            horizontal=True,
+            key="exec_heatmap_scope",
+            help="Choose whether heatmap covers only active watchlist or every ticker across all watchlists.",
+        )
+        st.session_state['exec_heatmap_scope_idx'] = 0 if _scope == _scope_opts[0] else 1
+        _universe_tickers = _all_watchlist_tickers if _scope == _scope_opts[1] else _active_watchlist
+        _universe_set = set(_universe_tickers)
         _ticker_sector_map = st.session_state.get('ticker_sectors', {}) or {}
         _rotation_map = st.session_state.get('sector_rotation', {}) or {}
 
@@ -11881,15 +11919,15 @@ def render_executive_dashboard():
                 _t = str(_r.get('ticker', '') or '').upper().strip()
                 if not _t:
                     continue
-                if _active_watchlist_set and _t not in _active_watchlist_set:
+                if _universe_set and _t not in _universe_set:
                     continue
                 _prev = _best_by_ticker.get(_t)
                 if _prev is None or _row_richness(_r) > _row_richness(_prev):
                     _best_by_ticker[_t] = dict(_r)
 
-        if _active_watchlist:
+        if _universe_tickers:
             source_rows = []
-            for _t in _active_watchlist:
+            for _t in _universe_tickers:
                 _row = dict(_best_by_ticker.get(_t, {}))
                 if not _row:
                     _row = {'ticker': _t, '_heatmap_placeholder': True}
@@ -11906,7 +11944,11 @@ def render_executive_dashboard():
                         _row['sector_phase'] = _phase
                 source_rows.append(_row)
             _covered = sum(1 for _r in source_rows if not bool(_r.get('_heatmap_placeholder')))
-            source_name = f"Active Watchlist ({len(_active_watchlist)} tickers)"
+            source_name = (
+                f"All Watchlists ({len(_universe_tickers)} tickers)"
+                if _scope == _scope_opts[1]
+                else f"Active Watchlist ({len(_universe_tickers)} tickers)"
+            )
             st.caption(f"Data source: {source_name} | coverage: {_covered}/{len(source_rows)} with scan/model data")
         else:
             source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else scan_rows)
@@ -12011,6 +12053,7 @@ def render_executive_dashboard():
                         'size_metric': False,
                         'heat_score': ':.2f',
                     },
+                    custom_data=['ticker'],
                 )
                 # Avoid NaN text artifacts; keep labels clean.
                 fig.update_traces(
@@ -12022,9 +12065,59 @@ def render_executive_dashboard():
                     margin=dict(l=8, r=8, t=24, b=8),
                     paper_bgcolor='rgba(0,0,0,0)',
                     plot_bgcolor='rgba(0,0,0,0)',
+                    clickmode='event+select',
                     coloraxis_colorbar=dict(title='Score'),
                 )
-                st.plotly_chart(fig, width="stretch", theme=None, key="exec_native_universe_heatmap")
+                _evt = st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    theme=None,
+                    key="exec_native_universe_heatmap",
+                    on_select="rerun",
+                    selection_mode=("points",),
+                )
+                _clicked_ticker = ""
+                try:
+                    _pts = []
+                    if isinstance(_evt, dict):
+                        _sel = _evt.get("selection", {}) or {}
+                        _pts = _sel.get("points", []) or _evt.get("points", []) or []
+                    elif _evt is not None:
+                        _sel = getattr(_evt, "selection", None)
+                        if _sel is not None:
+                            _pts = getattr(_sel, "points", []) or []
+                    for _pt in _pts:
+                        _cd = _pt.get("customdata") if isinstance(_pt, dict) else None
+                        if isinstance(_cd, (list, tuple)) and _cd:
+                            _cand = str(_cd[0] or '').upper().strip()
+                            if _cand:
+                                _clicked_ticker = _cand
+                                break
+                except Exception:
+                    _clicked_ticker = ""
+                if _clicked_ticker:
+                    st.session_state['exec_heatmap_selected_ticker'] = _clicked_ticker
+
+                _ticker_list = [str(x).upper().strip() for x in hdf['ticker'].dropna().tolist() if str(x).strip()]
+                _ticker_list = list(dict.fromkeys(_ticker_list))
+                _default_ticker = str(st.session_state.get('exec_heatmap_selected_ticker', '') or '').upper().strip()
+                if _default_ticker not in _ticker_list and _ticker_list:
+                    _default_ticker = _ticker_list[0]
+                _idx = _ticker_list.index(_default_ticker) if _default_ticker in _ticker_list else 0
+                _a1, _a2, _a3 = st.columns([2.5, 1, 1])
+                with _a1:
+                    _pick = st.selectbox(
+                        "Open ticker from heatmap universe",
+                        _ticker_list,
+                        index=int(_idx),
+                        key="exec_heatmap_picker",
+                    ) if _ticker_list else ""
+                with _a2:
+                    if st.button("📈 Open Chart", key="exec_heatmap_open_chart", width="stretch"):
+                        _open_from_heatmap(_pick, "chart")
+                with _a3:
+                    if st.button("✅ Open Trade", key="exec_heatmap_open_trade", width="stretch"):
+                        _open_from_heatmap(_pick, "trade")
                 st.caption(
                     "Color score: signal strength + sector phase + timeframe alignment. "
                     "Tile size: conviction adjusted by relative volume."
