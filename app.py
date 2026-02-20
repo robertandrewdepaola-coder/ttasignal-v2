@@ -1707,14 +1707,15 @@ def _load_ticker_for_view(ticker: str) -> bool:
     results = st.session_state.get('scan_results', [])
     for r in results:
         if r.ticker == ticker:
-            if not _ensure_chart_cache(ticker):
-                msg = f"No chart data for {ticker} (data provider limit or unavailable)."
-                st.session_state['_ticker_load_error'] = msg
-                st.sidebar.error(msg)
-                return False
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
             st.session_state['scroll_to_detail'] = True
+            if not _ensure_chart_cache(ticker):
+                # Keep navigation deterministic even when live chart fetch is rate-limited.
+                # Detail view still opens and will show explicit "No chart data available".
+                msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+                st.session_state['_ticker_load_error'] = msg
+                st.sidebar.error(msg)
             return True  # No rerun — current pass will render detail view
 
     # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
@@ -5658,6 +5659,9 @@ def render_scanner_table():
             f"Data provider is rate-limited ({int(_fh.get('cooldown_remaining_sec', 0) or 0)}s cooldown). "
             "Scanner is using cached/partial data where live fetch is unavailable."
         )
+    _scan_nav_err = str(st.session_state.pop('_scanner_nav_error', '') or '').strip()
+    if _scan_nav_err:
+        st.warning(_scan_nav_err)
 
     # ══════════════════════════════════════════════════════════════════
     # TRIGGERED ALERTS BANNER
@@ -5793,7 +5797,12 @@ def render_scanner_table():
                     if st.button("📈", key=f"chart_{t}",
                                  help="Open chart"):
                         st.session_state['default_detail_tab'] = 1  # Chart tab index
-                        _load_ticker_for_view(t)
+                        _loaded = _load_ticker_for_view(t)
+                        if not _loaded:
+                            st.session_state['_scanner_nav_error'] = str(
+                                st.session_state.get('_ticker_load_error', f"Unable to load {t}.")
+                            )
+                        st.rerun()
                 with tc4:
                     if st.button("🗑️", key=f"del_{t}",
                                  help="Remove from watchlist"):
@@ -6335,14 +6344,24 @@ def render_scanner_table():
                         width="stretch"):
                 st.session_state['default_detail_tab'] = 0  # Signal tab
                 st.session_state['scroll_to_detail'] = True
-                _load_ticker_for_view(row['Ticker'])
+                _loaded = _load_ticker_for_view(row['Ticker'])
+                if not _loaded:
+                    st.session_state['_scanner_nav_error'] = str(
+                        st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
+                    )
+                st.rerun()
 
         # Chart button — opens directly to chart tab
         with cols[1]:
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
                 st.session_state['default_detail_tab'] = 1  # Chart tab
                 st.session_state['scroll_to_detail'] = True
-                _load_ticker_for_view(row['Ticker'])
+                _loaded = _load_ticker_for_view(row['Ticker'])
+                if not _loaded:
+                    st.session_state['_scanner_nav_error'] = str(
+                        st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
+                    )
+                st.rerun()
 
         # Focus label — click to cycle through colors
         with cols[2]:
@@ -6445,7 +6464,12 @@ def render_scanner_table():
                 wl = bridge.get_watchlist_tickers()
                 if ticker_clean not in wl:
                     bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
-                _load_ticker_for_view(ticker_clean)
+                _loaded = _load_ticker_for_view(ticker_clean)
+                if not _loaded:
+                    st.session_state['_scanner_nav_error'] = str(
+                        st.session_state.get('_ticker_load_error', f"Unable to load {ticker_clean}.")
+                    )
+                st.rerun()
 
     # Alert form (if requested from detail view)
     alert_ticker = st.session_state.get('show_alert_form')
