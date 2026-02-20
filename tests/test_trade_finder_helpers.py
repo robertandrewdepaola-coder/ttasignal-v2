@@ -1,6 +1,11 @@
 import unittest
 
-from trade_finder_helpers import build_planned_trade, build_trade_finder_selection, compute_trade_score
+from trade_finder_helpers import (
+    build_planned_trade,
+    build_trade_finder_selection,
+    compute_trade_score,
+    derive_support_stop_levels,
+)
 
 
 class TradeFinderHelperTests(unittest.TestCase):
@@ -19,6 +24,8 @@ class TradeFinderHelperTests(unittest.TestCase):
         self.assertEqual(out["ticker"], "STRL")
         self.assertEqual(out["entry"], 421.2)
         self.assertEqual(out["trade_finder_run_id"], "TF_1")
+        self.assertIn("support_price", out)
+        self.assertIn("stop_basis", out)
 
     def test_build_planned_trade_maps_candidate(self):
         row = {
@@ -58,6 +65,13 @@ class TradeFinderHelperTests(unittest.TestCase):
             "decision_card": {"execution_readiness": "WAIT"},
         }
         self.assertGreater(compute_trade_score(strong), compute_trade_score(weak))
+
+    def test_derive_support_stop_levels_uses_support_when_available(self):
+        out = derive_support_stop_levels(entry=100.0, current_stop=95.0, support_price=96.0)
+        self.assertEqual(out["support_price"], 96.0)
+        self.assertGreater(out["support_stop_price"], 0.0)
+        self.assertLess(out["recommended_stop"], 100.0)
+        self.assertIn("support", out["stop_basis"])
 
 
 if __name__ == "__main__":

@@ -608,19 +608,51 @@ def check_timeframe_ao(df: pd.DataFrame) -> Dict[str, Any]:
     Check AO status on a given timeframe DataFrame (weekly or monthly).
     """
     if df is None or df.empty or len(df) < 35:
-        return {'positive': False, 'value': None, 'error': 'Insufficient data'}
+        return {
+            'positive': False,
+            'value': None,
+            'cross_up': False,
+            'cross_down': False,
+            'trend': 'flat',
+            'error': 'Insufficient data',
+        }
 
     df = normalize_columns(df)
     df = calculate_ao(df)
 
     ao_val = float(df['AO'].iloc[-1])
+    ao_prev = float(df['AO'].iloc[-2]) if len(df) >= 2 else 0.0
+    ao_prev2 = float(df['AO'].iloc[-3]) if len(df) >= 3 else ao_prev
 
     if pd.isna(ao_val):
-        return {'positive': False, 'value': None, 'error': 'NaN in AO'}
+        return {
+            'positive': False,
+            'value': None,
+            'cross_up': False,
+            'cross_down': False,
+            'trend': 'flat',
+            'error': 'NaN in AO',
+        }
+
+    cross_up = False
+    cross_down = False
+    if len(df) >= 2 and not pd.isna(ao_prev):
+        cross_up = (ao_val > 0) and (ao_prev <= 0)
+        cross_down = (ao_val < 0) and (ao_prev >= 0)
+
+    trend = 'flat'
+    if len(df) >= 3 and not pd.isna(ao_prev) and not pd.isna(ao_prev2):
+        if ao_val > ao_prev > ao_prev2:
+            trend = 'rising'
+        elif ao_val < ao_prev < ao_prev2:
+            trend = 'falling'
 
     return {
         'positive': ao_val > 0,
         'value': round(ao_val, 4),
+        'cross_up': cross_up,
+        'cross_down': cross_down,
+        'trend': trend,
         'error': None
     }
 

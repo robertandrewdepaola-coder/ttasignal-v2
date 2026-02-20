@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 from zoneinfo import ZoneInfo
 
 # Backend imports
@@ -73,7 +73,12 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
-from trade_finder_helpers import build_planned_trade, build_trade_finder_selection, compute_trade_score
+from trade_finder_helpers import (
+    build_planned_trade,
+    build_trade_finder_selection,
+    compute_trade_score,
+    derive_support_stop_levels,
+)
 
 
 # =============================================================================
@@ -545,7 +550,7 @@ if 'ticker_data_cache' not in st.session_state:
 
 # Find New / scan scope controls
 if 'find_new_max_tickers' not in st.session_state:
-    st.session_state['find_new_max_tickers'] = 250  # safer default; 0 = all
+    st.session_state['find_new_max_tickers'] = 0  # 0 = full cross-watchlist universe
 if 'find_new_in_rotation_only' not in st.session_state:
     st.session_state['find_new_in_rotation_only'] = True
 if 'find_new_selected_sectors' not in st.session_state:
@@ -553,11 +558,19 @@ if 'find_new_selected_sectors' not in st.session_state:
 if 'scan_max_minutes' not in st.session_state:
     st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
 if 'find_new_max_minutes' not in st.session_state:
-    st.session_state['find_new_max_minutes'] = 5.0
+    st.session_state['find_new_max_minutes'] = 0.0
 if 'trade_finder_last_status' not in st.session_state:
     st.session_state['trade_finder_last_status'] = {}
 if 'trade_finder_ai_budget_sec' not in st.session_state:
     st.session_state['trade_finder_ai_budget_sec'] = 30.0
+if 'trade_breakout_min_dist_pct' not in st.session_state:
+    st.session_state['trade_breakout_min_dist_pct'] = 0.2
+if 'trade_breakout_max_dist_pct' not in st.session_state:
+    st.session_state['trade_breakout_max_dist_pct'] = 4.0
+if 'trade_monthly_near_macd_pct' not in st.session_state:
+    st.session_state['trade_monthly_near_macd_pct'] = 0.08
+if 'trade_monthly_near_ao_floor' not in st.session_state:
+    st.session_state['trade_monthly_near_ao_floor'] = -0.25
 
 
 def get_journal() -> JournalManager:
@@ -922,11 +935,26 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         ai_validation_ok = bool(st.session_state.get(f"_ai_validated_{ai_key[:8]}"))
     ai_ok = bool((has_openai_compat and ai_validation_ok) or has_gemini)
 
-    spy_px = fetch_current_price("SPY")
-    price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
     fetch_health = get_fetch_health_status() or {}
     rate_limited = bool(fetch_health.get('rate_limited', False))
     cooldown_sec = int(fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    # Prefer live quote; if provider is briefly rate-limited, keep last good SPY
+    # for status continuity so transient 429 windows do not hard-fail health.
+    spy_px_live = fetch_current_price("SPY")
+    last_good_spy = st.session_state.get('_system_health_last_good_spy_price')
+    last_good_spy_ts = float(st.session_state.get('_system_health_last_good_spy_ts', 0.0) or 0.0)
+    spy_px = spy_px_live
+    price_feed_source = "live"
+    if spy_px_live is not None and float(spy_px_live) > 0:
+        st.session_state['_system_health_last_good_spy_price'] = float(spy_px_live)
+        st.session_state['_system_health_last_good_spy_ts'] = now
+    elif rate_limited and last_good_spy is not None:
+        # 30-minute stale window keeps UI stable while respecting data freshness.
+        if (now - last_good_spy_ts) <= (30 * 60):
+            spy_px = float(last_good_spy)
+            price_feed_source = "cached"
+    price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
+    price_feed_stale = bool(price_feed_ok and price_feed_source == "cached")
 
     ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     ts_utc = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -945,6 +973,8 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         issues.append("AI connection unavailable")
     if not price_feed_ok:
         issues.append("Price feed unavailable")
+    elif price_feed_stale:
+        warnings.append("Price feed temporarily rate-limited — showing cached SPY quote")
     if rate_limited:
         warnings.append(f"Data provider rate-limited ({cooldown_sec}s cooldown) — using cached/partial data")
 
@@ -965,6 +995,8 @@ def _compute_system_health(force: bool = False) -> Dict[str, Any]:
         'gemini_error': ai_clients.get('gemini_error'),
         'price_feed_ok': price_feed_ok,
         'spy_price': float(spy_px) if price_feed_ok else None,
+        'price_feed_source': price_feed_source,
+        'price_feed_stale': price_feed_stale,
         'rate_limited': rate_limited,
         'cooldown_sec': cooldown_sec,
         'fetch_hits': int(fetch_health.get('hits', 0) or 0),
@@ -1030,7 +1062,12 @@ def _render_system_status_panel():
             )
             st.sidebar.caption(
                 f"Price Feed: {'OK' if health.get('price_feed_ok') else 'FAIL'} "
-                + (f"(SPY ${health.get('spy_price', 0):.2f})" if health.get('price_feed_ok') else "")
+                + (
+                    f"(SPY ${health.get('spy_price', 0):.2f}"
+                    + (" cached" if health.get('price_feed_stale') else "")
+                    + ")"
+                    if health.get('price_feed_ok') else ""
+                )
             )
             if health.get('rate_limited'):
                 st.sidebar.caption(
@@ -2316,6 +2353,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         for r in results:
             rec = r.recommendation or {}
             q = r.quality or {}
+            sig = r.signal or None
             _batch_earn = earnings_flags.get(r.ticker, {}) if isinstance(earnings_flags, dict) else {}
             _scan_earn = scan_earn_map.get(r.ticker, {}) if isinstance(scan_earn_map, dict) else {}
             _persisted_date = str(
@@ -2375,6 +2413,25 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             )
             rec_text = str(rec_adj.get('recommendation', 'SKIP') or 'SKIP')
             conv_adj = int(rec_adj.get('conviction', int(rec.get('conviction', 0) or 0)) or 0)
+            _ores = (sig.overhead_resistance if sig else {}) or {}
+            _critical = (_ores.get('critical_level', {}) or {}) if isinstance(_ores, dict) else {}
+            _res_price = float(_critical.get('price', 0) or 0)
+            _res_dist = _ores.get('distance_to_critical_pct', None) if isinstance(_ores, dict) else None
+            try:
+                _res_dist = float(_res_dist) if _res_dist is not None else None
+            except Exception:
+                _res_dist = None
+            _klevels = (sig.key_levels if sig else {}) or {}
+            _support_price = float(_klevels.get('nearest_support', 0) or 0)
+            _support_dist = None
+            if _support_price > 0 and float(r.current_price or 0) > 0:
+                try:
+                    _support_dist = ((float(r.current_price or 0) - _support_price) / float(r.current_price or 0)) * 100.0
+                except Exception:
+                    _support_dist = None
+            _monthly_macd = (sig.monthly_macd if sig else {}) or {}
+            _monthly_ao = (sig.monthly_ao if sig else {}) or {}
+            _monthly_bullish = bool(_monthly_macd.get('bullish', False) and _monthly_ao.get('positive', False))
 
             row = {
                 'ticker': r.ticker,
@@ -2390,6 +2447,25 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'earn_source': earn_source,
                 'earn_confidence': earn_confidence,
                 'earn_trusted': bool(earn_trusted),
+                'daily_macd_cross_recent': bool(sig.macd.get('cross_recent', False)) if sig else False,
+                'daily_macd_bullish': bool(sig.macd.get('bullish', False)) if sig else False,
+                'daily_ao_positive': bool(sig.ao.get('positive', False)) if sig else False,
+                'daily_ao_zero_cross_found': bool(sig.ao.get('zero_cross_found', False)) if sig else False,
+                'weekly_bullish': bool(sig.weekly_macd.get('bullish', False)) if sig else False,
+                'monthly_bullish': _monthly_bullish,
+                'monthly_macd_bullish': bool(_monthly_macd.get('bullish', False)),
+                'monthly_ao_positive': bool(_monthly_ao.get('positive', False)),
+                'monthly_macd_value': float(_monthly_macd.get('macd', 0.0) or 0.0),
+                'monthly_signal_value': float(_monthly_macd.get('signal', 0.0) or 0.0),
+                'monthly_histogram': float(_monthly_macd.get('histogram', 0.0) or 0.0),
+                'monthly_cross_up': bool(_monthly_macd.get('cross_up', False)),
+                'monthly_ao_value': float(_monthly_ao.get('value', 0.0) or 0.0),
+                'monthly_ao_cross_up': bool(_monthly_ao.get('cross_up', False)),
+                'resistance_price': _res_price if _res_price > 0 else None,
+                'resistance_distance_pct': _res_dist,
+                'resistance_assessment': str(_ores.get('assessment', '') or '') if isinstance(_ores, dict) else '',
+                'support_price': round(_support_price, 2) if _support_price > 0 else None,
+                'support_distance_pct': round(float(_support_dist), 2) if _support_dist is not None else None,
                 'is_open_position': r.ticker in open_tickers,
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
                 'source_watchlists': ticker_sources.get(r.ticker, []),
@@ -2398,10 +2474,11 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
 
             rec_upper = rec_text.upper()
             is_entry = ('BUY' in rec_upper or 'ENTRY' in rec_upper) and 'SKIP' not in rec_upper and 'AVOID' not in rec_upper
-            if is_entry and not row['is_open_position']:
+            if not row['is_open_position']:
                 score = _recommendation_score(row)
                 candidates.append({
                     'ticker': row['ticker'],
+                    'scanner_entry_candidate': bool(is_entry),
                     'recommendation': row['recommendation'],
                     'conviction': row['conviction'],
                     'quality_grade': row['quality_grade'],
@@ -2414,6 +2491,25 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'earn_source': row.get('earn_source', ''),
                     'earn_confidence': row.get('earn_confidence', ''),
                     'earn_trusted': bool(row.get('earn_trusted', False)),
+                    'daily_macd_cross_recent': bool(row.get('daily_macd_cross_recent', False)),
+                    'daily_macd_bullish': bool(row.get('daily_macd_bullish', False)),
+                    'daily_ao_positive': bool(row.get('daily_ao_positive', False)),
+                    'daily_ao_zero_cross_found': bool(row.get('daily_ao_zero_cross_found', False)),
+                    'weekly_bullish': bool(row.get('weekly_bullish', False)),
+                    'monthly_bullish': bool(row.get('monthly_bullish', False)),
+                    'monthly_macd_bullish': bool(row.get('monthly_macd_bullish', False)),
+                    'monthly_ao_positive': bool(row.get('monthly_ao_positive', False)),
+                    'monthly_macd_value': float(row.get('monthly_macd_value', 0.0) or 0.0),
+                    'monthly_signal_value': float(row.get('monthly_signal_value', 0.0) or 0.0),
+                    'monthly_histogram': float(row.get('monthly_histogram', 0.0) or 0.0),
+                    'monthly_cross_up': bool(row.get('monthly_cross_up', False)),
+                    'monthly_ao_value': float(row.get('monthly_ao_value', 0.0) or 0.0),
+                    'monthly_ao_cross_up': bool(row.get('monthly_ao_cross_up', False)),
+                    'resistance_price': row.get('resistance_price'),
+                    'resistance_distance_pct': row.get('resistance_distance_pct'),
+                    'resistance_assessment': row.get('resistance_assessment', ''),
+                    'support_price': row.get('support_price'),
+                    'support_distance_pct': row.get('support_distance_pct'),
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
@@ -3068,6 +3164,9 @@ def _build_trade_finder_analysis_note(
     earn_trusted: bool = True,
     fallback_reason: str = "",
     is_gold_source: bool = False,
+    support_price: float = 0.0,
+    stop_price: float = 0.0,
+    stop_basis: str = "",
 ) -> str:
     """Build consistent, trader-readable Trade Finder decision note."""
     parts: List[str] = []
@@ -3131,6 +3230,13 @@ def _build_trade_finder_analysis_note(
 
     if fallback_reason:
         parts.append(f"AI mode: fallback ({fallback_reason})")
+
+    if support_price > 0 and stop_price > 0:
+        basis_txt = str(stop_basis or "").replace("_", " ").strip()
+        if basis_txt:
+            parts.append(f"Support {support_price:.2f}; stop {stop_price:.2f} ({basis_txt})")
+        else:
+            parts.append(f"Support {support_price:.2f}; stop {stop_price:.2f}")
 
     note = ". ".join([p for p in parts if p]).strip()
     if note and not note.endswith("."):
@@ -3378,17 +3484,292 @@ def _trade_quality_settings() -> Dict[str, Any]:
     if 'trade_min_rr_threshold' not in st.session_state:
         st.session_state['trade_min_rr_threshold'] = 1.2
     if 'trade_earnings_block_days' not in st.session_state:
-        st.session_state['trade_earnings_block_days'] = 3
+        st.session_state['trade_earnings_block_days'] = 7
     if 'trade_require_ready' not in st.session_state:
         st.session_state['trade_require_ready'] = False
     if 'trade_include_watch_only' not in st.session_state:
         st.session_state['trade_include_watch_only'] = True
+    if 'trade_breakout_min_dist_pct' not in st.session_state:
+        st.session_state['trade_breakout_min_dist_pct'] = 0.2
+    if 'trade_breakout_max_dist_pct' not in st.session_state:
+        st.session_state['trade_breakout_max_dist_pct'] = 4.0
+    if 'trade_monthly_near_macd_pct' not in st.session_state:
+        st.session_state['trade_monthly_near_macd_pct'] = 0.08
+    if 'trade_monthly_near_ao_floor' not in st.session_state:
+        st.session_state['trade_monthly_near_ao_floor'] = -0.25
     return {
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
-        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 3) or 3),
+        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
         'require_ready': bool(st.session_state.get('trade_require_ready', False)),
         'include_watch_only': bool(st.session_state.get('trade_include_watch_only', True)),
+        'breakout_min_dist_pct': float(st.session_state.get('trade_breakout_min_dist_pct', 0.2) or 0.2),
+        'breakout_max_dist_pct': float(st.session_state.get('trade_breakout_max_dist_pct', 4.0) or 4.0),
+        'monthly_near_macd_pct': float(st.session_state.get('trade_monthly_near_macd_pct', 0.08) or 0.08),
+        'monthly_near_ao_floor': float(st.session_state.get('trade_monthly_near_ao_floor', -0.25) or -0.25),
     }
+
+
+def _monthly_is_green_or_near(row: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """Monthly timing gate: green OR close enough to green for early breakout setups."""
+    mm_bull = bool(row.get('monthly_macd_bullish', row.get('monthly_bullish', False)))
+    ma_pos = bool(row.get('monthly_ao_positive', row.get('monthly_bullish', False)))
+    if mm_bull and ma_pos:
+        return True, "monthly_green"
+
+    macd_v = float(row.get('monthly_macd_value', 0.0) or 0.0)
+    sig_v = float(row.get('monthly_signal_value', 0.0) or 0.0)
+    ao_v = float(row.get('monthly_ao_value', 0.0) or 0.0)
+    macd_cross_up = bool(row.get('monthly_cross_up', False))
+    ao_cross_up = bool(row.get('monthly_ao_cross_up', False))
+    near_pct = float(settings.get('monthly_near_macd_pct', 0.08) or 0.08)
+    ao_floor = float(settings.get('monthly_near_ao_floor', -0.25) or -0.25)
+
+    denom = max(abs(sig_v), 1e-6)
+    macd_gap_pct = (macd_v - sig_v) / denom
+    near_macd = macd_gap_pct >= (-1.0 * near_pct)
+    near_ao = ao_v >= ao_floor
+
+    # Early-turn allowance: monthly MACD is crossing/near-cross while AO is already positive.
+    if ma_pos and (macd_cross_up or near_macd):
+        return True, "monthly_crossing_up"
+    # Early-turn allowance: AO just crossed green while MACD is already bullish or very close.
+    if ao_cross_up and (mm_bull or near_macd):
+        return True, "monthly_ao_just_green"
+    # Monthly MACD is bullish and AO is only slightly negative (near zero line).
+    if mm_bull and near_ao:
+        return True, "monthly_ao_near_green"
+    if near_macd and near_ao:
+        return True, "monthly_near_green"
+    return False, "monthly_not_green"
+
+
+def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic pre-AI gate for breakout candidates.
+    AI ranking must only run on rows that pass this gate.
+    """
+    fail_codes: List[str] = []
+    fail_reasons: List[str] = []
+
+    phase = str(row.get('sector_phase', '') or '').upper().strip()
+    if phase not in {"LEADING", "EMERGING"}:
+        fail_codes.append("sector_not_in_rotation")
+        fail_reasons.append(f"Sector phase not in rotation ({phase or 'unknown'})")
+
+    if not bool(row.get('daily_macd_cross_recent', False)):
+        fail_codes.append("daily_macd_cross_missing")
+        fail_reasons.append("Daily MACD cross is not recent")
+    if not bool(row.get('daily_ao_positive', False)):
+        fail_codes.append("daily_ao_not_positive")
+        fail_reasons.append("Daily AO is not positive")
+    if not bool(row.get('weekly_bullish', False)):
+        fail_codes.append("weekly_not_green")
+        fail_reasons.append("Weekly MACD is not bullish")
+
+    monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
+    if not monthly_ok:
+        fail_codes.append("monthly_not_green")
+        fail_reasons.append("Monthly momentum is not green/near-green")
+
+    dist = float(row.get('resistance_distance_pct', -1.0) or -1.0)
+    min_dist = float(settings.get('breakout_min_dist_pct', 0.2) or 0.2)
+    max_dist = float(settings.get('breakout_max_dist_pct', 4.0) or 4.0)
+    if dist <= 0:
+        fail_codes.append("resistance_missing")
+        fail_reasons.append("No critical overhead resistance level available")
+    elif dist < min_dist or dist > max_dist:
+        fail_codes.append("resistance_distance_outside_window")
+        fail_reasons.append(f"Resistance distance {dist:.2f}% outside {min_dist:.2f}-{max_dist:.2f}% breakout window")
+
+    earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+    earn_trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    )
+    earn_block_days = int(settings.get('earn_block_days', 7) or 7)
+    if not earn_trusted:
+        fail_codes.append("earnings_untrusted")
+        fail_reasons.append("Earnings data is unverified")
+    elif 0 <= earn_days <= earn_block_days:
+        fail_codes.append("earnings_too_near")
+        fail_reasons.append(f"Earnings in {earn_days}d (block <= {earn_block_days}d)")
+
+    return {
+        'pass': len(fail_codes) == 0,
+        'fail_codes': fail_codes,
+        'fail_reasons': fail_reasons,
+        'monthly_tag': monthly_tag,
+        'metrics': {
+            'sector_phase': phase,
+            'resistance_distance_pct': dist,
+            'breakout_window': [min_dist, max_dist],
+            'earn_days': earn_days,
+        },
+    }
+
+
+def _hard_gate_pass_count(rows: List[Dict[str, Any]], settings: Dict[str, Any]) -> int:
+    """Count hard-gate passers for a given threshold set."""
+    c = 0
+    for r in (rows or []):
+        if bool(_evaluate_trade_finder_hard_gate(r, settings).get('pass', False)):
+            c += 1
+    return c
+
+
+def _suggest_trade_gate_settings(rows: List[Dict[str, Any]], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministically tune strict hard-gate thresholds so Trade Finder remains selective
+    without starving opportunities.
+    """
+    total = int(len(rows or []))
+    if total <= 0:
+        return {
+            'updated': False,
+            'reason': 'No rows to tune.',
+            'current_pass': 0,
+            'target_pass': 0,
+            'suggested': dict(settings),
+        }
+
+    current_settings = dict(settings)
+    current_pass = _hard_gate_pass_count(rows, current_settings)
+    target_pass = max(5, min(40, int(round(total * 0.04))))
+    target_lo = max(2, int(round(target_pass * 0.6)))
+    target_hi = max(target_lo + 1, int(round(target_pass * 1.6)))
+
+    base_max = float(current_settings.get('breakout_max_dist_pct', 4.0) or 4.0)
+    base_macd = float(current_settings.get('monthly_near_macd_pct', 0.08) or 0.08)
+    base_ao = float(current_settings.get('monthly_near_ao_floor', -0.25) or -0.25)
+
+    max_opts = sorted(set([
+        round(max(1.0, min(12.0, base_max + d)), 2)
+        for d in (-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0)
+    ]))
+    macd_opts = sorted(set([
+        round(max(0.02, min(0.25, base_macd + d)), 3)
+        for d in (-0.02, 0.0, 0.02, 0.04, 0.06)
+    ]))
+    ao_opts = sorted(set([
+        round(max(-1.5, min(0.2, base_ao + d)), 3)
+        for d in (0.2, 0.1, 0.0, -0.1, -0.2, -0.3)
+    ]))
+
+    # Preserve user's minimum breakout proximity floor.
+    min_dist = float(current_settings.get('breakout_min_dist_pct', 0.2) or 0.2)
+    max_opts = [x for x in max_opts if x > min_dist]
+    if not max_opts:
+        max_opts = [max(min_dist + 0.1, 1.0)]
+
+    best = {
+        'score': float('inf'),
+        'pass_count': current_pass,
+        'settings': dict(current_settings),
+    }
+
+    for mx in max_opts:
+        for mp in macd_opts:
+            for ao in ao_opts:
+                trial = dict(current_settings)
+                trial['breakout_max_dist_pct'] = float(mx)
+                trial['monthly_near_macd_pct'] = float(mp)
+                trial['monthly_near_ao_floor'] = float(ao)
+                pcount = _hard_gate_pass_count(rows, trial)
+
+                # Primary objective: stay inside a practical pass band.
+                if target_lo <= pcount <= target_hi:
+                    band_penalty = 0.0
+                else:
+                    band_penalty = min(abs(pcount - target_lo), abs(pcount - target_hi))
+
+                # Secondary objective: avoid unnecessary drift from current settings.
+                drift = (
+                    abs(float(mx) - base_max) * 0.35
+                    + abs(float(mp) - base_macd) * 18.0
+                    + abs(float(ao) - base_ao) * 3.0
+                )
+                score = band_penalty + drift
+                if score < best['score']:
+                    best = {
+                        'score': score,
+                        'pass_count': pcount,
+                        'settings': trial,
+                    }
+
+    suggested = dict(best['settings'])
+    updated = (
+        round(float(suggested.get('breakout_max_dist_pct', base_max)), 4) != round(base_max, 4)
+        or round(float(suggested.get('monthly_near_macd_pct', base_macd)), 4) != round(base_macd, 4)
+        or round(float(suggested.get('monthly_near_ao_floor', base_ao)), 4) != round(base_ao, 4)
+    )
+    if current_pass >= target_lo and current_pass <= target_hi:
+        # Already in healthy band; do not auto-change.
+        updated = False
+        suggested = dict(current_settings)
+
+    return {
+        'updated': bool(updated),
+        'reason': (
+            f"Current pass {current_pass}/{total}; target band {target_lo}-{target_hi}."
+            if not updated
+            else f"Adjusted hard gate from {current_pass}/{total} to {int(best['pass_count'])}/{total} passers."
+        ),
+        'current_pass': int(current_pass),
+        'target_pass': int(target_pass),
+        'target_band': [int(target_lo), int(target_hi)],
+        'suggested_pass': int(best['pass_count']),
+        'suggested': suggested,
+    }
+
+
+def _ai_tuning_note(
+    total_rows: int,
+    tuning: Dict[str, Any],
+    current_settings: Dict[str, Any],
+) -> str:
+    """Optional short AI note explaining threshold tuning changes."""
+    try:
+        ai_clients = _get_ai_clients()
+        openai_client = ai_clients.get('openai_client')
+        if openai_client is None:
+            return ""
+        ai_cfg = ai_clients.get('ai_config', {}) or {}
+        model = str(ai_cfg.get('model', 'grok-3-fast') or 'grok-3-fast')
+        payload = {
+            'rows': int(total_rows or 0),
+            'current_pass': int(tuning.get('current_pass', 0) or 0),
+            'suggested_pass': int(tuning.get('suggested_pass', 0) or 0),
+            'target_band': tuning.get('target_band', []),
+            'current': {
+                'breakout_max_dist_pct': float(current_settings.get('breakout_max_dist_pct', 0) or 0),
+                'monthly_near_macd_pct': float(current_settings.get('monthly_near_macd_pct', 0) or 0),
+                'monthly_near_ao_floor': float(current_settings.get('monthly_near_ao_floor', 0) or 0),
+            },
+            'suggested': {
+                'breakout_max_dist_pct': float((tuning.get('suggested', {}) or {}).get('breakout_max_dist_pct', 0) or 0),
+                'monthly_near_macd_pct': float((tuning.get('suggested', {}) or {}).get('monthly_near_macd_pct', 0) or 0),
+                'monthly_near_ao_floor': float((tuning.get('suggested', {}) or {}).get('monthly_near_ao_floor', 0) or 0),
+            },
+        }
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Return one concise sentence (<=180 chars), no markdown."},
+                {"role": "user", "content": f"Explain this trade-gate tuning change for a trader: {payload}"},
+            ],
+            max_tokens=80,
+            temperature=0.2,
+            timeout=12,
+        )
+        msg = str(resp.choices[0].message.content or '').strip()
+        return msg[:180]
+    except Exception:
+        return ""
 
 
 def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any]) -> bool:
@@ -3397,6 +3778,9 @@ def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any])
     earn_block_days = int(settings.get('earn_block_days', 7) or 7)
     require_ready = bool(settings.get('require_ready', True))
     include_watch_only = bool(settings.get('include_watch_only', False))
+
+    if bool(row.get('hard_gate_pass', True)) is False:
+        return False
 
     entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
     stop = float(row.get('suggested_stop_loss', 0) or 0)
@@ -3482,6 +3866,14 @@ def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
         "summary": str(candidate.get('summary', '') or ''),
         "sector": str(candidate.get('sector', '') or ''),
         "sector_phase": str(candidate.get('sector_phase', '') or ''),
+        "daily_macd_cross_recent": bool(candidate.get('daily_macd_cross_recent', False)),
+        "daily_ao_positive": bool(candidate.get('daily_ao_positive', False)),
+        "daily_ao_zero_cross_found": bool(candidate.get('daily_ao_zero_cross_found', False)),
+        "weekly_bullish": bool(candidate.get('weekly_bullish', False)),
+        "monthly_macd_bullish": bool(candidate.get('monthly_macd_bullish', False)),
+        "monthly_ao_positive": bool(candidate.get('monthly_ao_positive', False)),
+        "monthly_ao_cross_up": bool(candidate.get('monthly_ao_cross_up', False)),
+        "resistance_distance_pct": candidate.get('resistance_distance_pct'),
         "earn_days": int(candidate.get('earn_days', 999) or 999),
         "earn_source": str(candidate.get('earn_source', '') or ''),
         "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
@@ -3668,9 +4060,10 @@ def _run_trade_finder_workflow(
     ai_clients = _get_ai_clients()
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
+    quality_settings = _trade_quality_settings()
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
-    # Full-quality mode: when 0, evaluate all candidates with AI.
-    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else min(ai_top_n_cfg, len(base_candidates))
+    # AI ranks only deterministic hard-gate passers.
+    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else max(0, ai_top_n_cfg)
     ai_budget_sec = float(st.session_state.get('trade_finder_ai_budget_sec', 30.0) or 0.0)
     ai_deadline_ts = (time.time() + ai_budget_sec) if ai_budget_sec > 0 else 0.0
     ai_cache_ttl_sec = 6 * 60 * 60
@@ -3678,6 +4071,14 @@ def _run_trade_finder_workflow(
     ai_eval_cache = st.session_state.get('_tf_ai_eval_cache', {}) or {}
     provider_counts: Dict[str, int] = {}
     fallback_counts: Dict[str, int] = {}
+    hard_gate_fail_counts: Dict[str, int] = {}
+    hard_gate_pass_count = 0
+    hard_gate_relaxed_pass_count = 0
+    ai_ranked_count = 0
+    relaxed_settings = dict(quality_settings)
+    relaxed_settings['breakout_max_dist_pct'] = float(quality_settings.get('breakout_max_dist_pct', 4.0) or 4.0) + 1.5
+    relaxed_settings['monthly_near_macd_pct'] = float(quality_settings.get('monthly_near_macd_pct', 0.08) or 0.08) + 0.03
+    relaxed_settings['monthly_near_ao_floor'] = float(quality_settings.get('monthly_near_ao_floor', -0.25) or -0.25) - 0.20
     _t0 = time.time()
     _tf_progress = None
     if not callable(ai_progress_cb):
@@ -3754,6 +4155,25 @@ def _run_trade_finder_workflow(
             confidence=earn_confidence,
             next_earnings=earn_date,
         )
+        gate_seed = dict(c)
+        gate_seed.update({
+            'earn_date': earn_date,
+            'earn_days': earn_days,
+            'earn_source': earn_source,
+            'earn_confidence': earn_confidence,
+            'earn_trusted': bool(earn_trusted),
+        })
+        gate_eval = _evaluate_trade_finder_hard_gate(gate_seed, quality_settings)
+        gate_pass = bool(gate_eval.get('pass', False))
+        if gate_pass:
+            hard_gate_pass_count += 1
+        else:
+            for _code in (gate_eval.get('fail_codes', []) or []):
+                hard_gate_fail_counts[_code] = int(hard_gate_fail_counts.get(_code, 0) + 1)
+            gate_eval_relaxed = _evaluate_trade_finder_hard_gate(gate_seed, relaxed_settings)
+            if bool(gate_eval_relaxed.get('pass', False)):
+                hard_gate_relaxed_pass_count += 1
+
         cand_sig = _trade_finder_candidate_signature(c)
         cache_entry = ai_eval_cache.get(ticker, {}) if isinstance(ai_eval_cache, dict) else {}
         cached_sig = str(cache_entry.get('signature', '') or '')
@@ -3766,52 +4186,75 @@ def _run_trade_finder_workflow(
             and (time.time() - cached_ts) <= ai_cache_ttl_sec
         )
 
-        if i < ai_top_n:
-            if cached_valid:
-                ai_rec = dict(cached_ai)
-                ai_rec['fallback_reason'] = 'cached_ai_eval'
-            else:
-                earn_days_now = int(earn_days or 999)
-                if 0 <= earn_days_now <= 7:
-                    ai_rec = _heuristic_trade_finder_ai(c)
-                    ai_rec['provider'] = 'system'
-                    ai_rec['ai_buy_recommendation'] = 'Skip'
-                    ai_rec['fallback_reason'] = 'earnings_hard_block'
-                    ai_rec['rationale'] = f"PASS due to earnings in {earn_days_now}d; avoid pre-event gap risk."
-                elif not earn_trusted:
-                    ai_rec = _heuristic_trade_finder_ai(c)
-                    ai_rec['provider'] = 'system'
-                    ai_rec['ai_buy_recommendation'] = 'Watch Only'
-                    ai_rec['fallback_reason'] = 'earnings_unverified'
-                    ai_rec['rationale'] = "Earnings date unverified; refresh earnings sources before considering entry."
-                elif ai_deadline_ts and time.time() > ai_deadline_ts:
-                    ai_rec = _heuristic_trade_finder_ai(c)
-                    ai_rec['provider'] = 'system'
-                    ai_rec['fallback_reason'] = 'ai_time_budget'
-                else:
-                    ai_rec = _grok_trade_finder_assessment(c, ai_clients)
-                    # Cache successful model-backed evaluations for fast reruns.
-                    if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
-                        ai_eval_cache[ticker] = {
-                            'signature': cand_sig,
-                            'ts': time.time(),
-                            'ai_rec': dict(ai_rec),
-                        }
-                    elif cached_valid:
-                        ai_rec = dict(cached_ai)
-                        ai_rec['fallback_reason'] = 'cached_ai_eval'
+        if not gate_pass:
+            ai_rec = _heuristic_trade_finder_ai(c)
+            ai_rec['provider'] = 'system'
+            ai_rec['ai_buy_recommendation'] = 'Skip'
+            ai_rec['fallback_reason'] = 'hard_gate_failed'
+            ai_rec['rationale'] = "Hard gate failed: " + "; ".join((gate_eval.get('fail_reasons', []) or [])[:3])
         else:
-            # Cap mode: still show best cached AI evaluation when available.
-            if cached_valid:
-                ai_rec = dict(cached_ai)
-                ai_rec['fallback_reason'] = 'cached_ai_eval'
+            if ai_ranked_count < ai_top_n:
+                ai_ranked_count += 1
+                if cached_valid:
+                    ai_rec = dict(cached_ai)
+                    ai_rec['fallback_reason'] = 'cached_ai_eval'
+                else:
+                    earn_days_now = int(earn_days or 999)
+                    if 0 <= earn_days_now <= 7:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['ai_buy_recommendation'] = 'Skip'
+                        ai_rec['fallback_reason'] = 'earnings_hard_block'
+                        ai_rec['rationale'] = f"PASS due to earnings in {earn_days_now}d; avoid pre-event gap risk."
+                    elif not earn_trusted:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['ai_buy_recommendation'] = 'Watch Only'
+                        ai_rec['fallback_reason'] = 'earnings_unverified'
+                        ai_rec['rationale'] = "Earnings date unverified; refresh earnings sources before considering entry."
+                    elif ai_deadline_ts and time.time() > ai_deadline_ts:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['fallback_reason'] = 'ai_time_budget'
+                    else:
+                        ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+                        # Cache successful model-backed evaluations for fast reruns.
+                        if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
+                            ai_eval_cache[ticker] = {
+                                'signature': cand_sig,
+                                'ts': time.time(),
+                                'ai_rec': dict(ai_rec),
+                            }
+                        elif cached_valid:
+                            ai_rec = dict(cached_ai)
+                            ai_rec['fallback_reason'] = 'cached_ai_eval'
             else:
-                ai_rec = _heuristic_trade_finder_ai(c)
-                ai_rec['provider'] = 'system'
-                ai_rec['fallback_reason'] = 'ai_top_n_limit'
+                # Cap mode: still show best cached AI evaluation when available.
+                if cached_valid:
+                    ai_rec = dict(cached_ai)
+                    ai_rec['fallback_reason'] = 'cached_ai_eval'
+                else:
+                    ai_rec = _heuristic_trade_finder_ai(c)
+                    ai_rec['provider'] = 'system'
+                    ai_rec['fallback_reason'] = 'ai_top_n_limit'
         entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
         stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
         target = float(ai_rec.get('suggested_target', 0) or 0)
+        support_ctx = derive_support_stop_levels(
+            entry=entry,
+            current_stop=stop,
+            support_price=float(c.get('support_price', 0) or 0),
+        )
+        support_price = float(support_ctx.get('support_price', 0) or 0)
+        support_distance_pct = float(support_ctx.get('support_distance_pct', 0) or 0)
+        support_stop_price = float(support_ctx.get('support_stop_price', 0) or 0)
+        support_stop = float(support_ctx.get('recommended_stop', 0) or 0)
+        stop_basis = str(support_ctx.get('stop_basis', '') or '')
+        if support_stop > 0 and entry > 0 and support_stop < entry:
+            stop = round(support_stop, 2)
+        if target > 0 and entry > 0 and stop > 0 and target <= entry:
+            # Keep a minimum 2R geometry when stop adjustment moves risk profile.
+            target = round(entry + ((entry - stop) * 2.0), 2)
         ai_rr = float(ai_rec.get('risk_reward', 0) or 0)
         # Canonical R:R is always derived from entry/stop/target levels.
         rr = _calc_rr(entry, stop, target)
@@ -3866,7 +4309,11 @@ def _run_trade_finder_workflow(
             earn_trusted=bool(earn_trusted),
             fallback_reason=fallback_reason,
             is_gold_source=bool(gold.get('is_gold_source', False)),
+            support_price=support_price,
+            stop_price=stop,
+            stop_basis=stop_basis,
         )
+        _decision_gate_status = gate.status if gate_pass else "NO_TRADE"
         rows.append({
             'ticker': ticker,
             'trade_finder_run_id': run_id,
@@ -3884,6 +4331,10 @@ def _run_trade_finder_workflow(
             'suggested_entry': round(entry, 2),
             'suggested_stop_loss': round(stop, 2),
             'suggested_target': round(target, 2),
+            'support_price': round(support_price, 2) if support_price > 0 else None,
+            'support_distance_pct': round(support_distance_pct, 2) if support_distance_pct > 0 else None,
+            'support_stop_price': round(support_stop_price, 2) if support_stop_price > 0 else None,
+            'stop_basis': stop_basis,
             'risk_reward': round(float(gold.get('risk_reward', rr) or rr), 2),
             'ai_reported_rr': round(ai_rr, 2),
             'rank_score': float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
@@ -3896,8 +4347,21 @@ def _run_trade_finder_workflow(
             'provider': gold.get('provider', ai_rec.get('provider', 'system')),
             'fallback_reason': fallback_reason,
             'fallback_error': fallback_error,
+            'hard_gate_pass': bool(gate_pass),
+            'hard_gate_monthly_tag': str(gate_eval.get('monthly_tag', '') or ''),
+            'hard_gate_fail_codes': list(gate_eval.get('fail_codes', []) or []),
+            'hard_gate_fail_reasons': list(gate_eval.get('fail_reasons', []) or []),
             'sector': sector_name,
             'sector_phase': sector_phase,
+            'daily_macd_cross_recent': bool(c.get('daily_macd_cross_recent', False)),
+            'daily_ao_positive': bool(c.get('daily_ao_positive', False)),
+            'daily_ao_zero_cross_found': bool(c.get('daily_ao_zero_cross_found', False)),
+            'weekly_bullish': bool(c.get('weekly_bullish', False)),
+            'monthly_bullish': bool(c.get('monthly_bullish', False)),
+            'monthly_macd_bullish': bool(c.get('monthly_macd_bullish', False)),
+            'monthly_ao_positive': bool(c.get('monthly_ao_positive', False)),
+            'resistance_price': c.get('resistance_price'),
+            'resistance_distance_pct': c.get('resistance_distance_pct'),
             'decision_card': build_trade_decision_card(
                 ticker=ticker,
                 source="trade_finder",
@@ -3910,7 +4374,7 @@ def _run_trade_finder_workflow(
                 target=target,
                 rank_score=float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
                 regime=snap.regime,
-                gate_status=gate.status,
+                gate_status=_decision_gate_status,
                 reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
                 ai_rationale=str(gold.get('note', '') or ai_rec.get('rationale', '') or ''),
                 sector_phase=sector_phase,
@@ -3920,6 +4384,7 @@ def _run_trade_finder_workflow(
                     f"conv={int(c.get('conviction', 0) or 0)}",
                     f"phase={sector_phase}",
                     f"rr={float(gold.get('risk_reward', rr) or rr):.2f}",
+                    f"hard_gate={'PASS' if gate_pass else 'FAIL'}",
                 ],
             ).to_dict(),
         })
@@ -3947,6 +4412,11 @@ def _run_trade_finder_workflow(
         'provider': rows[0].get('provider', 'system') if rows else 'system',
         'elapsed_sec': elapsed,
         'input_candidates': len(base_candidates),
+        'hard_gate_pass_count': int(hard_gate_pass_count),
+        'hard_gate_fail_count': int(max(0, len(base_candidates) - hard_gate_pass_count)),
+        'hard_gate_fail_counts': hard_gate_fail_counts,
+        'hard_gate_relaxed_pass_count': int(hard_gate_relaxed_pass_count),
+        'ai_ranked_count': int(ai_ranked_count),
         'provider_counts': provider_counts,
         'fallback_counts': fallback_counts,
         'ai_top_n': ai_top_n,
@@ -3969,14 +4439,17 @@ def _run_trade_finder_workflow(
         'kind': 'trade_finder',
         'candidates_in': len(base_candidates),
         'candidates_out': len(rows),
+        'hard_gate_pass': int(hard_gate_pass_count),
+        'ai_ranked': int(ai_ranked_count),
         'sec': round(elapsed, 3),
         'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
     })
     st.session_state['trade_finder_last_status'] = {
         'level': 'success' if len(rows) > 0 else 'info',
         'message': (
-            f"AI ranking complete: {len(rows)} ranked candidate(s) "
-            f"from {len(base_candidates)} scanner candidate(s)."
+            f"Trade Finder complete: {hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
+            f"AI ranked {ai_ranked_count}; {len(rows)} row(s) ready for review. "
+            f"Relaxed-profile passers: {hard_gate_relaxed_pass_count}."
         ),
         'ts': time.time(),
     }
@@ -3984,7 +4457,8 @@ def _run_trade_finder_workflow(
         try:
             ai_progress_cb(
                 100,
-                f"AI ranking complete: {len(rows)} ranked from {len(base_candidates)} candidate(s).",
+                f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(base_candidates)}, "
+                f"AI ranked {ai_ranked_count}, relaxed-profile passers {hard_gate_relaxed_pass_count}.",
             )
         except Exception:
             pass
@@ -4122,6 +4596,21 @@ def render_trade_finder_tab():
     _earn_touched = _backfill_trade_finder_earnings(rows, verify_limit=15)
     if _earn_touched > 0:
         _rows_touched = True
+    _hg_settings = _trade_quality_settings()
+    for _r in rows:
+        _need_eval = (
+            'hard_gate_pass' not in _r
+            or 'hard_gate_fail_codes' not in _r
+            or 'hard_gate_monthly_tag' not in _r
+        )
+        if not _need_eval:
+            continue
+        _gate_eval = _evaluate_trade_finder_hard_gate(_r, _hg_settings)
+        _r['hard_gate_pass'] = bool(_gate_eval.get('pass', False))
+        _r['hard_gate_monthly_tag'] = str(_gate_eval.get('monthly_tag', '') or '')
+        _r['hard_gate_fail_codes'] = list(_gate_eval.get('fail_codes', []) or [])
+        _r['hard_gate_fail_reasons'] = list(_gate_eval.get('fail_reasons', []) or [])
+        _rows_touched = True
     if _rows_touched:
         st.session_state['trade_finder_results'] = results
 
@@ -4180,6 +4669,79 @@ def render_trade_finder_tab():
         key="trade_include_watch_only",
         help="When enabled, Watch Only AI ratings are included if other gates pass.",
     )
+    with st.expander("🎯 Breakout Hard Gate Rules", expanded=False):
+        hg1, hg2 = st.columns(2)
+        with hg1:
+            st.number_input(
+                "Breakout min distance to resistance (%)",
+                min_value=0.0,
+                max_value=10.0,
+                step=0.1,
+                format="%.1f",
+                key="trade_breakout_min_dist_pct",
+                help="Ticker must be close enough to key resistance to support breakout-alert workflow.",
+            )
+            st.number_input(
+                "Monthly near-green MACD tolerance",
+                min_value=0.0,
+                max_value=0.5,
+                step=0.01,
+                format="%.2f",
+                key="trade_monthly_near_macd_pct",
+                help="Allows monthly MACD to be slightly below signal while still qualifying as near-green.",
+            )
+        with hg2:
+            st.number_input(
+                "Breakout max distance to resistance (%)",
+                min_value=0.1,
+                max_value=20.0,
+                step=0.1,
+                format="%.1f",
+                key="trade_breakout_max_dist_pct",
+                help="Ticker too far below resistance is filtered out for breakout focus.",
+            )
+            st.number_input(
+                "Monthly AO near-green floor",
+                min_value=-5.0,
+                max_value=1.0,
+                step=0.05,
+                format="%.2f",
+                key="trade_monthly_near_ao_floor",
+                help="Minimum monthly AO value allowed for near-green monthly setup.",
+            )
+        _rows_for_tune = list(results.get('rows', []) or [])
+        _tune_col1, _tune_col2 = st.columns([1, 2])
+        with _tune_col1:
+            if st.button("🧠 Auto-Calibrate Gate", key="tf_auto_calibrate_gate", width="stretch", help="Tune hard-gate thresholds from latest run."):
+                _curr = _trade_quality_settings()
+                _tuning = _suggest_trade_gate_settings(_rows_for_tune, _curr)
+                st.session_state['trade_gate_tuning_last'] = _tuning
+                if bool(_tuning.get('updated', False)):
+                    _s = _tuning.get('suggested', {}) or {}
+                    st.session_state['trade_breakout_max_dist_pct'] = float(_s.get('breakout_max_dist_pct', _curr.get('breakout_max_dist_pct', 4.0)) or _curr.get('breakout_max_dist_pct', 4.0))
+                    st.session_state['trade_monthly_near_macd_pct'] = float(_s.get('monthly_near_macd_pct', _curr.get('monthly_near_macd_pct', 0.08)) or _curr.get('monthly_near_macd_pct', 0.08))
+                    st.session_state['trade_monthly_near_ao_floor'] = float(_s.get('monthly_near_ao_floor', _curr.get('monthly_near_ao_floor', -0.25)) or _curr.get('monthly_near_ao_floor', -0.25))
+                    _ai_note = _ai_tuning_note(len(_rows_for_tune), _tuning, _curr)
+                    if _ai_note:
+                        st.session_state['trade_gate_tuning_ai_note'] = _ai_note
+                    else:
+                        st.session_state.pop('trade_gate_tuning_ai_note', None)
+                    st.success(str(_tuning.get('reason', 'Hard gate auto-calibrated.')))
+                    st.rerun()
+                else:
+                    st.info(str(_tuning.get('reason', 'Gate already within target selectivity band.')))
+        with _tune_col2:
+            _last_tune = st.session_state.get('trade_gate_tuning_last', {}) or {}
+            if _last_tune:
+                st.caption(
+                    f"Calibration: current={int(_last_tune.get('current_pass', 0) or 0)} | "
+                    f"suggested={int(_last_tune.get('suggested_pass', 0) or 0)} | "
+                    f"target band={(_last_tune.get('target_band', [0, 0]) or [0, 0])[0]}-"
+                    f"{(_last_tune.get('target_band', [0, 0]) or [0, 0])[1]}"
+                )
+                _ai_note = str(st.session_state.get('trade_gate_tuning_ai_note', '') or '').strip()
+                if _ai_note:
+                    st.caption(f"AI note: {_ai_note}")
     if 'trade_finder_ai_top_n' not in st.session_state:
         st.session_state['trade_finder_ai_top_n'] = 0  # 0 = all candidates
     st.number_input(
@@ -4200,21 +4762,41 @@ def render_trade_finder_tab():
     )
     settings = _trade_quality_settings()
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
+    hard_failed_rows = [r for r in rows if bool(r.get('hard_gate_pass', True)) is False]
 
     st.caption(
         f"Generated: {results.get('generated_at_iso', '')} | "
         f"Run: {results.get('run_id', 'n/a') or 'n/a'} | "
-        f"Candidates: {len(rows)} | Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
+        f"Candidates: {len(rows)} | Hard-gate pass: {int(results.get('hard_gate_pass_count', 0) or 0)} | "
+        f"Relaxed-profile pass: {int(results.get('hard_gate_relaxed_pass_count', 0) or 0)} | "
+        f"Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
         f"Provider: {results.get('provider', 'system')}"
     )
     st.caption("Snapshot is saved daily and restored after app restart.")
     _pc = results.get('provider_counts', {}) or {}
     _fc = results.get('fallback_counts', {}) or {}
+    _hfc = results.get('hard_gate_fail_counts', {}) or {}
     _pn = int(results.get('ai_top_n', st.session_state.get('trade_finder_ai_top_n', 12)) or 12)
     if _pc:
         st.caption("Provider mix: " + ", ".join([f"{k}={v}" for k, v in sorted(_pc.items())]))
     if _fc:
         st.caption("AI fallback reasons: " + ", ".join([f"{k}={v}" for k, v in sorted(_fc.items())]) + f" | AI Top N={_pn}")
+    if _hfc:
+        st.caption("Hard-gate fails: " + ", ".join([f"{k}={v}" for k, v in sorted(_hfc.items())]))
+    if int(results.get('hard_gate_pass_count', 0) or 0) == 0 and int(results.get('hard_gate_relaxed_pass_count', 0) or 0) > 0:
+        st.warning(
+            "Strict hard gate returned zero passers. "
+            f"A slightly relaxed profile would pass {int(results.get('hard_gate_relaxed_pass_count', 0) or 0)} ticker(s). "
+            "Consider widening breakout distance and monthly near-green tolerance."
+        )
+    if hard_failed_rows:
+        with st.expander(f"🚫 Hard-Gate Failures ({len(hard_failed_rows)})", expanded=False):
+            st.caption("These tickers were scanned but blocked before AI ranking due to deterministic setup rules.")
+            for _rf in hard_failed_rows[:80]:
+                _t = str(_rf.get('ticker', '')).upper().strip()
+                _codes = ", ".join([str(x) for x in (_rf.get('hard_gate_fail_codes', []) or [])[:4]])
+                _reasons = "; ".join([str(x) for x in (_rf.get('hard_gate_fail_reasons', []) or [])[:2]])
+                st.caption(f"{_t}: {_codes} | {_reasons}")
     _scope = results.get('scan_scope', {}) or {}
     if _scope:
         _flt = _scope.get('filtered_counts', {}) or {}
@@ -4315,8 +4897,14 @@ def render_trade_finder_tab():
             'earnings_untrusted': 0,
             'earnings_blocked': 0,
             'not_ready': 0,
+            'hard_gate_failed': 0,
         }
+        hard_gate_reason_counts: Dict[str, int] = {}
         for r in rows:
+            if bool(r.get('hard_gate_pass', True)) is False:
+                fail['hard_gate_failed'] += 1
+                for _code in (r.get('hard_gate_fail_codes', []) or []):
+                    hard_gate_reason_counts[_code] = int(hard_gate_reason_counts.get(_code, 0) + 1)
             entry = float(r.get('suggested_entry', r.get('price', 0)) or 0)
             stop = float(r.get('suggested_stop_loss', 0) or 0)
             target = float(r.get('suggested_target', 0) or 0)
@@ -4356,17 +4944,21 @@ def render_trade_finder_tab():
             if any(v > 0 for v in fail.values())
             else "Filter diagnostics: no hard failures detected (check data freshness)."
         )
+        if hard_gate_reason_counts:
+            st.caption("Hard-gate reason detail: " + ", ".join([f"{k}={v}" for k, v in sorted(hard_gate_reason_counts.items())]))
     else:
         st.markdown("### Qualified Signals")
         st.caption("Signal Verdict uses model/system scoring. Use actions to review chart or place trade.")
 
         def _open_candidate_for_action(_r: Dict[str, Any], detail_tab: int):
             _ticker = str(_r.get('ticker', '')).upper().strip()
-            st.session_state['trade_finder_selected_trade'] = build_trade_finder_selection(
+            _selection = build_trade_finder_selection(
                 _r,
                 generated_at_iso=str(results.get('generated_at_iso', '') or ''),
                 run_id=str(results.get('run_id', '') or ''),
             )
+            _selection['prefill_token'] = f"{_ticker}:{int(time.time() * 1000)}"
+            st.session_state['trade_finder_selected_trade'] = _selection
             st.session_state['trade_finder_last_action'] = 'chart' if int(detail_tab) == 1 else 'trade'
             st.session_state['trade_finder_last_ticker'] = _ticker
             if int(detail_tab) == 1:
@@ -4515,8 +5107,23 @@ def render_trade_finder_tab():
                             f"S ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
                             f"T ${float(r.get('suggested_target', 0) or 0):.2f}"
                         )
+                        _sup = float(r.get('support_price', 0) or 0)
+                        _sup_stop = float(r.get('support_stop_price', 0) or 0)
+                        _sup_dist = r.get('support_distance_pct', None)
+                        _stop_basis = str(r.get('stop_basis', '') or '')
+                        if _sup > 0:
+                            _dist_txt = f" ({float(_sup_dist):.2f}% below entry)" if _sup_dist is not None else ""
+                            st.caption(
+                                f"{ticker} Support ${_sup:.2f}{_dist_txt} | Stop plan ${(_sup_stop if _sup_stop > 0 else float(r.get('suggested_stop_loss', 0) or 0)):.2f} [{_stop_basis or 'support plan'}]"
+                            )
                         if signal_reason:
                             st.caption(f"{ticker} Scanner Context: {signal_reason}")
+                        _hg_monthly = str(r.get('hard_gate_monthly_tag', '') or '')
+                        _hg_dist = r.get('resistance_distance_pct', None)
+                        if _hg_dist is not None:
+                            st.caption(f"{ticker} Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'} | resistance distance={float(_hg_dist):.2f}%")
+                        else:
+                            st.caption(f"{ticker} Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'}")
                         if earn_source:
                             _ec = f" [{earn_confidence}]" if earn_confidence else ""
                             st.caption(f"{ticker} Earnings source: {earn_source}{_ec}")
@@ -4551,7 +5158,22 @@ def render_trade_finder_tab():
                                 f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
                                 f"R:R {rr:.2f}:1"
                             )
+                            _sup = float(r.get('support_price', 0) or 0)
+                            _sup_stop = float(r.get('support_stop_price', 0) or 0)
+                            _sup_dist = r.get('support_distance_pct', None)
+                            _stop_basis = str(r.get('stop_basis', '') or '')
+                            if _sup > 0:
+                                _dist_txt = f" ({float(_sup_dist):.2f}% below entry)" if _sup_dist is not None else ""
+                                st.caption(
+                                    f"Support ${_sup:.2f}{_dist_txt} | Stop plan ${(_sup_stop if _sup_stop > 0 else float(r.get('suggested_stop_loss', 0) or 0)):.2f} [{_stop_basis or 'support plan'}]"
+                                )
                             st.caption(f"Scanner Context: {signal_reason}")
+                            _hg_monthly = str(r.get('hard_gate_monthly_tag', '') or '')
+                            _hg_dist = r.get('resistance_distance_pct', None)
+                            if _hg_dist is not None:
+                                st.caption(f"Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'} | resistance distance={float(_hg_dist):.2f}%")
+                            else:
+                                st.caption(f"Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'}")
                             if fallback_reason:
                                 st.caption(f"AI fallback: {fallback_reason}")
                                 if fallback_error:
@@ -4613,6 +5235,7 @@ def render_trade_finder_tab():
                         'reason': str(p.get('reason', '') or ''),
                         'ai_rationale': str(p.get('notes', '') or ''),
                         'provider': str(p.get('source', 'planned') or 'planned'),
+                        'prefill_token': f"{pt}:{int(time.time() * 1000)}",
                     }
                     st.session_state['default_detail_tab'] = 4
                     st.session_state['_switch_to_scanner_tab'] = True
@@ -8663,6 +9286,32 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     confirm_entry_key = f"confirm_entry_{ticker}"
     confirm_stop_key = f"confirm_stop_{ticker}"
     confirm_target_key = f"confirm_target_{ticker}"
+    tf_prefill_token = str(finder_for_ticker.get('prefill_token', '') or '').strip()
+    tf_prefill_applied_key = f"_tf_prefill_applied_{ticker}"
+
+    if finder_for_ticker and tf_prefill_token and st.session_state.get(tf_prefill_applied_key) != tf_prefill_token:
+        _pref_entry = float(finder_for_ticker.get('entry', selected_entry) or selected_entry or current_price or 0)
+        _pref_stop = float(finder_for_ticker.get('stop', selected_stop) or selected_stop or 0)
+        _pref_target = float(finder_for_ticker.get('target', selected_target) or selected_target or 0)
+        if _pref_entry > 0 and (_pref_stop <= 0 or _pref_stop >= _pref_entry):
+            _pref_stop = round(_pref_entry * 0.94, 2)
+        if _pref_entry > 0 and (_pref_target <= _pref_entry):
+            _pref_target = round(_pref_entry + ((_pref_entry - _pref_stop) * 2.0), 2)
+        _pref_dist = ((_pref_entry - _pref_stop) / _pref_entry * 100.0) if _pref_entry > 0 and _pref_stop > 0 else 0.0
+        _pref_dist = round(max(0.0, _pref_dist), 2)
+        st.session_state[default_source_key] = "AI Recommended"
+        st.session_state[entry_key] = float(_pref_entry)
+        st.session_state[stop_key] = float(_pref_stop)
+        st.session_state[target_key] = float(_pref_target)
+        st.session_state[confirm_entry_key] = float(_pref_entry)
+        st.session_state[confirm_stop_key] = float(_pref_stop)
+        st.session_state[confirm_target_key] = float(_pref_target)
+        st.session_state[pending_stop_dist_key] = float(_pref_dist)
+        st.session_state[stop_dist_prev_key] = float(_pref_dist)
+        st.session_state[stop_prev_key] = float(_pref_stop)
+        st.session_state[prev_source_key] = "AI Recommended"
+        st.session_state[tf_prefill_applied_key] = tf_prefill_token
+        st.rerun()
 
     if entry_key not in st.session_state:
         st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
@@ -8727,6 +9376,17 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     if recommended_stop_ref > 0:
         st.caption(f"Recommended Stop Loss ({recommended_stop_src}): ${recommended_stop_ref:.2f}")
+    _tf_support = float(finder_for_ticker.get('support_price', 0) or 0)
+    _tf_support_stop = float(finder_for_ticker.get('support_stop_price', 0) or 0)
+    _tf_stop_basis = str(finder_for_ticker.get('stop_basis', '') or '').replace('_', ' ')
+    if _tf_support > 0:
+        _sp = _tf_support_stop if _tf_support_stop > 0 else float(ai_levels.get('stop', 0) or 0)
+        _sd = finder_for_ticker.get('support_distance_pct', None)
+        _sd_txt = f" ({float(_sd):.2f}% below entry)" if _sd is not None else ""
+        st.caption(
+            f"Support-based plan: support ${_tf_support:.2f}{_sd_txt} | stop ${_sp:.2f}"
+            + (f" [{_tf_stop_basis}]" if _tf_stop_basis else "")
+        )
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         entry_price = st.number_input("Entry Price", step=0.01, format="%.2f", key=entry_key)
@@ -10744,6 +11404,11 @@ def render_executive_dashboard():
                         'provider': str(tr.get('provider', 'system') or 'system'),
                         'generated_at_iso': str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '')),
                         'trade_finder_run_id': str(tr.get('trade_finder_run_id', '') or (st.session_state.get('trade_finder_results', {}) or {}).get('run_id', '') or ''),
+                        'support_price': float(tr.get('support_price', 0) or 0),
+                        'support_distance_pct': float(tr.get('support_distance_pct', 0) or 0),
+                        'support_stop_price': float(tr.get('support_stop_price', 0) or 0),
+                        'stop_basis': str(tr.get('stop_basis', '') or ''),
+                        'prefill_token': f"{ticker}:{int(time.time() * 1000)}",
                     }
                     st.session_state['default_detail_tab'] = 4
                     st.session_state['_switch_to_scanner_tab'] = True
@@ -11203,6 +11868,7 @@ def render_executive_dashboard():
                         'reason': str(p.get('reason', '') or ''),
                         'ai_rationale': str(p.get('notes', '') or ''),
                         'provider': str(p.get('source', 'planned') or 'planned'),
+                        'prefill_token': f"{pticker}:{int(time.time() * 1000)}",
                     }
                     st.session_state['default_detail_tab'] = 4
                     st.session_state['_switch_to_scanner_tab'] = True
