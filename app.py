@@ -11162,16 +11162,41 @@ def render_executive_dashboard():
 
     with st.expander("🔥 Market Heat Map", expanded=False):
         heatmap_url = "https://stockanalysis.com/markets/heatmap/"
-        st.caption("Live market heat map embedded from Stock Analysis.")
+        st.caption("Live market heat map (embedded widget) + StockAnalysis fallback link.")
         st.markdown(f"[Open heat map in new tab]({heatmap_url})")
+        st.info("StockAnalysis blocks iframe embedding in many browsers. Using embedded TradingView heatmap below.")
         try:
             import streamlit.components.v1 as components
-            components.iframe(heatmap_url, height=620, scrolling=True)
-        except Exception as e:
-            st.info(
-                "Heat map embed is unavailable in this browser/session. "
-                f"Use the link above. ({str(e)[:120]})"
+            components.html(
+                """
+                <div class="tradingview-widget-container" style="height:620px;width:100%;">
+                  <div id="tradingview_heatmap_execdash" style="height:100%;width:100%;"></div>
+                  <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
+                  {
+                    "exchanges": [],
+                    "dataSource": "SPX500",
+                    "grouping": "sector",
+                    "blockSize": "market_cap_basic",
+                    "blockColor": "change",
+                    "locale": "en",
+                    "symbolUrl": "",
+                    "colorTheme": "dark",
+                    "hasTopBar": true,
+                    "isDataSetEnabled": true,
+                    "isZoomEnabled": true,
+                    "hasSymbolTooltip": true,
+                    "isMonoSize": false,
+                    "width": "100%",
+                    "height": "620"
+                  }
+                  </script>
+                </div>
+                """,
+                height=640,
+                scrolling=False,
             )
+        except Exception as e:
+            st.warning(f"Embedded widget unavailable in this session ({str(e)[:120]}). Use the link above.")
 
     candidate_rows = []
     if gate.allow_new_trades:
