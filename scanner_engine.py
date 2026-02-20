@@ -805,6 +805,9 @@ class TickerAnalysis:
 
     # Apex signal
     apex_buy: bool = False
+    apex_signal_days_ago: int = 999
+    apex_signal_tier: str = ''
+    apex_signal_regime: str = ''
 
     # Error
     error: str = None
@@ -825,6 +828,9 @@ class TickerAnalysis:
             'avg_volume_50d': self.avg_volume_50d,
             'volume_ratio': self.volume_ratio,
             'apex_buy': self.apex_buy,
+            'apex_signal_days_ago': self.apex_signal_days_ago,
+            'apex_signal_tier': self.apex_signal_tier,
+            'apex_signal_regime': self.apex_signal_regime,
             'error': self.error,
         }
 
@@ -929,23 +935,30 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
         from apex_signals import detect_apex_signals
         if weekly is not None and monthly is not None:
             spy = ticker_data.get('spy_daily')
-            apex = detect_apex_signals(daily, weekly, monthly, spy_daily=spy)
-            if apex and apex.get('signals'):
-                # Check if most recent signal is a buy and within last 5 bars
-                last_sig = apex['signals'][-1] if apex['signals'] else None
-                if last_sig and last_sig.get('type') == 'buy':
-                    signal_date = last_sig.get('date')
-                    if signal_date and len(daily) > 0:
-                        last_date = daily.index[-1]
-                        # Within last 5 trading days
-                        if hasattr(signal_date, 'date'):
-                            signal_date = signal_date
-                        try:
-                            days_ago = (last_date - signal_date).days
-                            if days_ago <= 7:  # 7 calendar days ~ 5 trading days
-                                result.apex_buy = True
-                        except Exception:
-                            pass
+            apex_signals = detect_apex_signals(
+                ticker=ticker,
+                daily_data=daily,
+                weekly_data=weekly,
+                monthly_data=monthly,
+                spy_data=spy,
+                vix_data=ticker_data.get('vix_daily'),
+            )
+            if apex_signals:
+                last_date = daily.index[-1] if len(daily) > 0 else None
+                active = [s for s in apex_signals if bool(getattr(s, 'is_active', False))]
+                ref_sig = active[-1] if active else apex_signals[-1]
+                sig_date = getattr(ref_sig, 'entry_date', None)
+                sig_days = 999
+                if sig_date is not None and last_date is not None:
+                    try:
+                        sig_days = max(0, int((last_date - sig_date).days))
+                    except Exception:
+                        sig_days = 999
+                result.apex_signal_days_ago = sig_days
+                result.apex_signal_tier = str(getattr(ref_sig, 'signal_tier', '') or '')
+                result.apex_signal_regime = str(getattr(ref_sig, 'monthly_regime', '') or '')
+                # APEX buy if a signal is still active or fired very recently.
+                result.apex_buy = bool(active) or sig_days <= 7
     except Exception:
         pass
 

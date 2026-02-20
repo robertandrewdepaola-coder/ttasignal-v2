@@ -2013,6 +2013,9 @@ def _run_scan(mode='all'):
                 'sector_phase': sector_phase,
                 'ao_divergence_active': r.ao_divergence_active,
                 'apex_buy': r.apex_buy,
+                'apex_signal_days_ago': int(getattr(r, 'apex_signal_days_ago', 999) or 999),
+                'apex_signal_tier': str(getattr(r, 'apex_signal_tier', '') or ''),
+                'apex_signal_regime': str(getattr(r, 'apex_signal_regime', '') or ''),
                 'volume_str': vol_str,
                 'volume_ratio': vol_ratio,
                 'earn_date': earn_date,
@@ -2384,6 +2387,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             rec = r.recommendation or {}
             q = r.quality or {}
             sig = r.signal or None
+            _mkt = (sig.market_filter if sig else {}) or {}
             _batch_earn = earnings_flags.get(r.ticker, {}) if isinstance(earnings_flags, dict) else {}
             _scan_earn = scan_earn_map.get(r.ticker, {}) if isinstance(scan_earn_map, dict) else {}
             _persisted_date = str(
@@ -2491,11 +2495,22 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'monthly_cross_up': bool(_monthly_macd.get('cross_up', False)),
                 'monthly_ao_value': float(_monthly_ao.get('value', 0.0) or 0.0),
                 'monthly_ao_cross_up': bool(_monthly_ao.get('cross_up', False)),
+                'market_spy_above_200': bool(_mkt.get('spy_above_200', True)),
+                'market_vix_below_30': bool(_mkt.get('vix_below_30', True)),
+                'market_vix_close': (
+                    float(_mkt.get('vix_close'))
+                    if _mkt.get('vix_close') is not None and str(_mkt.get('vix_close')) != ''
+                    else None
+                ),
                 'resistance_price': _res_price if _res_price > 0 else None,
                 'resistance_distance_pct': _res_dist,
                 'resistance_assessment': str(_ores.get('assessment', '') or '') if isinstance(_ores, dict) else '',
                 'support_price': round(_support_price, 2) if _support_price > 0 else None,
                 'support_distance_pct': round(float(_support_dist), 2) if _support_dist is not None else None,
+                'apex_buy': bool(getattr(r, 'apex_buy', False)),
+                'apex_signal_days_ago': int(getattr(r, 'apex_signal_days_ago', 999) or 999),
+                'apex_signal_tier': str(getattr(r, 'apex_signal_tier', '') or ''),
+                'apex_signal_regime': str(getattr(r, 'apex_signal_regime', '') or ''),
                 'is_open_position': r.ticker in open_tickers,
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
                 'source_watchlists': ticker_sources.get(r.ticker, []),
@@ -2535,11 +2550,18 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'monthly_cross_up': bool(row.get('monthly_cross_up', False)),
                     'monthly_ao_value': float(row.get('monthly_ao_value', 0.0) or 0.0),
                     'monthly_ao_cross_up': bool(row.get('monthly_ao_cross_up', False)),
+                    'market_spy_above_200': bool(row.get('market_spy_above_200', True)),
+                    'market_vix_below_30': bool(row.get('market_vix_below_30', True)),
+                    'market_vix_close': row.get('market_vix_close'),
                     'resistance_price': row.get('resistance_price'),
                     'resistance_distance_pct': row.get('resistance_distance_pct'),
                     'resistance_assessment': row.get('resistance_assessment', ''),
                     'support_price': row.get('support_price'),
                     'support_distance_pct': row.get('support_distance_pct'),
+                    'apex_buy': bool(row.get('apex_buy', False)),
+                    'apex_signal_days_ago': int(row.get('apex_signal_days_ago', 999) or 999),
+                    'apex_signal_tier': str(row.get('apex_signal_tier', '') or ''),
+                    'apex_signal_regime': str(row.get('apex_signal_regime', '') or ''),
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
@@ -3197,6 +3219,10 @@ def _build_trade_finder_analysis_note(
     support_price: float = 0.0,
     stop_price: float = 0.0,
     stop_basis: str = "",
+    apex_buy: bool = False,
+    apex_days_ago: int = 999,
+    apex_tier: str = "",
+    apex_regime: str = "",
 ) -> str:
     """Build consistent, trader-readable Trade Finder decision note."""
     parts: List[str] = []
@@ -3246,6 +3272,17 @@ def _build_trade_finder_analysis_note(
         parts.append(f"Sector status: IN ROTATION ({sec} leading)" if sec else "Sector status: IN ROTATION")
     elif sec:
         parts.append(f"Sector: {sec}")
+
+    if apex_buy:
+        _tier = str(apex_tier or "").strip()
+        _regime = str(apex_regime or "").strip().replace("_", " ")
+        _days = int(apex_days_ago or 0)
+        _apex_bits = [f"APEX setup active ({_days}d)"]
+        if _tier:
+            _apex_bits.append(_tier)
+        if _regime:
+            _apex_bits.append(_regime)
+        parts.append(" | ".join(_apex_bits))
 
     if not bool(earn_trusted):
         parts.append("Earnings data unverified — refresh earnings before entry")
@@ -3527,6 +3564,10 @@ def _trade_quality_settings() -> Dict[str, Any]:
         st.session_state['trade_monthly_near_macd_pct'] = 0.08
     if 'trade_monthly_near_ao_floor' not in st.session_state:
         st.session_state['trade_monthly_near_ao_floor'] = -0.25
+    if 'trade_apex_primary' not in st.session_state:
+        st.session_state['trade_apex_primary'] = True
+    if 'trade_apex_bear_vix_threshold' not in st.session_state:
+        st.session_state['trade_apex_bear_vix_threshold'] = 20.0
     return {
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
         'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
@@ -3536,6 +3577,8 @@ def _trade_quality_settings() -> Dict[str, Any]:
         'breakout_max_dist_pct': float(st.session_state.get('trade_breakout_max_dist_pct', 4.0) or 4.0),
         'monthly_near_macd_pct': float(st.session_state.get('trade_monthly_near_macd_pct', 0.08) or 0.08),
         'monthly_near_ao_floor': float(st.session_state.get('trade_monthly_near_ao_floor', -0.25) or -0.25),
+        'apex_primary': bool(st.session_state.get('trade_apex_primary', True)),
+        'apex_bear_vix_threshold': float(st.session_state.get('trade_apex_bear_vix_threshold', 20.0) or 20.0),
     }
 
 
@@ -3586,20 +3629,66 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
         fail_codes.append("sector_not_in_rotation")
         fail_reasons.append(f"Sector phase not in rotation ({phase or 'unknown'})")
 
-    if not bool(row.get('daily_macd_cross_recent', False)):
-        fail_codes.append("daily_macd_cross_missing")
-        fail_reasons.append("Daily MACD cross is not recent")
-    if not bool(row.get('daily_ao_positive', False)):
-        fail_codes.append("daily_ao_not_positive")
-        fail_reasons.append("Daily AO is not positive")
-    if not bool(row.get('weekly_bullish', False)):
-        fail_codes.append("weekly_not_green")
-        fail_reasons.append("Weekly MACD is not bullish")
+    monthly_tag = "monthly_not_evaluated"
+    apex_primary = bool(settings.get('apex_primary', True))
+    apex_buy = bool(row.get('apex_buy', False))
+    apex_days = int(row.get('apex_signal_days_ago', 999) or 999)
+    daily_cross_recent = bool(row.get('daily_macd_cross_recent', False))
+    daily_ao_positive = bool(row.get('daily_ao_positive', False))
+    daily_ao_zero_cross = bool(row.get('daily_ao_zero_cross_found', False))
+    weekly_bullish = bool(row.get('weekly_bullish', False))
 
     monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
-    if not monthly_ok:
-        fail_codes.append("monthly_not_green")
-        fail_reasons.append("Monthly momentum is not green/near-green")
+    if apex_primary:
+        # APEX backtest parity: recent APEX buy qualifies directly; otherwise enforce
+        # full Daily + Weekly + Monthly alignment.
+        if apex_buy and apex_days <= 20:
+            monthly_tag = "apex_recent_buy"
+        else:
+            if not daily_cross_recent:
+                fail_codes.append("daily_macd_cross_missing")
+                fail_reasons.append("Daily MACD cross is not recent")
+            if not daily_ao_positive:
+                fail_codes.append("daily_ao_not_positive")
+                fail_reasons.append("Daily AO is not positive")
+            if not daily_ao_zero_cross:
+                fail_codes.append("daily_ao_zero_cross_missing")
+                fail_reasons.append("Daily AO has no recent zero-cross")
+            if not weekly_bullish:
+                fail_codes.append("weekly_not_green")
+                fail_reasons.append("Weekly MACD is not bullish")
+            if not monthly_ok:
+                fail_codes.append("monthly_not_green")
+                fail_reasons.append("Monthly momentum is not green/near-green")
+    else:
+        if not daily_cross_recent:
+            fail_codes.append("daily_macd_cross_missing")
+            fail_reasons.append("Daily MACD cross is not recent")
+        if not daily_ao_positive:
+            fail_codes.append("daily_ao_not_positive")
+            fail_reasons.append("Daily AO is not positive")
+        if not weekly_bullish:
+            fail_codes.append("weekly_not_green")
+            fail_reasons.append("Weekly MACD is not bullish")
+        if not monthly_ok:
+            fail_codes.append("monthly_not_green")
+            fail_reasons.append("Monthly momentum is not green/near-green")
+
+    # APEX bear-market filter: block only when SPY is below 200 and VIX is elevated.
+    spy_above_200 = bool(row.get('market_spy_above_200', True))
+    _vix_raw = row.get('market_vix_close', None)
+    vix_close: Optional[float] = None
+    try:
+        if _vix_raw is not None and str(_vix_raw) != '':
+            vix_close = float(_vix_raw)
+    except Exception:
+        vix_close = None
+    vix_bear_threshold = float(settings.get('apex_bear_vix_threshold', 20.0) or 20.0)
+    if (not spy_above_200) and vix_close is not None and vix_close >= vix_bear_threshold:
+        fail_codes.append("apex_bear_filter")
+        fail_reasons.append(
+            f"Bear filter active (SPY<200 & VIX {vix_close:.1f} >= {vix_bear_threshold:.1f})"
+        )
 
     dist = float(row.get('resistance_distance_pct', -1.0) or -1.0)
     min_dist = float(settings.get('breakout_min_dist_pct', 0.2) or 0.2)
@@ -3636,6 +3725,11 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
         'monthly_tag': monthly_tag,
         'metrics': {
             'sector_phase': phase,
+            'apex_primary': apex_primary,
+            'apex_buy': apex_buy,
+            'apex_signal_days_ago': apex_days,
+            'spy_above_200': spy_above_200,
+            'vix_close': vix_close,
             'resistance_distance_pct': dist,
             'breakout_window': [min_dist, max_dist],
             'earn_days': earn_days,
@@ -3903,6 +3997,13 @@ def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
         "monthly_macd_bullish": bool(candidate.get('monthly_macd_bullish', False)),
         "monthly_ao_positive": bool(candidate.get('monthly_ao_positive', False)),
         "monthly_ao_cross_up": bool(candidate.get('monthly_ao_cross_up', False)),
+        "market_spy_above_200": bool(candidate.get('market_spy_above_200', True)),
+        "market_vix_below_30": bool(candidate.get('market_vix_below_30', True)),
+        "market_vix_close": candidate.get('market_vix_close'),
+        "apex_buy": bool(candidate.get('apex_buy', False)),
+        "apex_signal_days_ago": int(candidate.get('apex_signal_days_ago', 999) or 999),
+        "apex_signal_tier": str(candidate.get('apex_signal_tier', '') or ''),
+        "apex_signal_regime": str(candidate.get('apex_signal_regime', '') or ''),
         "resistance_distance_pct": candidate.get('resistance_distance_pct'),
         "earn_days": int(candidate.get('earn_days', 999) or 999),
         "earn_source": str(candidate.get('earn_source', '') or ''),
@@ -3942,6 +4043,12 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
         "summary": candidate.get('summary', ''),
         "sector": candidate.get('sector', ''),
         "sector_phase": candidate.get('sector_phase', ''),
+        "apex_buy": bool(candidate.get('apex_buy', False)),
+        "apex_signal_days_ago": int(candidate.get('apex_signal_days_ago', 999) or 999),
+        "apex_signal_tier": str(candidate.get('apex_signal_tier', '') or ''),
+        "apex_signal_regime": str(candidate.get('apex_signal_regime', '') or ''),
+        "market_spy_above_200": bool(candidate.get('market_spy_above_200', True)),
+        "market_vix_close": candidate.get('market_vix_close'),
         "earn_days": int(candidate.get('earn_days', 999) or 999),
         "earn_source": str(candidate.get('earn_source', '') or ''),
         "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
@@ -4342,6 +4449,10 @@ def _run_trade_finder_workflow(
             support_price=support_price,
             stop_price=stop,
             stop_basis=stop_basis,
+            apex_buy=bool(c.get('apex_buy', False)),
+            apex_days_ago=int(c.get('apex_signal_days_ago', 999) or 999),
+            apex_tier=str(c.get('apex_signal_tier', '') or ''),
+            apex_regime=str(c.get('apex_signal_regime', '') or ''),
         )
         _decision_gate_status = gate.status if gate_pass else "NO_TRADE"
         rows.append({
@@ -4390,6 +4501,13 @@ def _run_trade_finder_workflow(
             'monthly_bullish': bool(c.get('monthly_bullish', False)),
             'monthly_macd_bullish': bool(c.get('monthly_macd_bullish', False)),
             'monthly_ao_positive': bool(c.get('monthly_ao_positive', False)),
+            'market_spy_above_200': bool(c.get('market_spy_above_200', True)),
+            'market_vix_below_30': bool(c.get('market_vix_below_30', True)),
+            'market_vix_close': c.get('market_vix_close'),
+            'apex_buy': bool(c.get('apex_buy', False)),
+            'apex_signal_days_ago': int(c.get('apex_signal_days_ago', 999) or 999),
+            'apex_signal_tier': str(c.get('apex_signal_tier', '') or ''),
+            'apex_signal_regime': str(c.get('apex_signal_regime', '') or ''),
             'resistance_price': c.get('resistance_price'),
             'resistance_distance_pct': c.get('resistance_distance_pct'),
             'decision_card': build_trade_decision_card(
@@ -4884,6 +5002,8 @@ def render_trade_finder_tab():
         'breakout_max_dist_pct': float(_hg_settings.get('breakout_max_dist_pct', 0.0) or 0.0),
         'monthly_near_macd_pct': float(_hg_settings.get('monthly_near_macd_pct', 0.0) or 0.0),
         'monthly_near_ao_floor': float(_hg_settings.get('monthly_near_ao_floor', 0.0) or 0.0),
+        'apex_primary': bool(_hg_settings.get('apex_primary', True)),
+        'apex_bear_vix_threshold': float(_hg_settings.get('apex_bear_vix_threshold', 20.0) or 20.0),
     }
     _force_hg_refresh = dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
     _hg_pass_count = 0
@@ -5030,6 +5150,23 @@ def render_trade_finder_tab():
                 format="%.2f",
                 key="trade_monthly_near_ao_floor",
                 help="Minimum monthly AO value allowed for near-green monthly setup.",
+            )
+        hg3, hg4 = st.columns(2)
+        with hg3:
+            st.checkbox(
+                "Use APEX backtested gate (recommended)",
+                key="trade_apex_primary",
+                help="When enabled, hard gate prioritizes the backtested APEX rule stack for Trade Finder qualification.",
+            )
+        with hg4:
+            st.number_input(
+                "APEX bear filter VIX threshold",
+                min_value=15.0,
+                max_value=40.0,
+                step=0.5,
+                format="%.1f",
+                key="trade_apex_bear_vix_threshold",
+                help="APEX bear filter blocks entries only when SPY is below 200-day and VIX is above this level.",
             )
         _rows_for_tune = list(results.get('rows', []) or [])
         _tune_col1, _tune_col2 = st.columns([1, 2])
@@ -11460,6 +11597,8 @@ def _recommendation_score(row: Dict) -> float:
     )
 
     score = conv * 3 + min(vol_ratio, 4) * 2 + grade_rank.get(grade, 0)
+    if bool(row.get('apex_buy', False)):
+        score += 2.5
     if "RE_ENTRY" in rec or "LATE_ENTRY" in rec:
         score += 1.0
     if "SKIP" in rec or "AVOID" in rec:
