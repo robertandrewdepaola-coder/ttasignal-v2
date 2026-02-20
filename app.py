@@ -10953,6 +10953,126 @@ def _position_posture_summary(snap: DashboardSnapshot, gate: TradeGateDecision) 
     }
 
 
+def _render_decision_contract(
+    snap: DashboardSnapshot,
+    gate: TradeGateDecision,
+    actionable: List[Dict[str, Any]],
+    ready_pending_alerts: List[Dict[str, Any]],
+    jm: JournalManager,
+    stale: Dict[str, Any],
+) -> None:
+    """Render a single, action-first checklist answering the core trading questions."""
+    stale_count = int(stale.get("count", 0) or 0)
+    stale_tags = list(stale.get("tags", []) or [])
+    pos_prices = st.session_state.get('_position_prices', {}) or {}
+    pos_summary = jm.get_position_summary(pos_prices)
+    perf = jm.get_performance_stats()
+
+    close_now: List[str] = []
+    for p in (pos_summary.get('positions', []) or []):
+        ticker = str(p.get('ticker', '') or '').upper().strip()
+        if not ticker:
+            continue
+        stop = float(p.get('stop', 0) or 0)
+        current = float(p.get('current_price', 0) or 0)
+        pnl_pct = float(p.get('unrealized_pnl_pct', 0) or 0)
+        if stop > 0 and current > 0 and current <= stop:
+            close_now.append(f"{ticker} (at/below stop)")
+        elif pnl_pct <= -3:
+            close_now.append(f"{ticker} ({pnl_pct:+.1f}%)")
+
+    top_trade_txt = "No qualified setup yet."
+    if actionable:
+        _top = actionable[0]
+        _row = _top.get('row', {}) or {}
+        _ticker = str(_row.get('ticker', '') or '').upper().strip()
+        _rec = str(_row.get('recommendation', '') or '').upper()
+        _conv = int(_row.get('conviction', 0) or 0)
+        _score = float(_top.get('score', 0) or 0)
+        if _ticker:
+            top_trade_txt = f"{_ticker} ({_rec}, conv {_conv}/10, score {_score:.1f})"
+    elif ready_pending_alerts:
+        _rt = str(ready_pending_alerts[0].get('ticker', '') or '').upper().strip()
+        if _rt:
+            top_trade_txt = f"{_rt} (alert-ready breakout)"
+
+    if gate.status == "NO_TRADE":
+        trade_now = "NO"
+        trade_now_detail = gate.reason
+    elif gate.status == "TRADE_LIGHT":
+        trade_now = "YES, LIGHT SIZE"
+        trade_now_detail = gate.reason
+    else:
+        trade_now = "YES"
+        trade_now_detail = gate.reason
+
+    when_trade = "After Fast Refresh + Check Alerts + fresh data."
+    if stale_count == 0:
+        if gate.status == "NO_TRADE":
+            when_trade = "Wait for gate to reopen (regime/volatility/alignment improves)."
+        elif gate.status == "TRADE_LIGHT":
+            when_trade = "Trade only A/B quality setups with reduced size."
+        else:
+            when_trade = "Now, if setup is qualified and risk is defined."
+
+    live_unreal = float(pos_summary.get('unrealized_pnl_pct', 0) or 0)
+    live_count = int(pos_summary.get('count', 0) or 0)
+    live_state = f"{live_count} open | unrealized {live_unreal:+.1f}%"
+    if live_count == 0:
+        live_state = "No open positions."
+
+    perf_trades = int(perf.get('total_trades', 0) or 0)
+    perf_win = float(perf.get('win_rate', 0) or 0)
+    perf_avg = float(perf.get('avg_pnl_pct', 0) or 0)
+    perf_total = float(perf.get('total_pnl', 0) or 0)
+    if perf_trades > 0:
+        perf_state = f"{perf_trades} closed | win rate {perf_win:.0f}% | avg {perf_avg:+.1f}% | total ${perf_total:+,.0f}"
+    else:
+        perf_state = "No closed-trade history yet."
+
+    st.markdown("**Decision Contract (Single Source Of Truth)**")
+    with st.container(border=True):
+        st.caption("This block always answers: should trade, what to trade, what to close, when to trade, and performance status.")
+
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.markdown(f"**1) Should we trade now?** `{trade_now}`")
+            st.caption(trade_now_detail)
+            if stale_count > 0:
+                st.caption(f"Blocking stale streams: {', '.join(stale_tags)}")
+
+            st.markdown(f"**2) What should we trade next?** {top_trade_txt}")
+            if not actionable and not ready_pending_alerts:
+                st.caption("No immediate trade candidate. Run Find New Trades after refresh.")
+
+            close_preview = ", ".join(close_now[:5]) if close_now else "None"
+            st.markdown(f"**3) What should we close/reduce now?** {close_preview}")
+
+        with c2:
+            st.markdown(f"**4) When should we trade?** {when_trade}")
+            st.markdown(f"**5) Live + Performance status** {live_state}")
+            st.caption(perf_state)
+
+            if stale_count > 0:
+                if st.button("⚡ Refresh Core Data", key="decision_contract_fast_refresh", width="stretch"):
+                    _fast_refresh_dashboard()
+                    st.rerun()
+            elif not actionable and gate.allow_new_trades:
+                if st.button("🧭 Find New Trades Now", key="decision_contract_find_new", width="stretch"):
+                    with st.spinner("Running Trade Finder workflow..."):
+                        _run_trade_finder_workflow()
+                    st.rerun()
+            elif close_now:
+                if st.button("🛑 Auto-Manage Positions", key="decision_contract_auto_manage", width="stretch"):
+                    prices = {}
+                    for t in jm.get_open_trades():
+                        tk = str(t.get('ticker', '') or '').upper().strip()
+                        if tk:
+                            prices[tk] = fetch_current_price(tk) or float(t.get('entry_price', 0) or 0)
+                    _run_auto_exit_engine(jm, prices, source="decision_contract")
+                    st.rerun()
+
+
 def _fmt_last_update(ts: float, fallback: str = "Never") -> str:
     """Format epoch timestamp to local date/time + age."""
     if not ts:
@@ -11710,6 +11830,15 @@ def render_executive_dashboard():
     stale = _stale_stream_status(snap)
     stale_count = int(stale["count"])
     stale_tags = list(stale["tags"])
+
+    _render_decision_contract(
+        snap=snap,
+        gate=gate,
+        actionable=actionable,
+        ready_pending_alerts=ready_pending_alerts,
+        jm=jm,
+        stale=stale,
+    )
 
     if stale_count > 0:
         st.warning(f"Stale data detected: {', '.join(stale_tags)}")
