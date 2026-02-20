@@ -9727,24 +9727,30 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
         )
 
     source_options = ["AI Recommended", "Technical"]
-    default_source_key = f"sizer_default_source_{ticker}"
+    source_state_key = f"sizer_default_source_state_{ticker}"  # non-widget state (safe to mutate)
+    source_widget_key = f"sizer_default_source_ui_{ticker}"    # widget key (never mutate directly)
     prev_source_key = f"sizer_default_source_prev_{ticker}"
-    pending_source_key = f"{default_source_key}_pending"
+    pending_source_key = f"{source_state_key}_pending"
     if pending_source_key in st.session_state:
         _pending_source = str(st.session_state.pop(pending_source_key) or "").strip()
         if _pending_source in source_options:
-            if not _safe_state_set(default_source_key, _pending_source):
-                st.session_state[pending_source_key] = _pending_source
-    if default_source_key not in st.session_state:
-        _safe_state_set(default_source_key, "AI Recommended" if ai_levels.get('using_ai') else "Technical")
-    elif st.session_state.get(default_source_key) not in source_options:
-        _safe_state_set(default_source_key, "Technical")
+            _safe_state_set(source_state_key, _pending_source)
+            # Force widget to rebind from updated state on next instantiation.
+            try:
+                st.session_state.pop(source_widget_key, None)
+            except Exception:
+                pass
+    if source_state_key not in st.session_state:
+        _safe_state_set(source_state_key, "AI Recommended" if ai_levels.get('using_ai') else "Technical")
+    elif st.session_state.get(source_state_key) not in source_options:
+        _safe_state_set(source_state_key, "Technical")
     selected_source = st.selectbox(
         "Default Price Source",
         source_options,
-        index=source_options.index(st.session_state.get(default_source_key, "Technical")),
-        key=default_source_key,
+        index=source_options.index(st.session_state.get(source_state_key, "Technical")),
+        key=source_widget_key,
     )
+    _safe_state_set(source_state_key, selected_source)
 
     selected_entry = ai_levels['entry'] if selected_source == "AI Recommended" else tech_entry
     selected_stop = ai_levels['stop'] if selected_source == "AI Recommended" else tech_stop
