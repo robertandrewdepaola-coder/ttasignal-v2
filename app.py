@@ -4692,15 +4692,24 @@ def render_trade_finder_tab():
     _pending_gate = st.session_state.pop('trade_gate_pending_apply', None)
     if isinstance(_pending_gate, dict) and _pending_gate:
         try:
-            st.session_state['trade_breakout_max_dist_pct'] = float(
+            _applied_max = float(
                 _pending_gate.get('trade_breakout_max_dist_pct', st.session_state.get('trade_breakout_max_dist_pct', 4.0))
             )
-            st.session_state['trade_monthly_near_macd_pct'] = float(
+            _applied_macd = float(
                 _pending_gate.get('trade_monthly_near_macd_pct', st.session_state.get('trade_monthly_near_macd_pct', 0.08))
             )
-            st.session_state['trade_monthly_near_ao_floor'] = float(
+            _applied_ao = float(
                 _pending_gate.get('trade_monthly_near_ao_floor', st.session_state.get('trade_monthly_near_ao_floor', -0.25))
             )
+            st.session_state['trade_breakout_max_dist_pct'] = _applied_max
+            st.session_state['trade_monthly_near_macd_pct'] = _applied_macd
+            st.session_state['trade_monthly_near_ao_floor'] = _applied_ao
+            st.session_state['trade_gate_last_applied'] = {
+                'trade_breakout_max_dist_pct': _applied_max,
+                'trade_monthly_near_macd_pct': _applied_macd,
+                'trade_monthly_near_ao_floor': _applied_ao,
+                'applied_ts': today_utc_str(),
+            }
         except Exception:
             pass
         _pending_reason = str(_pending_gate.get('_reason', '') or '').strip()
@@ -4995,6 +5004,14 @@ def render_trade_finder_tab():
                 _ai_note = str(st.session_state.get('trade_gate_tuning_ai_note', '') or '').strip()
                 if _ai_note:
                     st.caption(f"AI note: {_ai_note}")
+            _applied = st.session_state.get('trade_gate_last_applied', {}) or {}
+            if _applied:
+                st.caption(
+                    "Applied filters: "
+                    f"max dist {float(_applied.get('trade_breakout_max_dist_pct', settings.get('breakout_max_dist_pct', 4.0))):.1f}% | "
+                    f"monthly MACD tol {float(_applied.get('trade_monthly_near_macd_pct', settings.get('monthly_near_macd_pct', 0.08))):.2f} | "
+                    f"monthly AO floor {float(_applied.get('trade_monthly_near_ao_floor', settings.get('monthly_near_ao_floor', -0.25))):.2f}"
+                )
     if 'trade_finder_ai_top_n' not in st.session_state:
         st.session_state['trade_finder_ai_top_n'] = 0  # 0 = all candidates
     st.number_input(
