@@ -4857,19 +4857,56 @@ def render_trade_finder_tab():
     if _earn_touched > 0:
         _rows_touched = True
     _hg_settings = _trade_quality_settings()
+    _hg_sig = {
+        'breakout_min_dist_pct': float(_hg_settings.get('breakout_min_dist_pct', 0.0) or 0.0),
+        'breakout_max_dist_pct': float(_hg_settings.get('breakout_max_dist_pct', 0.0) or 0.0),
+        'monthly_near_macd_pct': float(_hg_settings.get('monthly_near_macd_pct', 0.0) or 0.0),
+        'monthly_near_ao_floor': float(_hg_settings.get('monthly_near_ao_floor', 0.0) or 0.0),
+    }
+    _force_hg_refresh = dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
+    _hg_pass_count = 0
+    _hg_fail_counts: Dict[str, int] = {}
+    _relaxed_settings = _trade_quality_settings(relaxed_profile=True)
+    _hg_relaxed_pass_count = 0
     for _r in rows:
-        _need_eval = (
-            'hard_gate_pass' not in _r
-            or 'hard_gate_fail_codes' not in _r
-            or 'hard_gate_monthly_tag' not in _r
-        )
-        if not _need_eval:
-            continue
         _gate_eval = _evaluate_trade_finder_hard_gate(_r, _hg_settings)
-        _r['hard_gate_pass'] = bool(_gate_eval.get('pass', False))
-        _r['hard_gate_monthly_tag'] = str(_gate_eval.get('monthly_tag', '') or '')
-        _r['hard_gate_fail_codes'] = list(_gate_eval.get('fail_codes', []) or [])
-        _r['hard_gate_fail_reasons'] = list(_gate_eval.get('fail_reasons', []) or [])
+        _new_pass = bool(_gate_eval.get('pass', False))
+        _new_monthly = str(_gate_eval.get('monthly_tag', '') or '')
+        _new_codes = list(_gate_eval.get('fail_codes', []) or [])
+        _new_reasons = list(_gate_eval.get('fail_reasons', []) or [])
+        if _new_pass:
+            _hg_pass_count += 1
+        else:
+            for _code in _new_codes:
+                _hg_fail_counts[_code] = int(_hg_fail_counts.get(_code, 0) + 1)
+        if bool(_evaluate_trade_finder_hard_gate(_r, _relaxed_settings).get('pass', False)):
+            _hg_relaxed_pass_count += 1
+
+        if (
+            _force_hg_refresh
+            or bool(_r.get('hard_gate_pass', True)) != _new_pass
+            or str(_r.get('hard_gate_monthly_tag', '') or '') != _new_monthly
+            or list(_r.get('hard_gate_fail_codes', []) or []) != _new_codes
+            or list(_r.get('hard_gate_fail_reasons', []) or []) != _new_reasons
+        ):
+            _r['hard_gate_pass'] = _new_pass
+            _r['hard_gate_monthly_tag'] = _new_monthly
+            _r['hard_gate_fail_codes'] = _new_codes
+            _r['hard_gate_fail_reasons'] = _new_reasons
+            _rows_touched = True
+
+    if (
+        int(results.get('hard_gate_pass_count', -1) or -1) != int(_hg_pass_count)
+        or int(results.get('hard_gate_fail_count', -1) or -1) != int(max(0, len(rows) - _hg_pass_count))
+        or dict(results.get('hard_gate_fail_counts', {}) or {}) != _hg_fail_counts
+        or int(results.get('hard_gate_relaxed_pass_count', -1) or -1) != int(_hg_relaxed_pass_count)
+        or dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
+    ):
+        results['hard_gate_pass_count'] = int(_hg_pass_count)
+        results['hard_gate_fail_count'] = int(max(0, len(rows) - _hg_pass_count))
+        results['hard_gate_fail_counts'] = dict(_hg_fail_counts)
+        results['hard_gate_relaxed_pass_count'] = int(_hg_relaxed_pass_count)
+        results['_hard_gate_signature'] = dict(_hg_sig)
         _rows_touched = True
     if _rows_touched:
         st.session_state['trade_finder_results'] = results
