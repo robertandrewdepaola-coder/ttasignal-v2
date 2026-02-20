@@ -11360,6 +11360,205 @@ def render_executive_dashboard():
                 f"Use the links above. ({str(e)[:120]})"
             )
 
+        st.divider()
+        st.markdown("**🧠 Green-on-Red Sector Finder**")
+        st.caption(
+            "Find sectors/tickers holding green on down SPY days, and suggest additions to broaden your scan basket."
+        )
+        try:
+            _spy_key = "_green_red_spy_day_change"
+            _spy_ts_key = "_green_red_spy_day_change_ts"
+            _spy_day_change = None
+            _spy_cached_ts = float(st.session_state.get(_spy_ts_key, 0.0) or 0.0)
+            if (time.time() - _spy_cached_ts) < 300:
+                _spy_day_change = st.session_state.get(_spy_key)
+            else:
+                _spy_df = fetch_daily("SPY")
+                if _spy_df is not None and len(_spy_df) >= 2:
+                    _prev = float(_spy_df["Close"].iloc[-2] or 0)
+                    _last = float(_spy_df["Close"].iloc[-1] or 0)
+                    if _prev > 0:
+                        _spy_day_change = ((_last - _prev) / _prev) * 100.0
+                st.session_state[_spy_key] = _spy_day_change
+                st.session_state[_spy_ts_key] = time.time()
+
+            if _spy_day_change is None:
+                st.info("SPY day-change unavailable right now. Try again after a refresh.")
+            else:
+                _is_down = float(_spy_day_change) < 0
+                _dir = "DOWN" if _is_down else "UP"
+                _color = "🔴" if _is_down else "🟢"
+                st.caption(f"{_color} SPY day change: {float(_spy_day_change):+.2f}% ({_dir} day)")
+
+                _ticker_cache = st.session_state.get('ticker_data_cache', {}) or {}
+                _sector_bucket: Dict[str, Dict[str, Any]] = {}
+                _leaders: List[Dict[str, Any]] = []
+
+                # Use the same source rows selected for native heatmap above.
+                _analysis_rows = source_rows if isinstance(source_rows, list) else []
+                for _r in _analysis_rows:
+                    _t = str(_r.get('ticker', '') or '').upper().strip()
+                    if not _t:
+                        continue
+                    _sec = str(_r.get('sector', '') or '').strip() or "Unknown"
+                    _phase = str(_r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
+                    _sector_key = f"{_sec} ({_phase})"
+
+                    _day_chg = None
+                    _td = (_ticker_cache.get(_t, {}) or {}).get('daily')
+                    try:
+                        if _td is not None and len(_td) >= 2:
+                            _p0 = float(_td['Close'].iloc[-2] or 0)
+                            _p1 = float(_td['Close'].iloc[-1] or 0)
+                            if _p0 > 0:
+                                _day_chg = ((_p1 - _p0) / _p0) * 100.0
+                    except Exception:
+                        _day_chg = None
+                    if _day_chg is None:
+                        continue
+
+                    _bucket = _sector_bucket.setdefault(_sector_key, {
+                        'sector': _sec,
+                        'phase': _phase,
+                        'total': 0,
+                        'green': 0,
+                        'sum_chg': 0.0,
+                        'tickers': [],
+                    })
+                    _bucket['total'] += 1
+                    if _day_chg > 0:
+                        _bucket['green'] += 1
+                    _bucket['sum_chg'] += float(_day_chg)
+                    _bucket['tickers'].append((_t, float(_day_chg), int(_r.get('conviction', _r.get('ai_confidence', 0)) or 0), str(_r.get('recommendation', _r.get('ai_buy_recommendation', '')) or '')))
+                    _leaders.append({
+                        'ticker': _t,
+                        'sector': _sec,
+                        'phase': _phase,
+                        'day_chg': float(_day_chg),
+                        'conviction': int(_r.get('conviction', _r.get('ai_confidence', 0)) or 0),
+                        'recommendation': str(_r.get('recommendation', _r.get('ai_buy_recommendation', '')) or ''),
+                    })
+
+                if not _sector_bucket:
+                    st.info("No per-ticker day-change data available in cache yet. Run Scan All / Find New first.")
+                else:
+                    _sector_rows = []
+                    for _k, _v in _sector_bucket.items():
+                        _tot = int(_v.get('total', 0) or 0)
+                        _green = int(_v.get('green', 0) or 0)
+                        _avg = (float(_v.get('sum_chg', 0.0) or 0.0) / _tot) if _tot > 0 else 0.0
+                        _green_rate = (_green / _tot * 100.0) if _tot > 0 else 0.0
+                        _sector_rows.append({
+                            'sector_bucket': _k,
+                            'sector': _v.get('sector', ''),
+                            'phase': _v.get('phase', ''),
+                            'green_count': _green,
+                            'total_count': _tot,
+                            'green_rate_pct': round(_green_rate, 1),
+                            'avg_day_change_pct': round(_avg, 2),
+                        })
+                    _sector_rows = sorted(
+                        _sector_rows,
+                        key=lambda x: (float(x.get('green_rate_pct', 0) or 0), float(x.get('avg_day_change_pct', 0) or 0)),
+                        reverse=True,
+                    )
+                    st.dataframe(pd.DataFrame(_sector_rows[:12]), hide_index=True, use_container_width=True)
+
+                    _target_sectors = []
+                    if _is_down:
+                        for _s in _sector_rows:
+                            if (
+                                float(_s.get('avg_day_change_pct', 0) or 0) > 0
+                                and float(_s.get('green_rate_pct', 0) or 0) >= 40.0
+                                and int(_s.get('total_count', 0) or 0) >= 2
+                            ):
+                                _target_sectors.append(_s)
+                    else:
+                        _target_sectors = _sector_rows[:3]
+
+                    if _target_sectors:
+                        _target_labels = ", ".join([str(_s.get('sector_bucket', '')) for _s in _target_sectors[:4]])
+                        if _is_down:
+                            st.success(f"Suggested sector expansion today: {_target_labels}")
+                        else:
+                            st.info(f"Momentum sectors to monitor/add today: {_target_labels}")
+                    else:
+                        st.info("No strong green-on-red sector cluster detected yet.")
+
+                    _bridge = st.session_state.get('watchlist_bridge')
+                    _active_set = set()
+                    try:
+                        if _bridge:
+                            _active_set = set(_bridge.get_watchlist_tickers() or [])
+                    except Exception:
+                        _active_set = set()
+
+                    _leaders = sorted(_leaders, key=lambda x: (float(x.get('day_chg', 0) or 0), int(x.get('conviction', 0) or 0)), reverse=True)
+                    _add_candidates = []
+                    _target_sector_names = {str(_s.get('sector', '')) for _s in _target_sectors}
+                    for _l in _leaders:
+                        if _target_sector_names and str(_l.get('sector', '')) not in _target_sector_names:
+                            continue
+                        _t = str(_l.get('ticker', '')).upper().strip()
+                        if not _t or _t in _active_set:
+                            continue
+                        _add_candidates.append(_l)
+                    _add_candidates = _add_candidates[:12]
+
+                    if _add_candidates:
+                        st.caption("Suggested tickers to add to active watchlist:")
+                        st.dataframe(pd.DataFrame(_add_candidates), hide_index=True, use_container_width=True)
+                        if _bridge and st.button("➕ Add Top 5 Suggestions To Active Watchlist", key="green_red_add_top5", width="stretch"):
+                            _added = 0
+                            for _c in _add_candidates[:5]:
+                                _tk = str(_c.get('ticker', '')).upper().strip()
+                                if not _tk:
+                                    continue
+                                try:
+                                    _bridge.add_to_watchlist(WatchlistItem(ticker=_tk))
+                                    _added += 1
+                                except Exception:
+                                    pass
+                            st.success(f"Added {_added} ticker(s) to active watchlist.")
+                            st.rerun()
+                    else:
+                        st.caption("No additional ticker suggestions right now (or all are already in active watchlist).")
+
+                    if st.button("🤖 AI Sector Add Suggestion", key="green_red_ai_suggest", width="stretch"):
+                        try:
+                            _ai = _get_ai_clients()
+                            _oc = _ai.get('openai_client')
+                            _cfg = _ai.get('ai_config', {}) or {}
+                            _model = _cfg.get('model', 'grok-3-fast')
+                            if _oc is None:
+                                st.info("AI client unavailable. Using rule-based recommendation only.")
+                            else:
+                                _payload = {
+                                    'spy_day_change_pct': round(float(_spy_day_change), 2),
+                                    'down_day': bool(_is_down),
+                                    'top_sectors': _sector_rows[:6],
+                                    'add_candidates': _add_candidates[:8],
+                                }
+                                _resp = _oc.chat.completions.create(
+                                    model=_model,
+                                    messages=[
+                                        {"role": "system", "content": "Return 3 short bullet lines, execution-focused, no markdown tables."},
+                                        {"role": "user", "content": f"Given this market-strength scan data, recommend sector adds and top ticker adds for a scanner watchlist: {_json.dumps(_payload)}"},
+                                    ],
+                                    max_tokens=220,
+                                    temperature=0.2,
+                                    timeout=18,
+                                )
+                                _txt = str((_resp.choices[0].message.content or '')).strip()
+                                if _txt:
+                                    st.info(_txt)
+                                else:
+                                    st.info("AI returned no text. Use rule-based suggestions above.")
+                        except Exception as _e:
+                            st.info(f"AI suggestion unavailable right now ({str(_e)[:140]}). Use rule-based suggestions above.")
+        except Exception as _e:
+            st.warning(f"Green-on-red analyzer unavailable in this session ({str(_e)[:140]}).")
+
     candidate_rows = []
     if gate.allow_new_trades:
         find_new = st.session_state.get('find_new_trades_report', {}) or {}
