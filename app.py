@@ -11160,43 +11160,158 @@ def render_executive_dashboard():
     if snap.workflow_sec > 0:
         st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
 
-    with st.expander("🔥 Market Heat Map", expanded=False):
-        heatmap_url = "https://stockanalysis.com/markets/heatmap/"
-        st.caption("Live market heat map (embedded widget) + StockAnalysis fallback link.")
-        st.markdown(f"[Open heat map in new tab]({heatmap_url})")
-        st.info("StockAnalysis blocks iframe embedding in many browsers. Using embedded TradingView heatmap below.")
-        try:
-            import streamlit.components.v1 as components
-            components.html(
-                """
-                <div class="tradingview-widget-container" style="height:620px;width:100%;">
-                  <div id="tradingview_heatmap_execdash" style="height:100%;width:100%;"></div>
-                  <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
-                  {
-                    "exchanges": [],
-                    "dataSource": "SPX500",
-                    "grouping": "sector",
-                    "blockSize": "market_cap_basic",
-                    "blockColor": "change",
-                    "locale": "en",
-                    "symbolUrl": "",
-                    "colorTheme": "dark",
-                    "hasTopBar": true,
-                    "isDataSetEnabled": true,
-                    "isZoomEnabled": true,
-                    "hasSymbolTooltip": true,
-                    "isMonoSize": false,
-                    "width": "100%",
-                    "height": "620"
-                  }
-                  </script>
-                </div>
-                """,
-                height=640,
-                scrolling=False,
-            )
-        except Exception as e:
-            st.warning(f"Embedded widget unavailable in this session ({str(e)[:120]}). Use the link above.")
+    with st.expander("🔥 Market Heat Maps", expanded=False):
+        hm1, hm2 = st.tabs(["Universe Heatmap", "TradingView Heatmap"])
+
+        with hm1:
+            st.caption("Native heatmap built from your scanned ticker universe.")
+            scan_rows = snap.scan_summary or []
+            if not scan_rows:
+                st.info("Run Scan All first to populate the native heatmap.")
+            else:
+                import plotly.express as px
+
+                heat_rows = []
+                for r in scan_rows:
+                    ticker = str(r.get('ticker', '') or '').upper().strip()
+                    if not ticker:
+                        continue
+                    sector = str(r.get('sector', '') or '').strip() or "Unknown"
+                    phase = str(r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
+                    sector_bucket = f"{sector} ({phase})"
+                    rec_u = str(r.get('recommendation', '') or '').upper()
+                    conv = int(r.get('conviction', 0) or 0)
+                    price = float(r.get('price', 0) or 0)
+                    vol_ratio = float(r.get('volume_ratio', 0) or 0)
+
+                    score = 0.0
+                    if "STRONG BUY" in rec_u:
+                        score += 2.0
+                    elif "BUY" in rec_u:
+                        score += 1.0
+                    elif "RE-ENTRY" in rec_u:
+                        score += 0.5
+                    elif "LATE ENTRY" in rec_u:
+                        score += 0.2
+                    elif "WAIT" in rec_u:
+                        score -= 0.4
+                    elif "SKIP" in rec_u:
+                        score -= 1.2
+
+                    if phase == "LEADING":
+                        score += 0.6
+                    elif phase == "EMERGING":
+                        score += 0.3
+                    elif phase == "FADING":
+                        score -= 0.4
+                    elif phase == "LAGGING":
+                        score -= 0.8
+
+                    if bool(r.get('monthly_bullish', False)):
+                        score += 0.3
+                    else:
+                        score -= 0.2
+                    if bool(r.get('weekly_bullish', False)):
+                        score += 0.2
+                    if bool(r.get('ao_positive', False)):
+                        score += 0.2
+
+                    size_metric = max(1.0, float(conv if conv > 0 else 1))
+                    if vol_ratio > 0:
+                        size_metric *= max(0.6, min(3.0, vol_ratio))
+
+                    heat_rows.append({
+                        'sector_bucket': sector_bucket,
+                        'ticker': ticker,
+                        'size_metric': float(size_metric),
+                        'heat_score': round(float(score), 2),
+                        'recommendation': str(r.get('recommendation', '') or ''),
+                        'conviction': conv,
+                        'price': price,
+                        'volume_ratio': round(vol_ratio, 2),
+                        'earn_days': int(r.get('earn_days', 999) or 999),
+                    })
+
+                if not heat_rows:
+                    st.info("No valid scan rows to render.")
+                else:
+                    hdf = pd.DataFrame(heat_rows)
+                    fig = px.treemap(
+                        hdf,
+                        path=['sector_bucket', 'ticker'],
+                        values='size_metric',
+                        color='heat_score',
+                        color_continuous_scale='RdYlGn',
+                        color_continuous_midpoint=0,
+                        hover_data={
+                            'recommendation': True,
+                            'conviction': True,
+                            'price': ':.2f',
+                            'volume_ratio': True,
+                            'earn_days': True,
+                            'size_metric': False,
+                            'heat_score': ':.2f',
+                        },
+                    )
+                    fig.update_traces(
+                        texttemplate="%{label}<br>%{color:.1f}",
+                        marker=dict(line=dict(width=0.7, color="rgba(255,255,255,0.15)")),
+                    )
+                    fig.update_layout(
+                        height=720,
+                        margin=dict(l=8, r=8, t=24, b=8),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        coloraxis_colorbar=dict(title='Score'),
+                    )
+                    st.plotly_chart(fig, use_container_width=True, theme=None, key="exec_native_universe_heatmap")
+                    st.caption(
+                        "Color score: signal strength + sector phase + timeframe alignment. "
+                        "Tile size: conviction adjusted by relative volume."
+                    )
+
+        with hm2:
+            stockanalysis_url = "https://stockanalysis.com/markets/heatmap/"
+            tv_url = "https://www.tradingview.com/heatmap/stock/"
+            st.caption("TradingView widget + external links.")
+            st.markdown(f"[Open TradingView heatmap in new tab]({tv_url})")
+            st.markdown(f"[Open StockAnalysis heatmap in new tab]({stockanalysis_url})")
+            try:
+                import streamlit.components.v1 as components
+                components.html(
+                    """
+                    <div class="tradingview-widget-container" style="height:620px;width:100%;">
+                      <div class="tradingview-widget-container__widget"></div>
+                      <script type="text/javascript"
+                        src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
+                      {
+                        "exchanges": [],
+                        "dataSource": "SPX500",
+                        "grouping": "sector",
+                        "blockSize": "market_cap_basic",
+                        "blockColor": "change",
+                        "locale": "en",
+                        "symbolUrl": "",
+                        "colorTheme": "dark",
+                        "hasTopBar": true,
+                        "isDataSetEnabled": true,
+                        "isZoomEnabled": true,
+                        "hasSymbolTooltip": true,
+                        "isMonoSize": false,
+                        "width": "100%",
+                        "height": "620"
+                      }
+                      </script>
+                    </div>
+                    """,
+                    height=640,
+                    scrolling=False,
+                )
+            except Exception as e:
+                st.warning(
+                    "TradingView widget unavailable in this browser/session. "
+                    f"Use the link above. ({str(e)[:120]})"
+                )
 
     candidate_rows = []
     if gate.allow_new_trades:
