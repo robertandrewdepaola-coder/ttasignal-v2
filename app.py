@@ -10882,6 +10882,17 @@ def _build_dashboard_snapshot() -> DashboardSnapshot:
     regime, confidence = _infer_exec_regime(market_filter, sector_rotation)
     policy = _risk_budget_for_regime(regime)
 
+    _scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
+    _find_new_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
+    _tf_ts = 0.0
+    try:
+        _tf_iso = str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '') or '').strip()
+        if _tf_iso:
+            _tf_ts = datetime.strptime(_tf_iso, '%Y-%m-%d %H:%M:%S').timestamp()
+    except Exception:
+        _tf_ts = 0.0
+    _effective_scan_ts = max(_scan_ts, _find_new_ts, _tf_ts)
+
     return DashboardSnapshot(
         generated_at=now,
         generated_at_iso=datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
@@ -10893,7 +10904,7 @@ def _build_dashboard_snapshot() -> DashboardSnapshot:
         market_filter=market_filter,
         sector_rotation=sector_rotation,
         earnings_flags=earnings_flags,
-        scan_ts=float(st.session_state.get('_scan_run_ts', 0.0) or 0.0),
+        scan_ts=_effective_scan_ts,
         market_ts=float(st.session_state.get('_market_filter_ts', 0.0) or 0.0),
         sector_ts=float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0),
         pos_ts=float(st.session_state.get('_position_prices_ts', 0.0) or 0.0),
@@ -10926,6 +10937,7 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
 
     stale = _stale_stream_status(snap)
     stale_count = int(stale["count"])
+    stale_core = bool(stale.get("market", False)) or (bool(stale.get("scan", False)) and bool(stale.get("sector", False)))
 
     deep_score = 0
     deep = st.session_state.get('deep_market_analysis') or {}
@@ -10964,9 +10976,9 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
         model_alignment = "PARTIAL"
 
     # Base decision from unified regime + volatility
-    if stale_count >= 3:
+    if stale_core:
         status = "NO_TRADE"
-        reason = "Core data is stale. Refresh before opening new trades."
+        reason = "Core data is stale (market/scan context). Refresh before opening new trades."
     elif snap.regime == "RISK_OFF" or vix >= 25:
         status = "NO_TRADE"
         reason = f"Risk-off environment (VIX {vix:.1f}). Preserve capital."
@@ -10987,11 +10999,12 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
             reason += " Downgraded due to model divergence."
 
     if status == "NO_TRADE":
+        stale_gate = reason.startswith("Core data is stale")
         return TradeGateDecision(
             status=status,
-            label="🛑 TOO RISKY TO TRADE",
+            label=("🟠 DATA STALE — REFRESH REQUIRED" if stale_gate else "🛑 TOO RISKY TO TRADE"),
             allow_new_trades=False,
-            severity="danger",
+            severity=("warning" if stale_gate else "danger"),
             reason=reason,
             model_alignment=model_alignment,
         )
