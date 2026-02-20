@@ -4600,7 +4600,7 @@ def _render_green_on_red_sector_finder(
             key=lambda x: (float(x.get('green_rate_pct', 0) or 0), float(x.get('avg_day_change_pct', 0) or 0)),
             reverse=True,
         )
-        st.dataframe(pd.DataFrame(_sector_rows[:12]), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(_sector_rows[:12]), hide_index=True, width="stretch")
 
         _target_sectors = []
         if _is_down:
@@ -4645,7 +4645,7 @@ def _render_green_on_red_sector_finder(
 
         if _add_candidates:
             st.caption("Suggested tickers to add to active watchlist:")
-            st.dataframe(pd.DataFrame(_add_candidates), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(_add_candidates), hide_index=True, width="stretch")
             if _bridge and st.button("➕ Add Top 5 Suggestions To Active Watchlist", key=f"{key_prefix}_green_red_add_top5", width="stretch"):
                 _added = 0
                 for _c in _add_candidates[:5]:
@@ -9635,8 +9635,15 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     source_options = ["AI Recommended", "Technical"]
     default_source_key = f"sizer_default_source_{ticker}"
     prev_source_key = f"sizer_default_source_prev_{ticker}"
+    pending_source_key = f"{default_source_key}_pending"
+    if pending_source_key in st.session_state:
+        _pending_source = str(st.session_state.pop(pending_source_key) or "").strip()
+        if _pending_source in source_options:
+            st.session_state[default_source_key] = _pending_source
     if default_source_key not in st.session_state:
         st.session_state[default_source_key] = "AI Recommended" if ai_levels.get('using_ai') else "Technical"
+    elif st.session_state.get(default_source_key) not in source_options:
+        st.session_state[default_source_key] = "Technical"
     selected_source = st.selectbox(
         "Default Price Source",
         source_options,
@@ -9682,7 +9689,7 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             _pref_target = round(_pref_entry + ((_pref_entry - _pref_stop) * 2.0), 2)
         _pref_dist = ((_pref_entry - _pref_stop) / _pref_entry * 100.0) if _pref_entry > 0 and _pref_stop > 0 else 0.0
         _pref_dist = round(max(0.0, _pref_dist), 2)
-        st.session_state[default_source_key] = "AI Recommended"
+        st.session_state[pending_source_key] = "AI Recommended"
         st.session_state[entry_key] = float(_pref_entry)
         st.session_state[stop_key] = float(_pref_stop)
         st.session_state[target_key] = float(_pref_target)
@@ -11809,7 +11816,7 @@ def render_executive_dashboard():
                     plot_bgcolor='rgba(0,0,0,0)',
                     coloraxis_colorbar=dict(title='Score'),
                 )
-                st.plotly_chart(fig, use_container_width=True, theme=None, key="exec_native_universe_heatmap")
+                st.plotly_chart(fig, width="stretch", theme=None, key="exec_native_universe_heatmap")
                 st.caption(
                     "Color score: signal strength + sector phase + timeframe alignment. "
                     "Tile size: conviction adjusted by relative volume."
