@@ -4866,7 +4866,10 @@ def render_trade_finder_tab():
     _force_hg_refresh = dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
     _hg_pass_count = 0
     _hg_fail_counts: Dict[str, int] = {}
-    _relaxed_settings = _trade_quality_settings(relaxed_profile=True)
+    _relaxed_settings = dict(_hg_settings)
+    _relaxed_settings['breakout_max_dist_pct'] = float(_hg_settings.get('breakout_max_dist_pct', 4.0) or 4.0) + 1.5
+    _relaxed_settings['monthly_near_macd_pct'] = float(_hg_settings.get('monthly_near_macd_pct', 0.08) or 0.08) + 0.03
+    _relaxed_settings['monthly_near_ao_floor'] = float(_hg_settings.get('monthly_near_ao_floor', -0.25) or -0.25) - 0.20
     _hg_relaxed_pass_count = 0
     for _r in rows:
         _gate_eval = _evaluate_trade_finder_hard_gate(_r, _hg_settings)
