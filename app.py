@@ -12001,7 +12001,7 @@ def render_executive_dashboard():
 
         _active_watchlist = [str(t).upper().strip() for t in (snap.watchlist_tickers or []) if str(t).strip()]
         _active_watchlist_set = set(_active_watchlist)
-        _bridge = get_watchlist_bridge()
+        _bridge = get_bridge()
         _all_watchlists = (_bridge.manager.get_all_watchlists() if _bridge else []) or []
         _all_watchlist_tickers: List[str] = []
         _seen_all: set[str] = set()
