@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
 
-from journal_manager import PlannedTrade
+if TYPE_CHECKING:
+    from journal_manager import PlannedTrade
 
 
 def build_trade_finder_selection(row: Dict[str, Any], generated_at_iso: str, run_id: str) -> Dict[str, Any]:
@@ -91,8 +92,9 @@ def derive_support_stop_levels(
     return out
 
 
-def build_planned_trade(row: Dict[str, Any], run_id: str) -> PlannedTrade:
+def build_planned_trade(row: Dict[str, Any], run_id: str) -> Any:
     """Build PlannedTrade from Trade Finder candidate row."""
+    from journal_manager import PlannedTrade
     price = float(row.get("price", 0) or 0)
     rr = float(row.get("risk_reward", 0) or 0)
     return PlannedTrade(

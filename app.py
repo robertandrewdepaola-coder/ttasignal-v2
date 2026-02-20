@@ -73,12 +73,30 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
-from trade_finder_helpers import (
-    build_planned_trade,
-    build_trade_finder_selection,
-    compute_trade_score,
-    derive_support_stop_levels,
-)
+try:
+    from trade_finder_helpers import (
+        build_planned_trade,
+        build_trade_finder_selection,
+        compute_trade_score,
+        derive_support_stop_levels,
+    )
+except (ImportError, AttributeError, KeyError):
+    import importlib as _importlib
+    _tfh = _importlib.import_module("trade_finder_helpers")
+    build_planned_trade = _tfh.build_planned_trade
+    build_trade_finder_selection = _tfh.build_trade_finder_selection
+    compute_trade_score = _tfh.compute_trade_score
+    derive_support_stop_levels = getattr(
+        _tfh,
+        "derive_support_stop_levels",
+        lambda entry, current_stop, support_price, **_: {
+            "support_price": float(support_price or 0.0),
+            "support_distance_pct": 0.0,
+            "support_stop_price": 0.0,
+            "recommended_stop": float(current_stop or 0.0),
+            "stop_basis": "model_stop_fallback",
+        },
+    )
 
 
 # =============================================================================
