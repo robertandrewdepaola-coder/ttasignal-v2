@@ -5233,6 +5233,43 @@ def render_trade_finder_tab():
                 f"{len(_hard_pass_rows)} ticker(s) passed hard gate but failed final filters. "
                 "You can expose them immediately without rescanning."
             )
+            _quick_cols = st.columns(3)
+            with _quick_cols[0]:
+                if (
+                    not bool(settings.get('include_watch_only', True))
+                    and st.button("👁 Include Watch Only (no rescan)", key="tf_relax_watch_only", width="stretch")
+                ):
+                    st.session_state['trade_include_watch_only'] = True
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Watch Only ideas enabled for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with _quick_cols[1]:
+                if (
+                    float(settings.get('min_rr', 1.2) or 1.2) > 1.0
+                    and st.button("📉 Set Min R:R = 1.0 (no rescan)", key="tf_relax_rr", width="stretch")
+                ):
+                    st.session_state['trade_min_rr_threshold'] = 1.0
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Min R:R lowered to 1.0 for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with _quick_cols[2]:
+                if (
+                    int(settings.get('earn_block_days', 7) or 7) > 0
+                    and st.button("📅 Set earnings block = 0d (no rescan)", key="tf_relax_earn_block", width="stretch")
+                ):
+                    st.session_state['trade_earnings_block_days'] = 0
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Earnings block window set to 0d for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
             if bool(settings.get('require_ready', True)) and _not_ready_rows:
                 if st.button("👁 Show Hard-Gate Passers (disable READY, no rescan)", key="tf_show_hard_passers", width="stretch"):
                     st.session_state['trade_require_ready'] = False
@@ -5276,7 +5313,10 @@ def render_trade_finder_tab():
                             _load_ticker_for_view(_t)
                             st.rerun()
 
-        fail = {
+        hard_gate_fail = {
+            'hard_gate_failed': 0,
+        }
+        post_gate_fail = {
             'ai_rating_filtered': 0,
             'missing_levels': 0,
             'invalid_level_order': 0,
@@ -5284,14 +5324,14 @@ def render_trade_finder_tab():
             'earnings_untrusted': 0,
             'earnings_blocked': 0,
             'not_ready': 0,
-            'hard_gate_failed': 0,
         }
         hard_gate_reason_counts: Dict[str, int] = {}
         for r in rows:
             if bool(r.get('hard_gate_pass', True)) is False:
-                fail['hard_gate_failed'] += 1
+                hard_gate_fail['hard_gate_failed'] += 1
                 for _code in (r.get('hard_gate_fail_codes', []) or []):
                     hard_gate_reason_counts[_code] = int(hard_gate_reason_counts.get(_code, 0) + 1)
+                continue
             entry = float(r.get('suggested_entry', r.get('price', 0)) or 0)
             stop = float(r.get('suggested_stop_loss', 0) or 0)
             target = float(r.get('suggested_target', 0) or 0)
@@ -5301,13 +5341,13 @@ def render_trade_finder_tab():
             ai_buy = str(r.get('ai_buy_recommendation', '') or '').strip()
             allowed_ai = {"Strong Buy", "Buy"} | ({"Watch Only"} if settings.get('include_watch_only') else set())
             if ai_buy not in allowed_ai:
-                fail['ai_rating_filtered'] += 1
+                post_gate_fail['ai_rating_filtered'] += 1
             if not (entry > 0 and stop > 0 and target > 0):
-                fail['missing_levels'] += 1
+                post_gate_fail['missing_levels'] += 1
             if not (stop < entry < target):
-                fail['invalid_level_order'] += 1
+                post_gate_fail['invalid_level_order'] += 1
             if rr < float(settings.get('min_rr', 2.0)):
-                fail['rr_below_threshold'] += 1
+                post_gate_fail['rr_below_threshold'] += 1
             earn_days = int(r.get('earn_days', 999) or 999)
             earn_source = str(r.get('earn_source', '') or '').strip()
             earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
@@ -5318,21 +5358,25 @@ def render_trade_finder_tab():
                 confidence=earn_confidence,
                 next_earnings=earn_date,
             ):
-                fail['earnings_untrusted'] += 1
+                post_gate_fail['earnings_untrusted'] += 1
             if 0 <= earn_days <= int(settings.get('earn_block_days', 7)):
-                fail['earnings_blocked'] += 1
+                post_gate_fail['earnings_blocked'] += 1
             if settings.get('require_ready'):
                 card = r.get('decision_card', {}) or {}
                 if str(card.get('execution_readiness', '')).upper() != "READY":
-                    fail['not_ready'] += 1
-        st.caption(
-            "Filter diagnostics: "
-            + ", ".join([f"{k}={v}" for k, v in fail.items() if v > 0])
-            if any(v > 0 for v in fail.values())
-            else "Filter diagnostics: no hard failures detected (check data freshness)."
-        )
+                    post_gate_fail['not_ready'] += 1
+        _hard_diag = ", ".join([f"{k}={v}" for k, v in hard_gate_fail.items() if v > 0])
+        if _hard_diag:
+            st.caption(f"Hard-gate diagnostics: {_hard_diag}")
         if hard_gate_reason_counts:
             st.caption("Hard-gate reason detail: " + ", ".join([f"{k}={v}" for k, v in sorted(hard_gate_reason_counts.items())]))
+        _post_diag = ", ".join([f"{k}={v}" for k, v in post_gate_fail.items() if v > 0])
+        if _post_diag:
+            st.caption(
+                f"Post hard-gate diagnostics (on {len(_hard_pass_rows)} passers): {_post_diag}"
+            )
+        if not _hard_diag and not _post_diag and not hard_gate_reason_counts:
+            st.caption("Filter diagnostics: no blocking failures detected (check data freshness).")
     else:
         st.markdown("### Qualified Signals")
         st.caption("Signal Verdict uses model/system scoring. Use actions to review chart or place trade.")
