@@ -5397,6 +5397,49 @@ def render_trade_finder_tab():
             st.success(jm.add_planned_trade(plan))
             st.rerun()
 
+        def _set_alert_for_candidate(_r: Dict[str, Any], _price: float, _rr: float, _reason: str):
+            _ticker = str(_r.get('ticker', '')).upper().strip()
+            _entry = float(_r.get('suggested_entry', _price) or _price or 0)
+            _resistance = float(_r.get('resistance_price', 0) or 0)
+            _trigger = _resistance if _resistance > 0 else 0.0
+            if _trigger <= 0 and _entry > 0:
+                _trigger = round(_entry * 1.005, 2)
+            if _trigger <= 0:
+                st.warning(f"Cannot set alert for {_ticker}: missing valid trigger price.")
+                return
+
+            _stop = float(_r.get('suggested_stop_loss', 0) or 0)
+            _target = float(_r.get('suggested_target', 0) or 0)
+            _conv = int(_r.get('conviction', 0) or 0)
+            _quality = str(_r.get('quality_grade', '') or '')
+            _sig_type = str(_r.get('recommendation', '') or '')
+            _expires = (datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d')
+            _note = (
+                f"[Trade Finder] trigger={_trigger:.2f} rr={float(_rr):.2f}:1 "
+                f"reason={str(_reason or '')[:160]}"
+            ).strip()
+
+            _entry_obj = ConditionalEntry(
+                ticker=_ticker,
+                condition_type='breakout_above',
+                trigger_price=float(_trigger),
+                volume_multiplier=1.5,
+                stop_price=float(_stop),
+                target_price=float(_target),
+                conviction=_conv,
+                signal_type=_sig_type,
+                quality_grade=_quality,
+                expires_date=_expires,
+                notes=_note,
+            )
+            _msg = jm.add_conditional(_entry_obj)
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'success',
+                'message': _msg,
+                'ts': time.time(),
+            }
+            st.rerun()
+
         for group_label, group_rows, expanded in [
             ("🚀 Actionable Signals", primary_rows, True),
             ("👀 Watchlist Signals", watch_rows, False),
@@ -5479,7 +5522,7 @@ def render_trade_finder_tab():
                             f"<span style='color:{earn_disp['color']};font-weight:700'>{earn_disp['icon']} {earn_disp['text']}</span>",
                             unsafe_allow_html=True,
                         )
-                        a1, a2, a3 = c11.columns(3)
+                        a1, a2, a3, a4 = c11.columns(4)
                         with a1:
                             if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=1)
@@ -5487,6 +5530,10 @@ def render_trade_finder_tab():
                             if st.button("✅", key=f"tf_tbl_trade_{group_label}_{i}_{ticker}", help="Place Trade", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=4)
                         with a3:
+                            _alert_help = "Update Alert" if has_alert else "Set Alert"
+                            if st.button("🎯", key=f"tf_tbl_alert_{group_label}_{i}_{ticker}", help=_alert_help, width="stretch"):
+                                _set_alert_for_candidate(r, price, rr, signal_reason)
+                        with a4:
                             if st.button("🗂️", key=f"tf_tbl_stage_{group_label}_{i}_{ticker}", help="Stage Ticket", width="stretch"):
                                 _stage_candidate(r, price, rr, rank, signal_reason, rationale)
                         st.caption(
@@ -5569,7 +5616,7 @@ def render_trade_finder_tab():
                                 st.caption(f"Analysis Note: {rationale}")
                             for w in warnings[:3]:
                                 st.warning(f"Consistency warning: {w}")
-                            a1, a2, a3 = st.columns(3)
+                            a1, a2, a3, a4 = st.columns(4)
                             with a1:
                                 if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
                                     _open_candidate_for_action(r, detail_tab=1)
@@ -5577,6 +5624,10 @@ def render_trade_finder_tab():
                                 if st.button("✅ Place Trade", key=f"tf_trade_{group_label}_{i}_{ticker}", width="stretch"):
                                     _open_candidate_for_action(r, detail_tab=4)
                             with a3:
+                                _alert_label = "🎯 Update Alert" if has_alert else "🎯 Set Alert"
+                                if st.button(_alert_label, key=f"tf_alert_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _set_alert_for_candidate(r, price, rr, signal_reason)
+                            with a4:
                                 if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
                                     _stage_candidate(r, price, rr, rank, signal_reason, rationale)
 
