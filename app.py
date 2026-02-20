@@ -11161,157 +11161,204 @@ def render_executive_dashboard():
         st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
 
     with st.expander("🔥 Market Heat Maps", expanded=False):
-        hm1, hm2 = st.tabs(["Universe Heatmap", "TradingView Heatmap"])
+        st.markdown("**Universe Heatmap (native)**")
+        st.caption("Built from your latest universe data: Trade Finder > Find New > Scanner (fallback order).")
 
-        with hm1:
-            st.caption("Native heatmap built from your scanned ticker universe.")
-            scan_rows = snap.scan_summary or []
-            if not scan_rows:
-                st.info("Run Scan All first to populate the native heatmap.")
-            else:
-                import plotly.express as px
-
-                heat_rows = []
-                for r in scan_rows:
-                    ticker = str(r.get('ticker', '') or '').upper().strip()
-                    if not ticker:
-                        continue
-                    sector = str(r.get('sector', '') or '').strip() or "Unknown"
-                    phase = str(r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
-                    sector_bucket = f"{sector} ({phase})"
-                    rec_u = str(r.get('recommendation', '') or '').upper()
-                    conv = int(r.get('conviction', 0) or 0)
-                    price = float(r.get('price', 0) or 0)
-                    vol_ratio = float(r.get('volume_ratio', 0) or 0)
-
-                    score = 0.0
-                    if "STRONG BUY" in rec_u:
-                        score += 2.0
-                    elif "BUY" in rec_u:
-                        score += 1.0
-                    elif "RE-ENTRY" in rec_u:
-                        score += 0.5
-                    elif "LATE ENTRY" in rec_u:
-                        score += 0.2
-                    elif "WAIT" in rec_u:
-                        score -= 0.4
-                    elif "SKIP" in rec_u:
-                        score -= 1.2
-
-                    if phase == "LEADING":
-                        score += 0.6
-                    elif phase == "EMERGING":
-                        score += 0.3
-                    elif phase == "FADING":
-                        score -= 0.4
-                    elif phase == "LAGGING":
-                        score -= 0.8
-
-                    if bool(r.get('monthly_bullish', False)):
-                        score += 0.3
-                    else:
-                        score -= 0.2
-                    if bool(r.get('weekly_bullish', False)):
-                        score += 0.2
-                    if bool(r.get('ao_positive', False)):
-                        score += 0.2
-
-                    size_metric = max(1.0, float(conv if conv > 0 else 1))
-                    if vol_ratio > 0:
-                        size_metric *= max(0.6, min(3.0, vol_ratio))
-
-                    heat_rows.append({
-                        'sector_bucket': sector_bucket,
-                        'ticker': ticker,
-                        'size_metric': float(size_metric),
-                        'heat_score': round(float(score), 2),
-                        'recommendation': str(r.get('recommendation', '') or ''),
-                        'conviction': conv,
-                        'price': price,
-                        'volume_ratio': round(vol_ratio, 2),
-                        'earn_days': int(r.get('earn_days', 999) or 999),
-                    })
-
-                if not heat_rows:
-                    st.info("No valid scan rows to render.")
-                else:
-                    hdf = pd.DataFrame(heat_rows)
-                    fig = px.treemap(
-                        hdf,
-                        path=['sector_bucket', 'ticker'],
-                        values='size_metric',
-                        color='heat_score',
-                        color_continuous_scale='RdYlGn',
-                        color_continuous_midpoint=0,
-                        hover_data={
-                            'recommendation': True,
-                            'conviction': True,
-                            'price': ':.2f',
-                            'volume_ratio': True,
-                            'earn_days': True,
-                            'size_metric': False,
-                            'heat_score': ':.2f',
-                        },
-                    )
-                    fig.update_traces(
-                        texttemplate="%{label}<br>%{color:.1f}",
-                        marker=dict(line=dict(width=0.7, color="rgba(255,255,255,0.15)")),
-                    )
-                    fig.update_layout(
-                        height=720,
-                        margin=dict(l=8, r=8, t=24, b=8),
-                        paper_bgcolor='rgba(0,0,0,0)',
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        coloraxis_colorbar=dict(title='Score'),
-                    )
-                    st.plotly_chart(fig, use_container_width=True, theme=None, key="exec_native_universe_heatmap")
-                    st.caption(
-                        "Color score: signal strength + sector phase + timeframe alignment. "
-                        "Tile size: conviction adjusted by relative volume."
-                    )
-
-        with hm2:
-            stockanalysis_url = "https://stockanalysis.com/markets/heatmap/"
-            tv_url = "https://www.tradingview.com/heatmap/stock/"
-            st.caption("TradingView widget + external links.")
-            st.markdown(f"[Open TradingView heatmap in new tab]({tv_url})")
-            st.markdown(f"[Open StockAnalysis heatmap in new tab]({stockanalysis_url})")
+        def _safe_float(v: Any, default: float = 0.0) -> float:
             try:
-                import streamlit.components.v1 as components
-                components.html(
-                    """
-                    <div class="tradingview-widget-container" style="height:620px;width:100%;">
-                      <div class="tradingview-widget-container__widget"></div>
-                      <script type="text/javascript"
-                        src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
-                      {
-                        "exchanges": [],
-                        "dataSource": "SPX500",
-                        "grouping": "sector",
-                        "blockSize": "market_cap_basic",
-                        "blockColor": "change",
-                        "locale": "en",
-                        "symbolUrl": "",
-                        "colorTheme": "dark",
-                        "hasTopBar": true,
-                        "isDataSetEnabled": true,
-                        "isZoomEnabled": true,
-                        "hasSymbolTooltip": true,
-                        "isMonoSize": false,
-                        "width": "100%",
-                        "height": "620"
-                      }
-                      </script>
-                    </div>
-                    """,
-                    height=640,
-                    scrolling=False,
+                f = float(v)
+                if pd.isna(f):
+                    return default
+                return f
+            except Exception:
+                return default
+
+        def _safe_int(v: Any, default: int = 0) -> int:
+            try:
+                if v is None:
+                    return default
+                if isinstance(v, str) and not v.strip():
+                    return default
+                i = int(float(v))
+                return i
+            except Exception:
+                return default
+
+        def _safe_bool(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return False
+            s = str(v).strip().lower()
+            return s in {"1", "true", "yes", "y", "t"}
+
+        tf_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        fn_rows = (st.session_state.get('find_new_trades_report', {}) or {}).get('candidates', []) or []
+        scan_rows = snap.scan_summary or []
+
+        source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else scan_rows)
+        source_name = "Trade Finder" if source_rows is tf_rows else ("Find New" if source_rows is fn_rows else "Scanner")
+        st.caption(f"Data source: {source_name} ({len(source_rows)} rows)")
+
+        if not source_rows:
+            st.info("No data available yet. Run Find New Trades or Scan All first.")
+        else:
+            import plotly.express as px
+
+            heat_rows: List[Dict[str, Any]] = []
+            dedup: Dict[str, Dict[str, Any]] = {}
+            for r in source_rows:
+                ticker = str(r.get('ticker', '') or '').upper().strip()
+                if not ticker:
+                    continue
+
+                sector = str(r.get('sector', '') or '').strip() or "Unknown"
+                phase = str(r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
+                rec_u = str(r.get('ai_buy_recommendation', r.get('recommendation', '')) or '').upper()
+                conv = _safe_int(r.get('conviction', r.get('ai_confidence', 0)), 0)
+                price = _safe_float(r.get('price', 0), 0.0)
+                vol_ratio = _safe_float(r.get('volume_ratio', 0), 0.0)
+
+                score = 0.0
+                if "STRONG BUY" in rec_u:
+                    score += 2.0
+                elif "BUY" in rec_u:
+                    score += 1.0
+                elif "RE-ENTRY" in rec_u:
+                    score += 0.5
+                elif "LATE ENTRY" in rec_u:
+                    score += 0.2
+                elif "WAIT" in rec_u or "WATCH" in rec_u:
+                    score -= 0.4
+                elif "SKIP" in rec_u:
+                    score -= 1.2
+
+                if phase == "LEADING":
+                    score += 0.6
+                elif phase == "EMERGING":
+                    score += 0.3
+                elif phase == "FADING":
+                    score -= 0.4
+                elif phase == "LAGGING":
+                    score -= 0.8
+
+                monthly_ok = _safe_bool(r.get('monthly_bullish', r.get('monthly_macd_bullish', False)))
+                weekly_ok = _safe_bool(r.get('weekly_bullish', False))
+                ao_ok = _safe_bool(r.get('ao_positive', r.get('daily_ao_positive', False)))
+                score += 0.3 if monthly_ok else -0.2
+                if weekly_ok:
+                    score += 0.2
+                if ao_ok:
+                    score += 0.2
+
+                size_metric = max(1.0, float(conv if conv > 0 else 1))
+                if vol_ratio > 0:
+                    size_metric *= max(0.6, min(3.0, vol_ratio))
+
+                row = {
+                    'sector_bucket': f"{sector} ({phase})",
+                    'ticker': ticker,
+                    'size_metric': float(size_metric),
+                    'heat_score': round(float(score), 2),
+                    'recommendation': str(r.get('ai_buy_recommendation', r.get('recommendation', '')) or ''),
+                    'conviction': conv,
+                    'price': price,
+                    'volume_ratio': round(vol_ratio, 2),
+                    'earn_days': _safe_int(r.get('earn_days', 999), 999),
+                }
+                prev = dedup.get(ticker)
+                if prev is None or float(row['size_metric']) > float(prev.get('size_metric', 0) or 0):
+                    dedup[ticker] = row
+
+            heat_rows = list(dedup.values())
+            if not heat_rows:
+                st.info("No valid rows to render.")
+            else:
+                hdf = pd.DataFrame(heat_rows)
+                hdf['heat_score'] = pd.to_numeric(hdf['heat_score'], errors='coerce').fillna(0.0)
+                hdf['size_metric'] = pd.to_numeric(hdf['size_metric'], errors='coerce').fillna(1.0).clip(lower=1.0)
+                hdf['price'] = pd.to_numeric(hdf['price'], errors='coerce').fillna(0.0)
+                hdf['volume_ratio'] = pd.to_numeric(hdf['volume_ratio'], errors='coerce').fillna(0.0)
+                hdf['conviction'] = pd.to_numeric(hdf['conviction'], errors='coerce').fillna(0).astype(int)
+                hdf['earn_days'] = pd.to_numeric(hdf['earn_days'], errors='coerce').fillna(999).astype(int)
+
+                fig = px.treemap(
+                    hdf,
+                    path=['sector_bucket', 'ticker'],
+                    values='size_metric',
+                    color='heat_score',
+                    color_continuous_scale='RdYlGn',
+                    color_continuous_midpoint=0,
+                    hover_data={
+                        'recommendation': True,
+                        'conviction': True,
+                        'price': ':.2f',
+                        'volume_ratio': True,
+                        'earn_days': True,
+                        'size_metric': False,
+                        'heat_score': ':.2f',
+                    },
                 )
-            except Exception as e:
-                st.warning(
-                    "TradingView widget unavailable in this browser/session. "
-                    f"Use the link above. ({str(e)[:120]})"
+                # Avoid NaN text artifacts; keep labels clean.
+                fig.update_traces(
+                    texttemplate="%{label}",
+                    marker=dict(line=dict(width=0.7, color="rgba(255,255,255,0.15)")),
                 )
+                fig.update_layout(
+                    height=720,
+                    margin=dict(l=8, r=8, t=24, b=8),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    coloraxis_colorbar=dict(title='Score'),
+                )
+                st.plotly_chart(fig, use_container_width=True, theme=None, key="exec_native_universe_heatmap")
+                st.caption(
+                    "Color score: signal strength + sector phase + timeframe alignment. "
+                    "Tile size: conviction adjusted by relative volume."
+                )
+
+        st.divider()
+        st.markdown("**TradingView Heatmap**")
+        stockanalysis_url = "https://stockanalysis.com/markets/heatmap/"
+        tv_url = "https://www.tradingview.com/heatmap/stock/"
+        st.markdown(f"[Open TradingView heatmap in new tab]({tv_url})")
+        st.markdown(f"[Open StockAnalysis heatmap in new tab]({stockanalysis_url})")
+        try:
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <div class="tradingview-widget-container" style="height:620px;width:100%;">
+                  <div class="tradingview-widget-container__widget"></div>
+                  <script type="text/javascript"
+                    src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
+                  {
+                    "exchanges": [],
+                    "dataSource": "SPX500",
+                    "grouping": "sector",
+                    "blockSize": "market_cap_basic",
+                    "blockColor": "change",
+                    "locale": "en",
+                    "symbolUrl": "",
+                    "colorTheme": "dark",
+                    "hasTopBar": true,
+                    "isDataSetEnabled": true,
+                    "isZoomEnabled": true,
+                    "hasSymbolTooltip": true,
+                    "isMonoSize": false,
+                    "width": "100%",
+                    "height": "620"
+                  }
+                  </script>
+                </div>
+                """,
+                height=640,
+                scrolling=False,
+            )
+        except Exception as e:
+            st.warning(
+                "TradingView widget unavailable in this browser/session. "
+                f"Use the links above. ({str(e)[:120]})"
+            )
 
     candidate_rows = []
     if gate.allow_new_trades:
