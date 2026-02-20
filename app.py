@@ -9683,6 +9683,22 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
 
     st.subheader(f"📐 Position Sizer — {ticker}")
 
+    def _safe_state_set(_key: str, _value: Any) -> bool:
+        """
+        Streamlit can invoke this renderer more than once in the same run path.
+        In that case, writing a widget-backed key after widget instantiation raises:
+        "cannot be modified after the widget with key ... is instantiated".
+        Guard writes so UI stays operational instead of crashing.
+        """
+        try:
+            st.session_state[_key] = _value
+            return True
+        except Exception as _e:
+            _msg = str(_e)
+            if "cannot be modified after the widget with key" in _msg:
+                return False
+            raise
+
     if losing_streak >= 2:
         st.warning(f"⚠️ On a {losing_streak}-trade losing streak — position sizes auto-reduced")
     if win_rate < 0.4 and jm.get_trade_history(last_n=5):
@@ -9717,11 +9733,12 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
     if pending_source_key in st.session_state:
         _pending_source = str(st.session_state.pop(pending_source_key) or "").strip()
         if _pending_source in source_options:
-            st.session_state[default_source_key] = _pending_source
+            if not _safe_state_set(default_source_key, _pending_source):
+                st.session_state[pending_source_key] = _pending_source
     if default_source_key not in st.session_state:
-        st.session_state[default_source_key] = "AI Recommended" if ai_levels.get('using_ai') else "Technical"
+        _safe_state_set(default_source_key, "AI Recommended" if ai_levels.get('using_ai') else "Technical")
     elif st.session_state.get(default_source_key) not in source_options:
-        st.session_state[default_source_key] = "Technical"
+        _safe_state_set(default_source_key, "Technical")
     selected_source = st.selectbox(
         "Default Price Source",
         source_options,
@@ -9767,79 +9784,79 @@ def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
             _pref_target = round(_pref_entry + ((_pref_entry - _pref_stop) * 2.0), 2)
         _pref_dist = ((_pref_entry - _pref_stop) / _pref_entry * 100.0) if _pref_entry > 0 and _pref_stop > 0 else 0.0
         _pref_dist = round(max(0.0, _pref_dist), 2)
-        st.session_state[pending_source_key] = "AI Recommended"
-        st.session_state[entry_key] = float(_pref_entry)
-        st.session_state[stop_key] = float(_pref_stop)
-        st.session_state[target_key] = float(_pref_target)
-        st.session_state[confirm_entry_key] = float(_pref_entry)
-        st.session_state[confirm_stop_key] = float(_pref_stop)
-        st.session_state[confirm_target_key] = float(_pref_target)
-        st.session_state[pending_stop_dist_key] = float(_pref_dist)
-        st.session_state[stop_dist_prev_key] = float(_pref_dist)
-        st.session_state[stop_prev_key] = float(_pref_stop)
-        st.session_state[prev_source_key] = "AI Recommended"
-        st.session_state[tf_prefill_applied_key] = tf_prefill_token
+        _safe_state_set(pending_source_key, "AI Recommended")
+        _safe_state_set(entry_key, float(_pref_entry))
+        _safe_state_set(stop_key, float(_pref_stop))
+        _safe_state_set(target_key, float(_pref_target))
+        _safe_state_set(confirm_entry_key, float(_pref_entry))
+        _safe_state_set(confirm_stop_key, float(_pref_stop))
+        _safe_state_set(confirm_target_key, float(_pref_target))
+        _safe_state_set(pending_stop_dist_key, float(_pref_dist))
+        _safe_state_set(stop_dist_prev_key, float(_pref_dist))
+        _safe_state_set(stop_prev_key, float(_pref_stop))
+        _safe_state_set(prev_source_key, "AI Recommended")
+        _safe_state_set(tf_prefill_applied_key, tf_prefill_token)
         st.rerun()
 
     if entry_key not in st.session_state:
-        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
     if stop_key not in st.session_state:
-        st.session_state[stop_key] = float(selected_stop)
+        _safe_state_set(stop_key, float(selected_stop))
     if target_key not in st.session_state:
-        st.session_state[target_key] = float(selected_target)
+        _safe_state_set(target_key, float(selected_target))
     if stop_dist_key not in st.session_state:
         _entry0 = float(st.session_state.get(entry_key, selected_entry) or 0)
         _stop0 = float(st.session_state.get(stop_key, selected_stop) or 0)
         _dist0 = ((_entry0 - _stop0) / _entry0 * 100) if _entry0 > 0 and _stop0 > 0 and _entry0 > _stop0 else 0.0
-        st.session_state[stop_dist_key] = round(max(0.0, _dist0), 2)
+        _safe_state_set(stop_dist_key, round(max(0.0, _dist0), 2))
     if stop_dist_prev_key not in st.session_state:
-        st.session_state[stop_dist_prev_key] = float(st.session_state.get(stop_dist_key, 0.0) or 0.0)
+        _safe_state_set(stop_dist_prev_key, float(st.session_state.get(stop_dist_key, 0.0) or 0.0))
     if stop_prev_key not in st.session_state:
-        st.session_state[stop_prev_key] = float(st.session_state.get(stop_key, selected_stop) or selected_stop or 0.0)
+        _safe_state_set(stop_prev_key, float(st.session_state.get(stop_key, selected_stop) or selected_stop or 0.0))
 
     # Apply deferred widget-sync updates before number_input widgets are instantiated.
     if pending_stop_key in st.session_state:
         _pending_stop = float(st.session_state.pop(pending_stop_key) or 0.0)
-        st.session_state[stop_key] = _pending_stop
-        st.session_state[confirm_stop_key] = _pending_stop
-        st.session_state[stop_prev_key] = _pending_stop
+        _safe_state_set(stop_key, _pending_stop)
+        _safe_state_set(confirm_stop_key, _pending_stop)
+        _safe_state_set(stop_prev_key, _pending_stop)
     if pending_stop_dist_key in st.session_state:
         _pending_dist = float(st.session_state.pop(pending_stop_dist_key) or 0.0)
-        st.session_state[stop_dist_key] = _pending_dist
-        st.session_state[stop_dist_prev_key] = _pending_dist
+        _safe_state_set(stop_dist_key, _pending_dist)
+        _safe_state_set(stop_dist_prev_key, _pending_dist)
 
     prev_source = st.session_state.get(prev_source_key)
     if prev_source != selected_source:
-        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
-        st.session_state[stop_key] = float(selected_stop)
-        st.session_state[target_key] = float(selected_target)
-        st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
-        st.session_state[confirm_stop_key] = float(selected_stop)
-        st.session_state[confirm_target_key] = float(selected_target)
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(stop_key, float(selected_stop))
+        _safe_state_set(target_key, float(selected_target))
+        _safe_state_set(confirm_entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(confirm_stop_key, float(selected_stop))
+        _safe_state_set(confirm_target_key, float(selected_target))
         _entry = float(st.session_state.get(entry_key, 0) or 0)
         _stop = float(st.session_state.get(stop_key, 0) or 0)
         _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
         _dist_val = round(max(0.0, _dist), 2)
-        st.session_state[pending_stop_dist_key] = _dist_val
-        st.session_state[stop_dist_prev_key] = float(_dist_val)
-        st.session_state[stop_prev_key] = float(_stop)
-        st.session_state[prev_source_key] = selected_source
+        _safe_state_set(pending_stop_dist_key, _dist_val)
+        _safe_state_set(stop_dist_prev_key, float(_dist_val))
+        _safe_state_set(stop_prev_key, float(_stop))
+        _safe_state_set(prev_source_key, selected_source)
         st.rerun()
 
     if st.button("↺ Apply Selected Defaults", key=f"apply_defaults_{ticker}"):
-        st.session_state[entry_key] = float(selected_entry if selected_entry > 0 else current_price)
-        st.session_state[stop_key] = float(selected_stop)
-        st.session_state[target_key] = float(selected_target)
-        st.session_state[confirm_entry_key] = float(selected_entry if selected_entry > 0 else current_price)
-        st.session_state[confirm_stop_key] = float(selected_stop)
-        st.session_state[confirm_target_key] = float(selected_target)
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(stop_key, float(selected_stop))
+        _safe_state_set(target_key, float(selected_target))
+        _safe_state_set(confirm_entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(confirm_stop_key, float(selected_stop))
+        _safe_state_set(confirm_target_key, float(selected_target))
         _entry = float(st.session_state.get(entry_key, 0) or 0)
         _stop = float(st.session_state.get(stop_key, 0) or 0)
         _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
         _dist_val = round(max(0.0, _dist), 2)
-        st.session_state[pending_stop_dist_key] = _dist_val
-        st.session_state[stop_dist_prev_key] = float(_dist_val)
-        st.session_state[stop_prev_key] = float(_stop)
+        _safe_state_set(pending_stop_dist_key, _dist_val)
+        _safe_state_set(stop_dist_prev_key, float(_dist_val))
+        _safe_state_set(stop_prev_key, float(_stop))
         st.rerun()
 
     if recommended_stop_ref > 0:
