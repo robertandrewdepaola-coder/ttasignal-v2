@@ -7360,7 +7360,7 @@ def render_detail_view():
     for tab, (_name, key) in zip(tabs, ordered_defs):
         with tab:
             if key == "signal":
-                _render_signal_tab(signal, analysis)
+                _render_signal_tab(ticker, signal, rec, analysis)
             elif key == "chart":
                 _render_chart_tab(ticker, signal)
             elif key == "ai":
@@ -7370,9 +7370,162 @@ def render_detail_view():
             elif key == "trade":
                 _render_trade_tab(ticker, signal, analysis)
 
+def _summary_snippet(value: Any, max_chars: int = 240) -> str:
+    txt = clean_ai_formatting(str(value or "").strip())
+    if len(txt) <= max_chars:
+        return txt
+    return txt[: max_chars - 1].rstrip() + "..."
 
-def _render_signal_tab(signal: EntrySignal, analysis: TickerAnalysis):
-    """Signal details and multi-timeframe status."""
+
+def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], analysis: TickerAnalysis):
+    """Master analysis panel: signal engine + Grok AI + Perplexity in one streamlined view."""
+    if not signal:
+        st.warning("No signal data")
+        return
+
+    quality = analysis.quality or {}
+    ai_result = st.session_state.get(f'ai_result_{ticker}') or {}
+    pplx_results = st.session_state.get(f"pplx_research_results_{ticker}", {}) or {}
+
+    _price = float(getattr(analysis, "current_price", 0.0) or 0.0)
+    _stops = signal.stops if signal else {}
+    _entry = float(_stops.get('entry', 0) or 0)
+    _stop = float(_stops.get('stop', 0) or 0)
+    _target = float(_stops.get('target', 0) or 0)
+    _rr = 0.0
+    if _entry > 0 and _stop > 0 and _target > 0 and _entry > _stop:
+        _risk = (_entry - _stop)
+        _reward = (_target - _entry)
+        _rr = (_reward / _risk) if _risk > 0 else 0.0
+
+    _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+    _rotation = st.session_state.get('sector_rotation', {}) or {}
+    _sector = _canonicalize_sector_name(str(_ticker_sectors.get(ticker, '') or ''), _rotation)
+    _phase = str((_rotation.get(_sector, {}) or {}).get('phase', '') or '').upper().strip() if _sector else ''
+    _phase_badge = _sector_phase_display(_phase)
+
+    _earn = resolve_earnings_for_ticker(ticker, verify_with_fetch=False)
+    _earn_days = int(_earn.get('days_until') or 999) if _earn.get('days_until') is not None else 999
+    _earn_badge = _earnings_badge(
+        _earn_days,
+        source=str(_earn.get('source', '') or ''),
+        confidence=str(_earn.get('confidence', '') or ''),
+        earn_date=str(_earn.get('next_earnings', '') or ''),
+    )
+    _earn_txt = str(_earn.get('next_earnings', '') or _earn_badge.get('text', 'n/a'))
+
+    st.markdown("### 🧭 Master Analysis")
+    st.caption("Unified view of scanner signal, Grok AI intelligence, and Perplexity research for faster decisions.")
+
+    mt1, mt2, mt3, mt4, mt5, mt6 = st.columns(6)
+    with mt1:
+        st.metric("Ticker", ticker)
+    with mt2:
+        st.metric("Price", f"${_price:.2f}" if _price > 0 else "n/a")
+    with mt3:
+        st.metric("Scanner Rec", str(rec.get('recommendation', 'SKIP') or 'SKIP'))
+    with mt4:
+        st.metric("Conviction", f"{int(rec.get('conviction', 0) or 0)}/10")
+    with mt5:
+        st.metric("Quality", str(quality.get('quality_grade', '?') or '?'))
+    with mt6:
+        st.metric("R:R", f"{_rr:.2f}:1" if _rr > 0 else "n/a")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        with st.container(border=True):
+            st.markdown("#### 📊 Signal Panel")
+            _daily_ok = bool(signal.macd.get('bullish', False))
+            _weekly_ok = bool((signal.weekly_macd or {}).get('bullish', False))
+            _monthly_ok = bool((signal.monthly_macd or {}).get('bullish', False))
+            _ao_ok = bool(signal.ao.get('positive', False))
+            st.caption(
+                f"Daily MACD: {'✅' if _daily_ok else '❌'} | Weekly: {'✅' if _weekly_ok else '❌'} | "
+                f"Monthly: {'✅' if _monthly_ok else '❌'} | AO: {'✅' if _ao_ok else '❌'}"
+            )
+            st.caption(
+                f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
+                + (f" ({_sector})" if _sector else " (n/a)")
+            )
+            st.caption(f"Earnings: {_earn_badge['icon']} {_earn_txt}")
+            if _entry > 0 and _stop > 0 and _target > 0:
+                st.caption(f"Entry ${_entry:.2f} | Stop ${_stop:.2f} | Target ${_target:.2f}")
+
+    with c2:
+        with st.container(border=True):
+            st.markdown("#### 🤖 Grok Panel")
+            if ai_result:
+                _action = str(ai_result.get('action', ai_result.get('timing', 'n/a')) or 'n/a')
+                _a_conv = int(ai_result.get('conviction', 0) or 0)
+                st.caption(f"Action: {_action}")
+                st.caption(f"AI Conviction: {_a_conv}/10")
+                st.caption(f"Sizing: {str(ai_result.get('position_sizing', 'n/a') or 'n/a')}")
+                st.caption(f"Quality: {str(ai_result.get('fundamental_quality', 'n/a') or 'n/a')[:90]}")
+                _why = _summary_snippet(ai_result.get('why_moving') or ai_result.get('analysis') or '', max_chars=220)
+                if _why:
+                    st.caption(f"Why now: {_why}")
+                _risk = _summary_snippet(ai_result.get('bear_case') or ai_result.get('red_flags') or '', max_chars=200)
+                if _risk:
+                    st.caption(f"Risk: {_risk}")
+            else:
+                st.info("No Grok analysis cached for this ticker yet.")
+                if st.button("Open AI Intel", key=f"master_open_aiintel_{ticker}", width="stretch"):
+                    st.session_state['default_detail_tab'] = 2
+                    st.rerun()
+
+    with c3:
+        with st.container(border=True):
+            st.markdown("#### 🔎 Perplexity Panel")
+            _labels = {
+                "fundamental_research": "Fundamental Research",
+                "fundamental_narrative": "Narrative",
+                "news_thesis": "News Thesis",
+            }
+            if not pplx_results:
+                st.info("No Perplexity outputs cached for this ticker yet.")
+            else:
+                for _k in ("fundamental_research", "fundamental_narrative", "news_thesis"):
+                    _r = pplx_results.get(_k) or {}
+                    _ok = bool(_r.get("ok"))
+                    _ts = str(_r.get("timestamp_utc", "") or "").strip()
+                    _prefix = "✅" if _ok else "⚠️"
+                    st.caption(f"{_prefix} {_labels.get(_k, _k)}" + (f" ({_ts})" if _ts else ""))
+                    if _ok:
+                        st.caption(_summary_snippet(_r.get("text", ""), max_chars=170))
+                    else:
+                        st.caption(_summary_snippet(_r.get("error", "not available"), max_chars=150))
+
+    st.markdown("#### 🔎 Research Actions")
+    _render_perplexity_research_controls(
+        ticker,
+        key_ns="master",
+        show_results=False,
+        heading="",
+    )
+
+    if pplx_results:
+        with st.expander("📚 Perplexity Output Details", expanded=False):
+            for _mode, _title in (
+                ("fundamental_research", "Fundamental Research"),
+                ("fundamental_narrative", "Fundamental Research — Narrative"),
+                ("news_thesis", "News Thesis"),
+            ):
+                _res = pplx_results.get(_mode)
+                if not _res:
+                    continue
+                st.markdown(f"**{_title}**")
+                if bool(_res.get("ok")):
+                    st.markdown(clean_ai_formatting(str(_res.get("text", "") or "")))
+                else:
+                    st.caption(str(_res.get("error", "failed"))[:220])
+                st.markdown("---")
+
+    with st.expander("🧪 Detailed Signal Diagnostics", expanded=False):
+        _render_signal_breakdown(signal, analysis)
+
+
+def _render_signal_breakdown(signal: EntrySignal, analysis: TickerAnalysis):
+    """Detailed signal diagnostics and multi-timeframe breakdown."""
     if not signal:
         st.warning("No signal data")
         return
