@@ -543,6 +543,134 @@ def fetch_current_price(ticker: str) -> Optional[float]:
         return None
 
 
+def fetch_batch_session_change(
+    tickers: List[str],
+    period: str = "5d",
+    interval: str = "1d",
+    chunk_size: int = 80,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Batch-fetch session % change (last close vs previous close) for many tickers.
+    Uses yfinance.download in chunks to reduce rate-limit pressure versus one-call-per-ticker.
+
+    Returns:
+        {
+          "AAPL": {"pct": 1.23, "asof": "2026-02-21", "last_close": 210.11, "prev_close": 207.56},
+          ...
+        }
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    cleaned: List[str] = []
+    seen = set()
+    for t in (tickers or []):
+        tk = str(t or "").upper().strip()
+        if not tk or tk in seen:
+            continue
+        seen.add(tk)
+        cleaned.append(tk)
+    if not cleaned:
+        return out
+
+    def _close_from_download(df: pd.DataFrame, tk: str) -> Optional[pd.Series]:
+        if df is None or df.empty:
+            return None
+        if not isinstance(df.columns, pd.MultiIndex):
+            if 'Close' in df.columns:
+                return pd.to_numeric(df['Close'], errors='coerce')
+            return None
+
+        # Case A: columns like (ticker, field)
+        try:
+            lvl0 = set(str(x) for x in df.columns.get_level_values(0))
+            if tk in lvl0:
+                sub = df[tk]
+                if isinstance(sub, pd.DataFrame) and 'Close' in sub.columns:
+                    return pd.to_numeric(sub['Close'], errors='coerce')
+        except Exception:
+            pass
+
+        # Case B: columns like (field, ticker)
+        try:
+            if ('Close', tk) in df.columns:
+                return pd.to_numeric(df[('Close', tk)], errors='coerce')
+        except Exception:
+            pass
+
+        return None
+
+    # First pass: use short-lived cache where available.
+    remaining: List[str] = []
+    for tk in cleaned:
+        cached = _cache.get(f"{tk}:session_change")
+        if isinstance(cached, dict) and cached.get('pct') is not None:
+            out[tk] = dict(cached)
+        else:
+            remaining.append(tk)
+
+    if not remaining:
+        return out
+
+    # Global cooldown guard.
+    if _is_scope_rate_limited("batch:session_change"):
+        return out
+
+    # Chunked download.
+    for i in range(0, len(remaining), max(10, int(chunk_size))):
+        chunk = remaining[i:i + max(10, int(chunk_size))]
+        scope = f"batch:session_change:{i//max(10, int(chunk_size))}"
+        if _is_scope_rate_limited(scope):
+            continue
+        try:
+            dl = yf.download(
+                tickers=" ".join(chunk),
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+            )
+            if dl is None or dl.empty:
+                continue
+            dl = normalize_columns(dl)
+
+            for tk in chunk:
+                close = _close_from_download(dl, tk)
+                if close is None:
+                    continue
+                close = close.dropna()
+                if len(close) < 2:
+                    continue
+                last_close = float(close.iloc[-1])
+                prev_close = float(close.iloc[-2])
+                if prev_close <= 0:
+                    continue
+                pct = round(((last_close - prev_close) / prev_close) * 100.0, 2)
+                try:
+                    asof = str(pd.Timestamp(close.index[-1]).strftime('%Y-%m-%d'))
+                except Exception:
+                    asof = ""
+                payload = {
+                    'pct': pct,
+                    'asof': asof,
+                    'last_close': last_close,
+                    'prev_close': prev_close,
+                }
+                out[tk] = payload
+                _cache.set(f"{tk}:session_change", payload, ttl_sec=900)
+            _mark_fetch_success(scope)
+            _mark_fetch_success("batch:session_change")
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(scope, e)
+                _register_rate_limit("batch:session_change", e)
+                break
+            print(f"[data_fetcher] Error fetching batch session change ({len(chunk)}): {e}")
+            continue
+
+    return out
+
+
 # =============================================================================
 # MARKET FILTER — SPY + VIX
 # =============================================================================

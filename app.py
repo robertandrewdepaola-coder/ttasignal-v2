@@ -31,7 +31,7 @@ try:
     from data_fetcher import (
         fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
         fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
-        clear_cache, get_fetch_health_status,
+        clear_cache, get_fetch_health_status, fetch_batch_session_change,
     )
 except (KeyError, ImportError, AttributeError):
     # Streamlit Cloud can race module loading during hot-reload after git pulls.
@@ -47,6 +47,7 @@ except (KeyError, ImportError, AttributeError):
     fetch_monthly = _df.fetch_monthly
     clear_cache = _df.clear_cache
     get_fetch_health_status = getattr(_df, "get_fetch_health_status", lambda: {})
+    fetch_batch_session_change = getattr(_df, "fetch_batch_session_change", lambda tickers, **kwargs: {})
 try:
     from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
 except KeyError:
@@ -12283,25 +12284,54 @@ def render_executive_dashboard():
                     _tickers_for_refresh = [t for t in dict.fromkeys(_tickers_for_refresh) if t]
                     _tickers_for_refresh = _tickers_for_refresh[:max(1, _refresh_cap)]
                     with st.spinner(f"Refreshing session change for {len(_tickers_for_refresh)} ticker(s)..."):
-                        for _tk in _tickers_for_refresh:
-                            _attempted += 1
+                        _attempted = len(_tickers_for_refresh)
+                        _batch = {}
+                        try:
+                            _batch = fetch_batch_session_change(
+                                _tickers_for_refresh,
+                                period='5d',
+                                interval='1d',
+                                chunk_size=80,
+                            ) or {}
+                        except Exception:
+                            _batch = {}
+
+                        for _tk, _payload in _batch.items():
                             try:
-                                _df5 = fetch_daily(_tk, period='5d')
+                                _pct = float(_payload.get('pct'))
                             except Exception:
-                                _df5 = None
-                            if _df5 is None or len(_df5) < 2:
                                 continue
-                            try:
-                                _last = float(_df5['Close'].iloc[-1])
-                                _prev = float(_df5['Close'].iloc[-2])
-                                if _prev <= 0:
+                            _change_cache[_tk] = {
+                                'pct': round(_pct, 2),
+                                'asof': str(_payload.get('asof', '') or ''),
+                                'last_close': _payload.get('last_close'),
+                                'prev_close': _payload.get('prev_close'),
+                            }
+                            _updated += 1
+
+                        # Fallback: if batch coverage is still poor, try a small single-ticker pass.
+                        # This salvages partial data when batch endpoint is degraded.
+                        _missing = [t for t in _tickers_for_refresh if t not in _batch]
+                        _fallback_limit = min(40, len(_missing))
+                        if _updated < max(5, int(_attempted * 0.20)) and _fallback_limit > 0:
+                            for _tk in _missing[:_fallback_limit]:
+                                try:
+                                    _df5 = fetch_daily(_tk, period='5d')
+                                except Exception:
+                                    _df5 = None
+                                if _df5 is None or len(_df5) < 2:
                                     continue
-                                _pct = round(((_last - _prev) / _prev) * 100.0, 2)
-                                _asof = str(pd.Timestamp(_df5.index[-1]).strftime('%Y-%m-%d'))
-                                _change_cache[_tk] = {'pct': _pct, 'asof': _asof}
-                                _updated += 1
-                            except Exception:
-                                continue
+                                try:
+                                    _last = float(_df5['Close'].iloc[-1])
+                                    _prev = float(_df5['Close'].iloc[-2])
+                                    if _prev <= 0:
+                                        continue
+                                    _pct = round(((_last - _prev) / _prev) * 100.0, 2)
+                                    _asof = str(pd.Timestamp(_df5.index[-1]).strftime('%Y-%m-%d'))
+                                    _change_cache[_tk] = {'pct': _pct, 'asof': _asof, 'last_close': _last, 'prev_close': _prev}
+                                    _updated += 1
+                                except Exception:
+                                    continue
                     st.session_state['exec_heatmap_day_change_map'] = _change_cache
                     st.session_state['exec_heatmap_day_change_ts'] = time.time()
                     st.session_state['exec_heatmap_day_change_cov'] = {
