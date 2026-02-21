@@ -2339,14 +2339,14 @@ def _run_scan(mode='all'):
                 ),
                 'monthly_macd_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
-                'vcp_detected': bool((sig.vcp or {}).get('vcp_detected', False)) if sig else False,
-                'vcp_score': float((sig.vcp or {}).get('vcp_score', 0.0) or 0.0) if sig else 0.0,
+                'vcp_detected': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_detected', False)),
+                'vcp_score': float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_score', 0.0) or 0.0),
                 'vcp_pivot_price': (
-                    float((sig.vcp or {}).get('pivot_price', 0.0) or 0.0)
+                    float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('pivot_price', 0.0) or 0.0)
                     if sig else 0.0
                 ),
-                'vcp_price_contracting': bool((sig.vcp or {}).get('price_contracting', False)) if sig else False,
-                'vcp_volume_contracting': bool((sig.vcp or {}).get('volume_contracting', False)) if sig else False,
+                'vcp_price_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('price_contracting', False)),
+                'vcp_volume_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('volume_contracting', False)),
                 'is_open_position': r.ticker in open_tickers,
                 'sector': sector_name,
                 'sector_phase': sector_phase,
@@ -7126,7 +7126,13 @@ def _build_rows_from_analysis(results, jm) -> list:
         rec = r.recommendation or {}
         q = r.quality or {}
         sig = r.signal
-        vcp = (sig.vcp if sig else {}) or {}
+        if sig:
+            if isinstance(sig, dict):
+                vcp = (sig.get('vcp', {}) or {})
+            else:
+                vcp = (getattr(sig, 'vcp', {}) or {})
+        else:
+            vcp = {}
 
         # Status column
         if r.ticker in open_tickers:
@@ -7615,7 +7621,12 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
                 f"Daily MACD: {'✅' if _daily_ok else '❌'} | Weekly: {'✅' if _weekly_ok else '❌'} | "
                 f"Monthly: {'✅' if _monthly_ok else '❌'} | AO: {'✅' if _ao_ok else '❌'}"
             )
-            _vcp = (signal.vcp if signal else {}) or {}
+            _vcp = {}
+            if signal:
+                if isinstance(signal, dict):
+                    _vcp = (signal.get('vcp', {}) or {})
+                else:
+                    _vcp = (getattr(signal, 'vcp', {}) or {})
             _vcp_det = bool(_vcp.get('vcp_detected', False))
             _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
             _vcp_pivot = _vcp.get('pivot_price', None)
@@ -7758,7 +7769,12 @@ def _render_signal_breakdown(signal: EntrySignal, analysis: TickerAnalysis):
                   f"Score: {q.get('quality_score', 0)}/100")
         st.caption(f"Win rate: {q.get('win_rate', 0):.0f}% | "
                    f"Signals: {q.get('signals_found', 0)}")
-        _vcp = (signal.vcp if signal else {}) or {}
+        _vcp = {}
+        if signal:
+            if isinstance(signal, dict):
+                _vcp = (signal.get('vcp', {}) or {})
+            else:
+                _vcp = (getattr(signal, 'vcp', {}) or {})
         _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
         _vcp_state = "Detected ✅" if bool(_vcp.get('vcp_detected', False)) else "No ❌"
         _vcp_delta = f"Score {_vcp_score:.0f}/100"
