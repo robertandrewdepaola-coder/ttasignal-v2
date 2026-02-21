@@ -415,6 +415,112 @@ def _run_perplexity_research_prompt(ticker: str, prompt_template: str, max_token
 
     return {"ok": False, "error": " | ".join(_errors[:3])}
 
+
+def _render_perplexity_research_controls(
+    ticker: str,
+    *,
+    key_ns: str = "default",
+    show_results: bool = True,
+    heading: str = "#### 🔎 Perplexity Research",
+) -> None:
+    """Render one-click Perplexity research buttons and cached results for a ticker."""
+    if heading:
+        st.markdown(heading)
+    _pplx_key = _get_perplexity_api_key()
+    st.caption(f"Perplexity status: {'configured' if _pplx_key else 'not configured'}")
+    if not _pplx_key:
+        st.info("Add `PERPLEXITY_API_KEY` in Streamlit secrets to enable one-click fundamental/news research.")
+
+    _pplx_prompts = {
+        "fundamental_research": (
+            "For [TICKER], give me: last 4 quarters of EPS and revenue growth rates with acceleration "
+            "or deceleration trend, gross and operating margin trend over the same period, the primary "
+            "business catalyst driving current growth, any near-term risks or headwinds including secondary "
+            "offerings or insider selling, and industry group strength and main competitors. Be concise and factual."
+        ),
+        "fundamental_narrative": (
+            "For [TICKER], what is the core investment thesis that institutional investors are using to justify "
+            "buying at current levels? What would need to be true for that thesis to break down? Be concise and specific."
+        ),
+        "news_thesis": (
+            "For [TICKER], search for recent news from the last 30 days. Include the date of each development. "
+            "Summarize only: (1) any developments that confirm or threaten the core growth thesis, "
+            "(2) sector or competitor news that directly affects this company, "
+            "(3) any notable institutional activity including large fund disclosures or insider buying. "
+            "Be concise and factual."
+        ),
+    }
+    _pplx_labels = {
+        "fundamental_research": "Fundamental Research",
+        "fundamental_narrative": "Fundamental Research — Narrative",
+        "news_thesis": "News Thesis",
+    }
+    _pplx_key_state = f"pplx_research_results_{ticker}"
+    if _pplx_key_state not in st.session_state:
+        st.session_state[_pplx_key_state] = {}
+    _pplx_results = dict(st.session_state.get(_pplx_key_state, {}) or {})
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        _run_fund = st.button(
+            "📚 Fundamental Research",
+            key=f"pplx_run_fund_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+    with p2:
+        _run_narr = st.button(
+            "🧠 Fundamental Research — Narrative",
+            key=f"pplx_run_narr_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+    with p3:
+        _run_news = st.button(
+            "📰 News Thesis",
+            key=f"pplx_run_news_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+
+    _run_mode = ""
+    if _run_fund:
+        _run_mode = "fundamental_research"
+    elif _run_narr:
+        _run_mode = "fundamental_narrative"
+    elif _run_news:
+        _run_mode = "news_thesis"
+
+    if _run_mode:
+        with st.spinner(f"Running {_pplx_labels.get(_run_mode, 'Perplexity research')} for {ticker}..."):
+            _out = _run_perplexity_research_prompt(ticker, _pplx_prompts[_run_mode], max_tokens=850)
+        _pplx_results[_run_mode] = _out
+        st.session_state[_pplx_key_state] = _pplx_results
+        if bool(_out.get("ok")):
+            st.toast(f"✅ {_pplx_labels.get(_run_mode)} updated.")
+        else:
+            st.warning(f"Perplexity request failed: {str(_out.get('error', 'unknown error'))[:220]}")
+        st.rerun()
+
+    if not show_results:
+        if _pplx_results:
+            st.caption("Latest Perplexity outputs are saved for this ticker and visible in 🤖 AI Intel.")
+        return
+
+    for _mode in ("fundamental_research", "fundamental_narrative", "news_thesis"):
+        _res = _pplx_results.get(_mode)
+        if not _res:
+            continue
+        _title = _pplx_labels.get(_mode, _mode)
+        if bool(_res.get("ok")):
+            _ts = str(_res.get("timestamp_utc", "") or "").strip()
+            _model = str(_res.get("model", "") or "").strip()
+            _meta = f" ({_ts}{' | ' + _model if _model else ''})" if (_ts or _model) else ""
+            with st.expander(f"{_title}{_meta}", expanded=False):
+                st.markdown(clean_ai_formatting(str(_res.get("text", "") or "")))
+        else:
+            st.caption(f"{_title}: {str(_res.get('error', 'failed'))[:220]}")
+
 # ── Restore data files from GitHub backup (before any data managers load) ──
 if '_github_backup_restored' not in st.session_state:
     try:
@@ -7350,6 +7456,14 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     weekly = ticker_data.get('weekly')
     monthly = ticker_data.get('monthly')
 
+    # Quick research actions placed in chart section for fast workflow.
+    _render_perplexity_research_controls(
+        ticker,
+        key_ns=f"chart_{key_ns}",
+        show_results=False,
+        heading="#### 🔎 Fundamental / News Research",
+    )
+
     # ── APEX Signal Detection (cached per ticker) ──────────────────
     show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{key_ns}_{ticker}")
 
@@ -7521,96 +7635,7 @@ def _render_ai_tab(ticker: str, signal: EntrySignal,
         st.caption("💡 After updating API keys, click 🔑 **Reset API** in ⚙️ Settings sidebar.")
 
     # ── Perplexity quick research (fundamentals/news narrative) ──────────────
-    st.markdown("#### 🔎 Perplexity Research")
-    _pplx_key = _get_perplexity_api_key()
-    st.caption(f"Perplexity status: {'configured' if _pplx_key else 'not configured'}")
-    if not _pplx_key:
-        st.info("Add `PERPLEXITY_API_KEY` in Streamlit secrets to enable one-click fundamental/news research.")
-
-    _pplx_prompts = {
-        "fundamental_research": (
-            "For [TICKER], give me: last 4 quarters of EPS and revenue growth rates with acceleration "
-            "or deceleration trend, gross and operating margin trend over the same period, the primary "
-            "business catalyst driving current growth, any near-term risks or headwinds including secondary "
-            "offerings or insider selling, and industry group strength and main competitors. Be concise and factual."
-        ),
-        "fundamental_narrative": (
-            "For [TICKER], what is the core investment thesis that institutional investors are using to justify "
-            "buying at current levels? What would need to be true for that thesis to break down? Be concise and specific."
-        ),
-        "news_thesis": (
-            "For [TICKER], search for recent news from the last 30 days. Include the date of each development. "
-            "Summarize only: (1) any developments that confirm or threaten the core growth thesis, "
-            "(2) sector or competitor news that directly affects this company, "
-            "(3) any notable institutional activity including large fund disclosures or insider buying. "
-            "Be concise and factual."
-        ),
-    }
-    _pplx_labels = {
-        "fundamental_research": "Fundamental Research",
-        "fundamental_narrative": "Fundamental Research — Narrative",
-        "news_thesis": "News Thesis",
-    }
-    _pplx_key_state = f"pplx_research_results_{ticker}"
-    if _pplx_key_state not in st.session_state:
-        st.session_state[_pplx_key_state] = {}
-    _pplx_results = dict(st.session_state.get(_pplx_key_state, {}) or {})
-
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        _run_fund = st.button(
-            "📚 Fundamental Research",
-            key=f"pplx_run_fund_{ticker}",
-            width="stretch",
-            disabled=(not bool(_pplx_key)),
-        )
-    with p2:
-        _run_narr = st.button(
-            "🧠 Fundamental Research — Narrative",
-            key=f"pplx_run_narr_{ticker}",
-            width="stretch",
-            disabled=(not bool(_pplx_key)),
-        )
-    with p3:
-        _run_news = st.button(
-            "📰 News Thesis",
-            key=f"pplx_run_news_{ticker}",
-            width="stretch",
-            disabled=(not bool(_pplx_key)),
-        )
-
-    _run_mode = ""
-    if _run_fund:
-        _run_mode = "fundamental_research"
-    elif _run_narr:
-        _run_mode = "fundamental_narrative"
-    elif _run_news:
-        _run_mode = "news_thesis"
-
-    if _run_mode:
-        with st.spinner(f"Running {_pplx_labels.get(_run_mode, 'Perplexity research')} for {ticker}..."):
-            _out = _run_perplexity_research_prompt(ticker, _pplx_prompts[_run_mode], max_tokens=850)
-        _pplx_results[_run_mode] = _out
-        st.session_state[_pplx_key_state] = _pplx_results
-        if bool(_out.get("ok")):
-            st.toast(f"✅ {_pplx_labels.get(_run_mode)} updated.")
-        else:
-            st.warning(f"Perplexity request failed: {str(_out.get('error', 'unknown error'))[:220]}")
-        st.rerun()
-
-    for _mode in ("fundamental_research", "fundamental_narrative", "news_thesis"):
-        _res = _pplx_results.get(_mode)
-        if not _res:
-            continue
-        _title = _pplx_labels.get(_mode, _mode)
-        if bool(_res.get("ok")):
-            _ts = str(_res.get("timestamp_utc", "") or "").strip()
-            _model = str(_res.get("model", "") or "").strip()
-            _meta = f" ({_ts}{' | ' + _model if _model else ''})" if (_ts or _model) else ""
-            with st.expander(f"{_title}{_meta}", expanded=False):
-                st.markdown(clean_ai_formatting(str(_res.get("text", "") or "")))
-        else:
-            st.caption(f"{_title}: {str(_res.get('error', 'failed'))[:220]}")
+    _render_perplexity_research_controls(ticker, key_ns="aiintel", show_results=True)
 
     # Auto-run on first view for this ticker, or manual re-run
     has_cached = st.session_state.get(f'ai_result_{ticker}') is not None
