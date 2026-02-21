@@ -1776,6 +1776,8 @@ def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
     st.session_state['default_detail_tab'] = _detail_tab
     st.session_state['_switch_to_scanner_tab'] = True
     st.session_state['_switch_to_scanner_target_tab'] = _target
+    # Ensure post-switch UX lands on detail panel (not just scanner table top).
+    st.session_state['_switch_to_scanner_focus_detail'] = True
     st.session_state.pop('_ticker_load_error', None)
     return True
 
@@ -13466,6 +13468,7 @@ def main():
 
     if st.session_state.pop('_switch_to_scanner_tab', False):
         _target_detail_tab = str(st.session_state.pop('_switch_to_scanner_target_tab', '') or '').strip().lower()
+        _focus_detail = bool(st.session_state.pop('_switch_to_scanner_focus_detail', False))
         import streamlit.components.v1 as components
         _target_label = "Chart" if _target_detail_tab == "chart" else ("Trade" if _target_detail_tab == "trade" else "")
         _switch_js = f"""
@@ -13476,6 +13479,7 @@ def main():
               const maxScannerAttempts = 40;
               const maxDetailAttempts = 35;
               const pollMs = 90;
+              const shouldFocusDetail = {str(_focus_detail).lower()};
 
               function clickTabByLabel(label) {{
                 if (!label) return false;
@@ -13487,12 +13491,20 @@ def main():
                 return true;
               }}
 
+              function focusDetailAnchor() {{
+                if (!shouldFocusDetail) return;
+                const anchor = doc.getElementById('detail-anchor');
+                if (!anchor) return;
+                anchor.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+              }}
+
               function openDetailTab(label) {{
-                if (!label) return;
                 let detailAttempts = 0;
                 const detailTimer = setInterval(function() {{
                   detailAttempts += 1;
-                  if (clickTabByLabel(label) || detailAttempts >= maxDetailAttempts) {{
+                  if (label) clickTabByLabel(label);
+                  focusDetailAnchor();
+                  if (detailAttempts >= maxDetailAttempts || doc.getElementById('detail-anchor')) {{
                     clearInterval(detailTimer);
                   }}
                 }}, pollMs);
