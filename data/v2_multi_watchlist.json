@@ -1509,6 +1509,15 @@
       ],
       "created_at": "2026-02-21T23:01:38.811413",
       "last_updated": "2026-02-21T23:03:03.040643"
+    },
+    {
+      "id": "e085f878-c39f-4594-ad65-465f04e81b84",
+      "name": "Minerini",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-21T23:09:28.304850",
+      "last_updated": "2026-02-21T23:09:28.304850"
     }
   ]
 }
