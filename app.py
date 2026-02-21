@@ -521,6 +521,40 @@ def _render_perplexity_research_controls(
         else:
             st.caption(f"{_title}: {str(_res.get('error', 'failed'))[:220]}")
 
+
+def _run_perplexity_weekly_market_read(max_tokens: int = 1400) -> Dict[str, Any]:
+    """Run the executive weekly market-read prompt through Perplexity."""
+    _today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    _prompt = (
+        "Analyze the current U.S. stock market environment as of today and provide a structured weekly "
+        "market read for a growth stock trader. Use real-time data and recent price action to complete the "
+        "following:\n"
+        "Overall Market Bias State the current market environment in one word: Risk-On, Risk-Off, or Neutral. "
+        "Follow with 2-3 sentences explaining why, referencing recent SPY, QQQ, and IWM price action and any "
+        "relevant macro context.\n\n"
+        "Sector ETF Leaderboard Rank the following 10 sector ETFs from strongest to weakest based on 1-week "
+        "performance: XLK (Technology), XLY (Consumer Discret.), XLC (Comm. Services), XLF (Financials), "
+        "XLI (Industrials), XLE (Energy), XLU (Utilities), XLP (Consumer Staples), XHB (Homebuilders), "
+        "XAR (Aerospace & Defense). For each show: Rank, Sector name, ETF ticker, 1-week % change, and a "
+        "one-line characterization (Leading / Neutral / Lagging).\n\n"
+        "Growth ETF Leaderboard Rank the following 10 growth-focused ETFs from strongest to weakest based on "
+        "1-week performance: SMH (Semiconductors), IGV (Software), ROBO (Robotics & AI), XBI (Biotech), "
+        "CIBR (Cybersecurity), TAN (Solar Energy), QTUM (Quantum Computing), VUG (Growth), ARKK (ARK Innovation), "
+        "FFTY (IBD 50). For each show: Rank, Theme name, ETF ticker, 1-week % change, and a one-line "
+        "characterization (Leading / Neutral / Lagging).\n\n"
+        "Growth Stock Opportunities This Week Based on both leaderboards above, identify the 2-3 sectors or themes "
+        "currently showing the strongest conditions for growth stock setups. For each: explain why it is attracting "
+        "institutional interest, what type of growth stocks within that area are worth watching, and what would "
+        "confirm or invalidate the opportunity heading into the week.\n\n"
+        "Weekly Bias Statement In 2-3 sentences, summarize what this environment means for a growth stock trader "
+        "heading into the week. Should they be aggressive, selective, or defensive? What is the single most "
+        "important thing to watch?"
+    )
+    _out = _run_perplexity_research_prompt("SPY", _prompt, max_tokens=max_tokens)
+    if bool(_out.get("ok")):
+        _out["as_of_et"] = _today_et
+    return _out
+
 # ── Restore data files from GitHub backup (before any data managers load) ──
 if '_github_backup_restored' not in st.session_state:
     try:
@@ -12335,6 +12369,58 @@ def render_executive_dashboard():
         f"Trade Finder: {len(tf_last.get('rows', []) or [])} ranked candidate(s) | "
         f"Updated: {tf_last.get('generated_at_iso', 'never') or 'never'}"
     )
+
+    st.markdown("### 🧠 Weekly Market Intelligence")
+    with st.container(border=True):
+        _exec_pplx_key = _get_perplexity_api_key()
+        _weekly_key = "exec_weekly_market_read_result"
+        _weekly_result = st.session_state.get(_weekly_key, {}) or {}
+
+        w1, w2, w3 = st.columns([2.4, 1.3, 1.0])
+        with w1:
+            st.caption(
+                "One-click Perplexity weekly macro read for growth trading: market bias, sector and growth ETF "
+                "leaderboards, top opportunity themes, and a weekly execution posture."
+            )
+            if not _exec_pplx_key:
+                st.info("Perplexity key not configured. Add `PERPLEXITY_API_KEY` in Streamlit secrets.")
+        with w2:
+            if st.button(
+                "🧠 Perplexity Weekly Market Read",
+                key="exec_run_weekly_market_read",
+                width="stretch",
+                disabled=(not bool(_exec_pplx_key)),
+            ):
+                with st.spinner("Running weekly market read via Perplexity..."):
+                    _weekly_result = _run_perplexity_weekly_market_read(max_tokens=1400)
+                st.session_state[_weekly_key] = _weekly_result
+                if bool(_weekly_result.get("ok")):
+                    st.toast("✅ Weekly market read updated.")
+                else:
+                    st.warning(f"Perplexity request failed: {str(_weekly_result.get('error', 'unknown error'))[:220]}")
+                st.rerun()
+        with w3:
+            if st.button("🧹 Clear Read", key="exec_clear_weekly_market_read", width="stretch"):
+                st.session_state.pop(_weekly_key, None)
+                st.rerun()
+
+        if _weekly_result:
+            if bool(_weekly_result.get("ok")):
+                _weekly_text = str(_weekly_result.get("text", "") or "").strip()
+                _weekly_ts = str(_weekly_result.get("timestamp_utc", "") or "").strip()
+                _weekly_model = str(_weekly_result.get("model", "") or "").strip()
+                _weekly_meta = " | ".join([x for x in [_weekly_ts, _weekly_model] if x])
+                if _weekly_meta:
+                    st.caption(f"Updated: {_weekly_meta}")
+                _preview = _summary_snippet(_weekly_text, max_chars=320)
+                if _preview:
+                    st.success(_preview)
+                with st.expander("📘 Weekly Market Read (full)", expanded=False):
+                    st.markdown(clean_ai_formatting(_weekly_text))
+            else:
+                st.warning(f"Last request failed: {str(_weekly_result.get('error', 'unknown error'))[:220]}")
+        else:
+            st.caption("No weekly market read cached yet for this session.")
 
     st.caption(
         f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
