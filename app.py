@@ -1878,7 +1878,64 @@ def render_sidebar():
             st.caption("🔑 Could not read secrets")
 
 
-def _load_ticker_for_view(ticker: str) -> bool:
+def _ensure_ticker_chart_cache(
+    ticker: str,
+    include_weekly: bool = False,
+    include_monthly: bool = False,
+    include_market_context: bool = False,
+) -> bool:
+    """Ensure chart data cache exists with minimal required payload for responsive open-chart UX."""
+    _ticker = str(ticker or "").upper().strip()
+    if not _ticker:
+        return False
+
+    cache = st.session_state.get('ticker_data_cache', {}) or {}
+    data = dict((cache.get(_ticker, {}) if isinstance(cache, dict) else {}) or {})
+
+    # Prefer already-fetched Trade Finder scan payload to avoid duplicate API calls.
+    tf_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+    tf_data = dict((tf_cache.get(_ticker, {}) if isinstance(tf_cache, dict) else {}) or {})
+    if tf_data:
+        for _k in ('daily', 'weekly', 'monthly', 'market_filter', 'spy_daily', 'current_price'):
+            if data.get(_k) is None and tf_data.get(_k) is not None:
+                data[_k] = tf_data.get(_k)
+
+    if data.get('daily') is None:
+        try:
+            data['daily'] = fetch_daily(_ticker)
+        except Exception:
+            data['daily'] = None
+
+    if include_weekly and data.get('weekly') is None:
+        try:
+            data['weekly'] = fetch_weekly(_ticker)
+        except Exception:
+            data['weekly'] = None
+
+    if include_monthly and data.get('monthly') is None:
+        try:
+            data['monthly'] = fetch_monthly(_ticker)
+        except Exception:
+            data['monthly'] = None
+
+    if include_market_context and data.get('market_filter') is None:
+        try:
+            data['market_filter'] = fetch_market_filter()
+        except Exception:
+            data['market_filter'] = {}
+
+    if data.get('daily') is not None:
+        try:
+            data['current_price'] = float(data['daily']['Close'].iloc[-1])
+        except Exception:
+            pass
+
+    cache[_ticker] = data
+    st.session_state['ticker_data_cache'] = cache
+    return bool(data.get('daily') is not None)
+
+
+def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
     """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.).
     
     NOTE: No st.rerun() needed here. Button clicks already trigger a Streamlit rerun.
@@ -1891,28 +1948,18 @@ def _load_ticker_for_view(ticker: str) -> bool:
     ticker = ticker.upper().strip()
     st.session_state.pop('_ticker_load_error', None)
 
-    def _ensure_chart_cache(_ticker: str) -> bool:
-        """Guarantee daily/weekly/monthly data exists for chart rendering."""
-        cache = st.session_state.get('ticker_data_cache', {}) or {}
-        _cached = cache.get(_ticker, {}) if isinstance(cache, dict) else {}
-        if _cached and _cached.get('daily') is not None:
-            return True
-        # Prefer data already fetched by Trade Finder scan run.
-        tf_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
-        _tf = tf_cache.get(_ticker, {}) if isinstance(tf_cache, dict) else {}
-        if _tf and _tf.get('daily') is not None:
-            cache[_ticker] = _tf
-            st.session_state['ticker_data_cache'] = cache
-            return True
-        try:
-            _data = fetch_all_ticker_data(_ticker)
-            if _data.get('daily') is None:
-                return False
-            cache[_ticker] = _data
-            st.session_state['ticker_data_cache'] = cache
-            return True
-        except Exception:
-            return False
+    analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
+    cached_analysis = analysis_cache.get(ticker)
+    if cached_analysis is not None:
+        st.session_state['selected_ticker'] = ticker
+        st.session_state['selected_analysis'] = cached_analysis
+        st.session_state['scroll_to_detail'] = True
+        _need_mtf = not bool(prefer_chart_fast)
+        if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
+            msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+            st.session_state['_ticker_load_error'] = msg
+            st.sidebar.error(msg)
+        return True
 
     # Check if we already have analysis from a scan (instant — no API call)
     results = st.session_state.get('scan_results', [])
@@ -1921,7 +1968,10 @@ def _load_ticker_for_view(ticker: str) -> bool:
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
             st.session_state['scroll_to_detail'] = True
-            if not _ensure_chart_cache(ticker):
+            analysis_cache[ticker] = r
+            st.session_state['_ticker_analysis_cache'] = analysis_cache
+            _need_mtf = not bool(prefer_chart_fast)
+            if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
                 # Keep navigation deterministic even when live chart fetch is rate-limited.
                 # Detail view still opens and will show explicit "No chart data available".
                 msg = f"No chart data for {ticker} (data provider limit or unavailable)."
@@ -1931,7 +1981,24 @@ def _load_ticker_for_view(ticker: str) -> bool:
 
     # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
     try:
-        data = fetch_all_ticker_data(ticker)
+        if prefer_chart_fast:
+            if not _ensure_ticker_chart_cache(
+                ticker,
+                include_weekly=False,
+                include_monthly=False,
+                include_market_context=True,
+            ):
+                msg = f"No data for {ticker}"
+                st.session_state['_ticker_load_error'] = msg
+                st.sidebar.error(msg)
+                return False
+            data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+            data = dict((data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}) or {})
+            data['ticker'] = ticker
+            data.setdefault('market_filter', fetch_market_filter() or {})
+        else:
+            data = fetch_all_ticker_data(ticker)
+
         if data.get('daily') is not None:
             analysis = analyze_ticker(data)
             st.session_state['selected_ticker'] = ticker
@@ -1941,6 +2008,8 @@ def _load_ticker_for_view(ticker: str) -> bool:
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
             st.session_state['ticker_data_cache'] = cache
+            analysis_cache[ticker] = analysis
+            st.session_state['_ticker_analysis_cache'] = analysis_cache
             # Clear stale APEX cache (new data = needs re-detection)
             st.session_state.pop(f'_apex_cache_{ticker}', None)
             # No rerun — current pass will render detail view
@@ -1972,7 +2041,7 @@ def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
         _target = "chart"
     _detail_tab = 1 if _target == "chart" else (4 if _target == "trade" else 0)
 
-    _loaded = _load_ticker_for_view(_tk)
+    _loaded = _load_ticker_for_view(_tk, prefer_chart_fast=(_target == "chart"))
     if not _loaded:
         st.session_state['_scanner_nav_error'] = str(
             st.session_state.get('_ticker_load_error', f"Unable to load {_tk}.")
@@ -5604,30 +5673,34 @@ def render_trade_finder_tab():
         _sel = st.session_state.get('selected_analysis')
         _sel_ticker = str(getattr(_sel, 'ticker', '') or '').upper().strip() if _sel is not None else ''
         try:
-            _cache = st.session_state.get('ticker_data_cache', {}) or {}
-            _have_daily = bool((_cache.get(_inline_chart_ticker, {}) or {}).get('daily') is not None)
-            if not _have_daily:
-                _find_new_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
-                _prefetched = _find_new_cache.get(_inline_chart_ticker, {}) if isinstance(_find_new_cache, dict) else {}
-                if _prefetched and _prefetched.get('daily') is not None:
-                    _cache[_inline_chart_ticker] = _prefetched
-                    st.session_state['ticker_data_cache'] = _cache
-                    _have_daily = True
-            if not _have_daily:
-                _tf_data_prefetch = fetch_all_ticker_data(_inline_chart_ticker)
-                if _tf_data_prefetch.get('daily') is not None:
-                    _cache[_inline_chart_ticker] = _tf_data_prefetch
-                    st.session_state['ticker_data_cache'] = _cache
+            _have_daily = _ensure_ticker_chart_cache(
+                _inline_chart_ticker,
+                include_weekly=False,
+                include_monthly=False,
+                include_market_context=True,
+            )
             if _sel is not None and _sel_ticker == _inline_chart_ticker:
                 _render_chart_tab(_inline_chart_ticker, _sel.signal, key_ns="tf_inline")
             else:
                 _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
                 _tf_analysis = _tf_cache.get(_inline_chart_ticker)
                 if _tf_analysis is None:
-                    _tf_data = fetch_all_ticker_data(_inline_chart_ticker)
+                    _data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+                    _tf_data = dict((_data_cache.get(_inline_chart_ticker, {}) if isinstance(_data_cache, dict) else {}) or {})
+                    if _tf_data.get('daily') is None:
+                        _have_daily = _ensure_ticker_chart_cache(_inline_chart_ticker, include_market_context=True)
+                        _data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+                        _tf_data = dict((_data_cache.get(_inline_chart_ticker, {}) if isinstance(_data_cache, dict) else {}) or {})
+                    if not _have_daily or _tf_data.get('daily') is None:
+                        raise ValueError("No daily chart data available")
+                    _tf_data['ticker'] = _inline_chart_ticker
+                    _tf_data.setdefault('market_filter', fetch_market_filter() or {})
                     _tf_analysis = analyze_ticker(_tf_data)
                     _tf_cache[_inline_chart_ticker] = _tf_analysis
                     st.session_state['_tf_inline_analysis_cache'] = _tf_cache
+                    _analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
+                    _analysis_cache[_inline_chart_ticker] = _tf_analysis
+                    st.session_state['_ticker_analysis_cache'] = _analysis_cache
                 st.session_state['selected_ticker'] = _inline_chart_ticker
                 st.session_state['selected_analysis'] = _tf_analysis
                 _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal, key_ns="tf_inline")
@@ -5732,7 +5805,7 @@ def render_trade_finder_tab():
                             st.session_state['trade_finder_inline_chart_ticker'] = _t
                             st.session_state['trade_finder_chart_focus'] = True
                             st.session_state['trade_finder_scroll_to_chart'] = True
-                            _load_ticker_for_view(_t)
+                            _load_ticker_for_view(_t, prefer_chart_fast=True)
                             st.rerun()
 
         hard_gate_fail = {
@@ -5823,7 +5896,7 @@ def render_trade_finder_tab():
             elif int(detail_tab) == 4:
                 st.session_state['trade_finder_chart_focus'] = False
                 st.session_state['_switch_to_scanner_target_tab'] = 'trade'
-            _loaded = _load_ticker_for_view(_ticker)
+            _loaded = _load_ticker_for_view(_ticker, prefer_chart_fast=(int(detail_tab) == 1))
             if not _loaded:
                 st.session_state['trade_finder_chart_error'] = str(
                     st.session_state.get('_ticker_load_error', f"Unable to load data for {_ticker}.")
@@ -6333,7 +6406,7 @@ def render_scanner_table():
                     if st.button("📈", key=f"chart_{t}",
                                  help="Open chart"):
                         st.session_state['default_detail_tab'] = 1  # Chart tab index
-                        _loaded = _load_ticker_for_view(t)
+                        _loaded = _load_ticker_for_view(t, prefer_chart_fast=True)
                         if not _loaded:
                             st.session_state['_scanner_nav_error'] = str(
                                 st.session_state.get('_ticker_load_error', f"Unable to load {t}.")
@@ -6892,7 +6965,7 @@ def render_scanner_table():
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
                 st.session_state['default_detail_tab'] = 1  # Chart tab
                 st.session_state['scroll_to_detail'] = True
-                _loaded = _load_ticker_for_view(row['Ticker'])
+                _loaded = _load_ticker_for_view(row['Ticker'], prefer_chart_fast=True)
                 if not _loaded:
                     st.session_state['_scanner_nav_error'] = str(
                         st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
@@ -7670,10 +7743,13 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     daily = ticker_data.get('daily')
 
     if daily is None:
-        st.warning("No chart data available")
-        return
-
-    from chart_engine import render_tv_chart, render_mtf_chart
+        if _ensure_ticker_chart_cache(ticker, include_weekly=False, include_monthly=False):
+            data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+            ticker_data = data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}
+            daily = ticker_data.get('daily')
+        if daily is None:
+            st.warning("No chart data available")
+            return
 
     weekly = ticker_data.get('weekly')
     monthly = ticker_data.get('monthly')
@@ -7687,13 +7763,24 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     )
 
     # ── APEX Signal Detection (cached per ticker) ──────────────────
-    show_apex = st.checkbox("🎯 Show APEX Signals", value=True, key=f"apex_{key_ns}_{ticker}")
+    _apex_toggle_key = f"apex_{key_ns}_{ticker}"
+    if _apex_toggle_key not in st.session_state:
+        # Default OFF for responsiveness; load on demand.
+        st.session_state[_apex_toggle_key] = False
+    show_apex = st.checkbox("🎯 Show APEX Signals", key=_apex_toggle_key)
 
     apex_markers = []
     apex_signals_list = []
     apex_summary = {}
 
     _apex_cache_key = f'_apex_cache_{ticker}'
+
+    if show_apex and (weekly is None or monthly is None):
+        _ensure_ticker_chart_cache(ticker, include_weekly=True, include_monthly=True)
+        data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+        ticker_data = data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}
+        weekly = ticker_data.get('weekly')
+        monthly = ticker_data.get('monthly')
 
     if show_apex and weekly is not None and monthly is not None:
         # Use cached APEX results if available
@@ -7819,8 +7906,16 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
 """)
 
     # ── MTF chart ─────────────────────────────────────────────────
-    if weekly is not None and monthly is not None:
-        with st.expander("Multi-Timeframe View"):
+    with st.expander("Multi-Timeframe View"):
+        if weekly is None or monthly is None:
+            st.caption("Weekly/monthly data not loaded yet.")
+            if st.button("Load weekly/monthly view", key=f"load_mtf_{key_ns}_{ticker}", width="stretch"):
+                _ok = _ensure_ticker_chart_cache(ticker, include_weekly=True, include_monthly=True)
+                if _ok:
+                    st.rerun()
+                else:
+                    st.warning("Unable to load multi-timeframe data right now.")
+        else:
             try:
                 render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_")
             except TypeError:
@@ -11373,7 +11468,7 @@ def render_position_manager():
         with pc6:
             if st.button("📈 Chart", key=f"pm_chart_{ticker}"):
                 st.session_state['default_detail_tab'] = 1
-                _load_ticker_for_view(ticker)
+                _load_ticker_for_view(ticker, prefer_chart_fast=True)
 
         # Show advice details if available
         if advice.get('reasoning'):
@@ -14040,9 +14135,9 @@ def main():
             (function() {{
               const doc = window.parent.document;
               const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
-              const maxScannerAttempts = 40;
-              const maxDetailAttempts = 35;
-              const pollMs = 90;
+              const maxScannerAttempts = 18;
+              const maxDetailAttempts = 16;
+              const pollMs = 55;
               const shouldFocusDetail = {str(_focus_detail).lower()};
 
               function clickTabByLabel(label) {{
@@ -14063,6 +14158,8 @@ def main():
               }}
 
               function openDetailTab(label) {{
+                if (label) clickTabByLabel(label);
+                focusDetailAnchor();
                 let detailAttempts = 0;
                 const detailTimer = setInterval(function() {{
                   detailAttempts += 1;
@@ -14074,6 +14171,10 @@ def main():
                 }}, pollMs);
               }}
 
+              if (clickTabByLabel('Scanner')) {{
+                openDetailTab({repr(_target_label)});
+                return;
+              }}
               let scannerAttempts = 0;
               const scannerTimer = setInterval(function() {{
                 scannerAttempts += 1;
