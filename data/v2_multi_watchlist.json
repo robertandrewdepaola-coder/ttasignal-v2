@@ -1515,9 +1515,11 @@
       "name": "Minerini",
       "type": "manual",
       "is_system": false,
-      "tickers": [],
+      "tickers": [
+        "VIAV"
+      ],
       "created_at": "2026-02-21T23:09:28.304850",
-      "last_updated": "2026-02-21T23:09:28.304850"
+      "last_updated": "2026-02-21T23:15:03.521407"
     }
   ]
 }
