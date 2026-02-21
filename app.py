@@ -12424,6 +12424,30 @@ def render_executive_dashboard():
 
                 _color_col = 'session_change_pct' if _color_mode.startswith("Session Change") else 'heat_score'
                 _color_title = "Session % Chg" if _color_col == 'session_change_pct' else "Score"
+                if _color_col == 'session_change_pct':
+                    _health = _compute_system_health()
+                    _rate_limited_now = bool((_health or {}).get('rate_limited', False))
+                    if _known_cnt == 0:
+                        st.warning(
+                            "No session-change data is currently available for this universe. "
+                            "Falling back to composite score coloring."
+                            + (" (Data provider is rate-limited.)" if _rate_limited_now else "")
+                        )
+                        _color_col = 'heat_score'
+                        _color_title = "Score (fallback)"
+                    elif _known_cnt < max(10, int(len(hdf) * 0.15)):
+                        # Mixed mode: use session change where available, fall back to score for unknowns.
+                        hdf['heat_color_mixed'] = hdf.apply(
+                            lambda _x: float(_x['session_change_pct'])
+                            if bool(_x.get('session_change_known', False))
+                            else float(_x['heat_score']),
+                            axis=1,
+                        )
+                        _color_col = 'heat_color_mixed'
+                        _color_title = "Session % Chg (mixed fallback)"
+                        st.info(
+                            "Session coverage is low; unknown tickers are colored by composite score."
+                        )
                 fig = px.treemap(
                     hdf,
                     path=['sector_bucket', 'ticker'],
