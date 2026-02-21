@@ -1746,6 +1746,35 @@ def _load_ticker_for_view(ticker: str) -> bool:
         return False
 
 
+def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
+    """
+    Safe cross-tab navigation helper used by heatmap/alerts/executive actions.
+    It only triggers scanner-tab switch after ticker data is successfully loaded.
+    """
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        st.session_state['_scanner_nav_error'] = "No ticker selected."
+        return False
+
+    _target = str(target or "chart").strip().lower()
+    if _target not in {"chart", "trade", "signal"}:
+        _target = "chart"
+    _detail_tab = 1 if _target == "chart" else (4 if _target == "trade" else 0)
+
+    _loaded = _load_ticker_for_view(_tk)
+    if not _loaded:
+        st.session_state['_scanner_nav_error'] = str(
+            st.session_state.get('_ticker_load_error', f"Unable to load {_tk}.")
+        )
+        return False
+
+    st.session_state['default_detail_tab'] = _detail_tab
+    st.session_state['_switch_to_scanner_tab'] = True
+    st.session_state['_switch_to_scanner_target_tab'] = _target
+    st.session_state.pop('_ticker_load_error', None)
+    return True
+
+
 def _resolve_tickers_to_scan(full_list: List[str], existing_summary: List[Dict], mode: str) -> List[str]:
     """Deterministic scan universe resolver used by scan-all and scan-new paths."""
     return resolve_tickers_to_scan(full_list, existing_summary, mode)
@@ -1987,6 +2016,26 @@ def _run_scan(mode='all'):
             sector_info = sector_rotation.get(sector_name, {})
             sector_phase = sector_info.get('phase', '')
 
+            # Session day-change snapshot (last close vs previous close) for heatmaps.
+            _day_change_pct = None
+            _prev_close = None
+            _price_asof = ''
+            try:
+                _daily_df = ((all_data.get(r.ticker, {}) or {}).get('daily') if isinstance(all_data, dict) else None)
+                if _daily_df is not None and len(_daily_df) >= 2:
+                    _last_close = float(_daily_df['Close'].iloc[-1])
+                    _prev_close = float(_daily_df['Close'].iloc[-2])
+                    if _prev_close > 0:
+                        _day_change_pct = round(((_last_close - _prev_close) / _prev_close) * 100.0, 2)
+                    try:
+                        _price_asof = str(pd.Timestamp(_daily_df.index[-1]).strftime('%Y-%m-%d'))
+                    except Exception:
+                        _price_asof = ''
+            except Exception:
+                _day_change_pct = None
+                _prev_close = None
+                _price_asof = ''
+
             rec_adj = _adjust_recommendation_for_sector(
                 str(rec.get('recommendation', 'SKIP') or 'SKIP'),
                 int(rec.get('conviction', 0) or 0),
@@ -2018,6 +2067,9 @@ def _run_scan(mode='all'):
                 'apex_signal_regime': str(getattr(r, 'apex_signal_regime', '') or ''),
                 'volume_str': vol_str,
                 'volume_ratio': vol_ratio,
+                'day_change_pct': _day_change_pct,
+                'previous_close': _prev_close,
+                'price_asof': _price_asof,
                 'earn_date': earn_date,
                 'earn_days': earn_days,
                 'earn_source': earn_source,
@@ -5858,10 +5910,10 @@ def render_trade_finder_tab():
                         'provider': str(p.get('source', 'planned') or 'planned'),
                         'prefill_token': f"{pt}:{int(time.time() * 1000)}",
                     }
-                    st.session_state['default_detail_tab'] = 4
-                    st.session_state['_switch_to_scanner_tab'] = True
-                    _load_ticker_for_view(pt)
-                    st.rerun()
+                    if _navigate_to_scanner_ticker(pt, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {pt}.")))
             with a2:
                 if st.button("⚡ Trigger", key=f"plan_trigger_{pid}", width="stretch"):
                     st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
@@ -11960,11 +12012,8 @@ def render_executive_dashboard():
             if not _tk:
                 st.warning("Select a ticker first.")
                 return
-            st.session_state['default_detail_tab'] = 1 if _target == "chart" else 4
-            st.session_state['_switch_to_scanner_tab'] = True
-            st.session_state['_switch_to_scanner_target_tab'] = "chart" if _target == "chart" else "trade"
-            _loaded = _load_ticker_for_view(_tk)
-            if not _loaded:
+            _ok = _navigate_to_scanner_ticker(_tk, target=("chart" if _target == "chart" else "trade"))
+            if not _ok:
                 st.warning(f"Unable to load {_tk} right now.")
                 return
             st.rerun()
@@ -12159,6 +12208,125 @@ def render_executive_dashboard():
         else:
             import plotly.express as px
 
+            def _extract_session_change_pct(_r: Dict[str, Any]) -> Optional[float]:
+                for _k in (
+                    'day_change_pct',
+                    'daily_change_pct',
+                    'session_change_pct',
+                    'change_pct',
+                    'pct_change',
+                ):
+                    _v = _r.get(_k, None)
+                    if _v is None:
+                        continue
+                    try:
+                        _f = float(_v)
+                        if pd.isna(_f):
+                            continue
+                        if abs(_f) <= 1000:
+                            return round(_f, 2)
+                    except Exception:
+                        continue
+                return None
+
+            _change_cache = st.session_state.get('exec_heatmap_day_change_map', {}) or {}
+            _cache_warm_updates = 0
+            for _sr in source_rows:
+                _tk = str(_sr.get('ticker', '') or '').upper().strip()
+                if not _tk:
+                    continue
+                _pct = _extract_session_change_pct(_sr)
+                if _pct is None:
+                    continue
+                _asof = str(_sr.get('price_asof', '') or _sr.get('asof', '') or '').strip()
+                _existing = _change_cache.get(_tk, {}) if isinstance(_change_cache, dict) else {}
+                if (not _existing) or (_existing.get('pct') != _pct) or (_asof and _existing.get('asof') != _asof):
+                    _change_cache[_tk] = {
+                        'pct': float(_pct),
+                        'asof': _asof,
+                    }
+                    _cache_warm_updates += 1
+            if _cache_warm_updates > 0:
+                st.session_state['exec_heatmap_day_change_map'] = _change_cache
+                if float(st.session_state.get('exec_heatmap_day_change_ts', 0.0) or 0.0) <= 0:
+                    st.session_state['exec_heatmap_day_change_ts'] = time.time()
+
+            _c1, _c2, _c3 = st.columns([1.4, 1.2, 2.4])
+            with _c1:
+                _color_mode = st.selectbox(
+                    "Color Mode",
+                    ["Session Change % (TradingView-style)", "Composite Signal Score"],
+                    key="exec_heatmap_color_mode",
+                )
+            with _c2:
+                _refresh_cap = int(
+                    st.number_input(
+                        "Refresh cap",
+                        min_value=25,
+                        max_value=1200,
+                        value=int(st.session_state.get('exec_heatmap_refresh_cap', 250) or 250),
+                        step=25,
+                        key="exec_heatmap_refresh_cap_input",
+                        help="Max tickers to live-refresh for session change. Keeps refresh deterministic.",
+                    )
+                )
+                st.session_state['exec_heatmap_refresh_cap'] = _refresh_cap
+            with _c3:
+                if st.button("🔄 Refresh Heatmap Prices", key="exec_heatmap_refresh_prices", width="stretch"):
+                    _updated = 0
+                    _attempted = 0
+                    _tickers_for_refresh = [str(_r.get('ticker', '') or '').upper().strip() for _r in source_rows]
+                    _tickers_for_refresh = [t for t in dict.fromkeys(_tickers_for_refresh) if t]
+                    _tickers_for_refresh = _tickers_for_refresh[:max(1, _refresh_cap)]
+                    with st.spinner(f"Refreshing session change for {len(_tickers_for_refresh)} ticker(s)..."):
+                        for _tk in _tickers_for_refresh:
+                            _attempted += 1
+                            try:
+                                _df5 = fetch_daily(_tk, period='5d')
+                            except Exception:
+                                _df5 = None
+                            if _df5 is None or len(_df5) < 2:
+                                continue
+                            try:
+                                _last = float(_df5['Close'].iloc[-1])
+                                _prev = float(_df5['Close'].iloc[-2])
+                                if _prev <= 0:
+                                    continue
+                                _pct = round(((_last - _prev) / _prev) * 100.0, 2)
+                                _asof = str(pd.Timestamp(_df5.index[-1]).strftime('%Y-%m-%d'))
+                                _change_cache[_tk] = {'pct': _pct, 'asof': _asof}
+                                _updated += 1
+                            except Exception:
+                                continue
+                    st.session_state['exec_heatmap_day_change_map'] = _change_cache
+                    st.session_state['exec_heatmap_day_change_ts'] = time.time()
+                    st.session_state['exec_heatmap_day_change_cov'] = {
+                        'updated': int(_updated),
+                        'attempted': int(_attempted),
+                    }
+                    st.success(f"Heatmap refresh complete: {_updated}/{_attempted} tickers updated.")
+                    st.rerun()
+
+            _hm_ts = float(st.session_state.get('exec_heatmap_day_change_ts', 0.0) or 0.0)
+            _hm_cov = st.session_state.get('exec_heatmap_day_change_cov', {}) or {}
+            st.caption(
+                f"Heatmap prices refreshed: {_fmt_last_update(_hm_ts)}"
+                + (
+                    f" | Last refresh coverage: {int(_hm_cov.get('updated', 0) or 0)}/{int(_hm_cov.get('attempted', 0) or 0)}"
+                    if _hm_cov else ""
+                )
+            )
+            _health = _compute_system_health()
+            _market_open_now = str(_health.get('market_session', 'CLOSED') or 'CLOSED').upper() == 'OPEN'
+            _stale_limit = 15 * 60 if _market_open_now else 12 * 60 * 60
+            if _hm_ts <= 0:
+                st.warning("Heatmap price-change data has not been manually refreshed yet in this session.")
+            elif (time.time() - _hm_ts) > _stale_limit:
+                st.warning("Heatmap price-change data is stale. Click Refresh Heatmap Prices.")
+            st.caption(
+                "Color can differ from a single red candle: session heatmap uses last price vs prior close."
+            )
+
             heat_rows: List[Dict[str, Any]] = []
             dedup: Dict[str, Dict[str, Any]] = {}
             for r in source_rows:
@@ -12172,6 +12340,17 @@ def render_executive_dashboard():
                 conv = _safe_int(r.get('conviction', r.get('ai_confidence', 0)), 0)
                 price = _safe_float(r.get('price', 0), 0.0)
                 vol_ratio = _safe_float(r.get('volume_ratio', 0), 0.0)
+                _chg_rec = _extract_session_change_pct(r)
+                if _chg_rec is None:
+                    _chg_blob = (_change_cache.get(ticker, {}) if isinstance(_change_cache, dict) else {}) or {}
+                    _chg_rec = _safe_float(_chg_blob.get('pct', None), None) if _chg_blob else None
+                _chg_known = _chg_rec is not None
+                _chg_value = float(_chg_rec) if _chg_known else 0.0
+                _chg_asof = str(
+                    r.get('price_asof', '')
+                    or ((_change_cache.get(ticker, {}) if isinstance(_change_cache, dict) else {}) or {}).get('asof', '')
+                    or ''
+                ).strip()
 
                 score = 0.0
                 if "STRONG BUY" in rec_u:
@@ -12219,6 +12398,9 @@ def render_executive_dashboard():
                     'price': price,
                     'volume_ratio': round(vol_ratio, 2),
                     'earn_days': _safe_int(r.get('earn_days', 999), 999),
+                    'session_change_pct': round(_chg_value, 2),
+                    'session_change_known': bool(_chg_known),
+                    'price_asof': _chg_asof,
                 }
                 prev = dedup.get(ticker)
                 if prev is None or float(row['size_metric']) > float(prev.get('size_metric', 0) or 0):
@@ -12235,18 +12417,27 @@ def render_executive_dashboard():
                 hdf['volume_ratio'] = pd.to_numeric(hdf['volume_ratio'], errors='coerce').fillna(0.0)
                 hdf['conviction'] = pd.to_numeric(hdf['conviction'], errors='coerce').fillna(0).astype(int)
                 hdf['earn_days'] = pd.to_numeric(hdf['earn_days'], errors='coerce').fillna(999).astype(int)
+                hdf['session_change_pct'] = pd.to_numeric(hdf['session_change_pct'], errors='coerce').fillna(0.0)
+                hdf['session_change_known'] = hdf['session_change_known'].astype(bool)
+                _known_cnt = int(hdf['session_change_known'].sum())
+                st.caption(f"Session change coverage: {_known_cnt}/{len(hdf)} tickers.")
 
+                _color_col = 'session_change_pct' if _color_mode.startswith("Session Change") else 'heat_score'
+                _color_title = "Session % Chg" if _color_col == 'session_change_pct' else "Score"
                 fig = px.treemap(
                     hdf,
                     path=['sector_bucket', 'ticker'],
                     values='size_metric',
-                    color='heat_score',
+                    color=_color_col,
                     color_continuous_scale='RdYlGn',
                     color_continuous_midpoint=0,
                     hover_data={
                         'recommendation': True,
                         'conviction': True,
                         'price': ':.2f',
+                        'session_change_pct': ':+.2f',
+                        'session_change_known': True,
+                        'price_asof': True,
                         'volume_ratio': True,
                         'earn_days': True,
                         'size_metric': False,
@@ -12265,7 +12456,7 @@ def render_executive_dashboard():
                     paper_bgcolor='rgba(0,0,0,0)',
                     plot_bgcolor='rgba(0,0,0,0)',
                     clickmode='event+select',
-                    coloraxis_colorbar=dict(title='Score'),
+                    coloraxis_colorbar=dict(title=_color_title),
                 )
                 _evt = st.plotly_chart(
                     fig,
@@ -12317,10 +12508,16 @@ def render_executive_dashboard():
                 with _a3:
                     if st.button("✅ Open Trade", key="exec_heatmap_open_trade", width="stretch"):
                         _open_from_heatmap(_pick, "trade")
-                st.caption(
-                    "Color score: signal strength + sector phase + timeframe alignment. "
-                    "Tile size: conviction adjusted by relative volume."
-                )
+                if _color_col == 'session_change_pct':
+                    st.caption(
+                        "Color = session % change (last price vs previous close). "
+                        "Tile size = conviction adjusted by relative volume."
+                    )
+                else:
+                    st.caption(
+                        "Color = composite score (signal strength + sector phase + timeframe alignment). "
+                        "Tile size = conviction adjusted by relative volume."
+                    )
 
         st.divider()
         st.markdown("**TradingView Heatmap**")
@@ -12645,10 +12842,10 @@ def render_executive_dashboard():
                         'stop_basis': str(tr.get('stop_basis', '') or ''),
                         'prefill_token': f"{ticker}:{int(time.time() * 1000)}",
                     }
-                    st.session_state['default_detail_tab'] = 4
-                    st.session_state['_switch_to_scanner_tab'] = True
-                    _load_ticker_for_view(ticker)
-                    st.rerun()
+                    if _navigate_to_scanner_ticker(ticker, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
                 st.caption(f"Why: {str(tr.get('ai_rationale', '') or str(tr.get('scanner_summary', '') or ''))[:180]}")
         else:
             for cand in actionable[:12]:
@@ -12907,10 +13104,10 @@ def render_executive_dashboard():
                 else:
                     if st.button("Open", key=f"aq_open_{i}_{ticker}", width="stretch"):
                         if ticker:
-                            _load_ticker_for_view(ticker)
-                            st.session_state['default_detail_tab'] = 4
-                            st.session_state['_switch_to_scanner_tab'] = True
-                            st.rerun()
+                            if _navigate_to_scanner_ticker(ticker, target="trade"):
+                                st.rerun()
+                            else:
+                                st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
             with c2:
                 if action == 'planned_queued' and plan_id:
                     if st.button("Trigger", key=f"aq_trigger_{i}_{plan_id}", width="stretch"):
@@ -13105,10 +13302,10 @@ def render_executive_dashboard():
                         'provider': str(p.get('source', 'planned') or 'planned'),
                         'prefill_token': f"{pticker}:{int(time.time() * 1000)}",
                     }
-                    st.session_state['default_detail_tab'] = 4
-                    st.session_state['_switch_to_scanner_tab'] = True
-                    _load_ticker_for_view(pticker)
-                    st.rerun()
+                    if _navigate_to_scanner_ticker(pticker, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {pticker}.")))
             with r2:
                 if st.button("⚡ Trigger", key=f"exec_plan_trigger_{pid}", width="stretch"):
                     st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
@@ -13195,46 +13392,51 @@ def main():
     if st.session_state.pop('_switch_to_scanner_tab', False):
         _target_detail_tab = str(st.session_state.pop('_switch_to_scanner_target_tab', '') or '').strip().lower()
         import streamlit.components.v1 as components
-        _target_js = ""
-        if _target_detail_tab == "chart":
-            _target_js = """
-              setTimeout(function() {
-                const tabs = Array.from(doc.querySelectorAll('button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'));
-                const chartTab = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes('Chart'));
-                if (chartTab) {
-                  chartTab.click();
-                  chartTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                }
-              }, 140);
-            """
-        elif _target_detail_tab == "trade":
-            _target_js = """
-              setTimeout(function() {
-                const tabs = Array.from(doc.querySelectorAll('button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'));
-                const tradeTab = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes('Trade'));
-                if (tradeTab) {
-                  tradeTab.click();
-                  tradeTab.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-                }
-              }, 140);
-            """
-        _switch_js = """
+        _target_label = "Chart" if _target_detail_tab == "chart" else ("Trade" if _target_detail_tab == "trade" else "")
+        _switch_js = f"""
             <script>
-            setTimeout(function() {
+            (function() {{
               const doc = window.parent.document;
-              const candidates = Array.from(doc.querySelectorAll(
-                'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]'
-              ));
-              const scanner = candidates.find(el => ((el.innerText || el.textContent || '') + '').includes('Scanner'));
-              if (scanner) {
-                scanner.click();
-                scanner.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-              }
-              __TARGET_JS__
-            }, 80);
+              const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
+              const maxScannerAttempts = 40;
+              const maxDetailAttempts = 35;
+              const pollMs = 90;
+
+              function clickTabByLabel(label) {{
+                if (!label) return false;
+                const tabs = Array.from(doc.querySelectorAll(tabSelector));
+                const found = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes(label));
+                if (!found) return false;
+                found.click();
+                found.dispatchEvent(new MouseEvent('click', {{ bubbles: true }}));
+                return true;
+              }}
+
+              function openDetailTab(label) {{
+                if (!label) return;
+                let detailAttempts = 0;
+                const detailTimer = setInterval(function() {{
+                  detailAttempts += 1;
+                  if (clickTabByLabel(label) || detailAttempts >= maxDetailAttempts) {{
+                    clearInterval(detailTimer);
+                  }}
+                }}, pollMs);
+              }}
+
+              let scannerAttempts = 0;
+              const scannerTimer = setInterval(function() {{
+                scannerAttempts += 1;
+                if (clickTabByLabel('Scanner')) {{
+                  clearInterval(scannerTimer);
+                  openDetailTab({repr(_target_label)});
+                }} else if (scannerAttempts >= maxScannerAttempts) {{
+                  clearInterval(scannerTimer);
+                }}
+              }}, pollMs);
+            }})();
             </script>
         """
-        components.html(_switch_js.replace("__TARGET_JS__", _target_js), height=0)
+        components.html(_switch_js, height=0)
 
 
 def _render_alerts_panel():
@@ -13255,18 +13457,16 @@ def _render_alerts_panel():
             return s[:19]
 
     def _open_chart_for_ticker(ticker: str):
-        st.session_state['default_detail_tab'] = 1
-        st.session_state['_switch_to_scanner_tab'] = True
-        st.session_state['_switch_to_scanner_target_tab'] = "chart"
-        _load_ticker_for_view(ticker)
-        st.rerun()
+        if _navigate_to_scanner_ticker(ticker, target="chart"):
+            st.rerun()
+        else:
+            st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
 
     def _open_trade_for_ticker(ticker: str):
-        st.session_state['default_detail_tab'] = 4
-        st.session_state['_switch_to_scanner_tab'] = True
-        st.session_state['_switch_to_scanner_target_tab'] = "trade"
-        _load_ticker_for_view(ticker)
-        st.rerun()
+        if _navigate_to_scanner_ticker(ticker, target="trade"):
+            st.rerun()
+        else:
+            st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
 
     conditionals = jm.get_pending_conditionals() or []
     pending_rows = _build_pending_alert_rows(conditionals)
