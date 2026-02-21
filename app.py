@@ -2719,6 +2719,8 @@ def _canonicalize_sector_name(sector_name: str, rotation_ctx: Optional[Dict[str,
     if not s:
         return ""
     aliases = {
+        "information technology": "Technology",
+        "info tech": "Technology",
         "health care": "Healthcare",
         "healthcare": "Healthcare",
         "financials": "Financial Services",
@@ -12005,12 +12007,19 @@ def render_executive_dashboard():
         _all_watchlists = (_bridge.manager.get_all_watchlists() if _bridge else []) or []
         _all_watchlist_tickers: List[str] = []
         _seen_all: set[str] = set()
+        _watchlist_sector_hints: Dict[str, str] = {}
         for _wl in _all_watchlists:
+            _wl_sector_hint = _canonicalize_sector_name(
+                str(_wl.get('name', '') or '').strip(),
+                st.session_state.get('sector_rotation', {}) or {},
+            )
             for _tk in (_wl.get('tickers', []) or []):
                 _tku = str(_tk or '').upper().strip()
                 if _tku and _tku not in _seen_all:
                     _all_watchlist_tickers.append(_tku)
                     _seen_all.add(_tku)
+                if _tku and _wl_sector_hint and _tku not in _watchlist_sector_hints:
+                    _watchlist_sector_hints[_tku] = _wl_sector_hint
 
         _scope_opts = ["Active Watchlist", "All Watchlists (Universe)"]
         _scope_default = 1 if _all_watchlist_tickers and len(_all_watchlist_tickers) > len(_active_watchlist) else 0
@@ -12027,6 +12036,23 @@ def render_executive_dashboard():
         _universe_set = set(_universe_tickers)
         _ticker_sector_map = st.session_state.get('ticker_sectors', {}) or {}
         _rotation_map = st.session_state.get('sector_rotation', {}) or {}
+        _scan_cache_rows: List[Dict[str, Any]] = []
+        try:
+            _scan_cache_blob = _load_scan_cache_file()
+            if isinstance(_scan_cache_blob, dict):
+                for _wl in _all_watchlists:
+                    _wl_id = str(_wl.get('id', '') or '').strip()
+                    if not _wl_id:
+                        continue
+                    _entry = _scan_cache_blob.get(_wl_id, {}) or {}
+                    _rows = (_entry.get('results', []) or []) if isinstance(_entry, dict) else []
+                    for _r in _rows:
+                        if isinstance(_r, dict):
+                            _scan_cache_rows.append(dict(_r))
+        except Exception:
+            _scan_cache_rows = []
+        _heatmap_sector_fetch_budget = int(st.session_state.get('exec_heatmap_sector_fetch_budget', 120) or 120)
+        st.session_state['exec_heatmap_sector_fetch_budget'] = _heatmap_sector_fetch_budget
 
         def _row_richness(_row: Dict[str, Any]) -> int:
             _score = 0
@@ -12051,9 +12077,9 @@ def render_executive_dashboard():
                 _score += 1
             return _score
 
-        # Build best-available row per ticker from all sources, then project full active watchlist.
+        # Build best-available row per ticker from all sources, then project full universe.
         _best_by_ticker: Dict[str, Dict[str, Any]] = {}
-        for _src_rows in (tf_rows, fn_rows, scan_rows):
+        for _src_rows in (tf_rows, fn_rows, scan_rows, _scan_cache_rows):
             for _r in _src_rows:
                 _t = str(_r.get('ticker', '') or '').upper().strip()
                 if not _t:
@@ -12066,6 +12092,8 @@ def render_executive_dashboard():
 
         if _universe_tickers:
             source_rows = []
+            _sector_fetch_used = 0
+            _sector_resolved = 0
             for _t in _universe_tickers:
                 _row = dict(_best_by_ticker.get(_t, {}))
                 if not _row:
@@ -12076,22 +12104,54 @@ def render_executive_dashboard():
                     _sector = str(_ticker_sector_map.get(_t, '') or '').strip()
                     if _sector:
                         _row['sector'] = _sector
+                if not _sector:
+                    _sector = str(_watchlist_sector_hints.get(_t, '') or '').strip()
+                    if _sector:
+                        _row['sector'] = _sector
+                _allow_fetch = bool(_sector_fetch_used < _heatmap_sector_fetch_budget)
+                if not _sector:
+                    _resolved = _resolve_trade_finder_sector_fields(
+                        _row,
+                        rotation_ctx=_rotation_map,
+                        ticker_sector_ctx=_ticker_sector_map,
+                        scan_sector_map={},
+                        allow_fetch=_allow_fetch,
+                    )
+                    _sector = str(_resolved.get('sector', '') or '').strip()
+                    _phase_r = str(_resolved.get('sector_phase', '') or '').strip().upper()
+                    if _sector:
+                        _row['sector'] = _sector
+                        _sector_resolved += 1
+                    if _phase_r:
+                        _row['sector_phase'] = _phase_r
+                    if _allow_fetch:
+                        _sector_fetch_used += 1
                 _phase = str(_row.get('sector_phase', '') or '').strip().upper()
                 if not _phase and _sector:
                     _phase = str((_rotation_map.get(_sector, {}) or {}).get('phase', '') or '').strip().upper()
                     if _phase:
                         _row['sector_phase'] = _phase
                 source_rows.append(_row)
+            st.session_state['ticker_sectors'] = _ticker_sector_map
             _covered = sum(1 for _r in source_rows if not bool(_r.get('_heatmap_placeholder')))
+            _sector_mapped = sum(1 for _r in source_rows if str(_r.get('sector', '') or '').strip())
             source_name = (
                 f"All Watchlists ({len(_universe_tickers)} tickers)"
                 if _scope == _scope_opts[1]
                 else f"Active Watchlist ({len(_universe_tickers)} tickers)"
             )
-            st.caption(f"Data source: {source_name} | coverage: {_covered}/{len(source_rows)} with scan/model data")
+            st.caption(
+                f"Data source: {source_name} | coverage: {_covered}/{len(source_rows)} with scan/model data | "
+                f"sector mapped: {_sector_mapped}/{len(source_rows)}"
+            )
+            if _scan_cache_rows:
+                st.caption(f"Included cached scan rows from watchlists: {len(_scan_cache_rows)}")
         else:
-            source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else scan_rows)
-            source_name = "Trade Finder" if source_rows is tf_rows else ("Find New" if source_rows is fn_rows else "Scanner")
+            source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else (scan_rows if len(scan_rows) >= 10 else _scan_cache_rows))
+            source_name = (
+                "Trade Finder" if source_rows is tf_rows else
+                ("Find New" if source_rows is fn_rows else ("Scanner" if source_rows is scan_rows else "Cached Watchlist Scans"))
+            )
             st.caption(f"Data source: {source_name} ({len(source_rows)} rows)")
 
         if not source_rows:
