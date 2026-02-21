@@ -1493,6 +1493,15 @@
       },
       "manual_additions": [],
       "manual_exclusions": []
+    },
+    {
+      "id": "570e95a4-65b7-4a1a-a408-909933bd7942",
+      "name": "Semis&Memory Leaders",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-21T23:01:38.811413",
+      "last_updated": "2026-02-21T23:01:38.811413"
     }
   ]
 }
