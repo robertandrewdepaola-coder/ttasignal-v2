@@ -1949,19 +1949,8 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
     st.session_state.pop('_ticker_load_error', None)
 
     analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
-    cached_analysis = analysis_cache.get(ticker)
-    if cached_analysis is not None:
-        st.session_state['selected_ticker'] = ticker
-        st.session_state['selected_analysis'] = cached_analysis
-        st.session_state['scroll_to_detail'] = True
-        _need_mtf = not bool(prefer_chart_fast)
-        if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
-            msg = f"No chart data for {ticker} (data provider limit or unavailable)."
-            st.session_state['_ticker_load_error'] = msg
-            st.sidebar.error(msg)
-        return True
 
-    # Check if we already have analysis from a scan (instant — no API call)
+    # Prefer fresh scan results over cache to avoid stale signal states.
     results = st.session_state.get('scan_results', [])
     for r in results:
         if r.ticker == ticker:
@@ -1978,6 +1967,18 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
                 st.session_state['_ticker_load_error'] = msg
                 st.sidebar.error(msg)
             return True  # No rerun — current pass will render detail view
+
+    cached_analysis = analysis_cache.get(ticker)
+    if cached_analysis is not None:
+        st.session_state['selected_ticker'] = ticker
+        st.session_state['selected_analysis'] = cached_analysis
+        st.session_state['scroll_to_detail'] = True
+        _need_mtf = not bool(prefer_chart_fast)
+        if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
+            msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+            st.session_state['_ticker_load_error'] = msg
+            st.sidebar.error(msg)
+        return True
 
     # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
     try:
@@ -2242,6 +2243,11 @@ def _run_scan(mode='all'):
             st.session_state['scan_results'] = new_results
             st.session_state['ticker_data_cache'] = all_data
 
+        # Refresh analysis cache from current scan universe to prevent stale detail panels.
+        st.session_state['_ticker_analysis_cache'] = {
+            r.ticker: r for r in st.session_state.get('scan_results', [])
+        }
+
         st.session_state['selected_ticker'] = None
         st.session_state['selected_analysis'] = None
 
@@ -2333,12 +2339,15 @@ def _run_scan(mode='all'):
                 'macd_bullish': sig.macd.get('bullish', False) if sig else False,
                 'ao_positive': sig.ao.get('positive', False) if sig else False,
                 'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
+                'weekly_available': bool(sig and bool(sig.weekly_macd)),
                 'monthly_bullish': (
                     bool(sig.monthly_macd.get('bullish', False) and sig.monthly_ao.get('positive', False))
                     if sig else False
                 ),
                 'monthly_macd_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
+                'monthly_available': bool(sig and bool(sig.monthly_macd)),
+                'monthly_ao_available': bool(sig and bool(sig.monthly_ao)),
                 'vcp_detected': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_detected', False)),
                 'vcp_score': float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_score', 0.0) or 0.0),
                 'vcp_pivot_price': (
@@ -7245,8 +7254,15 @@ def _build_rows_from_analysis(results, jm) -> list:
                 if bool(vcp.get('vcp_detected', False))
                 else "❌"
             ),
-            'Wkly': "✅" if sig and sig.weekly_macd.get('bullish') else "❌",
-            'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') and sig.monthly_ao.get('positive') else "❌",
+            'Wkly': (
+                "✅" if sig and bool(sig.weekly_macd) and sig.weekly_macd.get('bullish') else
+                ("❌" if sig and bool(sig.weekly_macd) else "➖")
+            ),
+            'Mthly': (
+                "✅" if sig and bool(sig.monthly_macd) and bool(sig.monthly_ao)
+                and sig.monthly_macd.get('bullish') and sig.monthly_ao.get('positive') else
+                ("❌" if sig and bool(sig.monthly_macd) and bool(sig.monthly_ao) else "➖")
+            ),
             'Quality': q.get('quality_grade', '?'),
             'Price': f"${r.current_price:.2f}" if r.current_price else "?",
             'Volume': vol_str,
@@ -7387,8 +7403,14 @@ def _build_rows_from_summary(summary, jm) -> list:
                 if bool(s.get('vcp_detected', False))
                 else "❌"
             ),
-            'Wkly': "✅" if s.get('weekly_bullish') else "❌",
-            'Mthly': "✅" if s.get('monthly_bullish') else "❌",
+            'Wkly': (
+                "✅" if bool(s.get('weekly_bullish', False)) else
+                ("❌" if bool(s.get('weekly_available', True)) else "➖")
+            ),
+            'Mthly': (
+                "✅" if bool(s.get('monthly_bullish', False)) else
+                ("❌" if bool(s.get('monthly_available', True)) and bool(s.get('monthly_ao_available', True)) else "➖")
+            ),
             'Quality': s.get('quality_grade', '?'),
             'Price': f"${s.get('price', 0):.2f}" if s.get('price') else "?",
             'Volume': vol_str,
@@ -7613,13 +7635,15 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
     with c1:
         with st.container(border=True):
             st.markdown("#### 📊 Signal Panel")
-            _daily_ok = bool(signal.macd.get('bullish', False))
-            _weekly_ok = bool((signal.weekly_macd or {}).get('bullish', False))
-            _monthly_ok = bool((signal.monthly_macd or {}).get('bullish', False))
-            _ao_ok = bool(signal.ao.get('positive', False))
+            _daily_icon = "✅" if bool(signal.macd.get('bullish', False)) else "❌"
+            _ao_icon = "✅" if bool(signal.ao.get('positive', False)) else "❌"
+            _w = (signal.weekly_macd or {})
+            _m = (signal.monthly_macd or {})
+            _weekly_icon = "➖" if not _w else ("✅" if bool(_w.get('bullish', False)) else "❌")
+            _monthly_icon = "➖" if not _m else ("✅" if bool(_m.get('bullish', False)) else "❌")
             st.caption(
-                f"Daily MACD: {'✅' if _daily_ok else '❌'} | Weekly: {'✅' if _weekly_ok else '❌'} | "
-                f"Monthly: {'✅' if _monthly_ok else '❌'} | AO: {'✅' if _ao_ok else '❌'}"
+                f"Daily MACD: {_daily_icon} | Weekly: {_weekly_icon} | "
+                f"Monthly: {_monthly_icon} | AO: {_ao_icon}"
             )
             _vcp = {}
             if signal:
