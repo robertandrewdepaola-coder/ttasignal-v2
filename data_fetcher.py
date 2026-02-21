@@ -548,6 +548,7 @@ def fetch_batch_session_change(
     period: str = "5d",
     interval: str = "1d",
     chunk_size: int = 80,
+    ignore_cooldown: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Batch-fetch session % change (last close vs previous close) for many tickers.
@@ -611,14 +612,14 @@ def fetch_batch_session_change(
         return out
 
     # Global cooldown guard.
-    if _is_scope_rate_limited("batch:session_change"):
+    if (not ignore_cooldown) and _is_scope_rate_limited("batch:session_change"):
         return out
 
     # Chunked download.
     for i in range(0, len(remaining), max(10, int(chunk_size))):
         chunk = remaining[i:i + max(10, int(chunk_size))]
         scope = f"batch:session_change:{i//max(10, int(chunk_size))}"
-        if _is_scope_rate_limited(scope):
+        if (not ignore_cooldown) and _is_scope_rate_limited(scope):
             continue
         try:
             dl = yf.download(

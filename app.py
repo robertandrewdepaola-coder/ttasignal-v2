@@ -12287,11 +12287,17 @@ def render_executive_dashboard():
                         _attempted = len(_tickers_for_refresh)
                         _batch = {}
                         try:
+                            # User explicitly requested refresh: reset provider cooldown pressure first.
+                            clear_cache(clear_rate_limits=True)
+                        except Exception:
+                            pass
+                        try:
                             _batch = fetch_batch_session_change(
                                 _tickers_for_refresh,
                                 period='5d',
                                 interval='1d',
                                 chunk_size=80,
+                                ignore_cooldown=True,
                             ) or {}
                         except Exception:
                             _batch = {}
@@ -12541,6 +12547,11 @@ def render_executive_dashboard():
                             if _cand:
                                 _clicked_ticker = _cand
                                 break
+                        if isinstance(_pt, dict):
+                            _lbl = str(_pt.get("label", '') or _pt.get("id", '') or '').upper().strip()
+                            if _lbl and re.match(r'^[A-Z0-9\.\-]{1,8}$', _lbl):
+                                _clicked_ticker = _lbl
+                                break
                 except Exception:
                     _clicked_ticker = ""
                 if _clicked_ticker:
@@ -12566,6 +12577,12 @@ def render_executive_dashboard():
                 with _a3:
                     if st.button("✅ Open Trade", key="exec_heatmap_open_trade", width="stretch"):
                         _open_from_heatmap(_pick, "trade")
+                if _pick:
+                    st.link_button(
+                        "🌐 Open TradingView Chart",
+                        f"https://www.tradingview.com/chart/?symbol={_pick}",
+                        width="stretch",
+                    )
                 if _color_col == 'session_change_pct':
                     st.caption(
                         "Color = session % change (last price vs previous close). "
