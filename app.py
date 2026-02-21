@@ -853,6 +853,7 @@ def _render_morning_briefing():
     deep_date = st.session_state.get('deep_analysis_date', '')
 
     with st.sidebar.expander("🏛️ Market Structure", expanded=True):
+        st.caption("Context only. Final execution decision uses the Unified Trade Gate below.")
         if deep_data and deep_date == today:
             score = deep_data.get('score', 0)
             label = deep_data.get('score_label', 'Neutral')
@@ -1029,8 +1030,10 @@ def _render_factual_market_brief():
     st.sidebar.caption(f"Unified Regime: **{_regime_u}** ({_reg_conf}%)")
 
     # Single execution authority: should we be trading at all?
+    _gate_ctx = None
     try:
         gate = _evaluate_trade_gate(_build_dashboard_snapshot())
+        _gate_ctx = gate
         if gate.severity == "danger":
             st.sidebar.error(f"**{gate.label}**")
         elif gate.severity == "warning":
@@ -1048,15 +1051,10 @@ def _render_factual_market_brief():
 
     if narrative_data and narrative_date == today:
         regime = narrative_data.get('regime', 'Neutral')
-        regime_colors = {
-            'Risk-On': '🟢', 'Bullish': '🟢', 'Cautiously Bullish': '🟢',
-            'Neutral': '🟡', 'Balanced': '🟡',
-            'Caution': '🟠', 'Rotation to Safety': '🟠',
-            'Risk-Off': '🔴', 'Bearish': '🔴',
-        }
-        icon = regime_colors.get(regime, '🟡')
-
-        with st.sidebar.expander(f"{icon} Market Brief — {regime}"):
+        with st.sidebar.expander("📓 Market Brief (Context Only)"):
+            st.caption(f"Brief regime model: {regime}")
+            if _gate_ctx is not None:
+                st.caption(f"Execution authority remains: {_gate_ctx.label}")
             st.caption(narrative_data.get('narrative', '')[:400])
 
             # Raw data — multi-timeframe momentum analysis
@@ -5499,6 +5497,24 @@ def render_trade_finder_tab():
         help="Runtime cap for live AI ranking. Remaining candidates fall back to fast model/system scoring.",
     )
     settings = _trade_quality_settings()
+    _tf_gate = _evaluate_trade_gate(_build_dashboard_snapshot())
+    _tf_gate_status = _normalize_gate_status(_tf_gate.status)
+    if _tf_gate.severity == "danger":
+        st.error(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    elif _tf_gate.severity == "warning":
+        st.warning(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    else:
+        st.success(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    st.caption("Ticker colors are now unified with this gate: NO_TRADE forces red; TRADE_LIGHT downgrades green to yellow.")
+
+    for _r in rows:
+        _cls = _classify_trade_candidate_color(_r, _tf_gate_status, settings=settings)
+        _r['market_class'] = str(_cls.get('level', 'YELLOW'))
+        _r['market_class_label'] = str(_cls.get('label', 'WATCH'))
+        _r['market_class_icon'] = str(_cls.get('icon', '🟡'))
+        _r['market_class_color'] = str(_cls.get('color', '#f59e0b'))
+        _r['market_class_reason'] = str(_cls.get('reason', ''))
+
     qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
     hard_failed_rows = [r for r in rows if bool(r.get('hard_gate_pass', True)) is False]
 
@@ -5826,8 +5842,9 @@ def render_trade_finder_tab():
                 st.session_state['_switch_to_scanner_tab'] = True
             st.rerun()
 
-        primary_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() in {"Strong Buy", "Buy"}]
-        watch_rows = [r for r in qualified_rows if str(r.get('ai_buy_recommendation', '')).strip() not in {"Strong Buy", "Buy"}]
+        green_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "GREEN"]
+        yellow_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "YELLOW"]
+        red_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "RED"]
         view_mode = st.radio(
             "View Mode",
             ["Cards", "Table"],
@@ -5891,25 +5908,27 @@ def render_trade_finder_tab():
             st.rerun()
 
         for group_label, group_rows, expanded in [
-            ("🚀 Actionable Signals", primary_rows, True),
-            ("👀 Watchlist Signals", watch_rows, False),
+            ("🟢 Trade-Ready", green_rows, True),
+            ("🟡 Watch / Conditional", yellow_rows, True),
+            ("🔴 Blocked By Gate/Rules", red_rows, False),
         ]:
             with st.expander(f"{group_label} ({len(group_rows)})", expanded=expanded):
                 if not group_rows:
                     st.caption("None in this group.")
                 if view_mode == "Table":
-                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11 = st.columns([0.7, 0.9, 1.8, 1.2, 1.3, 0.9, 1.2, 0.8, 0.8, 0.8, 2.1])
+                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12 = st.columns([0.7, 0.9, 1.8, 1.2, 1.2, 1.0, 0.9, 1.2, 0.8, 0.8, 0.8, 2.0])
                     h1.caption("Alert")
                     h2.caption("Ticker")
                     h3.caption("Company")
                     h4.caption("Sector")
                     h5.caption("Rotation")
-                    h6.caption("Price")
-                    h7.caption("Verdict")
-                    h8.caption("R:R")
-                    h9.caption("Score")
-                    h10.caption("Earn")
-                    h11.caption("Actions")
+                    h6.caption("Class")
+                    h7.caption("Price")
+                    h8.caption("Verdict")
+                    h9.caption("R:R")
+                    h10.caption("Score")
+                    h11.caption("Earn")
+                    h12.caption("Actions")
                 for i, r in enumerate(group_rows[:40]):
                     ticker = str(r.get('ticker', '')).upper().strip()
                     _resolved_sector = _resolve_trade_finder_sector_fields(
@@ -5938,6 +5957,10 @@ def render_trade_finder_tab():
                     sector_name = str(r.get('sector', '') or '').strip() or "Unknown sector"
                     sector_phase = str(r.get('sector_phase', '') or '').strip()
                     sector_disp = _sector_phase_display(sector_phase)
+                    class_icon = str(r.get('market_class_icon', '🟡') or '🟡')
+                    class_label = str(r.get('market_class_label', 'WATCH') or 'WATCH')
+                    class_color = str(r.get('market_class_color', '#f59e0b') or '#f59e0b')
+                    class_reason = str(r.get('market_class_reason', '') or '')
                     earn_disp = _earnings_badge(
                         earn_days,
                         source=earn_source,
@@ -5955,7 +5978,7 @@ def render_trade_finder_tab():
                     fallback_error = str(r.get('fallback_error', '') or '')
 
                     if view_mode == "Table":
-                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11 = st.columns([0.7, 0.9, 1.8, 1.2, 1.3, 0.9, 1.2, 0.8, 0.8, 0.8, 2.1])
+                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12 = st.columns([0.7, 0.9, 1.8, 1.2, 1.2, 1.0, 0.9, 1.2, 0.8, 0.8, 0.8, 2.0])
                         c1.write("🎯 Set" if has_alert else "—")
                         c2.write(ticker)
                         c3.write(company)
@@ -5964,15 +5987,19 @@ def render_trade_finder_tab():
                             f"<span style='color:{sector_disp['color']};font-weight:700'>{sector_disp['icon']} {sector_disp['label']}</span>",
                             unsafe_allow_html=True,
                         )
-                        c6.write(f"${price:.2f}")
-                        c7.write(ai_buy or "N/A")
-                        c8.write(f"{rr:.2f}:1")
-                        c9.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
-                        c10.markdown(
+                        c6.markdown(
+                            f"<span style='color:{class_color};font-weight:700'>{class_icon} {class_label}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        c7.write(f"${price:.2f}")
+                        c8.write(ai_buy or "N/A")
+                        c9.write(f"{rr:.2f}:1")
+                        c10.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
+                        c11.markdown(
                             f"<span style='color:{earn_disp['color']};font-weight:700'>{earn_disp['icon']} {earn_disp['text']}</span>",
                             unsafe_allow_html=True,
                         )
-                        a1, a2, a3, a4 = c11.columns(4)
+                        a1, a2, a3, a4 = c12.columns(4)
                         with a1:
                             if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
                                 _open_candidate_for_action(r, detail_tab=1)
@@ -5991,6 +6018,8 @@ def render_trade_finder_tab():
                             f"S ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
                             f"T ${float(r.get('suggested_target', 0) or 0):.2f}"
                         )
+                        if class_reason:
+                            st.caption(f"{ticker} Class reason: {class_reason}")
                         _sup = float(r.get('support_price', 0) or 0)
                         _sup_stop = float(r.get('support_stop_price', 0) or 0)
                         _sup_dist = r.get('support_distance_pct', None)
@@ -6021,6 +6050,10 @@ def render_trade_finder_tab():
                         with st.container(border=True):
                             alert_badge = " | 🎯 Alert Set" if has_alert else ""
                             st.markdown(f"**{ticker}{alert_badge} — {company}**")
+                            st.markdown(
+                                f"<span style='color:{class_color};font-weight:700'>{class_icon} {class_label}</span>",
+                                unsafe_allow_html=True,
+                            )
                             st.markdown(
                                 f"<span style='color:{sector_disp['color']};font-weight:700'>"
                                 f"{sector_disp['icon']} {sector_disp['label']}</span>",
@@ -6064,6 +6097,8 @@ def render_trade_finder_tab():
                                     st.caption(f"↳ {fallback_error[:140]}")
                             if rationale:
                                 st.caption(f"Analysis Note: {rationale}")
+                            if class_reason:
+                                st.caption(f"Class reason: {class_reason}")
                             for w in warnings[:3]:
                                 st.warning(f"Consistency warning: {w}")
                             a1, a2, a3, a4 = st.columns(4)
@@ -11747,6 +11782,111 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
         reason=reason,
         model_alignment=model_alignment,
     )
+
+
+def _normalize_gate_status(status: str) -> str:
+    """Normalize historical/variant gate strings to canonical status values."""
+    s = str(status or "").upper().strip()
+    if s in {"FAVOR_TRADING", "FAVORS_TRADING", "MARKET_FAVORS_TRADING"}:
+        return "FAVOR_TRADING"
+    if s in {"TRADE_LIGHT", "TRADE-LIGHT", "TRADE LIGHT"}:
+        return "TRADE_LIGHT"
+    if s in {"NO_TRADE", "NO-TRADE", "NO TRADE"}:
+        return "NO_TRADE"
+    return s or "NO_TRADE"
+
+
+def _classify_trade_candidate_color(
+    row: Dict[str, Any],
+    gate_status: str,
+    *,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
+    """
+    Unified green/yellow/red candidate classification.
+
+    Base class comes from ticker quality/readiness, then market gate overlays it:
+    - NO_TRADE => red
+    - TRADE_LIGHT => green downgrades to yellow
+    """
+    cfg = settings or _trade_quality_settings()
+    min_rr = float(cfg.get('min_rr', 1.2) or 1.2)
+    earn_block_days = int(cfg.get('earn_block_days', 7) or 7)
+
+    hard_pass = bool(row.get('hard_gate_pass', True))
+    ai_buy_u = str(row.get('ai_buy_recommendation', '') or '').strip().upper()
+    entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
+    stop = float(row.get('suggested_stop_loss', 0) or 0)
+    target = float(row.get('suggested_target', 0) or 0)
+    rr = float(row.get('risk_reward', 0) or 0)
+    if rr <= 0:
+        rr = _calc_rr(entry, stop, target)
+    phase = str(row.get('sector_phase', '') or '').upper().strip()
+    card = row.get('decision_card', {}) or {}
+    readiness = str(card.get('execution_readiness', '') or '').upper().strip()
+
+    earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+    earn_trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    )
+
+    level = "YELLOW"
+    reason = "Setup is partially aligned; keep on watch."
+
+    _invalid_levels = (entry <= 0 or stop <= 0 or target <= 0 or not (stop < entry < target))
+    _hard_block = (
+        (not hard_pass)
+        or _invalid_levels
+        or (ai_buy_u in {"SKIP", "AVOID"})
+        or (not earn_trusted)
+        or (0 <= earn_days <= earn_block_days)
+        or (readiness == "BLOCKED")
+    )
+    if _hard_block:
+        level = "RED"
+        if not hard_pass:
+            reason = "Blocked by hard-gate rules."
+        elif not earn_trusted:
+            reason = "Blocked: earnings data is untrusted/unverified."
+        elif 0 <= earn_days <= earn_block_days:
+            reason = f"Blocked: earnings within {earn_block_days}d window."
+        elif _invalid_levels:
+            reason = "Blocked: invalid trade levels."
+        else:
+            reason = "Blocked by recommendation/readiness."
+    else:
+        _ready_setup = (
+            ai_buy_u in {"STRONG BUY", "BUY"}
+            and rr >= min_rr
+            and readiness == "READY"
+            and phase in {"LEADING", "EMERGING"}
+        )
+        if _ready_setup:
+            level = "GREEN"
+            reason = "Trade-ready setup: quality + timing + sector alignment."
+        else:
+            level = "YELLOW"
+            reason = "Watch/conditional: waiting for stronger alignment."
+
+    gate_u = _normalize_gate_status(gate_status)
+    if gate_u == "NO_TRADE":
+        level = "RED"
+        reason = "Market gate is NO_TRADE; new entries blocked."
+    elif gate_u == "TRADE_LIGHT" and level == "GREEN":
+        level = "YELLOW"
+        reason = "Downgraded by TRADE_LIGHT market gate."
+
+    if level == "GREEN":
+        return {"level": "GREEN", "label": "TRADE-READY", "icon": "🟢", "color": "#22c55e", "reason": reason}
+    if level == "RED":
+        return {"level": "RED", "label": "BLOCKED", "icon": "🔴", "color": "#ef4444", "reason": reason}
+    return {"level": "YELLOW", "label": "WATCH", "icon": "🟡", "color": "#f59e0b", "reason": reason}
 
 
 def _position_posture_summary(snap: DashboardSnapshot, gate: TradeGateDecision) -> Dict[str, Any]:
