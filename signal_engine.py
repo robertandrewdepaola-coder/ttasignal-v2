@@ -15,7 +15,7 @@ Version: 2.0.0 (2026-02-07)
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 from dataclasses import dataclass, field
 
 
@@ -541,6 +541,117 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
         df.iloc[i, df.columns.get_loc('bearish_div_active')] = div_active
 
     return df
+
+
+# =============================================================================
+# VOLATILITY CONTRACTION PATTERN (VCP)
+# =============================================================================
+
+def detect_vcp(
+    df: pd.DataFrame,
+    lookback: int = 60,
+    n_segments: int = 4,
+    min_contractions: int = 2,
+    volume_contraction_threshold: float = 0.75,
+) -> Dict[str, Any]:
+    """
+    Detect Minervini-style Volatility Contraction Pattern (VCP).
+
+    Pattern requirements:
+    1) Left-to-right base range contraction (successively tighter swings)
+    2) Volume contraction in the right-side tight zone
+    3) Uptrend context (price > MA50 > MA150)
+    """
+    out = {
+        'vcp_detected': False,
+        'vcp_score': 0.0,
+        'price_contracting': False,
+        'volume_contracting': False,
+        'in_uptrend': False,
+        'segment_ranges': [],
+        'base_avg_volume': 0,
+        'tight_zone_volume': 0,
+        'contractions_found': 0,
+        'range_ratio': 1.0,
+        'volume_ratio': 1.0,
+        'pivot_price': None,  # Tight-zone breakout trigger
+    }
+    if df is None or len(df) < 30:
+        return out
+
+    data = normalize_columns(df).copy()
+    required_cols = {'High', 'Low', 'Close', 'Volume'}
+    if not required_cols.issubset(set(data.columns)):
+        return out
+
+    data = data.tail(max(lookback, n_segments * 8)).copy()
+    data = data.reset_index(drop=True)
+    if len(data) < (n_segments * 5):
+        return out
+
+    # Segment base and measure peak-to-trough range per segment.
+    n_segments = max(3, int(n_segments or 4))
+    seg_len = len(data) // n_segments
+    if seg_len < 5:
+        return out
+
+    ranges: List[float] = []
+    for i in range(n_segments):
+        seg = data.iloc[i * seg_len: (i + 1) * seg_len]
+        if seg.empty:
+            continue
+        seg_range = float(seg['High'].max() - seg['Low'].min())
+        ranges.append(seg_range)
+    if len(ranges) < 2:
+        return out
+
+    contractions = sum(ranges[i] > ranges[i + 1] for i in range(len(ranges) - 1))
+    price_contracting = contractions >= int(min_contractions or 2)
+
+    base_avg_volume = float(pd.to_numeric(data['Volume'], errors='coerce').dropna().mean() or 0.0)
+    tight_zone = data.tail(seg_len)
+    tight_avg_volume = float(pd.to_numeric(tight_zone['Volume'], errors='coerce').dropna().mean() or 0.0)
+    volume_contracting = (
+        base_avg_volume > 0
+        and tight_avg_volume < (base_avg_volume * float(volume_contraction_threshold or 0.75))
+    )
+
+    # Trend context: require price > MA50 > MA150 (or full-window MA when <150 bars).
+    close = pd.to_numeric(data['Close'], errors='coerce')
+    current_price = float(close.iloc[-1]) if len(close) > 0 else 0.0
+    ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float('nan')
+    ma150_window = min(150, len(close))
+    ma150 = float(close.rolling(ma150_window).mean().iloc[-1]) if ma150_window >= 2 else float('nan')
+    in_uptrend = (
+        current_price > 0
+        and not pd.isna(ma50)
+        and not pd.isna(ma150)
+        and current_price > ma50 > ma150
+    )
+
+    range_ratio = (ranges[-1] / ranges[0]) if ranges[0] > 0 else 1.0
+    volume_ratio = (tight_avg_volume / base_avg_volume) if base_avg_volume > 0 else 1.0
+    raw_score = ((1 - range_ratio) * 50.0) + ((1 - volume_ratio) * 50.0)
+    vcp_score = max(0.0, min(100.0, round(float(raw_score), 1)))
+
+    pivot_price = float(tight_zone['High'].max()) if len(tight_zone) > 0 else None
+    detected = bool(price_contracting and volume_contracting and in_uptrend)
+
+    out.update({
+        'vcp_detected': detected,
+        'vcp_score': vcp_score,
+        'price_contracting': bool(price_contracting),
+        'volume_contracting': bool(volume_contracting),
+        'in_uptrend': bool(in_uptrend),
+        'segment_ranges': [round(float(r), 4) for r in ranges],
+        'base_avg_volume': int(round(base_avg_volume)) if base_avg_volume > 0 else 0,
+        'tight_zone_volume': int(round(tight_avg_volume)) if tight_avg_volume > 0 else 0,
+        'contractions_found': int(contractions),
+        'range_ratio': round(float(range_ratio), 4),
+        'volume_ratio': round(float(volume_ratio), 4),
+        'pivot_price': round(float(pivot_price), 2) if pivot_price and pivot_price > 0 else None,
+    })
+    return out
 
 
 # =============================================================================
@@ -1329,6 +1440,7 @@ class EntrySignal:
     weekly_macd: Dict = field(default_factory=dict)
     monthly_macd: Dict = field(default_factory=dict)
     monthly_ao: Dict = field(default_factory=dict)
+    vcp: Dict = field(default_factory=dict)
 
     # Context (for AI analysis)
     weinstein: Dict = field(default_factory=dict)
@@ -1357,6 +1469,7 @@ class EntrySignal:
             'weekly_macd': self.weekly_macd,
             'monthly_macd': self.monthly_macd,
             'monthly_ao': self.monthly_ao,
+            'vcp': self.vcp,
             'weinstein': self.weinstein,
             'volume': self.volume,
             'key_levels': self.key_levels,
@@ -1415,6 +1528,9 @@ def validate_entry(daily_df: pd.DataFrame,
 
     # ── Key Levels ────────────────────────────────────────────────────
     signal.key_levels = analyze_key_levels(daily_df)
+
+    # ── Volatility Contraction Pattern (VCP) ──────────────────────────
+    signal.vcp = detect_vcp(daily_df)
 
     # ── Overhead Resistance ───────────────────────────────────────────
     signal.overhead_resistance = find_overhead_resistance(daily_df)

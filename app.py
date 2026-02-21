@@ -2339,6 +2339,14 @@ def _run_scan(mode='all'):
                 ),
                 'monthly_macd_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
                 'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
+                'vcp_detected': bool((sig.vcp or {}).get('vcp_detected', False)) if sig else False,
+                'vcp_score': float((sig.vcp or {}).get('vcp_score', 0.0) or 0.0) if sig else 0.0,
+                'vcp_pivot_price': (
+                    float((sig.vcp or {}).get('pivot_price', 0.0) or 0.0)
+                    if sig else 0.0
+                ),
+                'vcp_price_contracting': bool((sig.vcp or {}).get('price_contracting', False)) if sig else False,
+                'vcp_volume_contracting': bool((sig.vcp or {}).get('volume_contracting', False)) if sig else False,
                 'is_open_position': r.ticker in open_tickers,
                 'sector': sector_name,
                 'sector_phase': sector_phase,
@@ -6917,8 +6925,8 @@ def render_scanner_table():
                 st.rerun()
 
     # Table header — added Focus, Earnings Date, Volume, Apex columns
-    hdr_cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
-    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Summary']
+    hdr_cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.6])
+    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'VCP', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
@@ -6932,7 +6940,7 @@ def render_scanner_table():
     for idx, row in enumerate(page_rows):
         # Use global index for unique keys
         global_idx = start_idx + idx
-        cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.8])
+        cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.6])
 
         # Ticker as clickable button with earnings flag
         with cols[0]:
@@ -7021,20 +7029,21 @@ def render_scanner_table():
 
         cols[7].caption(row.get('MACD', '❌'))
         cols[8].caption(row.get('AO', '❌'))
-        cols[9].caption(row.get('Wkly', '❌'))
-        cols[10].caption(row.get('Mthly', '❌'))
+        cols[9].caption(row.get('VCP', '❌'))
+        cols[10].caption(row.get('Wkly', '❌'))
+        cols[11].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[11].caption(f"{q_colors.get(q, '⚪')}{q}")
+        cols[12].caption(f"{q_colors.get(q, '⚪')}{q}")
 
-        cols[12].caption(row.get('Price', '?'))
-        cols[13].caption(row.get('Volume', ''))
+        cols[13].caption(row.get('Price', '?'))
+        cols[14].caption(row.get('Volume', ''))
 
         # Earnings date with highlight
-        cols[14].caption(row.get('EarnDate', ''))
-        cols[15].caption(row.get('Summary', '')[:45])
+        cols[15].caption(row.get('EarnDate', ''))
+        cols[16].caption(row.get('Summary', '')[:45])
 
     # ── Bottom pagination ─────────────────────────────────────────────
     if total_pages > 1:
@@ -7117,6 +7126,7 @@ def _build_rows_from_analysis(results, jm) -> list:
         rec = r.recommendation or {}
         q = r.quality or {}
         sig = r.signal
+        vcp = (sig.vcp if sig else {}) or {}
 
         # Status column
         if r.ticker in open_tickers:
@@ -7224,6 +7234,11 @@ def _build_rows_from_analysis(results, jm) -> list:
             'Conv': f"{rec_adj.get('conviction', rec.get('conviction', 0))}/10",
             'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
             'AO': "✅" if sig and sig.ao.get('positive') else "❌",
+            'VCP': (
+                f"✅ {float(vcp.get('vcp_score', 0.0) or 0.0):.0f}"
+                if bool(vcp.get('vcp_detected', False))
+                else "❌"
+            ),
             'Wkly': "✅" if sig and sig.weekly_macd.get('bullish') else "❌",
             'Mthly': "✅" if sig and sig.monthly_macd.get('bullish') and sig.monthly_ao.get('positive') else "❌",
             'Quality': q.get('quality_grade', '?'),
@@ -7232,6 +7247,11 @@ def _build_rows_from_analysis(results, jm) -> list:
             'DivFlag': div_flag,
             'ApexFlag': apex_flag,
             'ReentryAge': reentry_bars_ago,
+            'VCPDetected': bool(vcp.get('vcp_detected', False)),
+            'VCPScore': float(vcp.get('vcp_score', 0.0) or 0.0),
+            'VCPPivot': float(vcp.get('pivot_price', 0.0) or 0.0),
+            'VCPPriceContracting': bool(vcp.get('price_contracting', False)),
+            'VCPVolumeContracting': bool(vcp.get('volume_contracting', False)),
             'Summary': rec.get('summary', ''),
         })
     return rows
@@ -7356,6 +7376,11 @@ def _build_rows_from_summary(summary, jm) -> list:
             'Conv': f"{rec_adj.get('conviction', s.get('conviction', 0))}/10",
             'MACD': "✅" if s.get('macd_bullish') else "❌",
             'AO': "✅" if s.get('ao_positive') else "❌",
+            'VCP': (
+                f"✅ {float(s.get('vcp_score', 0.0) or 0.0):.0f}"
+                if bool(s.get('vcp_detected', False))
+                else "❌"
+            ),
             'Wkly': "✅" if s.get('weekly_bullish') else "❌",
             'Mthly': "✅" if s.get('monthly_bullish') else "❌",
             'Quality': s.get('quality_grade', '?'),
@@ -7364,6 +7389,11 @@ def _build_rows_from_summary(summary, jm) -> list:
             'DivFlag': div_flag,
             'ApexFlag': apex_flag,
             'ReentryAge': reentry_bars_ago,
+            'VCPDetected': bool(s.get('vcp_detected', False)),
+            'VCPScore': float(s.get('vcp_score', 0.0) or 0.0),
+            'VCPPivot': float(s.get('vcp_pivot_price', 0.0) or 0.0),
+            'VCPPriceContracting': bool(s.get('vcp_price_contracting', False)),
+            'VCPVolumeContracting': bool(s.get('vcp_volume_contracting', False)),
             'Summary': s.get('summary', ''),
         })
     return rows
@@ -7585,6 +7615,18 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
                 f"Daily MACD: {'✅' if _daily_ok else '❌'} | Weekly: {'✅' if _weekly_ok else '❌'} | "
                 f"Monthly: {'✅' if _monthly_ok else '❌'} | AO: {'✅' if _ao_ok else '❌'}"
             )
+            _vcp = (signal.vcp if signal else {}) or {}
+            _vcp_det = bool(_vcp.get('vcp_detected', False))
+            _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+            _vcp_pivot = _vcp.get('pivot_price', None)
+            _vcp_txt = (
+                f"VCP: ✅ detected ({_vcp_score:.0f}/100)"
+                if _vcp_det else
+                f"VCP: ❌ not detected ({_vcp_score:.0f}/100)"
+            )
+            if _vcp_pivot:
+                _vcp_txt += f" | Pivot ${float(_vcp_pivot):.2f}"
+            st.caption(_vcp_txt)
             st.caption(
                 f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
                 + (f" ({_sector})" if _sector else " (n/a)")
@@ -7716,6 +7758,13 @@ def _render_signal_breakdown(signal: EntrySignal, analysis: TickerAnalysis):
                   f"Score: {q.get('quality_score', 0)}/100")
         st.caption(f"Win rate: {q.get('win_rate', 0):.0f}% | "
                    f"Signals: {q.get('signals_found', 0)}")
+        _vcp = (signal.vcp if signal else {}) or {}
+        _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+        _vcp_state = "Detected ✅" if bool(_vcp.get('vcp_detected', False)) else "No ❌"
+        _vcp_delta = f"Score {_vcp_score:.0f}/100"
+        st.metric("VCP", _vcp_state, _vcp_delta)
+        if _vcp.get('pivot_price'):
+            st.caption(f"Pivot: ${float(_vcp.get('pivot_price')):.2f}")
 
     # Overhead Resistance
     ores = signal.overhead_resistance
