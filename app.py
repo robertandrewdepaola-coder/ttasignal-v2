@@ -599,6 +599,10 @@ def get_journal() -> JournalManager:
 def get_bridge() -> WatchlistBridge:
     return st.session_state['watchlist_bridge']
 
+def get_watchlist_bridge() -> WatchlistBridge:
+    """Backward-compatible alias for legacy call sites."""
+    return get_bridge()
+
 
 if 'trade_finder_results' not in st.session_state:
     try:
