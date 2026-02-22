@@ -833,7 +833,9 @@ def check_macd_mtf_zones(daily_df: pd.DataFrame,
     """
     MTF MACD zone check using HPotter profile.
     BUY timing rule:
-      - Daily must be in just_cross (fresh lower-zone entry timing)
+      - Daily must be in fresh-entry timing:
+          just_cross
+          OR recent strong/extended cross that is not yet extreme
       - Weekly/Monthly can be just_cross, strong, or extended (momentum can be mature)
       - Weekly/Monthly bearish still reject
     """
@@ -864,10 +866,13 @@ def check_macd_mtf_zones(daily_df: pd.DataFrame,
     d_key = str(d_zone.get('zone', 'neutral') or 'neutral')
     w_key = str(w_zone.get('zone', 'neutral') or 'neutral')
     m_key = str(m_zone.get('zone', 'neutral') or 'neutral')
-    daily_ok = d_key == 'just_cross'
+    d_recent = bool(d_zone.get('recent_cross', False))
+    d_hist_pct = float(d_zone.get('hist_pct', 1.0) or 1.0)
+    # Allow fresh crosses that have accelerated quickly, but cap extreme late-chase.
+    daily_ok = (d_key == 'just_cross') or (d_recent and d_key in ('strong', 'extended') and d_hist_pct <= 0.90)
     weekly_ok = w_key in ('strong', 'just_cross', 'extended')
     monthly_ok = m_key in ('strong', 'just_cross', 'extended')
-    daily_reject = d_key in ('extended', 'bearish')
+    daily_reject = (d_key == 'bearish') or (d_key == 'extended' and (not d_recent or d_hist_pct > 0.90))
     weekly_reject = w_key in ('bearish',)
     monthly_reject = m_key in ('bearish',)
     failures: List[str] = []
@@ -878,7 +883,7 @@ def check_macd_mtf_zones(daily_df: pd.DataFrame,
     if monthly_reject:
         failures.append(f"Monthly bearish ({m_key})")
     if not daily_ok:
-        failures.append(f"Daily not just_cross ({d_key})")
+        failures.append(f"Daily not in fresh entry zone ({d_key})")
     if not weekly_ok:
         failures.append(f"Weekly not strong ({w_key})")
     if not monthly_ok:
