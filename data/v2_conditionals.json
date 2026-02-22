@@ -141,5 +141,27 @@
     "created_date": "2026-02-19",
     "expires_date": "2026-03-21",
     "status": "PENDING"
+  },
+  {
+    "ticker": "NGD",
+    "condition_type": "breakout_volume",
+    "trigger_price": 13.63,
+    "volume_multiplier": 1.5,
+    "stop_price": 10.5,
+    "target_price": 15.66,
+    "position_size_pct": 12.5,
+    "notes": "[Master] resistance trigger $13.63 | $13.63 \u2014 52-week high (11.5% above)",
+    "conviction": 4,
+    "signal_type": "",
+    "quality_grade": "C",
+    "created_date": "2026-02-22",
+    "created_at": "2026-02-22T01:27:29.493902+00:00",
+    "updated_at": "2026-02-22T01:27:29.493902+00:00",
+    "expires_date": "2026-03-24",
+    "status": "PENDING",
+    "triggered_date": "",
+    "triggered_at": "",
+    "triggered_price": 0,
+    "triggered_volume_ratio": 0
   }
 ]
