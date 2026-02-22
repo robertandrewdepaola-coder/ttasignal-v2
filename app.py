@@ -7151,6 +7151,14 @@ def render_scanner_table():
         'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'blue': '🔵', '': '⚪'
     }
     _focus_cycle = ['', 'green', 'yellow', 'red', 'blue']  # Click to cycle
+    _now_ts = time.time()
+    _flash_ticker = str(st.session_state.get('_scanner_alert_flash_ticker', '') or '').upper().strip()
+    _flash_until = float(st.session_state.get('_scanner_alert_flash_until', 0.0) or 0.0)
+    if _flash_until and _now_ts > _flash_until:
+        st.session_state.pop('_scanner_alert_flash_ticker', None)
+        st.session_state.pop('_scanner_alert_flash_until', None)
+        _flash_ticker = ''
+        _flash_until = 0.0
     _pending_alerts = jm.get_pending_conditionals() or []
     _pending_alert_map = {
         str(c.get('ticker', '') or '').upper().strip(): c
@@ -7232,7 +7240,8 @@ def render_scanner_table():
                 )
                 if _alert_desc:
                     _alert_help += f" — {_alert_desc[:100]}"
-                _alert_btn = "🎯" if _has_pending_alert else "🔔"
+                _is_flash = _has_pending_alert and (_flash_ticker == _ticker) and (_flash_until > _now_ts)
+                _alert_btn = "✨🎯" if _is_flash else ("🎯" if _has_pending_alert else "🔔")
                 if st.button(_alert_btn, key=f"scanner_alert_{_ticker}_{global_idx}", help=_alert_help, width="stretch"):
                     _notes = (
                         f"[Scanner] major resistance trigger=${_alert_trigger:.2f}"
@@ -7247,16 +7256,28 @@ def render_scanner_table():
                         quality_grade=_quality,
                         notes=_notes,
                     )
-                    st.success(_msg)
+                    st.session_state['_scanner_alert_flash_ticker'] = _ticker
+                    st.session_state['_scanner_alert_flash_until'] = time.time() + 1.8
+                    st.session_state['_scanner_alert_last_msg'] = _msg
                     st.rerun()
             else:
+                _is_flash = _has_pending_alert and (_flash_ticker == _ticker) and (_flash_until > _now_ts)
+                _manual_btn = "✨🎯" if _is_flash else ("🎯" if _has_pending_alert else "➕")
+                _manual_help = (
+                    "Alert active. Click to edit manually."
+                    if _has_pending_alert else
+                    "No auto resistance trigger available. Set manual alert."
+                )
                 if st.button(
-                    "➕",
+                    _manual_btn,
                     key=f"scanner_alert_manual_{_ticker}_{global_idx}",
-                    help="No auto resistance trigger available. Set manual alert.",
+                    help=_manual_help,
                     width="stretch",
                 ):
                     st.session_state['show_alert_form'] = _ticker
+                    if _has_pending_alert:
+                        st.session_state['_scanner_alert_flash_ticker'] = _ticker
+                        st.session_state['_scanner_alert_flash_until'] = time.time() + 1.8
                     st.rerun()
 
         # Focus label — click to cycle through colors
