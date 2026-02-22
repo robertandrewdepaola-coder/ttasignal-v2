@@ -26,7 +26,15 @@ from typing import Any, Dict, List, Optional, Callable, Tuple
 from zoneinfo import ZoneInfo
 
 # Backend imports
-from signal_engine import EntrySignal
+from signal_engine import (
+    EntrySignal,
+    get_active_macd_profile,
+    get_macd_indicator_label,
+    set_active_macd_profile,
+    MACD_PROFILE_LEGACY,
+    MACD_PROFILE_HPOTTER_ZONE,
+    MACD_PROFILE_SHADOW,
+)
 try:
     from data_fetcher import (
         fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
@@ -1748,6 +1756,27 @@ def render_sidebar():
             help="Toggle phased rollout of Executive Dashboard tab.",
         )
         st.session_state['exec_dashboard_beta_enabled'] = beta_enabled
+        if 'trade_macd_profile' not in st.session_state:
+            _p = str(get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+            if _p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+                _p = MACD_PROFILE_LEGACY
+            st.session_state['trade_macd_profile'] = _p
+        _profile_options = {
+            MACD_PROFILE_LEGACY: "Legacy MACD (12/26/9)",
+            MACD_PROFILE_HPOTTER_ZONE: "HPotter Zone (8/16/11)",
+            MACD_PROFILE_SHADOW: "Shadow Compare (legacy + HPotter diagnostics)",
+        }
+        st.selectbox(
+            "MACD Profile",
+            options=[MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW],
+            format_func=lambda x: _profile_options.get(str(x), str(x)),
+            key="trade_macd_profile",
+            help="Controls scanner/trade-finder signal profile. Shadow keeps legacy decisions while logging HPotter zone diffs.",
+        )
+        try:
+            set_active_macd_profile(str(st.session_state.get('trade_macd_profile', MACD_PROFILE_LEGACY)))
+        except Exception:
+            pass
 
         s1, s2, s3 = st.columns(3)
         with s1:
@@ -2001,7 +2030,8 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
             data = fetch_all_ticker_data(ticker)
 
         if data.get('daily') is not None:
-            analysis = analyze_ticker(data)
+            _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+            analysis = analyze_ticker(data, macd_profile=_macd_profile)
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = analysis
             st.session_state['scroll_to_detail'] = True
@@ -2171,7 +2201,8 @@ def _run_scan(mode='all'):
 
         _t = time.time()
         _set_scan_progress(55, "Analyzing signals...")
-        new_results = scan_watchlist(all_data)
+        _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        new_results = scan_watchlist(all_data, macd_profile=_macd_profile)
         _timing['scan_watchlist_sec'] = time.time() - _t
 
         # Defaults keep scan flow resilient if auxiliary fetches fail.
@@ -2348,6 +2379,16 @@ def _run_scan(mode='all'):
                 'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
                 'monthly_available': bool(sig and bool(sig.monthly_macd)),
                 'monthly_ao_available': bool(sig and bool(sig.monthly_ao)),
+                'macd_profile': str(getattr(sig, 'macd_profile', '') or ''),
+                'daily_macd_zone': str(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'weekly_macd_zone': str(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'monthly_macd_zone': str(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'daily_macd_hist_pct': float(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'weekly_macd_hist_pct': float(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'monthly_macd_hist_pct': float(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'mtf_zone_buy_approved': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('buy_approved', False)),
+                'mtf_zone_reject_reason': str(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('reject_reason', '') or ''),
+                'mtf_zone_shadow_diff': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('shadow_diff', False)),
                 'vcp_detected': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_detected', False)),
                 'vcp_score': float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_score', 0.0) or 0.0),
                 'vcp_pivot_price': (
@@ -2636,7 +2677,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     "Using partial results."
                 )
         _set_find_progress(63, "Analyzing trade candidates...")
-        results = scan_watchlist(all_data)
+        _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        results = scan_watchlist(all_data, macd_profile=_macd_profile)
         # Reuse scan-time price history for Trade Finder chart opens to avoid
         # per-click refetch/rate-limit failures.
         tf_data_cache: Dict[str, Dict[str, Any]] = {}
@@ -2836,6 +2878,16 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'daily_macd_bullish': bool(sig.macd.get('bullish', False)) if sig else False,
                 'daily_ao_positive': bool(sig.ao.get('positive', False)) if sig else False,
                 'daily_ao_zero_cross_found': bool(sig.ao.get('zero_cross_found', False)) if sig else False,
+                'macd_profile': str(getattr(sig, 'macd_profile', '') or ''),
+                'daily_macd_zone': str(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'weekly_macd_zone': str(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'monthly_macd_zone': str(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'daily_macd_hist_pct': float(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'weekly_macd_hist_pct': float(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'monthly_macd_hist_pct': float(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'mtf_zone_buy_approved': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('buy_approved', False)),
+                'mtf_zone_reject_reason': str(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('reject_reason', '') or ''),
+                'mtf_zone_shadow_diff': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('shadow_diff', False)),
                 'weekly_bullish': bool(sig.weekly_macd.get('bullish', False)) if sig else False,
                 'monthly_bullish': _monthly_bullish,
                 'monthly_macd_bullish': bool(_monthly_macd.get('bullish', False)),
@@ -2891,6 +2943,16 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     'daily_macd_bullish': bool(row.get('daily_macd_bullish', False)),
                     'daily_ao_positive': bool(row.get('daily_ao_positive', False)),
                     'daily_ao_zero_cross_found': bool(row.get('daily_ao_zero_cross_found', False)),
+                    'macd_profile': str(row.get('macd_profile', '') or ''),
+                    'daily_macd_zone': str(row.get('daily_macd_zone', '') or ''),
+                    'weekly_macd_zone': str(row.get('weekly_macd_zone', '') or ''),
+                    'monthly_macd_zone': str(row.get('monthly_macd_zone', '') or ''),
+                    'daily_macd_hist_pct': float(row.get('daily_macd_hist_pct', 0.0) or 0.0),
+                    'weekly_macd_hist_pct': float(row.get('weekly_macd_hist_pct', 0.0) or 0.0),
+                    'monthly_macd_hist_pct': float(row.get('monthly_macd_hist_pct', 0.0) or 0.0),
+                    'mtf_zone_buy_approved': bool(row.get('mtf_zone_buy_approved', False)),
+                    'mtf_zone_reject_reason': str(row.get('mtf_zone_reject_reason', '') or ''),
+                    'mtf_zone_shadow_diff': bool(row.get('mtf_zone_shadow_diff', False)),
                     'weekly_bullish': bool(row.get('weekly_bullish', False)),
                     'monthly_bullish': bool(row.get('monthly_bullish', False)),
                     'monthly_macd_bullish': bool(row.get('monthly_macd_bullish', False)),
@@ -3901,6 +3963,17 @@ def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: in
 
 def _trade_quality_settings() -> Dict[str, Any]:
     """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
+    def _resolved_profile() -> str:
+        _raw = st.session_state.get('trade_macd_profile', None)
+        p = str(_raw or get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+        if p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+            p = MACD_PROFILE_LEGACY
+        try:
+            set_active_macd_profile(p)
+        except Exception:
+            pass
+        return p
+
     if 'trade_min_rr_threshold' not in st.session_state:
         st.session_state['trade_min_rr_threshold'] = 1.2
     if 'trade_earnings_block_days' not in st.session_state:
@@ -3922,6 +3995,7 @@ def _trade_quality_settings() -> Dict[str, Any]:
     if 'trade_apex_bear_vix_threshold' not in st.session_state:
         st.session_state['trade_apex_bear_vix_threshold'] = 20.0
     return {
+        'macd_profile': _resolved_profile(),
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
         'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
         'require_ready': bool(st.session_state.get('trade_require_ready', False)),
@@ -3976,6 +4050,14 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
     """
     fail_codes: List[str] = []
     fail_reasons: List[str] = []
+    macd_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY).strip().lower()
+    if macd_profile not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+        macd_profile = MACD_PROFILE_LEGACY
+
+    def _zone_name(value: Any) -> str:
+        if isinstance(value, dict):
+            value = value.get('zone', '')
+        return str(value or '').strip().lower()
 
     phase = str(row.get('sector_phase', '') or '').upper().strip()
     if phase not in {"LEADING", "EMERGING"}:
@@ -3991,12 +4073,59 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
     daily_ao_zero_cross = bool(row.get('daily_ao_zero_cross_found', False))
     weekly_bullish = bool(row.get('weekly_bullish', False))
 
-    monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
-    if apex_primary:
-        # APEX backtest parity: recent APEX buy qualifies directly; otherwise enforce
-        # full Daily + Weekly + Monthly alignment.
-        if apex_buy and apex_days <= 20:
-            monthly_tag = "apex_recent_buy"
+    if macd_profile == MACD_PROFILE_HPOTTER_ZONE:
+        d_zone = _zone_name(row.get('daily_macd_zone', ''))
+        w_zone = _zone_name(row.get('weekly_macd_zone', ''))
+        m_zone = _zone_name(row.get('monthly_macd_zone', ''))
+        monthly_tag = f"zones:{d_zone or 'n/a'}/{w_zone or 'n/a'}/{m_zone or 'n/a'}"
+
+        if not daily_ao_positive:
+            fail_codes.append("daily_ao_not_positive")
+            fail_reasons.append("Daily AO is not positive")
+        if not daily_ao_zero_cross:
+            fail_codes.append("daily_ao_zero_cross_missing")
+            fail_reasons.append("Daily AO has no recent zero-cross")
+        if d_zone in {"extended", "bearish"}:
+            fail_codes.append("daily_zone_reject")
+            fail_reasons.append(f"Daily zone is disallowed ({d_zone})")
+        elif d_zone != "just_cross":
+            fail_codes.append("daily_zone_not_just_cross")
+            fail_reasons.append(f"Daily zone must be just_cross (got {d_zone or 'missing'})")
+        if w_zone in {"extended", "bearish"}:
+            fail_codes.append("weekly_zone_reject")
+            fail_reasons.append(f"Weekly zone is disallowed ({w_zone})")
+        elif w_zone not in {"strong", "just_cross"}:
+            fail_codes.append("weekly_zone_not_strong")
+            fail_reasons.append(f"Weekly zone must be strong/just_cross (got {w_zone or 'missing'})")
+        if m_zone in {"extended", "bearish"}:
+            fail_codes.append("monthly_zone_reject")
+            fail_reasons.append(f"Monthly zone is disallowed ({m_zone})")
+        elif m_zone not in {"strong", "just_cross"}:
+            fail_codes.append("monthly_zone_not_strong")
+            fail_reasons.append(f"Monthly zone must be strong/just_cross (got {m_zone or 'missing'})")
+    else:
+        monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
+        if apex_primary:
+            # APEX backtest parity: recent APEX buy qualifies directly; otherwise enforce
+            # full Daily + Weekly + Monthly alignment.
+            if apex_buy and apex_days <= 20:
+                monthly_tag = "apex_recent_buy"
+            else:
+                if not daily_cross_recent:
+                    fail_codes.append("daily_macd_cross_missing")
+                    fail_reasons.append("Daily MACD cross is not recent")
+                if not daily_ao_positive:
+                    fail_codes.append("daily_ao_not_positive")
+                    fail_reasons.append("Daily AO is not positive")
+                if not daily_ao_zero_cross:
+                    fail_codes.append("daily_ao_zero_cross_missing")
+                    fail_reasons.append("Daily AO has no recent zero-cross")
+                if not weekly_bullish:
+                    fail_codes.append("weekly_not_green")
+                    fail_reasons.append("Weekly MACD is not bullish")
+                if not monthly_ok:
+                    fail_codes.append("monthly_not_green")
+                    fail_reasons.append("Monthly momentum is not green/near-green")
         else:
             if not daily_cross_recent:
                 fail_codes.append("daily_macd_cross_missing")
@@ -4004,28 +4133,12 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
             if not daily_ao_positive:
                 fail_codes.append("daily_ao_not_positive")
                 fail_reasons.append("Daily AO is not positive")
-            if not daily_ao_zero_cross:
-                fail_codes.append("daily_ao_zero_cross_missing")
-                fail_reasons.append("Daily AO has no recent zero-cross")
             if not weekly_bullish:
                 fail_codes.append("weekly_not_green")
                 fail_reasons.append("Weekly MACD is not bullish")
             if not monthly_ok:
                 fail_codes.append("monthly_not_green")
                 fail_reasons.append("Monthly momentum is not green/near-green")
-    else:
-        if not daily_cross_recent:
-            fail_codes.append("daily_macd_cross_missing")
-            fail_reasons.append("Daily MACD cross is not recent")
-        if not daily_ao_positive:
-            fail_codes.append("daily_ao_not_positive")
-            fail_reasons.append("Daily AO is not positive")
-        if not weekly_bullish:
-            fail_codes.append("weekly_not_green")
-            fail_reasons.append("Weekly MACD is not bullish")
-        if not monthly_ok:
-            fail_codes.append("monthly_not_green")
-            fail_reasons.append("Monthly momentum is not green/near-green")
 
     # APEX bear-market filter: block only when SPY is below 200 and VIX is elevated.
     spy_above_200 = bool(row.get('market_spy_above_200', True))
@@ -4078,6 +4191,7 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
         'monthly_tag': monthly_tag,
         'metrics': {
             'sector_phase': phase,
+            'macd_profile': macd_profile,
             'apex_primary': apex_primary,
             'apex_buy': apex_buy,
             'apex_signal_days_ago': apex_days,
@@ -4346,6 +4460,15 @@ def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
         "daily_macd_cross_recent": bool(candidate.get('daily_macd_cross_recent', False)),
         "daily_ao_positive": bool(candidate.get('daily_ao_positive', False)),
         "daily_ao_zero_cross_found": bool(candidate.get('daily_ao_zero_cross_found', False)),
+        "macd_profile": str(candidate.get('macd_profile', '') or ''),
+        "daily_macd_zone": str(candidate.get('daily_macd_zone', '') or ''),
+        "weekly_macd_zone": str(candidate.get('weekly_macd_zone', '') or ''),
+        "monthly_macd_zone": str(candidate.get('monthly_macd_zone', '') or ''),
+        "daily_macd_hist_pct": round(float(candidate.get('daily_macd_hist_pct', 0.0) or 0.0), 4),
+        "weekly_macd_hist_pct": round(float(candidate.get('weekly_macd_hist_pct', 0.0) or 0.0), 4),
+        "monthly_macd_hist_pct": round(float(candidate.get('monthly_macd_hist_pct', 0.0) or 0.0), 4),
+        "mtf_zone_buy_approved": bool(candidate.get('mtf_zone_buy_approved', False)),
+        "mtf_zone_reject_reason": str(candidate.get('mtf_zone_reject_reason', '') or ''),
         "weekly_bullish": bool(candidate.get('weekly_bullish', False)),
         "monthly_macd_bullish": bool(candidate.get('monthly_macd_bullish', False)),
         "monthly_ao_positive": bool(candidate.get('monthly_ao_positive', False)),
@@ -4518,6 +4641,8 @@ def _run_trade_finder_workflow(
     _run_find_new_trades(progress_cb=find_progress_cb)
     report = st.session_state.get('find_new_trades_report', {}) or {}
     base_candidates = report.get('candidates', []) or []
+    quality_settings = _trade_quality_settings()
+    macd_profile = str(quality_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
     if not base_candidates:
         st.session_state['trade_finder_results'] = {
@@ -4525,6 +4650,7 @@ def _run_trade_finder_workflow(
             'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'rows': [],
             'provider': 'system',
+            'macd_profile': macd_profile,
             'elapsed_sec': 0.0,
             'input_candidates': 0,
             'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
@@ -4550,7 +4676,6 @@ def _run_trade_finder_workflow(
     ai_clients = _get_ai_clients()
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
-    quality_settings = _trade_quality_settings()
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
     # AI ranks only deterministic hard-gate passers.
     ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else max(0, ai_top_n_cfg)
@@ -4850,6 +4975,16 @@ def _run_trade_finder_workflow(
             'daily_macd_cross_recent': bool(c.get('daily_macd_cross_recent', False)),
             'daily_ao_positive': bool(c.get('daily_ao_positive', False)),
             'daily_ao_zero_cross_found': bool(c.get('daily_ao_zero_cross_found', False)),
+            'macd_profile': str(c.get('macd_profile', '') or ''),
+            'daily_macd_zone': str(c.get('daily_macd_zone', '') or ''),
+            'weekly_macd_zone': str(c.get('weekly_macd_zone', '') or ''),
+            'monthly_macd_zone': str(c.get('monthly_macd_zone', '') or ''),
+            'daily_macd_hist_pct': float(c.get('daily_macd_hist_pct', 0.0) or 0.0),
+            'weekly_macd_hist_pct': float(c.get('weekly_macd_hist_pct', 0.0) or 0.0),
+            'monthly_macd_hist_pct': float(c.get('monthly_macd_hist_pct', 0.0) or 0.0),
+            'mtf_zone_buy_approved': bool(c.get('mtf_zone_buy_approved', False)),
+            'mtf_zone_reject_reason': str(c.get('mtf_zone_reject_reason', '') or ''),
+            'mtf_zone_shadow_diff': bool(c.get('mtf_zone_shadow_diff', False)),
             'weekly_bullish': bool(c.get('weekly_bullish', False)),
             'monthly_bullish': bool(c.get('monthly_bullish', False)),
             'monthly_macd_bullish': bool(c.get('monthly_macd_bullish', False)),
@@ -4912,6 +5047,7 @@ def _run_trade_finder_workflow(
         'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         'rows': rows,
         'provider': rows[0].get('provider', 'system') if rows else 'system',
+        'macd_profile': macd_profile,
         'elapsed_sec': elapsed,
         'input_candidates': len(base_candidates),
         'hard_gate_pass_count': int(hard_gate_pass_count),
@@ -5351,6 +5487,7 @@ def render_trade_finder_tab():
         _rows_touched = True
     _hg_settings = _trade_quality_settings()
     _hg_sig = {
+        'macd_profile': str(_hg_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY),
         'breakout_min_dist_pct': float(_hg_settings.get('breakout_min_dist_pct', 0.0) or 0.0),
         'breakout_max_dist_pct': float(_hg_settings.get('breakout_max_dist_pct', 0.0) or 0.0),
         'monthly_near_macd_pct': float(_hg_settings.get('monthly_near_macd_pct', 0.0) or 0.0),
@@ -5465,6 +5602,11 @@ def render_trade_finder_tab():
         help="When enabled, Watch Only AI ratings are included if other gates pass.",
     )
     with st.expander("🎯 Breakout Hard Gate Rules", expanded=False):
+        _gate_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        if _gate_profile == MACD_PROFILE_HPOTTER_ZONE:
+            st.caption("HPotter zone mode active: hard gate uses Daily/Weekly/Monthly zone requirements (just_cross/strong).")
+        elif _gate_profile == MACD_PROFILE_SHADOW:
+            st.caption("Shadow mode active: live gates remain legacy while HPotter zone diagnostics are still computed.")
         hg1, hg2 = st.columns(2)
         with hg1:
             st.number_input(
@@ -5607,6 +5749,7 @@ def render_trade_finder_tab():
     st.caption(
         f"Generated: {results.get('generated_at_iso', '')} | "
         f"Run: {results.get('run_id', 'n/a') or 'n/a'} | "
+        f"MACD profile: {str(settings.get('macd_profile', MACD_PROFILE_LEGACY)).upper()} | "
         f"Candidates: {len(rows)} | Hard-gate pass: {int(results.get('hard_gate_pass_count', 0) or 0)} | "
         f"Relaxed-profile pass: {int(results.get('hard_gate_relaxed_pass_count', 0) or 0)} | "
         f"Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
@@ -5712,7 +5855,8 @@ def render_trade_finder_tab():
                         raise ValueError("No daily chart data available")
                     _tf_data['ticker'] = _inline_chart_ticker
                     _tf_data.setdefault('market_filter', fetch_market_filter() or {})
-                    _tf_analysis = analyze_ticker(_tf_data)
+                    _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+                    _tf_analysis = analyze_ticker(_tf_data, macd_profile=_macd_profile)
                     _tf_cache[_inline_chart_ticker] = _tf_analysis
                     st.session_state['_tf_inline_analysis_cache'] = _tf_cache
                     _analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
@@ -7842,6 +7986,8 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
 
     weekly = ticker_data.get('weekly')
     monthly = ticker_data.get('monthly')
+    macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+    macd_label = get_macd_indicator_label(macd_profile)
 
     # Quick research actions placed in chart section for fast workflow.
     _render_perplexity_research_controls(
@@ -7908,7 +8054,8 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     # ── Render Chart ──────────────────────────────────────────────
     render_tv_chart(daily, ticker, signal=signal, height=750,
                     zoom_level=200, extra_markers=apex_markers,
-                    key=f"tv_{key_ns}_{ticker}")
+                    key=f"tv_{key_ns}_{ticker}",
+                    macd_profile=macd_profile)
 
     # ── APEX Signal Panel ─────────────────────────────────────────
     if apex_signals_list:
@@ -7978,7 +8125,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
 - 🟢 **W3** — Wave 3 momentum peak
 """)
         with c2:
-            st.markdown("""
+            st.markdown(f"""
 **APEX MTF Signals (multi-timeframe system):**
 - 🟢 **APEX T1** — Daily + Weekly confirmed + Monthly bullish
 - 🟢 **APEX T2** — Daily + Weekly confirmed + Monthly curling
@@ -7991,7 +8138,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
 **Indicator Panels:**
 - **Volume** — Green/red bars
 - **AO** — Momentum histogram (green = bullish)
-- **MACD (12/26/9)** — Blue = MACD, Orange = Signal, Histogram = diff
+- **{macd_label}** — Blue = MACD, Orange = Signal, Histogram = diff
 """)
 
     # ── MTF chart ─────────────────────────────────────────────────
@@ -8006,7 +8153,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
                     st.warning("Unable to load multi-timeframe data right now.")
         else:
             try:
-                render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_")
+                render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_", macd_profile=macd_profile)
             except TypeError:
                 # Backward compatibility when Streamlit Cloud hot-reload has an older
                 # chart_engine module version in memory without key_prefix support.

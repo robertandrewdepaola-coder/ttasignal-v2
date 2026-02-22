@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Any
 from signal_engine import (
     normalize_columns, calculate_macd, calculate_ao,
     add_all_indicators, detect_bearish_divergence,
-    EntrySignal,
+    EntrySignal, get_macd_indicator_label,
 )
 
 # =============================================================================
@@ -402,6 +402,7 @@ def build_lwc_charts(
     show_divergence: bool = True,
     total_height: int = 800,
     extra_markers: list = None,
+    macd_profile: Optional[str] = None,
 ) -> list:
     """
     Build `charts` list for LWC v5.
@@ -410,8 +411,8 @@ def build_lwc_charts(
     wave labels, and price status.
     """
     df = normalize_columns(df).copy()
-    if 'MACD' not in df.columns:
-        df = add_all_indicators(df)
+    if macd_profile is not None or 'MACD' not in df.columns:
+        df = add_all_indicators(df, macd_profile=macd_profile)
     if show_divergence:
         df = detect_bearish_divergence(df)
 
@@ -674,7 +675,7 @@ def build_lwc_charts(
             "chart": _theme(),
             "series": macd_series,
             "height": int(total_height * 0.20),
-            "title": "MACD (12/26/9)",
+            "title": get_macd_indicator_label(macd_profile),
         })
 
     return panes
@@ -692,7 +693,8 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
                     height: int = 800,
                     zoom_level: int = 200,
                     extra_markers: list = None,
-                    key: str = None):
+                    key: str = None,
+                    macd_profile: Optional[str] = None):
     """Render TradingView chart in Streamlit."""
     from lightweight_charts_v5 import lightweight_charts_v5_component
 
@@ -703,6 +705,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
         show_divergence=show_divergence,
         total_height=height,
         extra_markers=extra_markers,
+        macd_profile=macd_profile,
     )
 
     lightweight_charts_v5_component(
@@ -718,7 +721,7 @@ def render_tv_chart(df: pd.DataFrame, ticker: str,
 # MTF CHART — Also TradingView LWC v5
 # =============================================================================
 
-def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350, key_prefix: str = ""):
+def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350, key_prefix: str = "", macd_profile: Optional[str] = None):
     """
     Multi-timeframe view: 3 separate LWC charts side by side
     using st.columns, each with candlestick + MACD + AO.
@@ -739,7 +742,7 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350, key_pr
             continue
 
         d = normalize_columns(raw_df).copy()
-        d = add_all_indicators(d)
+        d = add_all_indicators(d, macd_profile=macd_profile)
         # Pass ALL data — let LWC zoom_level handle initial view
         if d.empty:
             continue
@@ -803,7 +806,7 @@ def render_mtf_chart(daily_df, weekly_df, monthly_df, ticker, height=350, key_pr
                 "chart": _theme(),
                 "series": macd_s,
                 "height": int(height * 0.25),
-                "title": "MACD",
+                "title": get_macd_indicator_label(macd_profile),
             })
 
         with cols[col_idx]:

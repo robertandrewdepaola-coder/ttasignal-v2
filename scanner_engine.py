@@ -23,8 +23,10 @@ from signal_engine import (
     LATE_ENTRY_MAX_DAYS, LATE_ENTRY_MAX_PREMIUM,
     normalize_columns, calculate_macd, calculate_ao,
     detect_macd_cross, detect_ao_state,
-    check_timeframe_macd, check_timeframe_ao,
+    check_timeframe_macd, check_timeframe_ao, classify_macd_zone,
     validate_entry, EntrySignal,
+    MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW,
+    get_active_macd_profile,
 )
 
 
@@ -35,6 +37,13 @@ from signal_engine import (
 RE_ENTRY_MACD_LOOKBACK = 10  # Bars to look back for re-entry MACD cross
 
 
+def _resolve_macd_profile(profile: Optional[str]) -> str:
+    p = str(profile or get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+    if p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+        return MACD_PROFILE_LEGACY
+    return p
+
+
 # =============================================================================
 # QUALITY SCORING — Mini-Backtest
 # =============================================================================
@@ -42,7 +51,8 @@ RE_ENTRY_MACD_LOOKBACK = 10  # Bars to look back for re-entry MACD cross
 def calculate_quality_score(daily_df: pd.DataFrame,
                             weekly_df: pd.DataFrame = None,
                             ticker: str = '',
-                            lookback_years: int = 3) -> Dict[str, Any]:
+                            lookback_years: int = 3,
+                            macd_profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Run mini-backtest on historical data to calculate quality score.
 
@@ -70,15 +80,18 @@ def calculate_quality_score(daily_df: pd.DataFrame,
         result['error'] = "Insufficient daily data"
         return result
 
+    profile = _resolve_macd_profile(macd_profile)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
+
     daily = normalize_columns(daily_df).copy()
-    daily = calculate_macd(daily)
+    daily = calculate_macd(daily, profile=profile_for_primary)
     daily = calculate_ao(daily)
 
     # Weekly data for exit signals
     weekly = None
     if weekly_df is not None and len(weekly_df) >= 30:
         weekly = normalize_columns(weekly_df).copy()
-        weekly = calculate_macd(weekly)
+        weekly = calculate_macd(weekly, profile=profile_for_primary)
 
     PROTECTIVE_STOP_PCT = -15.0
     signals = []
@@ -222,7 +235,8 @@ def calculate_quality_score(daily_df: pd.DataFrame,
 
 def check_ao_confirmation(daily_df: pd.DataFrame,
                           market_filter: Dict = None,
-                          macd_lookback: int = AO_CONFIRM_MACD_LOOKBACK) -> Dict[str, Any]:
+                          macd_lookback: int = AO_CONFIRM_MACD_LOOKBACK,
+                          macd_profile: Optional[str] = None) -> Dict[str, Any]:
     """
     AO Confirmation signal: MACD crossed up first, AO confirms by crossing zero later.
 
@@ -252,8 +266,11 @@ def check_ao_confirmation(daily_df: pd.DataFrame,
         result['reason'] = 'Insufficient data'
         return result
 
+    profile = _resolve_macd_profile(macd_profile)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
+
     df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df)
+    df = calculate_macd(df, profile=profile_for_primary)
     df = calculate_ao(df)
 
     i = len(df) - 1
@@ -362,7 +379,8 @@ def check_ao_confirmation(daily_df: pd.DataFrame,
 
 
 def check_reentry_signal(daily_df: pd.DataFrame,
-                         market_filter: Dict = None) -> Dict[str, Any]:
+                         market_filter: Dict = None,
+                         macd_profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Re-entry signal: MACD crosses up while AO is already positive (established trend).
 
@@ -394,8 +412,11 @@ def check_reentry_signal(daily_df: pd.DataFrame,
         result['reason'] = 'Insufficient data'
         return result
 
+    profile = _resolve_macd_profile(macd_profile)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
+
     df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df)
+    df = calculate_macd(df, profile=profile_for_primary)
     df = calculate_ao(df)
 
     i = len(df) - 1
@@ -488,7 +509,8 @@ def check_reentry_signal(daily_df: pd.DataFrame,
 
 
 def check_late_entry(daily_df: pd.DataFrame,
-                     market_filter: Dict = None) -> Dict[str, Any]:
+                     market_filter: Dict = None,
+                     macd_profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Late entry: valid signal occurred 1-5 days ago, still actionable if not too extended.
 
@@ -510,8 +532,11 @@ def check_late_entry(daily_df: pd.DataFrame,
         result['reason'] = 'Insufficient data'
         return result
 
+    profile = _resolve_macd_profile(macd_profile)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
+
     df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df)
+    df = calculate_macd(df, profile=profile_for_primary)
     df = calculate_ao(df)
 
     i = len(df) - 1
@@ -835,7 +860,7 @@ class TickerAnalysis:
         }
 
 
-def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
+def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = None) -> TickerAnalysis:
     """
     Full analysis of a single ticker using pre-fetched data.
 
@@ -863,13 +888,17 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
                                  'summary': '❌ Insufficient data', 'conviction': 0}
         return result
 
+    profile_req = _resolve_macd_profile(macd_profile)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile_req == MACD_PROFILE_SHADOW else profile_req
+
     # --- Primary entry signal ---
     signal = validate_entry(
         daily_df=daily,
         weekly_df=weekly,
         monthly_df=monthly,
         spy_df=spy,
-        ticker=ticker
+        ticker=ticker,
+        macd_profile=profile_req,
     )
 
     # Inject market filter (VIX comes from data_fetcher)
@@ -879,36 +908,68 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
     spy_ok = mkt.get('spy_above_200', True)
     vix_ok = mkt.get('vix_below_30', True)
     
-    signal.is_valid = all([
+    legacy_valid = all([
         signal.macd['cross_recent'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
         spy_ok, vix_ok,
     ])
-    signal.is_valid_relaxed = all([
+    legacy_relaxed = all([
         signal.macd['bullish'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
         spy_ok, vix_ok,
     ])
+    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
+        d_zone = str((signal.daily_macd_zone or {}).get('zone', 'neutral'))
+        w_zone = str((signal.weekly_macd_zone or {}).get('zone', 'neutral'))
+        m_zone = str((signal.monthly_macd_zone or {}).get('zone', 'neutral'))
+        signal.is_valid = all([
+            bool((signal.mtf_zone_check or {}).get('buy_approved', False)),
+            signal.ao['positive'],
+            signal.ao['zero_cross_found'],
+            spy_ok,
+            vix_ok,
+        ])
+        signal.is_valid_relaxed = all([
+            d_zone not in {'bearish', 'extended'},
+            w_zone not in {'bearish', 'extended'},
+            m_zone not in {'bearish', 'extended'},
+            signal.ao['positive'],
+            spy_ok,
+            vix_ok,
+        ])
+    else:
+        signal.is_valid = legacy_valid
+        signal.is_valid_relaxed = legacy_relaxed
+    if profile_req == MACD_PROFILE_SHADOW:
+        zone_ok = bool((signal.mtf_zone_check or {}).get('buy_approved', False))
+        signal.mtf_zone_check['shadow_diff'] = bool(legacy_valid != zone_ok)
+        signal.mtf_zone_check['legacy_is_valid'] = bool(legacy_valid)
+        signal.mtf_zone_check['zone_is_valid'] = bool(zone_ok)
 
     result.signal = signal
 
     # --- Secondary signals (only if primary fails) ---
     if not signal.is_valid:
-        result.ao_confirmation = check_ao_confirmation(daily, market_filter=mkt)
+        result.ao_confirmation = check_ao_confirmation(daily, market_filter=mkt, macd_profile=profile_for_primary)
 
         if not result.ao_confirmation.get('is_valid'):
-            result.reentry = check_reentry_signal(daily, market_filter=mkt)
+            result.reentry = check_reentry_signal(daily, market_filter=mkt, macd_profile=profile_for_primary)
 
             if not result.reentry.get('is_valid'):
-                result.late_entry = check_late_entry(daily, market_filter=mkt)
+                result.late_entry = check_late_entry(daily, market_filter=mkt, macd_profile=profile_for_primary)
 
     # --- Quality score ---
     # Use longer history for backtest
     backtest_daily = ticker_data.get('daily')  # Already 1y
     backtest_weekly = ticker_data.get('weekly')  # Already 2y
-    result.quality = calculate_quality_score(backtest_daily, backtest_weekly, ticker=ticker)
+    result.quality = calculate_quality_score(
+        backtest_daily,
+        backtest_weekly,
+        ticker=ticker,
+        macd_profile=profile_for_primary,
+    )
 
     # --- AO Bearish Divergence Detection ---
     try:
@@ -986,7 +1047,7 @@ def analyze_ticker(ticker_data: Dict[str, Any]) -> TickerAnalysis:
     return result
 
 
-def scan_watchlist(all_ticker_data: Dict[str, Dict]) -> List[TickerAnalysis]:
+def scan_watchlist(all_ticker_data: Dict[str, Dict], macd_profile: Optional[str] = None) -> List[TickerAnalysis]:
     """
     Scan an entire watchlist.
 
@@ -997,7 +1058,7 @@ def scan_watchlist(all_ticker_data: Dict[str, Dict]) -> List[TickerAnalysis]:
     results = []
     for ticker, data in all_ticker_data.items():
         try:
-            analysis = analyze_ticker(data)
+            analysis = analyze_ticker(data, macd_profile=macd_profile)
             results.append(analysis)
         except Exception as e:
             err = TickerAnalysis(
@@ -1017,3 +1078,20 @@ def scan_watchlist(all_ticker_data: Dict[str, Dict]) -> List[TickerAnalysis]:
     ))
 
     return results
+    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
+        zone = classify_macd_zone(df, lookback_cross=3).get('zone', 'neutral')
+        if zone in {'bearish', 'extended'}:
+            result['reason'] = f'Daily MACD zone disallowed ({zone})'
+            return result
+
+    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
+        zone = classify_macd_zone(df, lookback_cross=4).get('zone', 'neutral')
+        if zone in {'bearish', 'extended'}:
+            result['reason'] = f'Daily MACD zone disallowed ({zone})'
+            return result
+
+    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
+        zone = classify_macd_zone(df, lookback_cross=5).get('zone', 'neutral')
+        if zone in {'bearish', 'extended'}:
+            result['reason'] = f'Daily MACD zone disallowed ({zone})'
+            return result

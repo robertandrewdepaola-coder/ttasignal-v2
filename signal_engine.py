@@ -5,14 +5,17 @@ TTA v2 Signal Engine — Single Source of Truth
 ALL indicator calculations and signal detection logic lives here.
 No other module should calculate MACD, AO, ATR, or detect signals.
 
-Matches TradingView Pine Script indicators exactly:
-- MACD: EMA(12,26) with SMA(9) signal line
+Supports staged MACD profiles:
+- Legacy: EMA(12,26) with SMA(9) signal line
+- HPotter Zone: EMA(8,16) with SMA(11) signal line
+- Shadow: legacy decision path + HPotter diagnostics
 - AO: (SMA(hl2,5) - SMA(hl2,34)) / 2
 - Signal line uses SMA, NOT EMA
 
-Version: 2.0.0 (2026-02-07)
+Version: 2.1.0 (2026-02-22)
 """
 
+import os
 import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional, Any, List
@@ -23,10 +26,29 @@ from dataclasses import dataclass, field
 # CONSTANTS — Define once, use everywhere
 # =============================================================================
 
-# MACD parameters (matches TradingView AO+MACD overlay)
+# MACD profiles
+MACD_PROFILE_LEGACY = "legacy"
+MACD_PROFILE_HPOTTER_ZONE = "hpotter_zone"
+MACD_PROFILE_SHADOW = "shadow"
+
+# Legacy MACD parameters (current production behavior)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
+
+# HPotter MACD parameters: EMA(8)-EMA(16), SMA(11) signal
+HPOTTER_MACD_FAST = 8
+HPOTTER_MACD_SLOW = 16
+HPOTTER_MACD_SIGNAL = 11
+
+_VALID_MACD_PROFILES = {
+    MACD_PROFILE_LEGACY,
+    MACD_PROFILE_HPOTTER_ZONE,
+    MACD_PROFILE_SHADOW,
+}
+_ACTIVE_MACD_PROFILE = str(os.getenv("TTA_MACD_PROFILE", MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY).strip().lower()
+if _ACTIVE_MACD_PROFILE not in _VALID_MACD_PROFILES:
+    _ACTIVE_MACD_PROFILE = MACD_PROFILE_LEGACY
 
 # Awesome Oscillator parameters
 AO_FAST = 5
@@ -66,6 +88,52 @@ MONTHLY_PERIOD = '10y'   # ~120 bars
 # =============================================================================
 # DATA NORMALIZATION — Handle yfinance quirks in ONE place
 # =============================================================================
+
+def get_active_macd_profile() -> str:
+    """Return active MACD profile."""
+    return _ACTIVE_MACD_PROFILE if _ACTIVE_MACD_PROFILE in _VALID_MACD_PROFILES else MACD_PROFILE_LEGACY
+
+
+def set_active_macd_profile(profile: str) -> str:
+    """Set active MACD profile at runtime. Returns resolved value."""
+    global _ACTIVE_MACD_PROFILE
+    p = str(profile or "").strip().lower()
+    if p not in _VALID_MACD_PROFILES:
+        p = MACD_PROFILE_LEGACY
+    _ACTIVE_MACD_PROFILE = p
+    return _ACTIVE_MACD_PROFILE
+
+
+def _resolve_macd_profile(profile: Optional[str]) -> str:
+    p = str(profile or get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+    if p not in _VALID_MACD_PROFILES:
+        p = MACD_PROFILE_LEGACY
+    return p
+
+
+def _macd_params_for_profile(profile: str) -> Tuple[int, int, int]:
+    p = _resolve_macd_profile(profile)
+    if p == MACD_PROFILE_HPOTTER_ZONE:
+        return HPOTTER_MACD_FAST, HPOTTER_MACD_SLOW, HPOTTER_MACD_SIGNAL
+    # Shadow keeps legacy signal path; HPotter is computed in parallel for diagnostics.
+    return MACD_FAST, MACD_SLOW, MACD_SIGNAL
+
+
+def get_macd_profile_params(profile: Optional[str] = None) -> Tuple[int, int, int]:
+    """Public accessor for MACD params under a given profile."""
+    return _macd_params_for_profile(_resolve_macd_profile(profile))
+
+
+def get_macd_indicator_label(profile: Optional[str] = None) -> str:
+    """
+    Human-readable MACD label for UI panes/legends.
+    Uses active profile when `profile` is None.
+    """
+    p = _resolve_macd_profile(profile)
+    fast, slow, sig = get_macd_profile_params(p)
+    if p == MACD_PROFILE_SHADOW:
+        return f"MACD ({fast}/{slow}/{sig}, shadow 8/16/11)"
+    return f"MACD ({fast}/{slow}/{sig})"
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -110,9 +178,10 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def calculate_macd(df: pd.DataFrame,
-                   fast: int = MACD_FAST,
-                   slow: int = MACD_SLOW,
-                   signal: int = MACD_SIGNAL) -> pd.DataFrame:
+                   fast: Optional[int] = None,
+                   slow: Optional[int] = None,
+                   signal: Optional[int] = None,
+                   profile: Optional[str] = None) -> pd.DataFrame:
     """
     Calculate MACD indicator.
 
@@ -124,13 +193,40 @@ def calculate_macd(df: pd.DataFrame,
 
     Adds columns: MACD, MACD_Signal, MACD_Hist
     """
-    df = df.copy()
+    df = normalize_columns(df.copy())
+    if fast is None or slow is None or signal is None:
+        _fast, _slow, _sig = _macd_params_for_profile(_resolve_macd_profile(profile))
+        fast = _fast if fast is None else fast
+        slow = _slow if slow is None else slow
+        signal = _sig if signal is None else signal
+
     ema_fast = df['Close'].ewm(span=fast, adjust=False).mean()
     ema_slow = df['Close'].ewm(span=slow, adjust=False).mean()
     df['MACD'] = ema_fast - ema_slow
     df['MACD_Signal'] = df['MACD'].rolling(window=signal).mean()  # SMA
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     return df
+
+
+def calculate_macd_hpotter(close: pd.Series,
+                           fast: int = HPOTTER_MACD_FAST,
+                           slow: int = HPOTTER_MACD_SLOW,
+                           signal: int = HPOTTER_MACD_SIGNAL) -> pd.DataFrame:
+    """
+    HPotter MACD: EMA(8)-EMA(16), signal=SMA(11) of MACD.
+    Accepts close series and returns MACD dataframe.
+    """
+    src = pd.to_numeric(close, errors='coerce')
+    fast_ma = src.ewm(span=fast, adjust=False).mean()
+    slow_ma = src.ewm(span=slow, adjust=False).mean()
+    macd = fast_ma - slow_ma
+    sig_line = macd.rolling(window=signal).mean()
+    hist = macd - sig_line
+    return pd.DataFrame({
+        'macd': macd,
+        'signal': sig_line,
+        'hist': hist,
+    }, index=src.index)
 
 
 def calculate_ao(df: pd.DataFrame,
@@ -176,13 +272,13 @@ def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
-def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_all_indicators(df: pd.DataFrame, macd_profile: Optional[str] = None) -> pd.DataFrame:
     """
     Add all standard indicators to a DataFrame in one call.
     Adds: MACD, MACD_Signal, MACD_Hist, AO, ATR, SMA_50, SMA_200, SMA_150
     """
     df = normalize_columns(df)
-    df = calculate_macd(df)
+    df = calculate_macd(df, profile=macd_profile)
     df = calculate_ao(df)
     df = calculate_atr(df)
     df['SMA_50'] = calculate_sma(df['Close'], 50)
@@ -658,7 +754,141 @@ def detect_vcp(
 # MULTI-TIMEFRAME CONFIRMATION
 # =============================================================================
 
-def check_timeframe_macd(df: pd.DataFrame) -> Dict[str, Any]:
+def classify_macd_zone(df_macd: pd.DataFrame,
+                       lookback_cross: int = 5,
+                       hist_norm_window: int = 60) -> Dict[str, Any]:
+    """
+    Classify MACD state into zones:
+      just_cross, strong, extended, bearish, neutral.
+    """
+    out = {
+        'zone': 'neutral',
+        'hist_pct': 0.0,
+        'recent_cross': False,
+        'macd': 0.0,
+        'signal': 0.0,
+        'hist': 0.0,
+        'error': None,
+    }
+    if df_macd is None or len(df_macd) < 5:
+        out['error'] = 'Insufficient MACD data'
+        return out
+
+    macd = pd.to_numeric(df_macd.get('MACD', df_macd.get('macd')), errors='coerce')
+    sig = pd.to_numeric(df_macd.get('MACD_Signal', df_macd.get('signal')), errors='coerce')
+    hist = pd.to_numeric(df_macd.get('MACD_Hist', df_macd.get('hist')), errors='coerce')
+    if macd is None or sig is None or hist is None:
+        out['error'] = 'Missing MACD columns'
+        return out
+
+    m = float(macd.iloc[-1]) if len(macd) else float('nan')
+    s = float(sig.iloc[-1]) if len(sig) else float('nan')
+    h = float(hist.iloc[-1]) if len(hist) else float('nan')
+    if any(pd.isna(v) for v in [m, s, h]):
+        out['error'] = 'NaN MACD values'
+        return out
+
+    hist_slice = hist.tail(max(10, hist_norm_window))
+    h_max = float(hist_slice.max()) if len(hist_slice) else 0.0
+    h_min = float(hist_slice.min()) if len(hist_slice) else 0.0
+    h_range = (h_max - h_min) if (h_max - h_min) != 0 else 1e-9
+    h_pct = (h - h_min) / h_range
+    h_pct = max(0.0, min(1.0, float(h_pct)))
+
+    recent_cross = False
+    max_lb = max(1, int(lookback_cross))
+    for i in range(1, max_lb + 1):
+        if len(hist) > i:
+            cur = float(hist.iloc[-i])
+            prev = float(hist.iloc[-(i + 1)])
+            if (not pd.isna(cur)) and (not pd.isna(prev)) and cur > 0 and prev <= 0:
+                recent_cross = True
+                break
+
+    if m < s:
+        zone = 'bearish'
+    elif recent_cross and h_pct <= 0.20:
+        zone = 'just_cross'
+    elif h_pct > 0.80:
+        zone = 'extended'
+    elif h_pct >= 0.35:
+        zone = 'strong'
+    else:
+        zone = 'neutral'
+
+    out.update({
+        'zone': zone,
+        'hist_pct': round(h_pct, 3),
+        'recent_cross': bool(recent_cross),
+        'macd': round(m, 4),
+        'signal': round(s, 4),
+        'hist': round(h, 4),
+    })
+    return out
+
+
+def check_macd_mtf_zones(daily_df: pd.DataFrame,
+                         weekly_df: Optional[pd.DataFrame],
+                         monthly_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """
+    MTF MACD zone check using HPotter profile.
+    BUY when Daily=just_cross and Weekly/Monthly are strong or just_cross.
+    """
+    out = {
+        'buy_approved': False,
+        'daily_zone': {'zone': 'neutral', 'error': 'missing'},
+        'weekly_zone': {'zone': 'neutral', 'error': 'missing'},
+        'monthly_zone': {'zone': 'neutral', 'error': 'missing'},
+        'reject_reason': 'missing_timeframes',
+    }
+    if daily_df is None or weekly_df is None or monthly_df is None:
+        return out
+    if len(daily_df) < 30 or len(weekly_df) < 20 or len(monthly_df) < 20:
+        out['reject_reason'] = 'insufficient_timeframe_data'
+        return out
+
+    d = calculate_macd(normalize_columns(daily_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+    w = calculate_macd(normalize_columns(weekly_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+    m = calculate_macd(normalize_columns(monthly_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+
+    d_zone = classify_macd_zone(d, lookback_cross=5)
+    w_zone = classify_macd_zone(w, lookback_cross=3)
+    m_zone = classify_macd_zone(m, lookback_cross=2)
+    out['daily_zone'] = d_zone
+    out['weekly_zone'] = w_zone
+    out['monthly_zone'] = m_zone
+
+    d_key = str(d_zone.get('zone', 'neutral') or 'neutral')
+    w_key = str(w_zone.get('zone', 'neutral') or 'neutral')
+    m_key = str(m_zone.get('zone', 'neutral') or 'neutral')
+    daily_ok = d_key == 'just_cross'
+    weekly_ok = w_key in ('strong', 'just_cross')
+    monthly_ok = m_key in ('strong', 'just_cross')
+    daily_reject = d_key in ('extended', 'bearish')
+    weekly_reject = w_key in ('extended', 'bearish')
+    monthly_reject = m_key in ('extended', 'bearish')
+    approved = daily_ok and weekly_ok and monthly_ok and not (daily_reject or weekly_reject or monthly_reject)
+    out['buy_approved'] = bool(approved)
+    if approved:
+        out['reject_reason'] = None
+    elif daily_reject:
+        out['reject_reason'] = f"Daily extended/bearish ({d_key})"
+    elif weekly_reject:
+        out['reject_reason'] = f"Weekly extended/bearish ({w_key})"
+    elif monthly_reject:
+        out['reject_reason'] = f"Monthly extended/bearish ({m_key})"
+    elif not daily_ok:
+        out['reject_reason'] = f"Daily not just_cross ({d_key})"
+    elif not weekly_ok:
+        out['reject_reason'] = f"Weekly not strong ({w_key})"
+    elif not monthly_ok:
+        out['reject_reason'] = f"Monthly not strong ({m_key})"
+    else:
+        out['reject_reason'] = 'mtf_zone_reject'
+    return out
+
+
+def check_timeframe_macd(df: pd.DataFrame, macd_profile: Optional[str] = None) -> Dict[str, Any]:
     """
     Check MACD status on a given timeframe DataFrame (weekly or monthly).
 
@@ -678,7 +908,7 @@ def check_timeframe_macd(df: pd.DataFrame) -> Dict[str, Any]:
         }
 
     df = normalize_columns(df)
-    df = calculate_macd(df)
+    df = calculate_macd(df, profile=macd_profile)
 
     macd_val = float(df['MACD'].iloc[-1])
     signal_val = float(df['MACD_Signal'].iloc[-1])
@@ -708,6 +938,7 @@ def check_timeframe_macd(df: pd.DataFrame) -> Dict[str, Any]:
         'macd': round(macd_val, 4),
         'signal': round(signal_val, 4),
         'histogram': round(hist, 4),
+        'zone': classify_macd_zone(df, lookback_cross=3).get('zone', 'neutral'),
         'cross_down': cross_down,
         'cross_up': cross_up,
         'error': None
@@ -1440,6 +1671,11 @@ class EntrySignal:
     weekly_macd: Dict = field(default_factory=dict)
     monthly_macd: Dict = field(default_factory=dict)
     monthly_ao: Dict = field(default_factory=dict)
+    macd_profile: str = MACD_PROFILE_LEGACY
+    daily_macd_zone: Dict = field(default_factory=dict)
+    weekly_macd_zone: Dict = field(default_factory=dict)
+    monthly_macd_zone: Dict = field(default_factory=dict)
+    mtf_zone_check: Dict = field(default_factory=dict)
     vcp: Dict = field(default_factory=dict)
 
     # Context (for AI analysis)
@@ -1469,6 +1705,11 @@ class EntrySignal:
             'weekly_macd': self.weekly_macd,
             'monthly_macd': self.monthly_macd,
             'monthly_ao': self.monthly_ao,
+            'macd_profile': self.macd_profile,
+            'daily_macd_zone': self.daily_macd_zone,
+            'weekly_macd_zone': self.weekly_macd_zone,
+            'monthly_macd_zone': self.monthly_macd_zone,
+            'mtf_zone_check': self.mtf_zone_check,
             'vcp': self.vcp,
             'weinstein': self.weinstein,
             'volume': self.volume,
@@ -1486,7 +1727,8 @@ def validate_entry(daily_df: pd.DataFrame,
                    weekly_df: pd.DataFrame = None,
                    monthly_df: pd.DataFrame = None,
                    spy_df: pd.DataFrame = None,
-                   ticker: str = '') -> EntrySignal:
+                   ticker: str = '',
+                   macd_profile: Optional[str] = None) -> EntrySignal:
     """
     Complete entry validation against TTA strategy rules.
 
@@ -1500,14 +1742,16 @@ def validate_entry(daily_df: pd.DataFrame,
     5. Weekly MACD confirmation
     6. Monthly MACD top-down context
     """
-    signal = EntrySignal(ticker=ticker)
+    profile_req = _resolve_macd_profile(macd_profile)
+    signal = EntrySignal(ticker=ticker, macd_profile=profile_req)
 
     if daily_df is None or len(daily_df) < 50:
         signal.error = 'Insufficient daily data'
         return signal
 
     # Normalize and add indicators
-    daily_df = add_all_indicators(daily_df)
+    profile_for_primary = MACD_PROFILE_LEGACY if profile_req == MACD_PROFILE_SHADOW else profile_req
+    daily_df = add_all_indicators(daily_df, macd_profile=profile_for_primary)
     signal.data_bars = len(daily_df)
 
     last_idx = daily_df.index[-1]
@@ -1550,12 +1794,19 @@ def validate_entry(daily_df: pd.DataFrame,
 
     # ── Weekly MACD ───────────────────────────────────────────────────
     if weekly_df is not None and len(weekly_df) >= 30:
-        signal.weekly_macd = check_timeframe_macd(weekly_df)
+        signal.weekly_macd = check_timeframe_macd(weekly_df, macd_profile=profile_for_primary)
 
     # ── Monthly MACD + AO ─────────────────────────────────────────────
     if monthly_df is not None and len(monthly_df) >= 30:
-        signal.monthly_macd = check_timeframe_macd(monthly_df)
+        signal.monthly_macd = check_timeframe_macd(monthly_df, macd_profile=profile_for_primary)
         signal.monthly_ao = check_timeframe_ao(monthly_df)
+
+    # ── MTF MACD Zones (HPotter) ──────────────────────────────────────
+    zone_check = check_macd_mtf_zones(daily_df, weekly_df, monthly_df)
+    signal.mtf_zone_check = zone_check
+    signal.daily_macd_zone = dict(zone_check.get('daily_zone', {}) or {})
+    signal.weekly_macd_zone = dict(zone_check.get('weekly_zone', {}) or {})
+    signal.monthly_macd_zone = dict(zone_check.get('monthly_zone', {}) or {})
 
     # ── Market Filter ─────────────────────────────────────────────────
     if spy_df is not None:
@@ -1577,20 +1828,44 @@ def validate_entry(daily_df: pd.DataFrame,
     spy_ok = signal.market_filter.get('spy_above_200', True)
     vix_ok = signal.market_filter.get('vix_below_30', True)
 
-    signal.is_valid = all([
+    legacy_valid = all([
         signal.macd['cross_recent'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
         spy_ok,
         vix_ok,
     ])
-
-    signal.is_valid_relaxed = all([
+    legacy_relaxed = all([
         signal.macd['bullish'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
         spy_ok,
         vix_ok,
     ])
+
+    if profile_req == MACD_PROFILE_HPOTTER_ZONE:
+        signal.is_valid = all([
+            bool(signal.mtf_zone_check.get('buy_approved', False)),
+            signal.ao['positive'],
+            signal.ao['zero_cross_found'],
+            spy_ok,
+            vix_ok,
+        ])
+        signal.is_valid_relaxed = all([
+            str(signal.daily_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
+            str(signal.weekly_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
+            str(signal.monthly_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
+            signal.ao['positive'],
+            spy_ok,
+            vix_ok,
+        ])
+    else:
+        signal.is_valid = legacy_valid
+        signal.is_valid_relaxed = legacy_relaxed
+
+    if profile_req == MACD_PROFILE_SHADOW:
+        signal.mtf_zone_check['shadow_diff'] = bool(signal.is_valid != bool(signal.mtf_zone_check.get('buy_approved', False)))
+        signal.mtf_zone_check['legacy_is_valid'] = bool(legacy_valid)
+        signal.mtf_zone_check['zone_is_valid'] = bool(signal.mtf_zone_check.get('buy_approved', False))
 
     return signal
