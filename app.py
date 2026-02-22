@@ -2120,6 +2120,7 @@ def _open_chart_anywhere(
     ticker: str,
     warn: bool = True,
     switch_to_scanner_tab: bool = True,
+    set_scroll_to_detail: bool = True,
 ) -> bool:
     """Open a ticker directly in Scanner -> Chart view from any UI surface."""
     _tk = str(ticker or "").upper().strip()
@@ -2131,7 +2132,7 @@ def _open_chart_anywhere(
         _tk,
         target="chart",
         switch_to_scanner_tab=switch_to_scanner_tab,
-        set_scroll_to_detail=False,
+        set_scroll_to_detail=set_scroll_to_detail,
     )
     if not _ok and warn:
         st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
