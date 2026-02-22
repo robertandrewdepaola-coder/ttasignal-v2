@@ -25,6 +25,8 @@ import requests as _requests_lib
 import logging
 import hashlib
 import os
+import threading
+from collections import deque
 from earnings_utils import select_earnings_dates
 
 # ── Suppress noisy yfinance logging globally ────────────────────────────────
@@ -100,6 +102,16 @@ def clear_cache(clear_rate_limits: bool = False):
         _rate_limit_scopes.clear()
         _rate_limit_state['active_until'] = 0.0
         _rate_limit_state['cooldown_remaining_sec'] = 0
+        _rate_limit_state['hits'] = 0
+        _rate_limit_state['last_error'] = ''
+        _rate_limit_state['throttle_wait_sec'] = 0.0
+        _rate_limit_state['requests_last_1s'] = 0
+        with _governor_lock:
+            _governor_state['interval_sec'] = float(_governor_state.get('base_interval_sec', 0.08) or 0.08)
+            _governor_state['next_allowed_ts'] = 0.0
+            recent = _governor_state.get('recent_ts_1s')
+            if isinstance(recent, deque):
+                recent.clear()
 
 
 def get_cache_stats() -> Dict[str, int]:
@@ -115,8 +127,70 @@ _rate_limit_state: Dict[str, Any] = {
     'last_rate_limit_ts': 0.0,
     'last_success_ts': 0.0,
     'cooldown_remaining_sec': 0,
+    'governor_interval_sec': 0.08,
+    'throttle_wait_sec': 0.0,
+    'requests_last_1s': 0,
+    'last_request_ts': 0.0,
 }
 _last_rate_limit_log_ts = 0.0
+_governor_lock = threading.Lock()
+_governor_state: Dict[str, Any] = {
+    'base_interval_sec': 0.08,
+    'interval_sec': 0.08,
+    'next_allowed_ts': 0.0,
+    'recent_ts_1s': deque(maxlen=512),
+}
+
+
+def _governed_request_acquire(scope: str, ignore_cooldown: bool = False) -> bool:
+    """
+    Global request governor to smooth API traffic before 429s occur.
+    Uses a shared, thread-safe leaky-bucket schedule across all fetch paths.
+    """
+    if (not ignore_cooldown) and _is_scope_rate_limited(scope):
+        return False
+
+    wait_sec = 0.0
+    with _governor_lock:
+        now = time.time()
+        interval = float(_governor_state.get('interval_sec', 0.08) or 0.08)
+        next_allowed = float(_governor_state.get('next_allowed_ts', 0.0) or 0.0)
+        wait_sec = max(0.0, next_allowed - now)
+
+        recent = _governor_state.get('recent_ts_1s')
+        if not isinstance(recent, deque):
+            recent = deque(maxlen=512)
+            _governor_state['recent_ts_1s'] = recent
+        while recent and (now - float(recent[0])) > 1.0:
+            recent.popleft()
+
+        hits = int(_rate_limit_state.get('hits', 0) or 0)
+        # Lower burst allowance as recent 429 pressure grows.
+        burst_limit = max(3, int(10 - min(6, hits)))
+        if len(recent) >= burst_limit:
+            burst_wait = max(0.0, (float(recent[0]) + 1.0) - now)
+            wait_sec = max(wait_sec, burst_wait)
+
+        scheduled = now + wait_sec
+        _governor_state['next_allowed_ts'] = scheduled + interval
+
+    if wait_sec > 0:
+        time.sleep(wait_sec)
+
+    with _governor_lock:
+        now2 = time.time()
+        recent2 = _governor_state.get('recent_ts_1s')
+        if not isinstance(recent2, deque):
+            recent2 = deque(maxlen=512)
+            _governor_state['recent_ts_1s'] = recent2
+        while recent2 and (now2 - float(recent2[0])) > 1.0:
+            recent2.popleft()
+        recent2.append(now2)
+        _rate_limit_state['throttle_wait_sec'] = round(float(wait_sec), 3)
+        _rate_limit_state['governor_interval_sec'] = round(float(_governor_state.get('interval_sec', 0.08) or 0.08), 3)
+        _rate_limit_state['requests_last_1s'] = int(len(recent2))
+        _rate_limit_state['last_request_ts'] = float(now2)
+    return True
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -163,6 +237,13 @@ def _register_rate_limit(scope: str, error: Exception):
     _rate_limit_state['active_until'] = max(float(_rate_limit_state.get('active_until', 0.0) or 0.0), global_until)
     _rate_limit_scopes[scope] = max(float(_rate_limit_scopes.get(scope, 0.0) or 0.0), scope_until)
     _rate_limit_state['cooldown_remaining_sec'] = int(_rate_limit_state['active_until'] - now)
+    # Tighten request pacing after each 429 event.
+    with _governor_lock:
+        curr = float(_governor_state.get('interval_sec', 0.08) or 0.08)
+        bumped = min(1.2, (curr * 1.35) + 0.03)
+        _governor_state['interval_sec'] = bumped
+        _governor_state['next_allowed_ts'] = max(float(_governor_state.get('next_allowed_ts', 0.0) or 0.0), now + min(2.0, bumped))
+        _rate_limit_state['governor_interval_sec'] = round(bumped, 3)
 
 
 def _mark_fetch_success(scope: str):
@@ -174,6 +255,13 @@ def _mark_fetch_success(scope: str):
         _rate_limit_state['active_until'] = 0.0
         _rate_limit_state['cooldown_remaining_sec'] = 0
         _rate_limit_state['hits'] = max(0, int(_rate_limit_state.get('hits', 0) or 0) - 1)
+    # Gradually relax request pacing after successful calls.
+    with _governor_lock:
+        base = float(_governor_state.get('base_interval_sec', 0.08) or 0.08)
+        curr = float(_governor_state.get('interval_sec', base) or base)
+        relaxed = max(base, (curr * 0.94))
+        _governor_state['interval_sec'] = relaxed
+        _rate_limit_state['governor_interval_sec'] = round(relaxed, 3)
 
 
 def get_fetch_health_status() -> Dict[str, Any]:
@@ -192,6 +280,10 @@ def get_fetch_health_status() -> Dict[str, Any]:
         'last_error': str(_rate_limit_state.get('last_error', '') or ''),
         'last_rate_limit_ts': float(_rate_limit_state.get('last_rate_limit_ts', 0.0) or 0.0),
         'last_success_ts': float(_rate_limit_state.get('last_success_ts', 0.0) or 0.0),
+        'governor_interval_sec': float(_rate_limit_state.get('governor_interval_sec', 0.08) or 0.08),
+        'throttle_wait_sec': float(_rate_limit_state.get('throttle_wait_sec', 0.0) or 0.0),
+        'requests_last_1s': int(_rate_limit_state.get('requests_last_1s', 0) or 0),
+        'last_request_ts': float(_rate_limit_state.get('last_request_ts', 0.0) or 0.0),
         'cache_entries': int(get_cache_stats().get('entries', 0) or 0),
     }
 
@@ -325,6 +417,8 @@ def fetch_daily(ticker: str, period: str = DAILY_PERIOD) -> Optional[pd.DataFram
     
     for attempt in range(2):
         try:
+            if not _governed_request_acquire(scope):
+                return None
             stock = yf.Ticker(ticker)
             df = stock.history(period=period, interval='1d')
             
@@ -367,6 +461,8 @@ def fetch_weekly(ticker: str, period: str = WEEKLY_PERIOD) -> Optional[pd.DataFr
     
     for attempt in range(2):
         try:
+            if not _governed_request_acquire(scope):
+                return None
             stock = yf.Ticker(ticker)
             df = stock.history(period=period, interval='1wk')
             
@@ -409,6 +505,8 @@ def fetch_monthly(ticker: str, period: str = MONTHLY_PERIOD) -> Optional[pd.Data
     
     for attempt in range(2):
         try:
+            if not _governed_request_acquire(scope):
+                return None
             stock = yf.Ticker(ticker)
             df = stock.history(period=period, interval='1mo')
             
@@ -451,6 +549,8 @@ def fetch_intraday(ticker: str, interval: str = '1h',
         return None
     
     try:
+        if not _governed_request_acquire(scope):
+            return None
         stock = yf.Ticker(ticker)
         df = stock.history(period=period, interval=interval)
         
@@ -486,6 +586,8 @@ def fetch_history(ticker: str, start: str = None, end: str = None,
         return None
     
     try:
+        if not _governed_request_acquire(scope):
+            return None
         stock = yf.Ticker(ticker)
         df = stock.history(start=start, end=end, interval=interval)
         
@@ -526,6 +628,8 @@ def fetch_current_price(ticker: str) -> Optional[float]:
         return None
     
     try:
+        if not _governed_request_acquire(scope):
+            return None
         stock = yf.Ticker(ticker)
         hist = stock.history(period='2d')
         if hist is not None and not hist.empty:
@@ -622,6 +726,8 @@ def fetch_batch_session_change(
         if (not ignore_cooldown) and _is_scope_rate_limited(scope):
             continue
         try:
+            if not _governed_request_acquire(scope, ignore_cooldown=ignore_cooldown):
+                continue
             dl = yf.download(
                 tickers=" ".join(chunk),
                 period=period,
@@ -1258,6 +1364,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     def _fetch_one_earnings(ticker: str):
         """Fetch earnings date for a single ticker with 3 fallback strategies."""
         try:
+            if not _governed_request_acquire(f"{ticker}:earnings:batch"):
+                return (ticker, None)
             stock = yf.Ticker(ticker)
             earn_dt = None
             recent_past = None
@@ -1266,6 +1374,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
 
             # Strategy 1: info dict (often has earningsTimestamp — fast, same API call)
             try:
+                if not _governed_request_acquire(f"{ticker}:earnings:batch:info"):
+                    return (ticker, None)
                 info = stock.info
                 if info:
                     # Try multiple possible keys
@@ -1307,6 +1417,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
             # Strategy 2: calendar property
             if earn_dt is None:
                 try:
+                    if not _governed_request_acquire(f"{ticker}:earnings:batch:calendar"):
+                        return (ticker, None)
                     cal = stock.calendar
                     if cal is not None:
                         raw_date = None
@@ -1335,6 +1447,8 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
             # Strategy 3: earnings_dates (most reliable but slowest)
             if earn_dt is None:
                 try:
+                    if not _governed_request_acquire(f"{ticker}:earnings:batch:dates"):
+                        return (ticker, None)
                     edates = stock.earnings_dates
                     if edates is not None and len(edates) > 0:
                         picks = select_earnings_dates(list(edates.index), today)
@@ -1806,6 +1920,10 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
     }
     
     try:
+        if not _governed_request_acquire(f"{ticker}:info"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         stock = yf.Ticker(ticker)
         info = None
         
@@ -1820,6 +1938,9 @@ def fetch_ticker_info(ticker: str) -> Dict[str, Any]:
             except Exception as _e:
                 if _is_crumb_or_auth_error(_e) and _attempt == 0:
                     _force_yfinance_session_reset()
+                    if not _governed_request_acquire(f"{ticker}:info:retry"):
+                        result['error'] = 'Rate-limited cooldown'
+                        break
                     stock = yf.Ticker(ticker)  # Fresh ticker object
                     time.sleep(1)
                     continue
@@ -1898,6 +2019,10 @@ def fetch_fundamental_profile(ticker: str) -> Dict[str, Any]:
     }
 
     try:
+        if not _governed_request_acquire(f"{ticker}:fundamentals"):
+            profile['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, profile, ttl_sec=45)
+            return profile
         stock = yf.Ticker(ticker)
         info = stock.info or {}
 
@@ -2026,6 +2151,10 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     # Try up to 2 attempts (initial + 1 retry after delay if rate-limited)
     for attempt in range(2):
         try:
+            if not _governed_request_acquire(f"{ticker}:earnings"):
+                result['error'] = 'Rate-limited cooldown'
+                _cache.set(cache_key, result, ttl_sec=45)
+                return result
             stock = yf.Ticker(ticker)
             
             # ── METHOD 1: stock.calendar ──────────────────────────────
@@ -2222,6 +2351,8 @@ def fetch_earnings_date(ticker: str) -> Dict[str, Any]:
     # ── METHOD 6b: If no last_earnings either, infer from historical cadence ──
     if not result['next_earnings'] and not result.get('last_earnings'):
         try:
+            if not _governed_request_acquire(f"{ticker}:earnings:hist_cadence"):
+                raise RuntimeError('Rate-limited cooldown')
             stock = yf.Ticker(ticker)
             edates = stock.earnings_dates
             if edates is not None and len(edates) > 0:
@@ -2264,6 +2395,10 @@ def fetch_earnings_history(ticker: str) -> Dict[str, Any]:
     }
 
     try:
+        if not _governed_request_acquire(f"{ticker}:earnings_hist"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         stock = yf.Ticker(ticker)
 
         # Next earnings date — use the robust 4-method cascade
@@ -2369,9 +2504,17 @@ def fetch_options_data(ticker: str) -> Dict[str, Any]:
         'max_pain': None,
         'error': None,
     }
-    
+
     try:
+        if not _governed_request_acquire(f"{ticker}:options"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         stock = yf.Ticker(ticker)
+        if not _governed_request_acquire(f"{ticker}:options:expiries"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         expiry_dates = stock.options
         
         if not expiry_dates or len(expiry_dates) == 0:
@@ -2382,7 +2525,10 @@ def fetch_options_data(ticker: str) -> Dict[str, Any]:
         # Use nearest expiry
         nearest = expiry_dates[0]
         result['nearest_expiry'] = nearest
-        
+        if not _governed_request_acquire(f"{ticker}:options:chain"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         chain = stock.option_chain(nearest)
         calls = chain.calls
         puts = chain.puts
@@ -2455,10 +2601,17 @@ def fetch_institutional_holders(ticker: str) -> Dict[str, Any]:
         'holder_count': 0,
         'error': None,
     }
-    
+
     try:
+        if not _governed_request_acquire(f"{ticker}:institutional"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         stock = yf.Ticker(ticker)
-        
+        if not _governed_request_acquire(f"{ticker}:institutional:holders"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         # Institutional holders
         inst = stock.institutional_holders
         if inst is not None and not inst.empty:
@@ -2478,7 +2631,10 @@ def fetch_institutional_holders(ticker: str) -> Dict[str, Any]:
             result['top_holders'] = holders
         
         # Major holders (ownership breakdown)
-        major = stock.major_holders
+        if _governed_request_acquire(f"{ticker}:institutional:major"):
+            major = stock.major_holders
+        else:
+            major = None
         if major is not None and not major.empty:
             # major_holders format varies; try to extract key percentages
             result['major_holders_raw'] = major.to_dict()
@@ -2510,10 +2666,17 @@ def fetch_insider_transactions(ticker: str) -> Dict[str, Any]:
         'total_sell_value': 0,
         'error': None,
     }
-    
+
     try:
+        if not _governed_request_acquire(f"{ticker}:insider"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         stock = yf.Ticker(ticker)
-        
+        if not _governed_request_acquire(f"{ticker}:insider:transactions"):
+            result['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, result, ttl_sec=45)
+            return result
         # Insider transactions
         insider = stock.insider_transactions
         if insider is not None and not insider.empty:
@@ -2716,6 +2879,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
     stock = None
     try:
+        if not _governed_request_acquire(f"{ticker}:market_intel"):
+            intel['error'] = 'Rate-limited cooldown'
+            _cache.set(cache_key, intel, ttl_sec=45)
+            return intel
         stock = yf.Ticker(ticker)
     except Exception:
         intel['error'] = 'Failed to create yfinance ticker'
@@ -2724,7 +2891,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
     # ── Analyst Recommendations ───────────────────────────────────
     try:
-        recs = stock.recommendations
+        if _governed_request_acquire(f"{ticker}:market_intel:recommendations"):
+            recs = stock.recommendations
+        else:
+            recs = None
         if recs is not None and len(recs) > 0:
             # Latest row contains aggregated counts
             latest = recs.iloc[-1] if len(recs) > 0 else None
@@ -2760,7 +2930,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
     # ── Price Targets ─────────────────────────────────────────────
     try:
-        targets = stock.analyst_price_targets
+        if _governed_request_acquire(f"{ticker}:market_intel:targets"):
+            targets = stock.analyst_price_targets
+        else:
+            targets = None
         if targets is not None:
             if isinstance(targets, dict):
                 intel['target_mean'] = targets.get('mean')
@@ -2779,7 +2952,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
     # ── Recent Upgrades/Downgrades ────────────────────────────────
     try:
-        upgrades = stock.upgrades_downgrades
+        if _governed_request_acquire(f"{ticker}:market_intel:upgrades"):
+            upgrades = stock.upgrades_downgrades
+        else:
+            upgrades = None
         if upgrades is not None and len(upgrades) > 0:
             recent = upgrades.head(10)
             changes = []
@@ -2797,7 +2973,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
 
     # ── Insider Transactions ──────────────────────────────────────
     try:
-        insiders = stock.insider_transactions
+        if _governed_request_acquire(f"{ticker}:market_intel:insiders"):
+            insiders = stock.insider_transactions
+        else:
+            insiders = None
         if insiders is not None and len(insiders) > 0:
             buys_90d = 0
             sells_90d = 0
@@ -2940,7 +3119,10 @@ def fetch_market_intelligence(ticker: str, finnhub_key: str = None) -> Dict[str,
             # Fallback: direct yfinance call
             if vol_data is None and stock is not None:
                 try:
-                    hist = stock.history(period='3mo')
+                    if not _governed_request_acquire(f"{ticker}:market_intel:history"):
+                        hist = None
+                    else:
+                        hist = stock.history(period='3mo')
                     if hist is not None and len(hist) >= 20:
                         vol_col = 'Volume' if 'Volume' in hist.columns else (
                             'volume' if 'volume' in hist.columns else None)
