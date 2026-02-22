@@ -2057,7 +2057,11 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
         return False
 
 
-def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
+def _navigate_to_scanner_ticker(
+    ticker: str,
+    target: str = "chart",
+    switch_to_scanner_tab: bool = True,
+) -> bool:
     """
     Safe cross-tab navigation helper used by heatmap/alerts/executive actions.
     It only triggers scanner-tab switch after ticker data is successfully loaded.
@@ -2080,35 +2084,57 @@ def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
         return False
 
     st.session_state['default_detail_tab'] = _detail_tab
-    st.session_state['_switch_to_scanner_tab'] = True
-    st.session_state['_switch_to_scanner_target_tab'] = _target
-    # Ensure post-switch UX lands on detail panel (not just scanner table top).
-    st.session_state['_switch_to_scanner_focus_detail'] = True
+    if bool(switch_to_scanner_tab):
+        st.session_state['_switch_to_scanner_tab'] = True
+        st.session_state['_switch_to_scanner_target_tab'] = _target
+        # Ensure post-switch UX lands on detail panel (not just scanner table top).
+        st.session_state['_switch_to_scanner_focus_detail'] = True
+    else:
+        # Explicitly clear deferred cross-tab navigation when opening from Scanner itself.
+        st.session_state.pop('_switch_to_scanner_tab', None)
+        st.session_state.pop('_switch_to_scanner_target_tab', None)
+        st.session_state.pop('_switch_to_scanner_focus_detail', None)
     st.session_state.pop('_ticker_load_error', None)
     return True
 
 
-def _open_chart_anywhere(ticker: str, warn: bool = True) -> bool:
+def _open_chart_anywhere(
+    ticker: str,
+    warn: bool = True,
+    switch_to_scanner_tab: bool = True,
+) -> bool:
     """Open a ticker directly in Scanner -> Chart view from any UI surface."""
     _tk = str(ticker or "").upper().strip()
     if not _tk:
         if warn:
             st.warning("No ticker selected.")
         return False
-    _ok = _navigate_to_scanner_ticker(_tk, target="chart")
+    _ok = _navigate_to_scanner_ticker(
+        _tk,
+        target="chart",
+        switch_to_scanner_tab=switch_to_scanner_tab,
+    )
     if not _ok and warn:
         st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
     return bool(_ok)
 
 
-def _open_trade_anywhere(ticker: str, warn: bool = True) -> bool:
+def _open_trade_anywhere(
+    ticker: str,
+    warn: bool = True,
+    switch_to_scanner_tab: bool = True,
+) -> bool:
     """Open a ticker directly in Scanner -> Trade view from any UI surface."""
     _tk = str(ticker or "").upper().strip()
     if not _tk:
         if warn:
             st.warning("No ticker selected.")
         return False
-    _ok = _navigate_to_scanner_ticker(_tk, target="trade")
+    _ok = _navigate_to_scanner_ticker(
+        _tk,
+        target="trade",
+        switch_to_scanner_tab=switch_to_scanner_tab,
+    )
     if not _ok and warn:
         st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
     return bool(_ok)
@@ -6635,7 +6661,7 @@ def render_scanner_table():
                 with tc3:
                     if st.button("📈", key=f"chart_{t}",
                                  help="Open chart"):
-                        if _open_chart_anywhere(t, warn=True):
+                        if _open_chart_anywhere(t, warn=True, switch_to_scanner_tab=False):
                             st.rerun()
                 with tc4:
                     if st.button("🗑️", key=f"del_{t}",
@@ -7223,7 +7249,7 @@ def render_scanner_table():
         # Chart button — opens directly to chart tab
         with cols[1]:
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
-                if _open_chart_anywhere(row['Ticker'], warn=True):
+                if _open_chart_anywhere(row['Ticker'], warn=True, switch_to_scanner_tab=False):
                     st.rerun()
 
         # One-click alert button @ major overhead resistance
