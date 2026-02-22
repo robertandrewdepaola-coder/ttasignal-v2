@@ -3793,6 +3793,59 @@ def _sector_phase_display(sector_phase: str) -> Dict[str, str]:
     return {"label": "UNCLASSIFIED", "icon": "⚪", "color": "#94a3b8"}
 
 
+def _resolve_ticker_sector_for_detail(
+    ticker: str,
+    text_hint: str = "",
+    allow_fetch: bool = True,
+) -> Dict[str, str]:
+    """Resolve sector/phase for detail panels with cache + optional provider fallback."""
+    t = str(ticker or "").upper().strip()
+    rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
+    ticker_sector_ctx = st.session_state.get('ticker_sectors', {}) or {}
+    scan_sector_map = st.session_state.get('_scan_sector_map', {}) or {}
+
+    sector_name = _canonicalize_sector_name(str(ticker_sector_ctx.get(t, '') or ''), rotation_ctx)
+    if not sector_name and t:
+        sector_name = _canonicalize_sector_name(str(scan_sector_map.get(t, '') or ''), rotation_ctx)
+    if not sector_name and text_hint:
+        sector_name = _canonicalize_sector_name(_infer_sector_from_text(text_hint), rotation_ctx)
+
+    if allow_fetch and t and not sector_name:
+        cache = st.session_state.get('_detail_sector_lookup_cache')
+        if not isinstance(cache, dict):
+            cache = {}
+        cached = str(cache.get(t, '') or '')
+        if not cached:
+            fetched = ""
+            try:
+                from data_fetcher import get_ticker_sector, fetch_fundamental_profile
+                fetched = str(get_ticker_sector(t) or '').strip()
+                if not fetched:
+                    profile = fetch_fundamental_profile(t) or {}
+                    fetched = str(profile.get('sector', '') or '').strip()
+            except Exception:
+                fetched = ""
+            cache[t] = fetched if fetched else "__MISS__"
+            st.session_state['_detail_sector_lookup_cache'] = cache
+            cached = fetched
+        if cached and cached != "__MISS__":
+            sector_name = _canonicalize_sector_name(cached, rotation_ctx)
+            if sector_name:
+                ticker_sector_ctx[t] = sector_name
+                st.session_state['ticker_sectors'] = ticker_sector_ctx
+
+    sector_phase = ""
+    if sector_name:
+        sector_phase = str((rotation_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+    if not sector_phase and text_hint:
+        sector_phase = _infer_sector_phase_from_text(text_hint)
+
+    return {
+        'sector': str(sector_name or '').strip(),
+        'sector_phase': str(sector_phase or '').upper().strip(),
+    }
+
+
 def _resolve_trade_finder_sector_fields(
     row: Dict[str, Any],
     rotation_ctx: Optional[Dict[str, Any]] = None,
@@ -7916,10 +7969,20 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
         _reward = (_target - _entry)
         _rr = (_reward / _risk) if _risk > 0 else 0.0
 
-    _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
     _rotation = st.session_state.get('sector_rotation', {}) or {}
-    _sector = _canonicalize_sector_name(str(_ticker_sectors.get(ticker, '') or ''), _rotation)
-    _phase = str((_rotation.get(_sector, {}) or {}).get('phase', '') or '').upper().strip() if _sector else ''
+    _sector_ctx_text = " ".join([
+        str(getattr(analysis, 'summary', '') or ''),
+        str(rec.get('summary', '') or ''),
+        str(getattr(analysis, 'reasoning', '') or ''),
+        str(getattr(analysis, 'market_intel', '') or ''),
+    ]).strip()
+    _sector_info = _resolve_ticker_sector_for_detail(
+        ticker,
+        text_hint=_sector_ctx_text,
+        allow_fetch=True,
+    )
+    _sector = str(_sector_info.get('sector', '') or '').strip()
+    _phase = str(_sector_info.get('sector_phase', '') or '').upper().strip()
     _phase_badge = _sector_phase_display(_phase)
 
     _earn = resolve_earnings_for_ticker(ticker, verify_with_fetch=False)
@@ -7978,8 +8041,19 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
                 f"VCP: ❌ not detected ({_vcp_score:.0f}/100)"
             )
             if _vcp_pivot:
-                _vcp_txt += f" | Pivot ${float(_vcp_pivot):.2f}"
+                _pivot_label = "Pivot" if _vcp_det else "Candidate pivot"
+                _vcp_txt += f" | {_pivot_label} ${float(_vcp_pivot):.2f}"
             st.caption(_vcp_txt)
+            if not _vcp_det and _vcp:
+                _pc = bool(_vcp.get('price_contracting', False))
+                _vc = bool(_vcp.get('volume_contracting', False))
+                _ut = bool(_vcp.get('in_uptrend', False))
+                st.caption(
+                    "VCP checks: "
+                    + f"price {'✅' if _pc else '❌'} | "
+                    + f"volume {'✅' if _vc else '❌'} | "
+                    + f"uptrend {'✅' if _ut else '❌'}"
+                )
             st.caption(
                 f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
                 + (f" ({_sector})" if _sector else " (n/a)")
@@ -8192,6 +8266,18 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
     macd_label = get_macd_indicator_label(macd_profile)
     jm = get_journal()
+    _sector_hint = " ".join([
+        str((signal.weinstein or {}).get('label', '') if signal else ''),
+        str((signal.overhead_resistance or {}).get('assessment', '') if signal else ''),
+    ]).strip()
+    _sector_info = _resolve_ticker_sector_for_detail(
+        ticker,
+        text_hint=_sector_hint,
+        allow_fetch=True,
+    )
+    _sector = str(_sector_info.get('sector', '') or '').strip()
+    _phase = str(_sector_info.get('sector_phase', '') or '').upper().strip()
+    _phase_badge = _sector_phase_display(_phase)
 
     # Quick research actions placed in chart section for fast workflow.
     _render_perplexity_research_controls(
@@ -8207,6 +8293,27 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     _vol_need = float(_ores.get('volume_needed', 0) or 0)
     _desc = str(_ores.get('description', '') or '')
     with st.container(border=True):
+        st.caption(
+            f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
+            + (f" ({_sector})" if _sector else " (n/a)")
+        )
+        _vcp = getattr(signal, 'vcp', {}) or {}
+        _vcp_det = bool(_vcp.get('vcp_detected', False))
+        _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+        _vcp_pivot = _vcp.get('pivot_price')
+        _vcp_line = (
+            f"VCP: {'✅ detected' if _vcp_det else '❌ not detected'} ({_vcp_score:.0f}/100)"
+        )
+        if _vcp_pivot:
+            _vcp_line += f" | {'Pivot' if _vcp_det else 'Candidate pivot'} ${float(_vcp_pivot):.2f}"
+        st.caption(_vcp_line)
+        if not _vcp_det and _vcp:
+            st.caption(
+                "VCP checks: "
+                + f"price {'✅' if bool(_vcp.get('price_contracting', False)) else '❌'} | "
+                + f"volume {'✅' if bool(_vcp.get('volume_contracting', False)) else '❌'} | "
+                + f"uptrend {'✅' if bool(_vcp.get('in_uptrend', False)) else '❌'}"
+            )
         if _trigger > 0:
             _line = f"🔔 Breakout alert trigger (major resistance): **${_trigger:.2f}**"
             if _dist:
