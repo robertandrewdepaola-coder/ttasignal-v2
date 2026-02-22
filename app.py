@@ -93,6 +93,14 @@ from navigation_state import (
     set_detail_tab_lock,
     set_scanner_switch_state,
 )
+from session_state_contract import (
+    ensure_core_defaults,
+    ensure_exec_dashboard_defaults,
+    ensure_exec_queue_defaults,
+    ensure_portfolio_defaults,
+    ensure_scanner_defaults,
+    ensure_trade_quality_defaults,
+)
 try:
     from trade_finder_helpers import (
         build_planned_trade,
@@ -785,40 +793,9 @@ if 'apex_spy_data' not in st.session_state:
         st.session_state['apex_spy_data'] = None
         st.session_state['apex_vix_data'] = None
 
-if 'selected_ticker' not in st.session_state:
-    st.session_state['selected_ticker'] = None
-
-if 'selected_analysis' not in st.session_state:
-    st.session_state['selected_analysis'] = None
-
-if 'ticker_data_cache' not in st.session_state:
-    st.session_state['ticker_data_cache'] = {}
-
-# Find New / scan scope controls
-if 'find_new_max_tickers' not in st.session_state:
-    st.session_state['find_new_max_tickers'] = 250  # speed default; user can set 0 for full universe
-if 'find_new_in_rotation_only' not in st.session_state:
-    st.session_state['find_new_in_rotation_only'] = True
-if 'find_new_include_unknown_sector' not in st.session_state:
-    st.session_state['find_new_include_unknown_sector'] = False
-if 'find_new_selected_sectors' not in st.session_state:
-    st.session_state['find_new_selected_sectors'] = []
-if 'scan_max_minutes' not in st.session_state:
-    st.session_state['scan_max_minutes'] = 0.0  # 0 = no runtime cap
-if 'find_new_max_minutes' not in st.session_state:
-    st.session_state['find_new_max_minutes'] = 5.0
-if 'trade_finder_last_status' not in st.session_state:
-    st.session_state['trade_finder_last_status'] = {}
-if 'trade_finder_ai_budget_sec' not in st.session_state:
-    st.session_state['trade_finder_ai_budget_sec'] = 30.0
-if 'trade_breakout_min_dist_pct' not in st.session_state:
-    st.session_state['trade_breakout_min_dist_pct'] = 0.2
-if 'trade_breakout_max_dist_pct' not in st.session_state:
-    st.session_state['trade_breakout_max_dist_pct'] = 4.0
-if 'trade_monthly_near_macd_pct' not in st.session_state:
-    st.session_state['trade_monthly_near_macd_pct'] = 0.08
-if 'trade_monthly_near_ao_floor' not in st.session_state:
-    st.session_state['trade_monthly_near_ao_floor'] = -0.25
+# Centralized session-state defaults for scanner/trade-finder controls.
+ensure_core_defaults(st.session_state)
+ensure_scanner_defaults(st.session_state)
 
 
 def get_journal() -> JournalManager:
@@ -4109,26 +4086,7 @@ def _trade_quality_settings() -> Dict[str, Any]:
             pass
         return p
 
-    if 'trade_min_rr_threshold' not in st.session_state:
-        st.session_state['trade_min_rr_threshold'] = 1.2
-    if 'trade_earnings_block_days' not in st.session_state:
-        st.session_state['trade_earnings_block_days'] = 7
-    if 'trade_require_ready' not in st.session_state:
-        st.session_state['trade_require_ready'] = False
-    if 'trade_include_watch_only' not in st.session_state:
-        st.session_state['trade_include_watch_only'] = True
-    if 'trade_breakout_min_dist_pct' not in st.session_state:
-        st.session_state['trade_breakout_min_dist_pct'] = 0.2
-    if 'trade_breakout_max_dist_pct' not in st.session_state:
-        st.session_state['trade_breakout_max_dist_pct'] = 4.0
-    if 'trade_monthly_near_macd_pct' not in st.session_state:
-        st.session_state['trade_monthly_near_macd_pct'] = 0.08
-    if 'trade_monthly_near_ao_floor' not in st.session_state:
-        st.session_state['trade_monthly_near_ao_floor'] = -0.25
-    if 'trade_apex_primary' not in st.session_state:
-        st.session_state['trade_apex_primary'] = True
-    if 'trade_apex_bear_vix_threshold' not in st.session_state:
-        st.session_state['trade_apex_bear_vix_threshold'] = 20.0
+    ensure_trade_quality_defaults(st.session_state)
     return {
         'macd_profile': _resolved_profile(),
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
@@ -5841,8 +5799,6 @@ def render_trade_finder_tab():
                     f"monthly MACD tol {float(_applied.get('trade_monthly_near_macd_pct', settings.get('monthly_near_macd_pct', 0.08))):.2f} | "
                     f"monthly AO floor {float(_applied.get('trade_monthly_near_ao_floor', settings.get('monthly_near_ao_floor', -0.25))):.2f}"
                 )
-    if 'trade_finder_ai_top_n' not in st.session_state:
-        st.session_state['trade_finder_ai_top_n'] = 0  # 0 = all candidates
     st.number_input(
         "AI Rank Top N",
         min_value=0,
@@ -6605,9 +6561,8 @@ def render_scanner_table():
     # Get active watchlist name for display
     _active_wl_name = bridge.manager.get_active_watchlist().get("name", "Watchlist")
 
-    # Watchlist version counter — used to force text_area reset when watchlist changes
-    if 'wl_version' not in st.session_state:
-        st.session_state['wl_version'] = 0
+    # Watchlist version counter defaults are centrally managed.
+    ensure_scanner_defaults(st.session_state)
 
     with st.expander(f"📋 {_active_wl_name} ({len(watchlist_tickers)} tickers) — click to edit",
                      expanded=(len(watchlist_tickers) == 0)):
@@ -7152,9 +7107,8 @@ def render_scanner_table():
     PAGE_SIZE = 25
     total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    # Track page in session state
-    if 'scanner_page' not in st.session_state:
-        st.session_state['scanner_page'] = 0
+    # Scanner pagination defaults are centrally managed.
+    ensure_scanner_defaults(st.session_state)
     current_page = st.session_state['scanner_page']
     # Clamp to valid range
     if current_page >= total_pages:
@@ -10809,9 +10763,8 @@ def _render_capital_overview(jm: JournalManager):
     """
     open_trades = jm.get_open_trades()
 
-    # Account size (persist across session)
-    if 'account_size' not in st.session_state:
-        st.session_state['account_size'] = 100000.0
+    # Account-size default is centrally managed.
+    ensure_portfolio_defaults(st.session_state)
 
     account_size = st.session_state['account_size']
 
@@ -13236,8 +13189,7 @@ def render_executive_dashboard():
 
     st.subheader("Executive Dashboard")
     st.caption(f"Now: {snap.generated_at_iso}")
-    if 'exec_auto_exit_enabled' not in st.session_state:
-        st.session_state['exec_auto_exit_enabled'] = False
+    ensure_exec_dashboard_defaults(st.session_state)
     st.checkbox(
         "Enable Auto Exit on Fast Refresh / Daily Workflow",
         key="exec_auto_exit_enabled",
@@ -14305,16 +14257,7 @@ def render_executive_dashboard():
                     if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
                         _load_ticker_for_view(ticker)
 
-    if '_queue_action_confirm' not in st.session_state:
-        st.session_state['_queue_action_confirm'] = {}
-    if '_queue_pending_actions' not in st.session_state:
-        st.session_state['_queue_pending_actions'] = {}
-    if '_queue_action_executed' not in st.session_state:
-        st.session_state['_queue_action_executed'] = {}
-    if '_queue_recent_actions' not in st.session_state:
-        st.session_state['_queue_recent_actions'] = []
-    if '_queue_last_result_toasts' not in st.session_state:
-        st.session_state['_queue_last_result_toasts'] = []
+    ensure_exec_queue_defaults(st.session_state)
 
     undo_window_s = 12
     confirm_ttl_s = 20
