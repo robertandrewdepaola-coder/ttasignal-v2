@@ -4172,32 +4172,26 @@ def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, An
         d_zone = _zone_name(row.get('daily_macd_zone', ''))
         w_zone = _zone_name(row.get('weekly_macd_zone', ''))
         m_zone = _zone_name(row.get('monthly_macd_zone', ''))
+        zone_ok = bool(row.get('mtf_zone_buy_approved', False))
+        zone_reason = str(row.get('mtf_zone_reject_reason', '') or '').strip()
         monthly_tag = f"zones:{d_zone or 'n/a'}/{w_zone or 'n/a'}/{m_zone or 'n/a'}"
+        if zone_ok:
+            monthly_tag += " (approved)"
+        elif zone_reason:
+            monthly_tag += f" (rejected: {zone_reason[:64]})"
 
+        # Daily momentum confirmation remains mandatory for breakout timing.
         if not daily_ao_positive:
             fail_codes.append("daily_ao_not_positive")
             fail_reasons.append("Daily AO is not positive")
-        if not daily_ao_zero_cross:
-            fail_codes.append("daily_ao_zero_cross_missing")
-            fail_reasons.append("Daily AO has no recent zero-cross")
-        if d_zone in {"extended", "bearish"}:
-            fail_codes.append("daily_zone_reject")
-            fail_reasons.append(f"Daily zone is disallowed ({d_zone})")
-        elif d_zone != "just_cross":
-            fail_codes.append("daily_zone_not_just_cross")
-            fail_reasons.append(f"Daily zone must be just_cross (got {d_zone or 'missing'})")
-        if w_zone in {"extended", "bearish"}:
-            fail_codes.append("weekly_zone_reject")
-            fail_reasons.append(f"Weekly zone is disallowed ({w_zone})")
-        elif w_zone not in {"strong", "just_cross"}:
-            fail_codes.append("weekly_zone_not_strong")
-            fail_reasons.append(f"Weekly zone must be strong/just_cross (got {w_zone or 'missing'})")
-        if m_zone in {"extended", "bearish"}:
-            fail_codes.append("monthly_zone_reject")
-            fail_reasons.append(f"Monthly zone is disallowed ({m_zone})")
-        elif m_zone not in {"strong", "just_cross"}:
-            fail_codes.append("monthly_zone_not_strong")
-            fail_reasons.append(f"Monthly zone must be strong/just_cross (got {m_zone or 'missing'})")
+        # Use signal-engine zone approval as single source of truth.
+        # Weekly/monthly extended momentum is allowed when daily timing is valid.
+        if not zone_ok:
+            fail_codes.append("mtf_zone_not_approved")
+            fail_reasons.append(
+                zone_reason or
+                f"MACD zone timing not approved (D:{d_zone or 'n/a'} W:{w_zone or 'n/a'} M:{m_zone or 'n/a'})"
+            )
     else:
         monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
         if apex_primary:
@@ -5699,7 +5693,7 @@ def render_trade_finder_tab():
     with st.expander("🎯 Breakout Hard Gate Rules", expanded=False):
         _gate_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
         if _gate_profile == MACD_PROFILE_HPOTTER_ZONE:
-            st.caption("HPotter zone mode active: hard gate uses Daily/Weekly/Monthly zone requirements (just_cross/strong).")
+            st.caption("HPotter zone mode active: hard gate follows signal-engine MTF zone approval (daily timing + weekly/monthly momentum).")
         elif _gate_profile == MACD_PROFILE_SHADOW:
             st.caption("Shadow mode active: live gates remain legacy while HPotter zone diagnostics are still computed.")
         hg1, hg2 = st.columns(2)

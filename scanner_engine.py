@@ -970,6 +970,11 @@ def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = No
         d_zone = str((signal.daily_macd_zone or {}).get('zone', 'neutral'))
         w_zone = str((signal.weekly_macd_zone or {}).get('zone', 'neutral'))
         m_zone = str((signal.monthly_macd_zone or {}).get('zone', 'neutral'))
+        d_recent = bool((signal.daily_macd_zone or {}).get('recent_cross', False))
+        d_hist_pct = float((signal.daily_macd_zone or {}).get('hist_pct', 1.0) or 1.0)
+        daily_relaxed_ok = (d_zone != 'bearish') and not (
+            d_zone == 'extended' and (not d_recent or d_hist_pct > 0.95)
+        )
         signal.is_valid = all([
             bool((signal.mtf_zone_check or {}).get('buy_approved', False)),
             signal.ao['positive'],
@@ -978,9 +983,9 @@ def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = No
             vix_ok,
         ])
         signal.is_valid_relaxed = all([
-            d_zone not in {'bearish', 'extended'},
-            w_zone not in {'bearish', 'extended'},
-            m_zone not in {'bearish', 'extended'},
+            daily_relaxed_ok,
+            w_zone not in {'bearish'},
+            m_zone not in {'bearish'},
             signal.ao['positive'],
             spy_ok,
             vix_ok,

@@ -1861,10 +1861,18 @@ def validate_entry(daily_df: pd.DataFrame,
             spy_ok,
             vix_ok,
         ])
+        d_zone = str(signal.daily_macd_zone.get('zone', 'neutral') or 'neutral')
+        w_zone = str(signal.weekly_macd_zone.get('zone', 'neutral') or 'neutral')
+        m_zone = str(signal.monthly_macd_zone.get('zone', 'neutral') or 'neutral')
+        d_recent = bool(signal.daily_macd_zone.get('recent_cross', False))
+        d_hist_pct = float(signal.daily_macd_zone.get('hist_pct', 1.0) or 1.0)
+        daily_relaxed_ok = (d_zone != 'bearish') and not (
+            d_zone == 'extended' and (not d_recent or d_hist_pct > 0.95)
+        )
         signal.is_valid_relaxed = all([
-            str(signal.daily_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
-            str(signal.weekly_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
-            str(signal.monthly_macd_zone.get('zone', 'neutral')) not in ('bearish', 'extended'),
+            daily_relaxed_ok,
+            w_zone != 'bearish',
+            m_zone != 'bearish',
             signal.ao['positive'],
             spy_ok,
             vix_ok,
