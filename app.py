@@ -2360,6 +2360,12 @@ def _run_scan(mode='all'):
                 int(rec.get('conviction', 0) or 0),
                 sector_phase,
             )
+            _ores_sig = (getattr(sig, 'overhead_resistance', {}) or {}) if sig else {}
+            _crit_sig = (_ores_sig.get('critical_level', {}) or {})
+            _crit_px = float(_crit_sig.get('price', 0.0) or 0.0)
+            _crit_desc = str(_crit_sig.get('description', '') or '')
+            _crit_dist = float(_ores_sig.get('distance_to_critical_pct', 0.0) or 0.0)
+            _crit_vol_need = float(_ores_sig.get('breakout_volume_needed', 0.0) or 0.0)
             summary.append({
                 'ticker': r.ticker,
                 'recommendation': rec_adj.get('recommendation', rec.get('recommendation', 'SKIP')),
@@ -2397,6 +2403,10 @@ def _run_scan(mode='all'):
                 ),
                 'vcp_price_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('price_contracting', False)),
                 'vcp_volume_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('volume_contracting', False)),
+                'critical_resistance_price': _crit_px,
+                'critical_resistance_desc': _crit_desc,
+                'critical_resistance_dist_pct': _crit_dist,
+                'critical_breakout_volume_needed': _crit_vol_need,
                 'is_open_position': r.ticker in open_tickers,
                 'sector': sector_name,
                 'sector_phase': sector_phase,
@@ -7078,8 +7088,8 @@ def render_scanner_table():
                 st.rerun()
 
     # Table header — added Focus, Earnings Date, Volume, Apex columns
-    hdr_cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.6])
-    headers = ['Ticker', '📈', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'VCP', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Summary']
+    hdr_cols = st.columns([0.9, 0.3, 0.42, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 0.8, 1.35])
+    headers = ['Ticker', '📈', '🔔', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'VCP', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Alert@', 'Summary']
     for col, h in zip(hdr_cols, headers):
         col.markdown(f"**{h}**")
 
@@ -7088,12 +7098,39 @@ def render_scanner_table():
         'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'blue': '🔵', '': '⚪'
     }
     _focus_cycle = ['', 'green', 'yellow', 'red', 'blue']  # Click to cycle
+    _pending_alerts = jm.get_pending_conditionals() or []
+    _pending_alert_map = {
+        str(c.get('ticker', '') or '').upper().strip(): c
+        for c in _pending_alerts
+        if str(c.get('status', 'PENDING') or 'PENDING').upper() == 'PENDING'
+    }
 
     # Table rows — ONLY render current page (25 rows max = fast)
     for idx, row in enumerate(page_rows):
         # Use global index for unique keys
         global_idx = start_idx + idx
-        cols = st.columns([0.9, 0.3, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 1.6])
+        cols = st.columns([0.9, 0.3, 0.42, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 0.8, 1.35])
+        _ticker = str(row.get('Ticker', '') or '').upper().strip()
+        try:
+            _alert_trigger = float(row.get('AlertTrigger', 0) or 0)
+        except Exception:
+            _alert_trigger = 0.0
+        try:
+            _alert_dist = float(row.get('AlertTriggerDistPct', 0) or 0)
+        except Exception:
+            _alert_dist = 0.0
+        try:
+            _alert_vol_need = float(row.get('BreakoutVolumeNeeded', 0) or 0)
+        except Exception:
+            _alert_vol_need = 0.0
+        _alert_desc = str(row.get('AlertTriggerDesc', '') or '').strip()
+        _conv_raw = str(row.get('Conv', '0/10') or '0/10')
+        try:
+            _conv_int = int(_conv_raw.split('/')[0])
+        except Exception:
+            _conv_int = 0
+        _quality = str(row.get('Quality', '?') or '?')
+        _has_pending_alert = _ticker in _pending_alert_map
 
         # Ticker as clickable button with earnings flag
         with cols[0]:
@@ -7133,8 +7170,37 @@ def render_scanner_table():
                     )
                 st.rerun()
 
-        # Focus label — click to cycle through colors
+        # One-click alert button @ major overhead resistance
         with cols[2]:
+            if _alert_trigger > 0:
+                _alert_help = (
+                    f"{'Update' if _has_pending_alert else 'Set'} alert for {_ticker} "
+                    f"at ${_alert_trigger:.2f}"
+                )
+                if _alert_desc:
+                    _alert_help += f" — {_alert_desc[:100]}"
+                _alert_btn = "🎯" if _has_pending_alert else "🔔"
+                if st.button(_alert_btn, key=f"scanner_alert_{_ticker}_{global_idx}", help=_alert_help, width="stretch"):
+                    _notes = (
+                        f"[Scanner] major resistance trigger=${_alert_trigger:.2f}"
+                        + (f" dist={_alert_dist:+.1f}%" if _alert_dist else "")
+                        + (f" | {_alert_desc}" if _alert_desc else "")
+                    )
+                    _msg = _set_breakout_alert_from_resistance(
+                        jm,
+                        ticker=_ticker,
+                        trigger_price=_alert_trigger,
+                        conviction=_conv_int,
+                        quality_grade=_quality,
+                        notes=_notes,
+                    )
+                    st.success(_msg)
+                    st.rerun()
+            else:
+                st.caption("—")
+
+        # Focus label — click to cycle through colors
+        with cols[3]:
             curr_label = focus_labels.get(row['Ticker'], '')
             curr_icon = _focus_icons.get(curr_label, '⚪')
             if st.button(curr_icon, key=f"focus_{row['Ticker']}_{global_idx}",
@@ -7173,30 +7239,39 @@ def render_scanner_table():
                 age_tag = f" 🔴{reentry_age}d"      # Stale — higher risk
                 rec_icon = '🔴'
 
-        cols[3].caption(f"{rec_icon}{rec_val}{div_flag}{age_tag}")
-        cols[4].caption(row.get('Conv', '0/10'))
-        cols[5].caption(row.get('Sector', ''))
+        cols[4].caption(f"{rec_icon}{rec_val}{div_flag}{age_tag}")
+        cols[5].caption(row.get('Conv', '0/10'))
+        cols[6].caption(row.get('Sector', ''))
 
         # Apex buy indicator
-        cols[6].caption(row.get('ApexFlag', ''))
+        cols[7].caption(row.get('ApexFlag', ''))
 
-        cols[7].caption(row.get('MACD', '❌'))
-        cols[8].caption(row.get('AO', '❌'))
-        cols[9].caption(row.get('VCP', '❌'))
-        cols[10].caption(row.get('Wkly', '❌'))
-        cols[11].caption(row.get('Mthly', '❌'))
+        cols[8].caption(row.get('MACD', '❌'))
+        cols[9].caption(row.get('AO', '❌'))
+        cols[10].caption(row.get('VCP', '❌'))
+        cols[11].caption(row.get('Wkly', '❌'))
+        cols[12].caption(row.get('Mthly', '❌'))
 
         # Quality with color
         q = row.get('Quality', '?')
         q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
-        cols[12].caption(f"{q_colors.get(q, '⚪')}{q}")
+        cols[13].caption(f"{q_colors.get(q, '⚪')}{q}")
 
-        cols[13].caption(row.get('Price', '?'))
-        cols[14].caption(row.get('Volume', ''))
+        cols[14].caption(row.get('Price', '?'))
+        cols[15].caption(row.get('Volume', ''))
 
         # Earnings date with highlight
-        cols[15].caption(row.get('EarnDate', ''))
-        cols[16].caption(row.get('Summary', '')[:45])
+        cols[16].caption(row.get('EarnDate', ''))
+        if _alert_trigger > 0:
+            _alert_txt = f"${_alert_trigger:.2f}"
+            if _alert_dist:
+                _alert_txt += f" ({_alert_dist:+.1f}%)"
+            if _alert_vol_need > 0:
+                _alert_txt += f" · {_alert_vol_need:.1f}x"
+        else:
+            _alert_txt = "n/a"
+        cols[17].caption(_alert_txt)
+        cols[18].caption(row.get('Summary', '')[:42])
 
     # ── Bottom pagination ─────────────────────────────────────────────
     if total_pages > 1:
@@ -7286,6 +7361,20 @@ def _build_rows_from_analysis(results, jm) -> list:
                 vcp = (getattr(sig, 'vcp', {}) or {})
         else:
             vcp = {}
+        _ores = (sig.overhead_resistance if (sig and not isinstance(sig, dict)) else ((sig or {}).get('overhead_resistance', {}) if isinstance(sig, dict) else {})) or {}
+        _crit = (_ores.get('critical_level') or {}) if isinstance(_ores, dict) else {}
+        try:
+            _crit_px = float(_crit.get('price', 0) or 0)
+        except Exception:
+            _crit_px = 0.0
+        try:
+            _crit_dist = float(_ores.get('distance_to_critical_pct', 0) or 0)
+        except Exception:
+            _crit_dist = 0.0
+        try:
+            _breakout_vol_need = float(_ores.get('breakout_volume_needed', 0) or 0)
+        except Exception:
+            _breakout_vol_need = 0.0
 
         # Status column
         if r.ticker in open_tickers:
@@ -7418,6 +7507,10 @@ def _build_rows_from_analysis(results, jm) -> list:
             'VCPPivot': float(vcp.get('pivot_price', 0.0) or 0.0),
             'VCPPriceContracting': bool(vcp.get('price_contracting', False)),
             'VCPVolumeContracting': bool(vcp.get('volume_contracting', False)),
+            'AlertTrigger': _crit_px,
+            'AlertTriggerDistPct': _crit_dist,
+            'AlertTriggerDesc': str(_crit.get('description', '') or ''),
+            'BreakoutVolumeNeeded': _breakout_vol_need,
             'Summary': rec.get('summary', ''),
         })
     return rows
@@ -7566,9 +7659,89 @@ def _build_rows_from_summary(summary, jm) -> list:
             'VCPPivot': float(s.get('vcp_pivot_price', 0.0) or 0.0),
             'VCPPriceContracting': bool(s.get('vcp_price_contracting', False)),
             'VCPVolumeContracting': bool(s.get('vcp_volume_contracting', False)),
+            'AlertTrigger': float(s.get('critical_resistance_price', 0.0) or 0.0),
+            'AlertTriggerDistPct': float(s.get('critical_resistance_dist_pct', 0.0) or 0.0),
+            'AlertTriggerDesc': str(s.get('critical_resistance_desc', '') or ''),
+            'BreakoutVolumeNeeded': float(s.get('critical_breakout_volume_needed', 0.0) or 0.0),
             'Summary': s.get('summary', ''),
         })
     return rows
+
+
+def _extract_overhead_alert_metrics(signal: Optional[EntrySignal]) -> Dict[str, Any]:
+    """Extract major overhead resistance metrics for alert actions."""
+    ores = {}
+    if signal:
+        if isinstance(signal, dict):
+            ores = signal.get('overhead_resistance', {}) or {}
+        else:
+            ores = getattr(signal, 'overhead_resistance', {}) or {}
+    critical = (ores.get('critical_level') or {}) if isinstance(ores, dict) else {}
+    try:
+        trigger = float(critical.get('price', 0) or 0)
+    except Exception:
+        trigger = 0.0
+    try:
+        dist_pct = float(ores.get('distance_to_critical_pct', 0) or 0)
+    except Exception:
+        dist_pct = 0.0
+    try:
+        vol_need = float(ores.get('breakout_volume_needed', 0) or 0)
+    except Exception:
+        vol_need = 0.0
+    return {
+        'trigger': trigger,
+        'distance_pct': dist_pct,
+        'volume_needed': vol_need,
+        'description': str(critical.get('description', '') or ''),
+        'assessment': str(ores.get('assessment', '') or ''),
+    }
+
+
+def _set_breakout_alert_from_resistance(
+    jm: JournalManager,
+    *,
+    ticker: str,
+    trigger_price: float,
+    stop_price: float = 0.0,
+    target_price: float = 0.0,
+    conviction: int = 0,
+    quality_grade: str = "?",
+    notes: str = "",
+) -> str:
+    """Create/update a breakout-volume alert at major overhead resistance."""
+    t = str(ticker or '').upper().strip()
+    if not t:
+        return "Cannot set alert: missing ticker."
+    try:
+        trig = float(trigger_price or 0)
+    except Exception:
+        trig = 0.0
+    if trig <= 0:
+        return f"Cannot set alert for {t}: missing valid trigger price."
+    try:
+        stop_val = float(stop_price or 0)
+    except Exception:
+        stop_val = 0.0
+    try:
+        target_val = float(target_price or 0)
+    except Exception:
+        target_val = 0.0
+    q = str(quality_grade or '?').strip().upper()[:1] if str(quality_grade or '').strip() else '?'
+    c = max(0, min(10, int(conviction or 0)))
+    entry = ConditionalEntry(
+        ticker=t,
+        condition_type='breakout_volume',
+        trigger_price=round(trig, 2),
+        volume_multiplier=1.5,
+        stop_price=round(stop_val, 2) if stop_val > 0 else 0.0,
+        target_price=round(target_val, 2) if target_val > 0 else 0.0,
+        conviction=c,
+        quality_grade=q,
+        notes=str(notes or '').strip()[:240],
+        expires_date=(datetime.now() + timedelta(days=30)).strftime('%Y-%m-%d'),
+    )
+    return jm.add_conditional(entry)
 
 
 def _render_quick_alert_form(ticker: str, jm: JournalManager):
@@ -7728,6 +7901,7 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
         return
 
     quality = analysis.quality or {}
+    jm = get_journal()
     ai_result = st.session_state.get(f'ai_result_{ticker}') or {}
     pplx_results = st.session_state.get(f"pplx_research_results_{ticker}", {}) or {}
 
@@ -7813,6 +7987,35 @@ def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], an
             st.caption(f"Earnings: {_earn_badge['icon']} {_earn_txt}")
             if _entry > 0 and _stop > 0 and _target > 0:
                 st.caption(f"Entry ${_entry:.2f} | Stop ${_stop:.2f} | Target ${_target:.2f}")
+            _ores = _extract_overhead_alert_metrics(signal)
+            _trigger = float(_ores.get('trigger', 0) or 0)
+            _dist = float(_ores.get('distance_pct', 0) or 0)
+            _vol_need = float(_ores.get('volume_needed', 0) or 0)
+            _desc = str(_ores.get('description', '') or '')
+            if _trigger > 0:
+                _line = f"Major overhead resistance trigger: ${_trigger:.2f}"
+                if _dist:
+                    _line += f" ({_dist:+.1f}% from price)"
+                if _vol_need > 0:
+                    _line += f" | breakout vol ~{_vol_need:.1f}x"
+                st.caption(_line)
+                if _desc:
+                    st.caption(_desc[:180])
+                if st.button("🔔 Set Alert @ Resistance", key=f"master_set_alert_{ticker}", width="stretch"):
+                    _msg = _set_breakout_alert_from_resistance(
+                        jm,
+                        ticker=ticker,
+                        trigger_price=_trigger,
+                        stop_price=_stop,
+                        target_price=_target,
+                        conviction=int(rec.get('conviction', 0) or 0),
+                        quality_grade=str(quality.get('quality_grade', '?') or '?'),
+                        notes=f"[Master] resistance trigger ${_trigger:.2f} | {_desc[:140]}",
+                    )
+                    st.success(_msg)
+                    st.rerun()
+            else:
+                st.caption("Major overhead resistance trigger: n/a")
 
     with c2:
         with st.container(border=True):
@@ -7988,6 +8191,7 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
     monthly = ticker_data.get('monthly')
     macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
     macd_label = get_macd_indicator_label(macd_profile)
+    jm = get_journal()
 
     # Quick research actions placed in chart section for fast workflow.
     _render_perplexity_research_controls(
@@ -7996,6 +8200,38 @@ def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
         show_results=False,
         heading="#### 🔎 Fundamental / News Research",
     )
+
+    _ores = _extract_overhead_alert_metrics(signal)
+    _trigger = float(_ores.get('trigger', 0) or 0)
+    _dist = float(_ores.get('distance_pct', 0) or 0)
+    _vol_need = float(_ores.get('volume_needed', 0) or 0)
+    _desc = str(_ores.get('description', '') or '')
+    with st.container(border=True):
+        if _trigger > 0:
+            _line = f"🔔 Breakout alert trigger (major resistance): **${_trigger:.2f}**"
+            if _dist:
+                _line += f" ({_dist:+.1f}% from price)"
+            if _vol_need > 0:
+                _line += f" | needs ~{_vol_need:.1f}x volume"
+            st.markdown(_line)
+            if _desc:
+                st.caption(_desc[:180])
+            if st.button("🔔 Set Alert @ Resistance", key=f"chart_set_alert_{key_ns}_{ticker}", width="stretch"):
+                _stops = (signal.stops if signal else {}) or {}
+                _msg = _set_breakout_alert_from_resistance(
+                    jm,
+                    ticker=ticker,
+                    trigger_price=_trigger,
+                    stop_price=float(_stops.get('stop', 0) or 0),
+                    target_price=float(_stops.get('target', 0) or 0),
+                    conviction=0,
+                    quality_grade='?',
+                    notes=f"[Chart] resistance trigger ${_trigger:.2f} | {_desc[:140]}",
+                )
+                st.success(_msg)
+                st.rerun()
+        else:
+            st.caption("🔔 Breakout alert trigger (major resistance): n/a")
 
     # ── APEX Signal Detection (cached per ticker) ──────────────────
     _apex_toggle_key = f"apex_{key_ns}_{ticker}"
