@@ -2088,6 +2088,32 @@ def _navigate_to_scanner_ticker(ticker: str, target: str = "chart") -> bool:
     return True
 
 
+def _open_chart_anywhere(ticker: str, warn: bool = True) -> bool:
+    """Open a ticker directly in Scanner -> Chart view from any UI surface."""
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        if warn:
+            st.warning("No ticker selected.")
+        return False
+    _ok = _navigate_to_scanner_ticker(_tk, target="chart")
+    if not _ok and warn:
+        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
+    return bool(_ok)
+
+
+def _open_trade_anywhere(ticker: str, warn: bool = True) -> bool:
+    """Open a ticker directly in Scanner -> Trade view from any UI surface."""
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        if warn:
+            st.warning("No ticker selected.")
+        return False
+    _ok = _navigate_to_scanner_ticker(_tk, target="trade")
+    if not _ok and warn:
+        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
+    return bool(_ok)
+
+
 def _resolve_tickers_to_scan(full_list: List[str], existing_summary: List[Dict], mode: str) -> List[str]:
     """Deterministic scan universe resolver used by scan-all and scan-new paths."""
     return resolve_tickers_to_scan(full_list, existing_summary, mode)
@@ -6026,11 +6052,8 @@ def render_trade_finder_tab():
                         )
                     with _c2:
                         if st.button("📈 Chart", key=f"tf_hardpass_chart_{_i}_{_t}", width="stretch"):
-                            st.session_state['trade_finder_inline_chart_ticker'] = _t
-                            st.session_state['trade_finder_chart_focus'] = True
-                            st.session_state['trade_finder_scroll_to_chart'] = True
-                            _load_ticker_for_view(_t, prefer_chart_fast=True)
-                            st.rerun()
+                            if _open_chart_anywhere(_t, warn=True):
+                                st.rerun()
 
         hard_gate_fail = {
             'hard_gate_failed': 0,
@@ -6111,32 +6134,15 @@ def render_trade_finder_tab():
             st.session_state['trade_finder_selected_trade'] = _selection
             st.session_state['trade_finder_last_action'] = 'chart' if int(detail_tab) == 1 else 'trade'
             st.session_state['trade_finder_last_ticker'] = _ticker
-            if int(detail_tab) == 1:
-                st.session_state['trade_finder_inline_chart_ticker'] = _ticker
-                st.session_state['trade_finder_chart_focus'] = True
-                st.session_state['trade_finder_scroll_to_chart'] = True
-                # Chart now opens inline in Trade Finder for deterministic UX.
-                st.session_state.pop('_switch_to_scanner_target_tab', None)
-            elif int(detail_tab) == 4:
-                st.session_state['trade_finder_chart_focus'] = False
-                st.session_state['_switch_to_scanner_target_tab'] = 'trade'
-            _loaded = _load_ticker_for_view(_ticker, prefer_chart_fast=(int(detail_tab) == 1))
-            if not _loaded:
+            _target = "chart" if int(detail_tab) == 1 else ("trade" if int(detail_tab) == 4 else "signal")
+            _opened = _navigate_to_scanner_ticker(_ticker, target=_target)
+            if not _opened:
                 st.session_state['trade_finder_chart_error'] = str(
-                    st.session_state.get('_ticker_load_error', f"Unable to load data for {_ticker}.")
+                    st.session_state.get('_scanner_nav_error', f"Unable to load data for {_ticker}.")
                 )
-                # Keep user on Trade Finder and show explicit blocker.
-                if int(detail_tab) != 1:
-                    st.session_state.pop('trade_finder_inline_chart_ticker', None)
                 st.rerun()
                 return
             st.session_state.pop('trade_finder_chart_error', None)
-            if int(detail_tab) == 1:
-                st.session_state['default_detail_tab'] = 1
-                st.session_state.pop('_switch_to_scanner_tab', None)
-            else:
-                st.session_state['default_detail_tab'] = detail_tab
-                st.session_state['_switch_to_scanner_tab'] = True
             st.rerun()
 
         green_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "GREEN"]
@@ -6629,13 +6635,8 @@ def render_scanner_table():
                 with tc3:
                     if st.button("📈", key=f"chart_{t}",
                                  help="Open chart"):
-                        st.session_state['default_detail_tab'] = 1  # Chart tab index
-                        _loaded = _load_ticker_for_view(t, prefer_chart_fast=True)
-                        if not _loaded:
-                            st.session_state['_scanner_nav_error'] = str(
-                                st.session_state.get('_ticker_load_error', f"Unable to load {t}.")
-                            )
-                        st.rerun()
+                        if _open_chart_anywhere(t, warn=True):
+                            st.rerun()
                 with tc4:
                     if st.button("🗑️", key=f"del_{t}",
                                  help="Remove from watchlist"):
@@ -7222,14 +7223,8 @@ def render_scanner_table():
         # Chart button — opens directly to chart tab
         with cols[1]:
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
-                st.session_state['default_detail_tab'] = 1  # Chart tab
-                st.session_state['scroll_to_detail'] = True
-                _loaded = _load_ticker_for_view(row['Ticker'], prefer_chart_fast=True)
-                if not _loaded:
-                    st.session_state['_scanner_nav_error'] = str(
-                        st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
-                    )
-                st.rerun()
+                if _open_chart_anywhere(row['Ticker'], warn=True):
+                    st.rerun()
 
         # One-click alert button @ major overhead resistance
         with cols[2]:
@@ -12074,8 +12069,8 @@ def render_position_manager():
 
         with pc6:
             if st.button("📈 Chart", key=f"pm_chart_{ticker}"):
-                st.session_state['default_detail_tab'] = 1
-                _load_ticker_for_view(ticker, prefer_chart_fast=True)
+                if _open_chart_anywhere(ticker, warn=True):
+                    st.rerun()
 
         # Show advice details if available
         if advice.get('reasoning'):
@@ -14742,8 +14737,8 @@ def main():
             (function() {{
               const doc = window.parent.document;
               const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
-              const maxScannerAttempts = 18;
-              const maxDetailAttempts = 16;
+              const maxScannerAttempts = 80;
+              const maxDetailAttempts = 220;
               const pollMs = 55;
               const shouldFocusDetail = {str(_focus_detail).lower()};
 
@@ -14765,14 +14760,19 @@ def main():
               }}
 
               function openDetailTab(label) {{
-                if (label) clickTabByLabel(label);
-                focusDetailAnchor();
                 let detailAttempts = 0;
+                let openedTarget = !label;
                 const detailTimer = setInterval(function() {{
                   detailAttempts += 1;
-                  if (label) clickTabByLabel(label);
+                  if (label) {{
+                    openedTarget = clickTabByLabel(label) || openedTarget;
+                  }}
                   focusDetailAnchor();
-                  if (detailAttempts >= maxDetailAttempts || doc.getElementById('detail-anchor')) {{
+                  const haveAnchor = !!doc.getElementById('detail-anchor');
+                  if (
+                    detailAttempts >= maxDetailAttempts ||
+                    (openedTarget && (!shouldFocusDetail || haveAnchor))
+                  ) {{
                     clearInterval(detailTimer);
                   }}
                 }}, pollMs);
@@ -14816,13 +14816,13 @@ def _render_alerts_panel():
             return s[:19]
 
     def _open_chart_for_ticker(ticker: str):
-        if _navigate_to_scanner_ticker(ticker, target="chart"):
+        if _open_chart_anywhere(ticker, warn=False):
             st.rerun()
         else:
             st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
 
     def _open_trade_for_ticker(ticker: str):
-        if _navigate_to_scanner_ticker(ticker, target="trade"):
+        if _open_trade_anywhere(ticker, warn=False):
             st.rerun()
         else:
             st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
