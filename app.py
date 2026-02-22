@@ -7250,7 +7250,14 @@ def render_scanner_table():
                     st.success(_msg)
                     st.rerun()
             else:
-                st.caption("—")
+                if st.button(
+                    "➕",
+                    key=f"scanner_alert_manual_{_ticker}_{global_idx}",
+                    help="No auto resistance trigger available. Set manual alert.",
+                    width="stretch",
+                ):
+                    st.session_state['show_alert_form'] = _ticker
+                    st.rerun()
 
         # Focus label — click to cycle through colors
         with cols[3]:
