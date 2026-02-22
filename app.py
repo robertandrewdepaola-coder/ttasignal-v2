@@ -82,65 +82,74 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
+# Startup-safe defaults for navigation helpers.
+# If navigation_state cannot import for any reason (missing module, stale hot-reload,
+# syntax/attribute errors), these keep the app bootable.
+KEY_SWITCH_TO_SCANNER_TAB = "_switch_to_scanner_tab"
+KEY_SWITCH_TO_SCANNER_TARGET_TAB = "_switch_to_scanner_target_tab"
+KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = "_switch_to_scanner_focus_detail"
+
+
+def clear_scanner_switch_state(state):
+    state.pop(KEY_SWITCH_TO_SCANNER_TAB, None)
+    state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None)
+    state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, None)
+
+
+def normalize_nav_target(target, fallback="chart"):
+    _t = str(target or "").strip().lower()
+    if _t in {"signal", "chart", "trade"}:
+        return _t
+    _fb = str(fallback or "").strip().lower()
+    return _fb if _fb in {"signal", "chart", "trade"} else "chart"
+
+
+def detail_tab_for_target(target, fallback="chart"):
+    return {"signal": 0, "chart": 1, "trade": 4}.get(normalize_nav_target(target, fallback=fallback), 1)
+
+
+def set_detail_tab_lock(state, *, ticker, tab_index, lock_runs=3, now_ts=None):
+    state["default_detail_tab"] = int(tab_index or 0)
+
+
+def set_detail_tab_selector_target(state, *, ticker, target):
+    _tk = str(ticker or "").upper().strip()
+    _target = normalize_nav_target(target, fallback="chart")
+    _selector = {"signal": "signal", "trade": "trade"}.get(_target, "chart")
+    state[f"detail_view_tab_{_tk}"] = _selector
+    return _selector
+
+
+def set_scanner_switch_state(state, *, target, focus_detail=True):
+    state[KEY_SWITCH_TO_SCANNER_TAB] = True
+    state[KEY_SWITCH_TO_SCANNER_TARGET_TAB] = normalize_nav_target(target, fallback="chart")
+    state[KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL] = bool(focus_detail)
+
+
 try:
     from navigation_state import (
-        KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
-        KEY_SWITCH_TO_SCANNER_TAB,
-        KEY_SWITCH_TO_SCANNER_TARGET_TAB,
-        clear_scanner_switch_state,
-        detail_tab_for_target,
-        normalize_nav_target,
-        set_detail_tab_lock,
-        set_detail_tab_selector_target,
-        set_scanner_switch_state,
+        KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL as _KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
+        KEY_SWITCH_TO_SCANNER_TAB as _KEY_SWITCH_TO_SCANNER_TAB,
+        KEY_SWITCH_TO_SCANNER_TARGET_TAB as _KEY_SWITCH_TO_SCANNER_TARGET_TAB,
+        clear_scanner_switch_state as _clear_scanner_switch_state,
+        detail_tab_for_target as _detail_tab_for_target,
+        normalize_nav_target as _normalize_nav_target,
+        set_detail_tab_lock as _set_detail_tab_lock,
+        set_detail_tab_selector_target as _set_detail_tab_selector_target,
+        set_scanner_switch_state as _set_scanner_switch_state,
     )
-except (ImportError, AttributeError, KeyError):
-    # Streamlit Cloud hot-reload can temporarily import stale module objects.
-    import importlib as _importlib
-    _nav = _importlib.import_module("navigation_state")
 
-    KEY_SWITCH_TO_SCANNER_TAB = getattr(_nav, "KEY_SWITCH_TO_SCANNER_TAB", "_switch_to_scanner_tab")
-    KEY_SWITCH_TO_SCANNER_TARGET_TAB = getattr(_nav, "KEY_SWITCH_TO_SCANNER_TARGET_TAB", "_switch_to_scanner_target_tab")
-    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = getattr(_nav, "KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL", "_switch_to_scanner_focus_detail")
-
-    clear_scanner_switch_state = getattr(
-        _nav,
-        "clear_scanner_switch_state",
-        lambda state: (
-            state.pop(KEY_SWITCH_TO_SCANNER_TAB, None),
-            state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None),
-            state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, None),
-        ),
-    )
-    detail_tab_for_target = getattr(
-        _nav,
-        "detail_tab_for_target",
-        lambda target, fallback="chart": {"signal": 0, "chart": 1, "trade": 4}.get(str(target or fallback).strip().lower(), 1),
-    )
-    normalize_nav_target = getattr(
-        _nav,
-        "normalize_nav_target",
-        lambda target, fallback="chart": (str(target or fallback).strip().lower() if str(target or fallback).strip().lower() in {"signal", "chart", "trade"} else "chart"),
-    )
-    set_detail_tab_lock = getattr(
-        _nav,
-        "set_detail_tab_lock",
-        lambda state, *, ticker, tab_index, lock_runs=3, now_ts=None: state.__setitem__("default_detail_tab", int(tab_index or 0)),
-    )
-    set_detail_tab_selector_target = getattr(
-        _nav,
-        "set_detail_tab_selector_target",
-        lambda state, *, ticker, target: state.__setitem__(f"detail_view_tab_{str(ticker or '').upper().strip()}", {"signal": "signal", "trade": "trade"}.get(str(target or "").strip().lower(), "chart")),
-    )
-    set_scanner_switch_state = getattr(
-        _nav,
-        "set_scanner_switch_state",
-        lambda state, *, target, focus_detail=True: (
-            state.__setitem__(KEY_SWITCH_TO_SCANNER_TAB, True),
-            state.__setitem__(KEY_SWITCH_TO_SCANNER_TARGET_TAB, normalize_nav_target(target)),
-            state.__setitem__(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, bool(focus_detail)),
-        ),
-    )
+    KEY_SWITCH_TO_SCANNER_TAB = _KEY_SWITCH_TO_SCANNER_TAB
+    KEY_SWITCH_TO_SCANNER_TARGET_TAB = _KEY_SWITCH_TO_SCANNER_TARGET_TAB
+    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = _KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL
+    clear_scanner_switch_state = _clear_scanner_switch_state
+    detail_tab_for_target = _detail_tab_for_target
+    normalize_nav_target = _normalize_nav_target
+    set_detail_tab_lock = _set_detail_tab_lock
+    set_detail_tab_selector_target = _set_detail_tab_selector_target
+    set_scanner_switch_state = _set_scanner_switch_state
+except Exception:
+    pass
 try:
     from detail_view_ui import render_detail_view_shell
 except (ImportError, AttributeError, KeyError):
