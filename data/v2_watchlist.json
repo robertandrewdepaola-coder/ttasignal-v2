@@ -1345,7 +1345,7 @@
   },
   {
     "ticker": "MRNA",
-    "added_date": "2026-02-21",
+    "added_date": "2026-02-22",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -3837,7 +3837,7 @@
   },
   {
     "ticker": "SII",
-    "added_date": "2026-02-18",
+    "added_date": "2026-02-22",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -4201,7 +4201,7 @@
   },
   {
     "ticker": "COIN",
-    "added_date": "2026-02-18",
+    "added_date": "2026-02-22",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -4873,7 +4873,7 @@
   },
   {
     "ticker": "OMC",
-    "added_date": "2026-02-18",
+    "added_date": "2026-02-22",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -5629,7 +5629,7 @@
   },
   {
     "ticker": "TPL",
-    "added_date": "2026-02-18",
+    "added_date": "2026-02-22",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
