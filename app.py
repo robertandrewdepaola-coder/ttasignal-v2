@@ -2655,6 +2655,21 @@ def _run_scan(mode='all'):
     st.rerun()
 
 
+def _format_eta(seconds: float) -> str:
+    """Compact ETA formatter for progress text."""
+    try:
+        s = int(max(0, float(seconds)))
+    except Exception:
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    m, rem = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {rem}s"
+    h, m2 = divmod(m, 60)
+    return f"{h}h {m2}m"
+
+
 def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = None):
     """
     Scan the union of ALL watchlists and build a consolidated "new trades" report.
@@ -2685,6 +2700,11 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
     _selected_sectors = set([str(x) for x in (st.session_state.get('find_new_selected_sectors', []) or []) if str(x)])
     _max_minutes = float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0)
     _deadline_ts = (time.time() + (_max_minutes * 60.0)) if _max_minutes > 0 else 0.0
+    _cache_ttl_min = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0)
+    _cache_ttl_sec = max(60.0, _cache_ttl_min * 60.0)
+    _fetch_batch_size = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
+    _fetch_batch_size = max(10, min(250, _fetch_batch_size))
+    _cancel_flag = lambda: bool(st.session_state.get('trade_finder_cancel_requested', False))
 
     _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
     _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
@@ -2700,6 +2720,10 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         "unknown_sector": 0,
         "rotation_unknown_kept": 0,
         "max_tickers": 0,
+        "cache_reused_find": 0,
+        "cache_reused_scan": 0,
+        "stale_evicted": 0,
+        "fetched_live": 0,
     }
 
     # Validate symbols before data fetch.
@@ -2761,6 +2785,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 'max_tickers': _max_tickers,
                 'only_in_rotation': _only_in_rotation,
                 'selected_sectors': sorted(list(_selected_sectors)),
+                'cache_ttl_min': _cache_ttl_min,
+                'fetch_batch_size': _fetch_batch_size,
                 'filtered_counts': _filtered_counts,
                 'requested_universe': len(ticker_sources),
                 'effective_universe': 0,
@@ -2812,32 +2838,108 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             source="find_new",
         )
         _set_find_progress(5, f"Scope ready: {len(universe)} tickers")
-        # Reuse fresh scanner cache first; fetch only missing tickers.
+        # Reuse incremental Trade Finder cache first, then fresh scanner cache; fetch only stale/missing.
         all_data: Dict[str, Dict[str, Any]] = {}
+        _now = time.time()
+        _find_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+        _find_cache_meta = st.session_state.get('_find_new_ticker_data_cache_meta', {}) or {}
+        _find_cache_ts = float(st.session_state.get('_find_new_ticker_data_cache_ts', 0.0) or 0.0)
+        if isinstance(_find_cache, dict):
+            for _t in universe:
+                _cached = _find_cache.get(_t, {})
+                if not isinstance(_cached, dict) or _cached.get('daily') is None:
+                    continue
+                _meta = _find_cache_meta.get(_t, {}) if isinstance(_find_cache_meta, dict) else {}
+                _ts = float((_meta.get('ts', 0.0) if isinstance(_meta, dict) else 0.0) or _find_cache_ts or 0.0)
+                _age = (_now - _ts) if _ts > 0 else (10**9)
+                if _age <= _cache_ttl_sec:
+                    all_data[_t] = _cached
+                    _filtered_counts["cache_reused_find"] += 1
+                else:
+                    _filtered_counts["stale_evicted"] += 1
         scan_cache = st.session_state.get('ticker_data_cache', {}) or {}
         scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
         fresh_scan_cache = bool(scan_ts and (time.time() - scan_ts) <= (15 * 60))
         if fresh_scan_cache and isinstance(scan_cache, dict):
             for _t in universe:
+                if _t in all_data:
+                    continue
                 _cached = scan_cache.get(_t, {})
                 if isinstance(_cached, dict) and _cached.get('daily') is not None:
                     all_data[_t] = _cached
+                    _filtered_counts["cache_reused_scan"] += 1
         missing = [t for t in universe if t not in all_data]
         if all_data:
-            _set_find_progress(15, f"Reused cache for {len(all_data)}/{len(universe)} tickers")
+            _set_find_progress(
+                15,
+                f"Reused cache for {len(all_data)}/{len(universe)} "
+                f"(TF {_filtered_counts['cache_reused_find']}, scanner {_filtered_counts['cache_reused_scan']})",
+            )
+        _cancelled = False
         if missing:
-            def _find_progress_cb(i: int, total: int, ticker: str) -> bool:
+            missing_total = len(missing)
+            _fetch_stage_start = time.time()
+            _processed_missing = 0
+            _fetched_live = 0
+            _batch_count = int((missing_total + _fetch_batch_size - 1) // _fetch_batch_size)
+            for _bi in range(0, missing_total, _fetch_batch_size):
+                if _cancel_flag():
+                    _cancelled = True
+                    break
                 if _deadline_ts and time.time() > _deadline_ts:
-                    return False
-                pct = 15 + int((max(1, i) / max(1, total)) * 45)
-                _set_find_progress(pct, f"Fetching {i}/{total} ({pct}%) — {ticker}")
-                return True
-            fetched = fetch_scan_data(missing, progress_cb=_find_progress_cb)
-            all_data.update(fetched)
-            if len(fetched) < len(missing):
+                    _cancelled = True
+                    break
+                _batch = missing[_bi:_bi + _fetch_batch_size]
+                _batch_idx = int((_bi // _fetch_batch_size) + 1)
+                _set_find_progress(
+                    15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45),
+                    f"Fetching batch {_batch_idx}/{_batch_count} ({len(_batch)} tickers)...",
+                )
+
+                def _find_progress_cb(i: int, total: int, ticker: str) -> bool:
+                    if _cancel_flag():
+                        return False
+                    if _deadline_ts and time.time() > _deadline_ts:
+                        return False
+                    _global_done = _processed_missing + max(0, i - 1)
+                    _elapsed_fetch = max(0.001, time.time() - _fetch_stage_start)
+                    _rate = float(_global_done) / _elapsed_fetch if _global_done > 0 else 0.0
+                    _remain = max(0, missing_total - _global_done)
+                    _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                    pct = 15 + int((max(1, _global_done) / max(1, missing_total)) * 45)
+                    _set_find_progress(
+                        pct,
+                        f"Fetching {_global_done}/{missing_total} — {ticker} "
+                        f"| ETA {_format_eta(_eta_sec)}",
+                    )
+                    return True
+
+                _fetched_batch = fetch_scan_data(_batch, progress_cb=_find_progress_cb)
+                all_data.update(_fetched_batch)
+                _fetched_live += len(_fetched_batch)
+                _processed_missing += len(_batch)
+                _elapsed_fetch = max(0.001, time.time() - _fetch_stage_start)
+                _rate = float(_processed_missing) / _elapsed_fetch if _processed_missing > 0 else 0.0
+                _remain = max(0, missing_total - _processed_missing)
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                _pct_done = 15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45)
+                _set_find_progress(
+                    _pct_done,
+                    f"Fetched {_processed_missing}/{missing_total} missing tickers "
+                    f"(live {_fetched_live}) | ETA {_format_eta(_eta_sec)}",
+                )
+                if len(_fetched_batch) < len(_batch):
+                    _cancelled = True
+                    st.warning(
+                        f"Find New fetch stopped early in batch {_batch_idx}/{_batch_count}: "
+                        f"fetched {len(_fetched_batch)}/{len(_batch)}."
+                    )
+                    break
+            _filtered_counts["fetched_live"] = _fetched_live
+            if _cancelled:
                 st.warning(
-                    f"Find New fetch stopped early: fetched {len(fetched)}/{len(missing)} missing tickers. "
-                    "Using partial results."
+                    f"Find New fetch interrupted: fetched {_processed_missing}/{missing_total} missing tickers. "
+                    "Continuing with partial results."
                 )
         _set_find_progress(63, "Analyzing trade candidates...")
         _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
@@ -2940,6 +3042,9 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         candidates = []
         _set_find_progress(92, "Scoring opportunities...")
         for r in results:
+            if _cancel_flag():
+                _cancelled = True
+                break
             rec = r.recommendation or {}
             q = r.quality or {}
             sig = r.signal or None
@@ -3159,6 +3264,9 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             row_by_ticker = {str(rw.get('ticker', '')).upper().strip(): rw for rw in rows}
             cand_by_ticker = {str(cd.get('ticker', '')).upper().strip(): cd for cd in candidates}
             for _t in missing_candidate_tickers[:25]:
+                if _cancel_flag():
+                    _cancelled = True
+                    break
                 _row_seed = row_by_ticker.get(_t, {}) or {}
                 _earn2 = resolve_earnings_for_ticker(
                     _t,
@@ -3194,7 +3302,10 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                     cand_by_ticker[_t]['earn_trusted'] = bool(_trusted2)
 
         candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
-        _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
+        if _cancelled:
+            _set_find_progress(100, f"Find New interrupted: {len(candidates)} candidates from partial run")
+        else:
+            _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
 
     elapsed = max(0.0, time.time() - _start)
     report = {
@@ -3211,18 +3322,36 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             'max_tickers': _max_tickers,
             'only_in_rotation': _only_in_rotation,
             'selected_sectors': sorted(list(_selected_sectors)),
+            'cache_ttl_min': _cache_ttl_min,
+            'fetch_batch_size': _fetch_batch_size,
             'filtered_counts': _filtered_counts,
             'requested_universe': len(ticker_sources),
             'effective_universe': len(universe),
         },
+        'interrupted': bool(_cancelled),
     }
     st.session_state['find_new_trades_report'] = report
     st.session_state['_find_new_trades_ts'] = time.time()
+    st.session_state['_find_new_ticker_data_cache_ts'] = time.time()
+    st.session_state['_find_new_ticker_data_cache_meta'] = {
+        str(_t).upper().strip(): {'ts': time.time()}
+        for _t in tf_data_cache.keys()
+    }
     st.session_state['trade_finder_last_status'] = {
-        'level': 'success' if len(candidates) > 0 else 'info',
+        'level': 'warning' if _cancelled else ('success' if len(candidates) > 0 else 'info'),
         'message': (
-            f"Find New complete: scanned {len(universe)} ticker(s), "
-            f"scored {len(rows)} result(s), {len(candidates)} candidate(s)."
+            (
+                f"Find New interrupted: scanned {len(universe)} ticker(s), "
+                f"scored {len(rows)} result(s), {len(candidates)} candidate(s), "
+                f"live fetched {_filtered_counts.get('fetched_live', 0)}."
+            )
+            if _cancelled else
+            (
+                f"Find New complete: scanned {len(universe)} ticker(s), "
+                f"scored {len(rows)} result(s), {len(candidates)} candidate(s), "
+                f"cache reuse TF/scan={_filtered_counts.get('cache_reused_find', 0)}/"
+                f"{_filtered_counts.get('cache_reused_scan', 0)}."
+            )
         ),
         'ts': time.time(),
     }
@@ -3245,6 +3374,10 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         'universe': len(universe),
         'results': len(rows),
         'candidates': len(candidates),
+        'interrupted': bool(_cancelled),
+        'cache_reused_find': int(_filtered_counts.get('cache_reused_find', 0) or 0),
+        'cache_reused_scan': int(_filtered_counts.get('cache_reused_scan', 0) or 0),
+        'fetched_live': int(_filtered_counts.get('fetched_live', 0) or 0),
         'sec': round(elapsed, 3),
     })
     _append_audit_event(
@@ -3252,7 +3385,15 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         f"watchlists={len(all_watchlists)} universe={len(universe)} candidates={len(candidates)} sec={elapsed:.1f}",
         source="find_new",
     )
-    st.success(f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists.")
+    if _cancelled:
+        st.warning(
+            f"Find New stopped early: {len(candidates)} candidate(s) from partial run "
+            f"({len(universe)} ticker universe)."
+        )
+    else:
+        st.success(
+            f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists."
+        )
 
 
 def _extract_first_json_object(raw: str) -> Dict[str, Any]:
@@ -4819,11 +4960,14 @@ def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[st
 def _run_trade_finder_workflow(
     find_progress_cb: Optional[Callable[[int, str], None]] = None,
     ai_progress_cb: Optional[Callable[[int, str], None]] = None,
+    stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
 ) -> None:
     """
     Executes scanner candidate discovery + Grok scoring.
     Reuses existing find-new logic, then enriches/ranks candidates.
     """
+    st.session_state['trade_finder_running'] = True
+    _cancelled = False
     st.session_state['trade_finder_last_status'] = {
         'level': 'info',
         'message': 'Running Find New Trades and AI ranking...',
@@ -4862,6 +5006,7 @@ def _run_trade_finder_workflow(
                 ai_progress_cb(100, "AI ranking complete: no candidates passed scanner gates.")
             except Exception:
                 pass
+        st.session_state['trade_finder_running'] = False
         return
 
     ai_clients = _get_ai_clients()
@@ -4910,6 +5055,9 @@ def _run_trade_finder_workflow(
                 _tf_progress.progress(pct)
 
     for i, c in enumerate(base_candidates):
+        if bool(st.session_state.get('trade_finder_cancel_requested', False)):
+            _cancelled = True
+            break
         ticker = str(c.get('ticker', '')).upper().strip()
         _set_tf_progress(i + 1, len(base_candidates), ticker)
         company_name = str(c.get('company_name', '') or '').strip()
@@ -5220,6 +5368,25 @@ def _run_trade_finder_workflow(
         provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
         if fallback_reason:
             fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
+        if callable(stream_rows_cb) and ((i + 1) % 5 == 0 or (i + 1) == len(base_candidates)):
+            try:
+                _preview = sorted(
+                    rows,
+                    key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+                    reverse=True,
+                )[:8]
+                stream_rows_cb(
+                    _preview,
+                    {
+                        'processed': int(i + 1),
+                        'total': int(len(base_candidates)),
+                        'hard_gate_pass': int(hard_gate_pass_count),
+                        'ai_ranked': int(ai_ranked_count),
+                        'cancelled': bool(_cancelled),
+                    },
+                )
+            except Exception:
+                pass
     if _tf_progress is not None:
         try:
             _tf_progress.empty()
@@ -5275,11 +5442,18 @@ def _run_trade_finder_workflow(
         'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
     })
     st.session_state['trade_finder_last_status'] = {
-        'level': 'success' if len(rows) > 0 else 'info',
+        'level': 'warning' if _cancelled else ('success' if len(rows) > 0 else 'info'),
         'message': (
-            f"Trade Finder complete: {hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
-            f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
-            f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
+            (
+                f"Trade Finder canceled: processed {len(rows)}/{len(base_candidates)}; "
+                f"hard-gate pass {hard_gate_pass_count}; qualified {qualified_count}; AI ranked {ai_ranked_count}."
+            )
+            if _cancelled else
+            (
+                f"Trade Finder complete: {hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
+                f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
+                f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
+            )
         ),
         'ts': time.time(),
     }
@@ -5287,12 +5461,18 @@ def _run_trade_finder_workflow(
         try:
             ai_progress_cb(
                 100,
-                f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(base_candidates)}, "
-                f"qualified {qualified_count}, AI ranked {ai_ranked_count}, "
-                f"relaxed-profile passers {hard_gate_relaxed_pass_count}.",
+                (
+                    f"Trade Finder canceled: processed {len(rows)}/{len(base_candidates)}, "
+                    f"hard-gate pass {hard_gate_pass_count}, qualified {qualified_count}, AI ranked {ai_ranked_count}."
+                    if _cancelled else
+                    f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(base_candidates)}, "
+                    f"qualified {qualified_count}, AI ranked {ai_ranked_count}, "
+                    f"relaxed-profile passers {hard_gate_relaxed_pass_count}."
+                ),
             )
         except Exception:
             pass
+    st.session_state['trade_finder_running'] = False
 
 
 def _render_green_on_red_sector_finder(
@@ -5584,6 +5764,25 @@ def render_trade_finder_tab():
             key="find_new_max_minutes",
             help="Stops long scans once this runtime limit is hit (partial results are kept).",
         )
+        adv1, adv2 = st.columns(2)
+        with adv1:
+            st.number_input(
+                "Incremental cache TTL (minutes)",
+                min_value=1.0,
+                max_value=120.0,
+                step=1.0,
+                key="find_new_cache_ttl_min",
+                help="Recently scanned tickers inside this TTL reuse cached OHLC data instead of refetching.",
+            )
+        with adv2:
+            st.number_input(
+                "Fetch batch size",
+                min_value=10,
+                max_value=250,
+                step=10,
+                key="find_new_fetch_batch_size",
+                help="Controls request burst size. Smaller batches reduce API pressure and improve pacing visibility.",
+            )
     _scope_bits = []
     if int(st.session_state.get('find_new_max_tickers', 0) or 0) > 0:
         _scope_bits.append(f"max {int(st.session_state.get('find_new_max_tickers', 0) or 0)}")
@@ -5596,8 +5795,29 @@ def render_trade_finder_tab():
         _scope_bits.append(f"{len(_sel_scope)} sectors")
     if float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0) > 0:
         _scope_bits.append(f"{float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0):.1f}m cap")
+    _scope_bits.append(f"cache {float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0):.0f}m")
+    _scope_bits.append(f"batch {int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)}")
     if _scope_bits:
         st.caption("Active scope: " + " | ".join(_scope_bits))
+
+    _run_active = bool(st.session_state.get('trade_finder_running', False))
+    _cancel_requested = bool(st.session_state.get('trade_finder_cancel_requested', False))
+    _rc1, _rc2 = st.columns([4, 1])
+    with _rc1:
+        if _run_active:
+            st.warning("Trade Finder run is active. You can request stop; it will halt at the next safe checkpoint.")
+        elif _cancel_requested:
+            st.info("A cancel request is queued for the next running workflow.")
+    with _rc2:
+        if _run_active:
+            if st.button("🛑 Cancel Run", key="tf_cancel_run_btn", width="stretch"):
+                st.session_state['trade_finder_cancel_requested'] = True
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'warning',
+                    'message': "Cancel requested. Trade Finder will stop at the next batch/checkpoint.",
+                    'ts': time.time(),
+                }
+                st.rerun()
 
     with st.expander("🧠 Green-on-Red Sector Finder", expanded=False):
         _tf_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
@@ -5607,9 +5827,14 @@ def render_trade_finder_tab():
         _render_green_on_red_sector_finder(_source_rows, key_prefix="tf", include_ai_button=True)
 
     if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_running'] = True
         st.markdown("**Progress**")
         _find_bar = st.progress(0, text="Find New: preparing scope...")
         _ai_bar = st.progress(0, text="AI ranking: waiting for scanner candidates...")
+        _stream_meta = st.empty()
+        _stream_table = st.empty()
+        _run_error = None
 
         def _find_progress_cb(pct: int, text: str) -> None:
             try:
@@ -5623,13 +5848,58 @@ def render_trade_finder_tab():
             except TypeError:
                 _ai_bar.progress(int(max(0, min(100, pct))))
 
-        _run_trade_finder_workflow(
-            find_progress_cb=_find_progress_cb,
-            ai_progress_cb=_ai_progress_cb,
-        )
-        _find_bar.progress(100, text="Find New: complete.")
+        def _stream_rows_cb(preview_rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
+            _processed = int(meta.get('processed', 0) or 0)
+            _total = int(meta.get('total', 0) or 0)
+            _pass = int(meta.get('hard_gate_pass', 0) or 0)
+            _ai_ranked = int(meta.get('ai_ranked', 0) or 0)
+            _cancel = bool(meta.get('cancelled', False))
+            _status = (
+                f"Live preview: processed {_processed}/{_total} | "
+                f"hard-gate pass {_pass} | AI-ranked {_ai_ranked}"
+            )
+            if _cancel:
+                _status += " | cancel requested"
+            _stream_meta.caption(_status)
+            if preview_rows:
+                _preview_df = pd.DataFrame(
+                    [
+                        {
+                            "Ticker": str(_r.get("ticker", "")).upper(),
+                            "Verdict": str(_r.get("ai_buy_recommendation", "")),
+                            "Score": round(float(_r.get("trade_score", 0.0) or 0.0), 2),
+                            "R:R": f"{float(_r.get('risk_reward', 0.0) or 0.0):.2f}:1",
+                            "Earn(d)": int(_r.get("earn_days", 999) or 999),
+                            "Sector": str(_r.get("sector", "") or "-"),
+                        }
+                        for _r in (preview_rows or [])
+                    ]
+                )
+                _stream_table.dataframe(_preview_df, hide_index=True, width="stretch")
+
+        try:
+            _run_trade_finder_workflow(
+                find_progress_cb=_find_progress_cb,
+                ai_progress_cb=_ai_progress_cb,
+                stream_rows_cb=_stream_rows_cb,
+            )
+        except Exception as _e:
+            _run_error = str(_e)
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'error',
+                'message': f"Trade Finder run failed: {_run_error}",
+                'ts': time.time(),
+            }
+        finally:
+            st.session_state['trade_finder_running'] = False
+
         _rows_done = len((st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or [])
-        _ai_bar.progress(100, text=f"AI ranking: complete ({_rows_done} ranked).")
+        if _run_error:
+            _find_bar.progress(100, text="Find New: failed.")
+            _ai_bar.progress(100, text="AI ranking: stopped due to error.")
+        else:
+            _find_bar.progress(100, text="Find New: complete.")
+            _ai_bar.progress(100, text=f"AI ranking: complete ({_rows_done} ranked).")
         st.rerun()
 
     _last_status = st.session_state.get('trade_finder_last_status', {}) or {}
