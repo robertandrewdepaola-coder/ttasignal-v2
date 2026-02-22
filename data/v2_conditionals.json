@@ -92,7 +92,12 @@
     "quality_grade": "C",
     "created_date": "2026-02-18",
     "expires_date": "2026-03-20",
-    "status": "PENDING"
+    "status": "TRIGGERED",
+    "triggered_price": 59.150001525878906,
+    "triggered_date": "2026-02-22",
+    "triggered_at": "2026-02-22T04:26:39.763322+00:00",
+    "updated_at": "2026-02-22T04:26:39.763336+00:00",
+    "triggered_volume_ratio": 1.5589875084763132
   },
   {
     "ticker": "CBOE",
