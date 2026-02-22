@@ -15,12 +15,19 @@ KEY_DETAIL_TAB_LOCK = "_detail_tab_lock"
 KEY_SWITCH_TO_SCANNER_TAB = "_switch_to_scanner_tab"
 KEY_SWITCH_TO_SCANNER_TARGET_TAB = "_switch_to_scanner_target_tab"
 KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = "_switch_to_scanner_focus_detail"
+KEY_DETAIL_TAB_SELECTOR_PREFIX = "detail_view_tab_"
 
 # Supported navigation targets -> detail tab index
 _TARGET_TO_TAB = {
     "signal": 0,
     "chart": 1,
     "trade": 4,
+}
+
+_TARGET_TO_SELECTOR = {
+    "signal": "signal",
+    "chart": "chart",
+    "trade": "trade",
 }
 
 
@@ -35,6 +42,25 @@ def normalize_nav_target(target: Any, fallback: str = "chart") -> str:
 def detail_tab_for_target(target: Any, fallback: str = "chart") -> int:
     """Resolve detail tab index for a target label."""
     return int(_TARGET_TO_TAB.get(normalize_nav_target(target, fallback=fallback), _TARGET_TO_TAB["chart"]))
+
+
+def detail_selector_key_for_ticker(ticker: Any) -> str:
+    """Canonical per-ticker detail selector key."""
+    _ticker = str(ticker or "").upper().strip()
+    return f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}{_ticker}"
+
+
+def set_detail_tab_selector_target(
+    state: MutableMapping[str, Any],
+    *,
+    ticker: Any,
+    target: Any,
+) -> str:
+    """Set per-ticker detail selector target (signal/chart/trade) and return value."""
+    _target = normalize_nav_target(target, fallback="chart")
+    _selector = _TARGET_TO_SELECTOR.get(_target, "chart")
+    state[detail_selector_key_for_ticker(ticker)] = _selector
+    return _selector
 
 
 def set_detail_tab_lock(

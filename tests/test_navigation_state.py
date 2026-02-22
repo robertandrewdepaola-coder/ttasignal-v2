@@ -1,14 +1,17 @@
 from navigation_state import (
     KEY_DEFAULT_DETAIL_TAB,
     KEY_DETAIL_TAB_LOCK,
+    KEY_DETAIL_TAB_SELECTOR_PREFIX,
     KEY_SWITCH_TO_SCANNER_TAB,
     KEY_SWITCH_TO_SCANNER_TARGET_TAB,
     KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
     clear_scanner_switch_state,
     consume_detail_tab_with_lock,
+    detail_selector_key_for_ticker,
     detail_tab_for_target,
     normalize_nav_target,
     set_detail_tab_lock,
+    set_detail_tab_selector_target,
     set_scanner_switch_state,
 )
 
@@ -21,6 +24,20 @@ def test_normalize_target_and_tab_mapping():
     assert detail_tab_for_target("chart") == 1
     assert detail_tab_for_target("trade") == 4
     assert detail_tab_for_target("signal") == 0
+
+
+def test_detail_selector_key_and_target_mapping():
+    state = {}
+    assert detail_selector_key_for_ticker("au") == f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"
+    target = set_detail_tab_selector_target(state, ticker="au", target="chart")
+    assert target == "chart"
+    assert state[f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"] == "chart"
+
+    set_detail_tab_selector_target(state, ticker="au", target="trade")
+    assert state[f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"] == "trade"
+
+    set_detail_tab_selector_target(state, ticker="au", target="bad-value")
+    assert state[f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"] == "chart"
 
 
 def test_lock_consumed_for_same_ticker():
@@ -63,4 +80,3 @@ def test_scanner_switch_state_set_and_clear():
     assert KEY_SWITCH_TO_SCANNER_TAB not in state
     assert KEY_SWITCH_TO_SCANNER_TARGET_TAB not in state
     assert KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL not in state
-
