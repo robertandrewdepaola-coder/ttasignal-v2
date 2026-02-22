@@ -2070,6 +2070,10 @@ def _navigate_to_scanner_ticker(
 
     _target = normalize_nav_target(target, fallback="chart")
     _detail_tab = detail_tab_for_target(_target)
+    _detail_tab_key = {
+        "signal": "signal",
+        "trade": "trade",
+    }.get(_target, "chart")
 
     _loaded = _load_ticker_for_view(
         _tk,
@@ -2084,6 +2088,9 @@ def _navigate_to_scanner_ticker(
 
     # One-shot lock is enough now that detail tab selection is state-driven.
     set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=1)
+    # Force the per-ticker detail selector state so scanner-origin chart/trade clicks
+    # cannot fall back to a stale previously selected tab on rerun.
+    st.session_state[f"detail_view_tab_{_tk}"] = _detail_tab_key
     if bool(switch_to_scanner_tab):
         # Ensure post-switch UX lands on detail panel (not just scanner table top).
         set_scanner_switch_state(st.session_state, target=_target, focus_detail=True)
