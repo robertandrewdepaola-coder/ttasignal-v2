@@ -83,6 +83,7 @@ from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
 from navigation_state import (
+    KEY_DEFAULT_DETAIL_TAB,
     KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
     KEY_SWITCH_TO_SCANNER_TAB,
     KEY_SWITCH_TO_SCANNER_TARGET_TAB,
@@ -2081,7 +2082,8 @@ def _navigate_to_scanner_ticker(
         )
         return False
 
-    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=3)
+    # One-shot lock is enough now that detail tab selection is state-driven.
+    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=1)
     if bool(switch_to_scanner_tab):
         # Ensure post-switch UX lands on detail panel (not just scanner table top).
         set_scanner_switch_state(st.session_state, target=_target, focus_detail=True)
@@ -7936,7 +7938,7 @@ def render_detail_view():
 
     st.caption(rec.get('summary', ''))
 
-    # ── Tabs (stable order + explicit JS select for deterministic behavior) ──
+    # ── Detail view selector (state-driven; deterministic across reruns) ──
     tab_defs = [
         ("📊 Signal", "signal"),
         ("📈 Chart", "chart"),
@@ -7944,6 +7946,9 @@ def render_detail_view():
         ("💬 Ask AI", "chat"),
         ("💼 Trade", "trade"),
     ]
+    tab_labels_by_key = {key: name for name, key in tab_defs}
+    tab_keys = [key for _name, key in tab_defs]
+    has_explicit_tab_intent = KEY_DEFAULT_DETAIL_TAB in st.session_state
     default_tab = consume_detail_tab_with_lock(
         st.session_state,
         ticker=ticker,
@@ -7952,54 +7957,33 @@ def render_detail_view():
     )
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
-    _target_tab_label = str(tab_defs[default_tab][0])
-    tabs = st.tabs([name for name, _ in tab_defs])
+    target_tab_key = tab_defs[default_tab][1]
+    selector_key = f"detail_view_tab_{ticker}"
+    selected_tab_key = st.session_state.get(selector_key)
+    if selected_tab_key not in tab_keys:
+        st.session_state[selector_key] = target_tab_key
+    elif has_explicit_tab_intent:
+        st.session_state[selector_key] = target_tab_key
 
-    # Streamlit can preserve a previously selected tab by label across reruns.
-    # Explicitly click target tab in DOM to avoid falling back to Signal.
-    if default_tab != 0:
-        import streamlit.components.v1 as components
-        components.html(
-            f"""
-            <script>
-            (function() {{
-              const targetLabel = {repr(_target_tab_label)};
-              const doc = window.parent.document;
-              const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
-              let attempts = 0;
-              const maxAttempts = 36;
-              const timer = setInterval(function() {{
-                attempts += 1;
-                const tabs = Array.from(doc.querySelectorAll(tabSelector));
-                const target = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes(targetLabel));
-                if (target) {{
-                  target.click();
-                  target.dispatchEvent(new MouseEvent('click', {{ bubbles: true }}));
-                  clearInterval(timer);
-                  return;
-                }}
-                if (attempts >= maxAttempts) {{
-                  clearInterval(timer);
-                }}
-              }}, 45);
-            }})();
-            </script>
-            """,
-            height=0,
-        )
+    selected_tab_key = st.radio(
+        "Detail View",
+        options=tab_keys,
+        key=selector_key,
+        format_func=lambda k: tab_labels_by_key.get(str(k), str(k)),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-    for tab, (_name, key) in zip(tabs, tab_defs):
-        with tab:
-            if key == "signal":
-                _render_signal_tab(ticker, signal, rec, analysis)
-            elif key == "chart":
-                _render_chart_tab(ticker, signal)
-            elif key == "ai":
-                _render_ai_tab(ticker, signal, rec, analysis)
-            elif key == "chat":
-                _render_chat_tab(ticker, signal, rec, analysis)
-            elif key == "trade":
-                _render_trade_tab(ticker, signal, analysis)
+    if selected_tab_key == "signal":
+        _render_signal_tab(ticker, signal, rec, analysis)
+    elif selected_tab_key == "chart":
+        _render_chart_tab(ticker, signal)
+    elif selected_tab_key == "ai":
+        _render_ai_tab(ticker, signal, rec, analysis)
+    elif selected_tab_key == "chat":
+        _render_chat_tab(ticker, signal, rec, analysis)
+    elif selected_tab_key == "trade":
+        _render_trade_tab(ticker, signal, analysis)
 
 def _summary_snippet(value: Any, max_chars: int = 240) -> str:
     txt = clean_ai_formatting(str(value or "").strip())
@@ -14755,20 +14739,16 @@ def main():
             render_performance()
 
     if st.session_state.pop(KEY_SWITCH_TO_SCANNER_TAB, False):
-        _target_detail_tab = normalize_nav_target(
-            st.session_state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, ''),
-            fallback='chart',
-        )
+        st.session_state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None)
         _focus_detail = bool(st.session_state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, False))
         import streamlit.components.v1 as components
-        _target_label = "Chart" if _target_detail_tab == "chart" else ("Trade" if _target_detail_tab == "trade" else "")
         _switch_js = f"""
             <script>
             (function() {{
               const doc = window.parent.document;
               const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
               const maxScannerAttempts = 80;
-              const maxDetailAttempts = 220;
+              const maxFocusAttempts = 220;
               const pollMs = 55;
               const shouldFocusDetail = {str(_focus_detail).lower()};
 
@@ -14789,27 +14769,20 @@ def main():
                 anchor.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
               }}
 
-              function openDetailTab(label) {{
-                let detailAttempts = 0;
-                let openedTarget = !label;
-                const detailTimer = setInterval(function() {{
-                  detailAttempts += 1;
-                  if (label) {{
-                    openedTarget = clickTabByLabel(label) || openedTarget;
-                  }}
+              function focusDetailPanel() {{
+                let focusAttempts = 0;
+                const focusTimer = setInterval(function() {{
+                  focusAttempts += 1;
                   focusDetailAnchor();
                   const haveAnchor = !!doc.getElementById('detail-anchor');
-                  if (
-                    detailAttempts >= maxDetailAttempts ||
-                    (openedTarget && (!shouldFocusDetail || haveAnchor))
-                  ) {{
-                    clearInterval(detailTimer);
+                  if (focusAttempts >= maxFocusAttempts || !shouldFocusDetail || haveAnchor) {{
+                    clearInterval(focusTimer);
                   }}
                 }}, pollMs);
               }}
 
               if (clickTabByLabel('Scanner')) {{
-                openDetailTab({repr(_target_label)});
+                focusDetailPanel();
                 return;
               }}
               let scannerAttempts = 0;
@@ -14817,7 +14790,7 @@ def main():
                 scannerAttempts += 1;
                 if (clickTabByLabel('Scanner')) {{
                   clearInterval(scannerTimer);
-                  openDetailTab({repr(_target_label)});
+                  focusDetailPanel();
                 }} else if (scannerAttempts >= maxScannerAttempts) {{
                   clearInterval(scannerTimer);
                 }}
