@@ -7983,7 +7983,7 @@ def render_detail_view():
 
     st.caption(rec.get('summary', ''))
 
-    # ── Tabs (supports programmatic default by ordering selected tab first) ──
+    # ── Tabs (stable order + explicit JS select for deterministic behavior) ──
     tab_defs = [
         ("📊 Signal", "signal"),
         ("📈 Chart", "chart"),
@@ -8009,10 +8009,43 @@ def render_detail_view():
             st.session_state.pop('_detail_tab_lock', None)
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
-    ordered_defs = tab_defs[default_tab:] + tab_defs[:default_tab]
-    tabs = st.tabs([name for name, _ in ordered_defs])
+    _target_tab_label = str(tab_defs[default_tab][0])
+    tabs = st.tabs([name for name, _ in tab_defs])
 
-    for tab, (_name, key) in zip(tabs, ordered_defs):
+    # Streamlit can preserve a previously selected tab by label across reruns.
+    # Explicitly click target tab in DOM to avoid falling back to Signal.
+    if default_tab != 0:
+        import streamlit.components.v1 as components
+        components.html(
+            f"""
+            <script>
+            (function() {{
+              const targetLabel = {repr(_target_tab_label)};
+              const doc = window.parent.document;
+              const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
+              let attempts = 0;
+              const maxAttempts = 36;
+              const timer = setInterval(function() {{
+                attempts += 1;
+                const tabs = Array.from(doc.querySelectorAll(tabSelector));
+                const target = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes(targetLabel));
+                if (target) {{
+                  target.click();
+                  target.dispatchEvent(new MouseEvent('click', {{ bubbles: true }}));
+                  clearInterval(timer);
+                  return;
+                }}
+                if (attempts >= maxAttempts) {{
+                  clearInterval(timer);
+                }}
+              }}, 45);
+            }})();
+            </script>
+            """,
+            height=0,
+        )
+
+    for tab, (_name, key) in zip(tabs, tab_defs):
         with tab:
             if key == "signal":
                 _render_signal_tab(ticker, signal, rec, analysis)
