@@ -82,6 +82,17 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
+from navigation_state import (
+    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
+    KEY_SWITCH_TO_SCANNER_TAB,
+    KEY_SWITCH_TO_SCANNER_TARGET_TAB,
+    clear_scanner_switch_state,
+    consume_detail_tab_with_lock,
+    detail_tab_for_target,
+    normalize_nav_target,
+    set_detail_tab_lock,
+    set_scanner_switch_state,
+)
 try:
     from trade_finder_helpers import (
         build_planned_trade,
@@ -2079,10 +2090,8 @@ def _navigate_to_scanner_ticker(
         st.session_state['_scanner_nav_error'] = "No ticker selected."
         return False
 
-    _target = str(target or "chart").strip().lower()
-    if _target not in {"chart", "trade", "signal"}:
-        _target = "chart"
-    _detail_tab = 1 if _target == "chart" else (4 if _target == "trade" else 0)
+    _target = normalize_nav_target(target, fallback="chart")
+    _detail_tab = detail_tab_for_target(_target)
 
     _loaded = _load_ticker_for_view(
         _tk,
@@ -2095,23 +2104,13 @@ def _navigate_to_scanner_ticker(
         )
         return False
 
-    st.session_state['default_detail_tab'] = _detail_tab
-    st.session_state['_detail_tab_lock'] = {
-        'ticker': _tk,
-        'tab': _detail_tab,
-        'remaining': 3,
-        'set_at': time.time(),
-    }
+    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=3)
     if bool(switch_to_scanner_tab):
-        st.session_state['_switch_to_scanner_tab'] = True
-        st.session_state['_switch_to_scanner_target_tab'] = _target
         # Ensure post-switch UX lands on detail panel (not just scanner table top).
-        st.session_state['_switch_to_scanner_focus_detail'] = True
+        set_scanner_switch_state(st.session_state, target=_target, focus_detail=True)
     else:
         # Explicitly clear deferred cross-tab navigation when opening from Scanner itself.
-        st.session_state.pop('_switch_to_scanner_tab', None)
-        st.session_state.pop('_switch_to_scanner_target_tab', None)
-        st.session_state.pop('_switch_to_scanner_focus_detail', None)
+        clear_scanner_switch_state(st.session_state)
     st.session_state.pop('_ticker_load_error', None)
     return True
 
@@ -7991,22 +7990,12 @@ def render_detail_view():
         ("💬 Ask AI", "chat"),
         ("💼 Trade", "trade"),
     ]
-    default_tab = int(st.session_state.pop('default_detail_tab', 0) or 0)
-    _lock = st.session_state.get('_detail_tab_lock')
-    if isinstance(_lock, dict):
-        _lock_ticker = str(_lock.get('ticker', '') or '').upper().strip()
-        _lock_tab = int(_lock.get('tab', 0) or 0)
-        _lock_remaining = int(_lock.get('remaining', 0) or 0)
-        _lock_age = time.time() - float(_lock.get('set_at', 0) or 0)
-        if _lock_ticker == str(ticker).upper().strip() and _lock_remaining > 0 and _lock_age <= 8.0:
-            default_tab = _lock_tab
-            _lock['remaining'] = _lock_remaining - 1
-            if _lock['remaining'] <= 0:
-                st.session_state.pop('_detail_tab_lock', None)
-            else:
-                st.session_state['_detail_tab_lock'] = _lock
-        elif _lock_ticker != str(ticker).upper().strip() or _lock_age > 8.0:
-            st.session_state.pop('_detail_tab_lock', None)
+    default_tab = consume_detail_tab_with_lock(
+        st.session_state,
+        ticker=ticker,
+        fallback_tab=0,
+        max_age_sec=8.0,
+    )
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
     _target_tab_label = str(tab_defs[default_tab][0])
@@ -14822,9 +14811,12 @@ def main():
         with tab_perf:
             render_performance()
 
-    if st.session_state.pop('_switch_to_scanner_tab', False):
-        _target_detail_tab = str(st.session_state.pop('_switch_to_scanner_target_tab', '') or '').strip().lower()
-        _focus_detail = bool(st.session_state.pop('_switch_to_scanner_focus_detail', False))
+    if st.session_state.pop(KEY_SWITCH_TO_SCANNER_TAB, False):
+        _target_detail_tab = normalize_nav_target(
+            st.session_state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, ''),
+            fallback='chart',
+        )
+        _focus_detail = bool(st.session_state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, False))
         import streamlit.components.v1 as components
         _target_label = "Chart" if _target_detail_tab == "chart" else ("Trade" if _target_detail_tab == "trade" else "")
         _switch_js = f"""
