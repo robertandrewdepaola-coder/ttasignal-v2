@@ -1964,7 +1964,11 @@ def _ensure_ticker_chart_cache(
     return bool(data.get('daily') is not None)
 
 
-def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
+def _load_ticker_for_view(
+    ticker: str,
+    prefer_chart_fast: bool = False,
+    set_scroll_to_detail: bool = True,
+) -> bool:
     """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.).
     
     NOTE: No st.rerun() needed here. Button clicks already trigger a Streamlit rerun.
@@ -1985,7 +1989,8 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
         if r.ticker == ticker:
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = r
-            st.session_state['scroll_to_detail'] = True
+            if set_scroll_to_detail:
+                st.session_state['scroll_to_detail'] = True
             analysis_cache[ticker] = r
             st.session_state['_ticker_analysis_cache'] = analysis_cache
             _need_mtf = not bool(prefer_chart_fast)
@@ -2001,7 +2006,8 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
     if cached_analysis is not None:
         st.session_state['selected_ticker'] = ticker
         st.session_state['selected_analysis'] = cached_analysis
-        st.session_state['scroll_to_detail'] = True
+        if set_scroll_to_detail:
+            st.session_state['scroll_to_detail'] = True
         _need_mtf = not bool(prefer_chart_fast)
         if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
             msg = f"No chart data for {ticker} (data provider limit or unavailable)."
@@ -2034,7 +2040,8 @@ def _load_ticker_for_view(ticker: str, prefer_chart_fast: bool = False) -> bool:
             analysis = analyze_ticker(data, macd_profile=_macd_profile)
             st.session_state['selected_ticker'] = ticker
             st.session_state['selected_analysis'] = analysis
-            st.session_state['scroll_to_detail'] = True
+            if set_scroll_to_detail:
+                st.session_state['scroll_to_detail'] = True
             # Cache the data
             cache = st.session_state.get('ticker_data_cache', {})
             cache[ticker] = data
@@ -2061,6 +2068,7 @@ def _navigate_to_scanner_ticker(
     ticker: str,
     target: str = "chart",
     switch_to_scanner_tab: bool = True,
+    set_scroll_to_detail: bool = True,
 ) -> bool:
     """
     Safe cross-tab navigation helper used by heatmap/alerts/executive actions.
@@ -2076,7 +2084,11 @@ def _navigate_to_scanner_ticker(
         _target = "chart"
     _detail_tab = 1 if _target == "chart" else (4 if _target == "trade" else 0)
 
-    _loaded = _load_ticker_for_view(_tk, prefer_chart_fast=(_target == "chart"))
+    _loaded = _load_ticker_for_view(
+        _tk,
+        prefer_chart_fast=(_target == "chart"),
+        set_scroll_to_detail=set_scroll_to_detail,
+    )
     if not _loaded:
         st.session_state['_scanner_nav_error'] = str(
             st.session_state.get('_ticker_load_error', f"Unable to load {_tk}.")
@@ -2084,6 +2096,12 @@ def _navigate_to_scanner_ticker(
         return False
 
     st.session_state['default_detail_tab'] = _detail_tab
+    st.session_state['_detail_tab_lock'] = {
+        'ticker': _tk,
+        'tab': _detail_tab,
+        'remaining': 3,
+        'set_at': time.time(),
+    }
     if bool(switch_to_scanner_tab):
         st.session_state['_switch_to_scanner_tab'] = True
         st.session_state['_switch_to_scanner_target_tab'] = _target
@@ -2113,6 +2131,7 @@ def _open_chart_anywhere(
         _tk,
         target="chart",
         switch_to_scanner_tab=switch_to_scanner_tab,
+        set_scroll_to_detail=False,
     )
     if not _ok and warn:
         st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
@@ -2134,6 +2153,7 @@ def _open_trade_anywhere(
         _tk,
         target="trade",
         switch_to_scanner_tab=switch_to_scanner_tab,
+        set_scroll_to_detail=True,
     )
     if not _ok and warn:
         st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
@@ -7971,6 +7991,21 @@ def render_detail_view():
         ("💼 Trade", "trade"),
     ]
     default_tab = int(st.session_state.pop('default_detail_tab', 0) or 0)
+    _lock = st.session_state.get('_detail_tab_lock')
+    if isinstance(_lock, dict):
+        _lock_ticker = str(_lock.get('ticker', '') or '').upper().strip()
+        _lock_tab = int(_lock.get('tab', 0) or 0)
+        _lock_remaining = int(_lock.get('remaining', 0) or 0)
+        _lock_age = time.time() - float(_lock.get('set_at', 0) or 0)
+        if _lock_ticker == str(ticker).upper().strip() and _lock_remaining > 0 and _lock_age <= 8.0:
+            default_tab = _lock_tab
+            _lock['remaining'] = _lock_remaining - 1
+            if _lock['remaining'] <= 0:
+                st.session_state.pop('_detail_tab_lock', None)
+            else:
+                st.session_state['_detail_tab_lock'] = _lock
+        elif _lock_ticker != str(ticker).upper().strip() or _lock_age > 8.0:
+            st.session_state.pop('_detail_tab_lock', None)
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
     ordered_defs = tab_defs[default_tab:] + tab_defs[:default_tab]
