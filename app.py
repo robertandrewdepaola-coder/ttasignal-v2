@@ -82,20 +82,108 @@ from scan_utils import resolve_tickers_to_scan
 from trade_decision import build_trade_decision_card
 from backup_health import get_backup_health_status, run_backup_now
 from system_self_test import run_system_self_test
-from navigation_state import (
-    KEY_DEFAULT_DETAIL_TAB,
-    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
-    KEY_SWITCH_TO_SCANNER_TAB,
-    KEY_SWITCH_TO_SCANNER_TARGET_TAB,
-    clear_scanner_switch_state,
-    consume_detail_tab_with_lock,
-    detail_selector_key_for_ticker,
-    detail_tab_for_target,
-    normalize_nav_target,
-    set_detail_tab_lock,
-    set_detail_tab_selector_target,
-    set_scanner_switch_state,
-)
+try:
+    from navigation_state import (
+        KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
+        KEY_SWITCH_TO_SCANNER_TAB,
+        KEY_SWITCH_TO_SCANNER_TARGET_TAB,
+        clear_scanner_switch_state,
+        detail_tab_for_target,
+        normalize_nav_target,
+        set_detail_tab_lock,
+        set_detail_tab_selector_target,
+        set_scanner_switch_state,
+    )
+except (ImportError, AttributeError, KeyError):
+    # Streamlit Cloud hot-reload can temporarily import stale module objects.
+    import importlib as _importlib
+    _nav = _importlib.import_module("navigation_state")
+
+    KEY_SWITCH_TO_SCANNER_TAB = getattr(_nav, "KEY_SWITCH_TO_SCANNER_TAB", "_switch_to_scanner_tab")
+    KEY_SWITCH_TO_SCANNER_TARGET_TAB = getattr(_nav, "KEY_SWITCH_TO_SCANNER_TARGET_TAB", "_switch_to_scanner_target_tab")
+    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = getattr(_nav, "KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL", "_switch_to_scanner_focus_detail")
+
+    clear_scanner_switch_state = getattr(
+        _nav,
+        "clear_scanner_switch_state",
+        lambda state: (
+            state.pop(KEY_SWITCH_TO_SCANNER_TAB, None),
+            state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None),
+            state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, None),
+        ),
+    )
+    detail_tab_for_target = getattr(
+        _nav,
+        "detail_tab_for_target",
+        lambda target, fallback="chart": {"signal": 0, "chart": 1, "trade": 4}.get(str(target or fallback).strip().lower(), 1),
+    )
+    normalize_nav_target = getattr(
+        _nav,
+        "normalize_nav_target",
+        lambda target, fallback="chart": (str(target or fallback).strip().lower() if str(target or fallback).strip().lower() in {"signal", "chart", "trade"} else "chart"),
+    )
+    set_detail_tab_lock = getattr(
+        _nav,
+        "set_detail_tab_lock",
+        lambda state, *, ticker, tab_index, lock_runs=3, now_ts=None: state.__setitem__("default_detail_tab", int(tab_index or 0)),
+    )
+    set_detail_tab_selector_target = getattr(
+        _nav,
+        "set_detail_tab_selector_target",
+        lambda state, *, ticker, target: state.__setitem__(f"detail_view_tab_{str(ticker or '').upper().strip()}", {"signal": "signal", "trade": "trade"}.get(str(target or "").strip().lower(), "chart")),
+    )
+    set_scanner_switch_state = getattr(
+        _nav,
+        "set_scanner_switch_state",
+        lambda state, *, target, focus_detail=True: (
+            state.__setitem__(KEY_SWITCH_TO_SCANNER_TAB, True),
+            state.__setitem__(KEY_SWITCH_TO_SCANNER_TARGET_TAB, normalize_nav_target(target)),
+            state.__setitem__(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, bool(focus_detail)),
+        ),
+    )
+try:
+    from detail_view_ui import render_detail_view_shell
+except (ImportError, AttributeError, KeyError):
+    # Startup-safe fallback if detail_view_ui is temporarily unavailable during reload.
+    def render_detail_view_shell(
+        *,
+        analysis,
+        render_signal_tab,
+        render_chart_tab,
+        render_ai_tab,
+        render_chat_tab,
+        render_trade_tab,
+    ):
+        if not analysis:
+            return
+        ticker = analysis.ticker
+        signal = analysis.signal
+        rec = analysis.recommendation or {}
+        st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
+        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+        st.caption(rec.get("summary", ""))
+        tab_map = {
+            "signal": lambda: render_signal_tab(ticker, signal, rec, analysis),
+            "chart": lambda: render_chart_tab(ticker, signal),
+            "ai": lambda: render_ai_tab(ticker, signal, rec, analysis),
+            "chat": lambda: render_chat_tab(ticker, signal, rec, analysis),
+            "trade": lambda: render_trade_tab(ticker, signal, analysis),
+        }
+        choice = st.radio(
+            "Detail View",
+            options=["signal", "chart", "ai", "chat", "trade"],
+            horizontal=True,
+            format_func=lambda k: {
+                "signal": "📊 Signal",
+                "chart": "📈 Chart",
+                "ai": "🤖 AI Intel",
+                "chat": "💬 Ask AI",
+                "trade": "💼 Trade",
+            }.get(k, k),
+            label_visibility="collapsed",
+            key=f"detail_view_tab_{str(ticker).upper().strip()}",
+        )
+        tab_map.get(choice, tab_map["signal"])()
 from session_state_contract import (
     ensure_core_defaults,
     ensure_exec_dashboard_defaults,
@@ -7879,110 +7967,16 @@ def _render_quick_alert_form(ticker: str, jm: JournalManager):
 
 @st.fragment
 def render_detail_view():
-    """Render detailed analysis for selected ticker.
-    
-    Decorated with @st.fragment — interactions within this view (button clicks,
-    tab switches, checkbox toggles) only re-render this fragment, NOT the entire
-    scanner table + sidebar. This eliminates ~1-2s of lag on every interaction.
-    """
-    analysis: TickerAnalysis = st.session_state.get('selected_analysis')
-    if not analysis:
-        return
-
-    ticker = analysis.ticker
-    signal = analysis.signal
-    rec = analysis.recommendation or {}
-
-    # Auto-scroll anchor — when a ticker is clicked, scroll here
-    st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
-
-    # Auto-scroll JavaScript — fires once when a new ticker is selected
-    if st.session_state.pop('scroll_to_detail', False):
-        import streamlit.components.v1 as components
-        components.html(
-            """<script>
-            const el = window.parent.document.getElementById('detail-anchor');
-            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
-            </script>""",
-            height=0,
-        )
-
-    # Header with scroll-to-top button
-    hdr_col1, hdr_col2 = st.columns([8, 1])
-    with hdr_col1:
-        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
-    with hdr_col2:
-        if st.button("⬆️ Top", key="scroll_top", help="Scroll to top"):
-            st.session_state['_do_scroll_top'] = True
-            st.rerun()
-
-    # Scroll-to-top JS — fires on next render after button click
-    if st.session_state.pop('_do_scroll_top', False):
-        import streamlit.components.v1 as components
-        components.html(
-            """<script>
-            setTimeout(function() {
-                var doc = window.parent.document;
-                // Try iframe parent scroll
-                doc.querySelectorAll('[data-testid="stAppViewContainer"], section.main, .main, [data-testid="stMain"]').forEach(function(el) {
-                    el.scrollTop = 0;
-                });
-                window.parent.scrollTo(0, 0);
-                doc.documentElement.scrollTop = 0;
-                doc.body.scrollTop = 0;
-            }, 100);
-            </script>""",
-            height=0,
-        )
-
-    st.caption(rec.get('summary', ''))
-
-    # ── Detail view selector (state-driven; deterministic across reruns) ──
-    tab_defs = [
-        ("📊 Signal", "signal"),
-        ("📈 Chart", "chart"),
-        ("🤖 AI Intel", "ai"),
-        ("💬 Ask AI", "chat"),
-        ("💼 Trade", "trade"),
-    ]
-    tab_labels_by_key = {key: name for name, key in tab_defs}
-    tab_keys = [key for _name, key in tab_defs]
-    has_explicit_tab_intent = KEY_DEFAULT_DETAIL_TAB in st.session_state
-    default_tab = consume_detail_tab_with_lock(
-        st.session_state,
-        ticker=ticker,
-        fallback_tab=0,
-        max_age_sec=8.0,
+    """Render detailed analysis for selected ticker via delegated UI shell."""
+    analysis: TickerAnalysis = st.session_state.get("selected_analysis")
+    render_detail_view_shell(
+        analysis=analysis,
+        render_signal_tab=_render_signal_tab,
+        render_chart_tab=_render_chart_tab,
+        render_ai_tab=_render_ai_tab,
+        render_chat_tab=_render_chat_tab,
+        render_trade_tab=_render_trade_tab,
     )
-    if default_tab < 0 or default_tab >= len(tab_defs):
-        default_tab = 0
-    target_tab_key = tab_defs[default_tab][1]
-    selector_key = detail_selector_key_for_ticker(ticker)
-    selected_tab_key = st.session_state.get(selector_key)
-    if selected_tab_key not in tab_keys:
-        st.session_state[selector_key] = target_tab_key
-    elif has_explicit_tab_intent:
-        st.session_state[selector_key] = target_tab_key
-
-    selected_tab_key = st.radio(
-        "Detail View",
-        options=tab_keys,
-        key=selector_key,
-        format_func=lambda k: tab_labels_by_key.get(str(k), str(k)),
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    if selected_tab_key == "signal":
-        _render_signal_tab(ticker, signal, rec, analysis)
-    elif selected_tab_key == "chart":
-        _render_chart_tab(ticker, signal)
-    elif selected_tab_key == "ai":
-        _render_ai_tab(ticker, signal, rec, analysis)
-    elif selected_tab_key == "chat":
-        _render_chat_tab(ticker, signal, rec, analysis)
-    elif selected_tab_key == "trade":
-        _render_trade_tab(ticker, signal, analysis)
 
 def _summary_snippet(value: Any, max_chars: int = 240) -> str:
     txt = clean_ai_formatting(str(value or "").strip())
