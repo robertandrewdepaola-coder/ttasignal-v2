@@ -832,7 +832,10 @@ def check_macd_mtf_zones(daily_df: pd.DataFrame,
                          monthly_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
     """
     MTF MACD zone check using HPotter profile.
-    BUY when Daily=just_cross and Weekly/Monthly are strong or just_cross.
+    BUY timing rule:
+      - Daily must be in just_cross (fresh lower-zone entry timing)
+      - Weekly/Monthly can be just_cross, strong, or extended (momentum can be mature)
+      - Weekly/Monthly bearish still reject
     """
     out = {
         'buy_approved': False,
@@ -862,29 +865,31 @@ def check_macd_mtf_zones(daily_df: pd.DataFrame,
     w_key = str(w_zone.get('zone', 'neutral') or 'neutral')
     m_key = str(m_zone.get('zone', 'neutral') or 'neutral')
     daily_ok = d_key == 'just_cross'
-    weekly_ok = w_key in ('strong', 'just_cross')
-    monthly_ok = m_key in ('strong', 'just_cross')
+    weekly_ok = w_key in ('strong', 'just_cross', 'extended')
+    monthly_ok = m_key in ('strong', 'just_cross', 'extended')
     daily_reject = d_key in ('extended', 'bearish')
-    weekly_reject = w_key in ('extended', 'bearish')
-    monthly_reject = m_key in ('extended', 'bearish')
-    approved = daily_ok and weekly_ok and monthly_ok and not (daily_reject or weekly_reject or monthly_reject)
+    weekly_reject = w_key in ('bearish',)
+    monthly_reject = m_key in ('bearish',)
+    failures: List[str] = []
+    if daily_reject:
+        failures.append(f"Daily extended/bearish ({d_key})")
+    if weekly_reject:
+        failures.append(f"Weekly bearish ({w_key})")
+    if monthly_reject:
+        failures.append(f"Monthly bearish ({m_key})")
+    if not daily_ok:
+        failures.append(f"Daily not just_cross ({d_key})")
+    if not weekly_ok:
+        failures.append(f"Weekly not strong ({w_key})")
+    if not monthly_ok:
+        failures.append(f"Monthly not strong ({m_key})")
+
+    approved = (len(failures) == 0)
     out['buy_approved'] = bool(approved)
     if approved:
         out['reject_reason'] = None
-    elif daily_reject:
-        out['reject_reason'] = f"Daily extended/bearish ({d_key})"
-    elif weekly_reject:
-        out['reject_reason'] = f"Weekly extended/bearish ({w_key})"
-    elif monthly_reject:
-        out['reject_reason'] = f"Monthly extended/bearish ({m_key})"
-    elif not daily_ok:
-        out['reject_reason'] = f"Daily not just_cross ({d_key})"
-    elif not weekly_ok:
-        out['reject_reason'] = f"Weekly not strong ({w_key})"
-    elif not monthly_ok:
-        out['reject_reason'] = f"Monthly not strong ({m_key})"
     else:
-        out['reject_reason'] = 'mtf_zone_reject'
+        out['reject_reason'] = "; ".join(failures) if failures else 'mtf_zone_reject'
     return out
 
 

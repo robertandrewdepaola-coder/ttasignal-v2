@@ -689,6 +689,52 @@ def generate_recommendation(signal: EntrySignal,
             out['monthly_ao_value'] = signal.monthly_ao.get('value')
         return out
 
+    def _apply_mtf_zone_guard(out: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Hard guardrail: prevent bullish entry recommendations when MTF MACD zone check rejects.
+        This enforces "not extended/bearish" and daily just_cross requirements for entry timing.
+        """
+        zone = signal.mtf_zone_check or {}
+        buy_approved = bool(zone.get('buy_approved', False))
+        if buy_approved:
+            return out
+
+        rec_u = str(out.get('recommendation', '') or '').upper()
+        is_bullish_entry = (
+            ('BUY' in rec_u or 'ENTRY' in rec_u)
+            and 'WATCH' not in rec_u
+            and 'WAIT' not in rec_u
+            and 'SKIP' not in rec_u
+            and 'AVOID' not in rec_u
+        )
+        if not is_bullish_entry:
+            return out
+
+        reject_reason = str(zone.get('reject_reason', '') or '').strip()
+        d_zone = str((signal.daily_macd_zone or {}).get('zone', '') or '')
+        w_zone = str((signal.weekly_macd_zone or {}).get('zone', '') or '')
+        m_zone = str((signal.monthly_macd_zone or {}).get('zone', '') or '')
+        reason_txt = reject_reason or f"D:{d_zone} W:{w_zone} M:{m_zone}"
+        rr = reason_txt.lower()
+
+        if ('extended' in rr) or ('bearish' in rr):
+            out['recommendation'] = 'SKIP'
+            out['summary'] = f"⚠️ MACD zone reject ({reason_txt}) — setup extended/bearish, skip new entry."
+            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 0), 1)
+        else:
+            out['recommendation'] = 'WAIT (ZONE)'
+            out['summary'] = f"⚠️ MACD zone timing not approved ({reason_txt}) — wait for valid just-cross entry."
+            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 1), 4)
+
+        out['mtf_zone_downgrade'] = True
+        out['mtf_zone_reject_reason'] = reason_txt
+        return out
+
+    def _apply_signal_guards(out: Dict[str, Any]) -> Dict[str, Any]:
+        out = _apply_monthly_ao_guard(out)
+        out = _apply_mtf_zone_guard(out)
+        return out
+
     # --- PRIMARY SIGNAL ---
     if signal.is_valid:
         result['signal_type'] = 'PRIMARY'
@@ -717,7 +763,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'SKIP'
             result['summary'] = f"❌ Entry valid but Quality {grade}"
             result['conviction'] = 1
-        return _apply_monthly_ao_guard(result)
+        return _apply_signal_guards(result)
 
     # --- AO CONFIRMATION ---
     if ao_confirm and ao_confirm.get('is_valid'):
@@ -736,7 +782,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'SKIP'
             result['summary'] = f"⚠️ AO Confirmation but weak"
             result['conviction'] = 2
-        return _apply_monthly_ao_guard(result)
+        return _apply_signal_guards(result)
 
     # --- RE-ENTRY ---
     if reentry and reentry.get('is_valid'):
@@ -755,7 +801,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🟡 Re-Entry but Quality {grade}"
             result['conviction'] = _q_refine(2, 4, q_score)
-        return _apply_monthly_ao_guard(result)
+        return _apply_signal_guards(result)
 
     # --- LATE ENTRY ---
     if late_entry and late_entry.get('is_valid'):
@@ -771,7 +817,7 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
             result['conviction'] = _q_refine(2, 3, q_score)
-        return _apply_monthly_ao_guard(result)
+        return _apply_signal_guards(result)
 
     # --- NO SIGNAL ---
     if signal.is_valid_relaxed:
