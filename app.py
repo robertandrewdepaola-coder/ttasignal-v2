@@ -6541,7 +6541,7 @@ def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
     _top_state = render_trade_finder_top_panel(
         can_auto_rerank_cached_fn=can_auto_rerank_cached,
-        today_utc_str_fn=today_utc_str,
+        today_utc_str_fn=lambda: datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
         get_fetch_health_status_fn=get_fetch_health_status,
         trade_finder_data_gate_state_fn=_trade_finder_data_gate_state,
         get_journal_fn=get_journal,
