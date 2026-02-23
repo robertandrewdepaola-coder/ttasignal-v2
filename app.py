@@ -4961,6 +4961,7 @@ def _run_trade_finder_workflow(
     find_progress_cb: Optional[Callable[[int, str], None]] = None,
     ai_progress_cb: Optional[Callable[[int, str], None]] = None,
     stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
+    rerank_only: bool = False,
 ) -> None:
     """
     Executes scanner candidate discovery + Grok scoring.
@@ -4968,13 +4969,50 @@ def _run_trade_finder_workflow(
     """
     st.session_state['trade_finder_running'] = True
     _cancelled = False
-    st.session_state['trade_finder_last_status'] = {
-        'level': 'info',
-        'message': 'Running Find New Trades and AI ranking...',
-        'ts': time.time(),
-    }
-    _run_find_new_trades(progress_cb=find_progress_cb)
-    report = st.session_state.get('find_new_trades_report', {}) or {}
+    _report_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
+    _report_age_sec = max(0.0, time.time() - _report_ts) if _report_ts else 0.0
+    _report = st.session_state.get('find_new_trades_report', {}) or {}
+    if rerank_only:
+        if not _report:
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': "No cached Find New snapshot available. Run 'Find New Trades' first.",
+                'ts': time.time(),
+            }
+            if callable(find_progress_cb):
+                try:
+                    find_progress_cb(100, "Find New: no cached snapshot available.")
+                except Exception:
+                    pass
+            st.session_state['trade_finder_running'] = False
+            return
+        _ttl_min = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0)
+        _fresh = bool(_report_ts and _report_age_sec <= (_ttl_min * 60.0))
+        _age_txt = _format_eta(_report_age_sec)
+        _mode_txt = "fresh" if _fresh else "stale"
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': (
+                f"Re-ranking cached Find New snapshot ({_mode_txt}, age {_age_txt}) "
+                f"without data fetch."
+            ),
+            'ts': time.time(),
+        }
+        if callable(find_progress_cb):
+            try:
+                find_progress_cb(100, f"Find New: cached snapshot reused ({_mode_txt}, age {_age_txt}).")
+            except Exception:
+                pass
+    else:
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': 'Running Find New Trades and AI ranking...',
+            'ts': time.time(),
+        }
+        _run_find_new_trades(progress_cb=find_progress_cb)
+        _report = st.session_state.get('find_new_trades_report', {}) or {}
+
+    report = _report
     base_candidates = report.get('candidates', []) or []
     quality_settings = _trade_quality_settings()
     macd_profile = str(quality_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
@@ -4986,6 +5024,7 @@ def _run_trade_finder_workflow(
             'rows': [],
             'provider': 'system',
             'macd_profile': macd_profile,
+            'run_mode': 'rerank_only' if rerank_only else 'full_scan',
             'elapsed_sec': 0.0,
             'input_candidates': 0,
             'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
@@ -4996,8 +5035,13 @@ def _run_trade_finder_workflow(
             st.session_state['trade_finder_last_status'] = {
                 'level': 'warning',
                 'message': (
-                    f"Run complete: scanned {_scan_universe} ticker(s), analyzed {_results_count} result(s), "
-                    "but no entry candidates passed current gates."
+                    (
+                        f"Re-rank complete: reused cached scan "
+                        f"(analyzed {_results_count} result(s)), but no entry candidates passed current gates."
+                        if rerank_only else
+                        f"Run complete: scanned {_scan_universe} ticker(s), analyzed {_results_count} result(s), "
+                        "but no entry candidates passed current gates."
+                    )
                 ),
                 'ts': time.time(),
             }
@@ -5406,6 +5450,7 @@ def _run_trade_finder_workflow(
         'rows': rows,
         'provider': rows[0].get('provider', 'system') if rows else 'system',
         'macd_profile': macd_profile,
+        'run_mode': 'rerank_only' if rerank_only else 'full_scan',
         'elapsed_sec': elapsed,
         'input_candidates': len(base_candidates),
         'hard_gate_pass_count': int(hard_gate_pass_count),
@@ -5445,12 +5490,13 @@ def _run_trade_finder_workflow(
         'level': 'warning' if _cancelled else ('success' if len(rows) > 0 else 'info'),
         'message': (
             (
-                f"Trade Finder canceled: processed {len(rows)}/{len(base_candidates)}; "
+                f"{'Re-rank' if rerank_only else 'Trade Finder'} canceled: processed {len(rows)}/{len(base_candidates)}; "
                 f"hard-gate pass {hard_gate_pass_count}; qualified {qualified_count}; AI ranked {ai_ranked_count}."
             )
             if _cancelled else
             (
-                f"Trade Finder complete: {hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
+                f"{'Re-rank' if rerank_only else 'Trade Finder'} complete: "
+                f"{hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
                 f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
                 f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
             )
@@ -5826,7 +5872,22 @@ def render_trade_finder_tab():
         _source_rows = _tf_rows if _tf_rows else (_fn_rows if _fn_rows else _scan_rows)
         _render_green_on_red_sector_finder(_source_rows, key_prefix="tf", include_ai_button=True)
 
-    if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
+    _cached_report = st.session_state.get('find_new_trades_report', {}) or {}
+    _cached_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
+    _cached_age = max(0.0, time.time() - _cached_ts) if _cached_ts else None
+    _cached_ttl_sec = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0) * 60.0
+    _cached_is_fresh = bool(_cached_age is not None and _cached_age <= _cached_ttl_sec)
+    _cached_analyzed = int(_cached_report.get('results_count', 0) or 0)
+    _cached_candidates = int(_cached_report.get('candidate_count', 0) or 0)
+    if _cached_ts:
+        st.caption(
+            f"Cached Find New snapshot: analyzed={_cached_analyzed}, candidates={_cached_candidates}, "
+            f"age={_format_eta(_cached_age or 0)} ({'fresh' if _cached_is_fresh else 'stale'})."
+        )
+    else:
+        st.caption("Cached Find New snapshot: none yet.")
+
+    def _run_trade_finder_from_ui(*, rerank_only: bool) -> None:
         st.session_state['trade_finder_cancel_requested'] = False
         st.session_state['trade_finder_running'] = True
         st.markdown("**Progress**")
@@ -5835,6 +5896,12 @@ def render_trade_finder_tab():
         _stream_meta = st.empty()
         _stream_table = st.empty()
         _run_error = None
+
+        if rerank_only:
+            try:
+                _find_bar.progress(100, text="Find New: reusing cached snapshot (no fetch).")
+            except Exception:
+                pass
 
         def _find_progress_cb(pct: int, text: str) -> None:
             try:
@@ -5882,6 +5949,7 @@ def render_trade_finder_tab():
                 find_progress_cb=_find_progress_cb,
                 ai_progress_cb=_ai_progress_cb,
                 stream_rows_cb=_stream_rows_cb,
+                rerank_only=rerank_only,
             )
         except Exception as _e:
             _run_error = str(_e)
@@ -5898,9 +5966,31 @@ def render_trade_finder_tab():
             _find_bar.progress(100, text="Find New: failed.")
             _ai_bar.progress(100, text="AI ranking: stopped due to error.")
         else:
-            _find_bar.progress(100, text="Find New: complete.")
-            _ai_bar.progress(100, text=f"AI ranking: complete ({_rows_done} ranked).")
+            if not rerank_only:
+                _find_bar.progress(100, text="Find New: complete.")
+            _ai_bar.progress(
+                100,
+                text=(
+                    f"AI rerank complete ({_rows_done} ranked)."
+                    if rerank_only else
+                    f"AI ranking: complete ({_rows_done} ranked)."
+                ),
+            )
         st.rerun()
+
+    _b1, _b2 = st.columns([3, 2])
+    with _b1:
+        if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
+            _run_trade_finder_from_ui(rerank_only=False)
+    with _b2:
+        if st.button(
+            "⚡ Re-rank Cached",
+            width="stretch",
+            key="tf_rerank_cached_btn",
+            disabled=not bool(_cached_report),
+            help="Re-ranks the existing Find New snapshot without any data fetch.",
+        ):
+            _run_trade_finder_from_ui(rerank_only=True)
 
     _last_status = st.session_state.get('trade_finder_last_status', {}) or {}
     _last_level = str(_last_status.get('level', 'info') or 'info').lower()
