@@ -240,6 +240,26 @@ except (ImportError, AttributeError, KeyError):
             "stop_basis": "model_stop_fallback",
         },
     )
+try:
+    from trade_finder_state import (
+        adaptive_fetch_batch_size_for_health,
+        bg_mode_from_job,
+        can_auto_rerank_cached,
+        evaluate_active_background_start,
+        scope_signature_from_state,
+        scope_unchanged,
+        should_auto_rerank_after_terminal,
+    )
+except (ImportError, AttributeError, KeyError):
+    import importlib as _importlib
+    _tfs = _importlib.import_module("trade_finder_state")
+    adaptive_fetch_batch_size_for_health = _tfs.adaptive_fetch_batch_size_for_health
+    bg_mode_from_job = _tfs.bg_mode_from_job
+    can_auto_rerank_cached = _tfs.can_auto_rerank_cached
+    evaluate_active_background_start = _tfs.evaluate_active_background_start
+    scope_signature_from_state = _tfs.scope_signature_from_state
+    scope_unchanged = _tfs.scope_unchanged
+    should_auto_rerank_after_terminal = _tfs.should_auto_rerank_after_terminal
 
 try:
     from streamlit.runtime.scriptrunner import get_script_run_ctx
@@ -2734,53 +2754,6 @@ def _format_eta(seconds: float) -> str:
     return f"{h}h {m2}m"
 
 
-def _find_new_scope_signature_from_state() -> Dict[str, Any]:
-    """Scope knobs that change universe membership for Find New scans."""
-    _sectors = sorted(
-        [
-            str(x).strip()
-            for x in (st.session_state.get('find_new_selected_sectors', []) or [])
-            if str(x).strip()
-        ]
-    )
-    return {
-        'max_tickers': int(st.session_state.get('find_new_max_tickers', 0) or 0),
-        'in_rotation_only': bool(st.session_state.get('find_new_in_rotation_only', False)),
-        'include_unknown_sector': bool(st.session_state.get('find_new_include_unknown_sector', False)),
-        'selected_sectors': _sectors,
-    }
-
-
-def _find_new_scope_signature_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
-    _scope = (report or {}).get('scan_scope', {}) or {}
-    _sig = (report or {}).get('scope_signature', {}) or {}
-    _sig_sectors = _sig.get('selected_sectors', _scope.get('selected_sectors', []))
-    return {
-        'max_tickers': int(_sig.get('max_tickers', _scope.get('max_tickers', 0)) or 0),
-        'in_rotation_only': bool(
-            _sig.get('in_rotation_only', _scope.get('only_in_rotation', False))
-        ),
-        'include_unknown_sector': bool(
-            _sig.get('include_unknown_sector', _scope.get('include_unknown_sector', False))
-        ),
-        'selected_sectors': sorted(
-            [
-                str(x).strip()
-                for x in (_sig_sectors or [])
-                if str(x).strip()
-            ]
-        ),
-    }
-
-
-def _find_new_scope_unchanged(report: Dict[str, Any]) -> bool:
-    """True when current scope knobs match the snapshot scope."""
-    _report = report or {}
-    if not _report:
-        return False
-    return _find_new_scope_signature_from_report(_report) == _find_new_scope_signature_from_state()
-
-
 def _run_find_new_trades(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
@@ -2819,15 +2792,11 @@ def _run_find_new_trades(
     _deadline_ts = (time.time() + (_max_minutes * 60.0)) if _max_minutes > 0 else 0.0
     _cache_ttl_min = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0)
     _cache_ttl_sec = max(60.0, _cache_ttl_min * 60.0)
-    _fetch_batch_size = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
-    _fetch_batch_size = max(10, min(250, _fetch_batch_size))
+    _fetch_batch_size_cfg = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
     _fetch_health = get_fetch_health_status() or {}
     _cooldown_now = int(_fetch_health.get('cooldown_remaining_sec', 0) or 0)
     _hits_now = int(_fetch_health.get('hits', 0) or 0)
-    if _cooldown_now > 0 or _hits_now >= 3:
-        _fetch_batch_size = min(_fetch_batch_size, 20)
-    elif _hits_now >= 1:
-        _fetch_batch_size = min(_fetch_batch_size, 30)
+    _fetch_batch_size = adaptive_fetch_batch_size_for_health(_fetch_batch_size_cfg, _fetch_health)
     if callable(cancel_checker):
         _cancel_flag = lambda: bool(cancel_checker())
     else:
@@ -2941,7 +2910,7 @@ def _run_find_new_trades(
                 'requested_universe': len(ticker_sources),
                 'effective_universe': 0,
             },
-            'scope_signature': _find_new_scope_signature_from_state(),
+            'scope_signature': scope_signature_from_state(st.session_state),
         }
         st.session_state['find_new_trades_report'] = report
         st.session_state['_find_new_trades_ts'] = time.time()
@@ -3127,19 +3096,28 @@ def _run_find_new_trades(
             _fetch_stage_start = time.time()
             _processed_missing = 0
             _fetched_live = 0
-            _batch_count = int((missing_total + _fetch_batch_size - 1) // _fetch_batch_size)
-            for _bi in range(0, missing_total, _fetch_batch_size):
+            _batch_idx = 0
+            while _processed_missing < missing_total:
                 if _cancel_flag():
                     _cancelled = True
                     break
                 if _deadline_ts and time.time() > _deadline_ts:
                     _cancelled = True
                     break
-                _batch = missing[_bi:_bi + _fetch_batch_size]
-                _batch_idx = int((_bi // _fetch_batch_size) + 1)
+                _fh_loop = get_fetch_health_status() or {}
+                _fetch_batch_size = adaptive_fetch_batch_size_for_health(_fetch_batch_size_cfg, _fh_loop)
+                _filtered_counts["governor_hits"] = int(_fh_loop.get('hits', _filtered_counts["governor_hits"]) or 0)
+                _filtered_counts["governor_cooldown_sec"] = int(
+                    _fh_loop.get('cooldown_remaining_sec', _filtered_counts["governor_cooldown_sec"]) or 0
+                )
+                _filtered_counts["effective_batch_size"] = _fetch_batch_size
+                _batch = missing[_processed_missing:_processed_missing + _fetch_batch_size]
+                if not _batch:
+                    break
+                _batch_idx += 1
                 _set_find_progress(
                     15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45),
-                    f"Fetching batch {_batch_idx}/{_batch_count} ({len(_batch)} tickers)...",
+                    f"Fetching {_processed_missing}/{missing_total} ({len(_batch)} tickers, paced batch {_fetch_batch_size})...",
                 )
                 _emit_find_metrics(
                     phase='find_fetch',
@@ -3213,7 +3191,7 @@ def _run_find_new_trades(
                     _cancelled = True
                     if ui_mode:
                         st.warning(
-                            f"Find New fetch stopped early in batch {_batch_idx}/{_batch_count}: "
+                            f"Find New fetch stopped early in batch {_batch_idx}: "
                             f"fetched {len(_fetched_batch)}/{len(_batch)}."
                         )
                     break
@@ -3667,7 +3645,7 @@ def _run_find_new_trades(
             'requested_universe': len(ticker_sources),
             'effective_universe': len(universe),
         },
-        'scope_signature': _find_new_scope_signature_from_state(),
+        'scope_signature': scope_signature_from_state(st.session_state),
         'interrupted': bool(_cancelled),
     }
     st.session_state['find_new_trades_report'] = report
@@ -6121,15 +6099,6 @@ def _run_trade_finder_workflow(
     st.session_state['trade_finder_running'] = False
 
 
-def _trade_finder_bg_mode(job: Optional[Dict[str, Any]]) -> str:
-    _name = str((job or {}).get('name', '') or '').strip().lower()
-    if "rerank" in _name:
-        return "rerank"
-    if "full" in _name:
-        return "full"
-    return ""
-
-
 def _persist_trade_finder_bg_state(state: Optional[Dict[str, Any]]) -> None:
     """Persist compact Trade Finder background status for restart visibility."""
     _state = dict(state or {})
@@ -6180,20 +6149,19 @@ def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_ru
 
     _active_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
     _active_job = get_background_job(_active_id) if _active_id else {}
-    _active_status = str((_active_job or {}).get('status', '') or '').lower()
-    _active_mode = _trade_finder_bg_mode(_active_job)
-    if _active_id and _active_job and _active_status == "running":
+    _active_policy = evaluate_active_background_start(
+        _active_job,
+        requested_mode=_requested_mode,
+        queue_if_running=queue_if_running,
+    )
+    if _active_id and _active_job and bool(_active_policy.get('reuse_active', False)):
         st.session_state['trade_finder_running'] = True
         st.session_state['trade_finder_cancel_requested'] = False
         st.session_state['trade_finder_bg_job_id'] = _active_id
         _persist_trade_finder_bg_state(_active_job)
-        if queue_if_running and rerank_only and _active_mode == "full":
+        if bool(_active_policy.get('queue_rerank', False)):
             st.session_state['trade_finder_bg_rerank_queued'] = True
-            _msg = "Background full scan already running. Re-rank queued for auto-start on completion."
-        elif queue_if_running and not rerank_only and _active_mode == "rerank":
-            _msg = "Background re-rank already running. Start full scan when current job completes."
-        else:
-            _msg = "Background Trade Finder already running; using the current job."
+        _msg = str(_active_policy.get('message', '') or '').strip() or "Background Trade Finder already running; using the current job."
         st.session_state['trade_finder_last_status'] = {
             'level': 'info',
             'message': _msg,
@@ -6292,7 +6260,7 @@ def _get_trade_finder_background_status() -> Dict[str, Any]:
     if _status in {"done", "failed", "canceled"}:
         st.session_state['trade_finder_running'] = False
         st.session_state['trade_finder_cancel_requested'] = False
-        _mode = _trade_finder_bg_mode(_job)
+        _mode = bg_mode_from_job(_job)
         _last_terminal = str(st.session_state.get('_trade_finder_bg_last_terminal_job_id', '') or '')
         if _last_terminal != _job_id:
             if _status == "done":
@@ -6315,7 +6283,12 @@ def _get_trade_finder_background_status() -> Dict[str, Any]:
 
             _manual_queue = bool(st.session_state.get('trade_finder_bg_rerank_queued', False))
             _auto_enabled = bool(st.session_state.get('trade_finder_bg_auto_rerank', True))
-            _should_auto_rerank = (_status == "done" and _mode == "full" and (_manual_queue or _auto_enabled))
+            _should_auto_rerank = should_auto_rerank_after_terminal(
+                status=_status,
+                mode=_mode,
+                manual_queue=_manual_queue,
+                auto_enabled=_auto_enabled,
+            )
             if _status != "done" and _mode == "full":
                 st.session_state['trade_finder_bg_rerank_queued'] = False
             if _should_auto_rerank:
@@ -6581,11 +6554,7 @@ def render_trade_finder_tab():
                 'applied_ts': today_utc_str(),
             }
             _cached_report = st.session_state.get('find_new_trades_report', {}) or {}
-            _can_rerank_cached = bool(
-                _cached_report
-                and int(_cached_report.get('results_count', 0) or 0) > 0
-                and _find_new_scope_unchanged(_cached_report)
-            )
+            _can_rerank_cached = can_auto_rerank_cached(st.session_state, _cached_report)
             if _can_rerank_cached:
                 st.session_state['trade_gate_auto_rerank_requested'] = True
                 st.session_state['trade_gate_auto_rerank_requested_ts'] = time.time()
@@ -6719,7 +6688,7 @@ def render_trade_finder_tab():
     cleanup_background_jobs()
     _bg_job = _get_trade_finder_background_status()
     _bg_status = str((_bg_job or {}).get('status', '') or '').lower()
-    _bg_mode = _trade_finder_bg_mode(_bg_job)
+    _bg_mode = bg_mode_from_job(_bg_job)
     _bg_full_active = bool(_bg_status == "running" and _bg_mode == "full")
     _bg_active = _bg_status == "running"
     _bg_preview_rows = (_bg_job or {}).get('preview_rows', []) or []
@@ -6863,7 +6832,7 @@ def render_trade_finder_tab():
     _cached_is_fresh = bool(_cached_age is not None and _cached_age <= _cached_ttl_sec)
     _cached_analyzed = int(_cached_report.get('results_count', 0) or 0)
     _cached_candidates = int(_cached_report.get('candidate_count', 0) or 0)
-    _cached_scope_match = _find_new_scope_unchanged(_cached_report) if _cached_report else False
+    _cached_scope_match = scope_unchanged(st.session_state, _cached_report) if _cached_report else False
     if _cached_ts:
         st.caption(
             f"Cached Find New snapshot: analyzed={_cached_analyzed}, candidates={_cached_candidates}, "
@@ -6872,97 +6841,6 @@ def render_trade_finder_tab():
         )
     else:
         st.caption("Cached Find New snapshot: none yet.")
-
-    def _run_trade_finder_from_ui(*, rerank_only: bool) -> None:
-        st.session_state['trade_finder_cancel_requested'] = False
-        st.session_state['trade_finder_running'] = True
-        st.markdown("**Progress**")
-        _find_bar = st.progress(0, text="Find New: preparing scope...")
-        _ai_bar = st.progress(0, text="AI ranking: waiting for scanner candidates...")
-        _stream_meta = st.empty()
-        _stream_table = st.empty()
-        _run_error = None
-
-        if rerank_only:
-            try:
-                _find_bar.progress(100, text="Find New: reusing cached snapshot (no fetch).")
-            except Exception:
-                pass
-
-        def _find_progress_cb(pct: int, text: str) -> None:
-            try:
-                _find_bar.progress(int(max(0, min(100, pct))), text=text)
-            except TypeError:
-                _find_bar.progress(int(max(0, min(100, pct))))
-
-        def _ai_progress_cb(pct: int, text: str) -> None:
-            try:
-                _ai_bar.progress(int(max(0, min(100, pct))), text=text)
-            except TypeError:
-                _ai_bar.progress(int(max(0, min(100, pct))))
-
-        def _stream_rows_cb(preview_rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> None:
-            _processed = int(meta.get('processed', 0) or 0)
-            _total = int(meta.get('total', 0) or 0)
-            _pass = int(meta.get('hard_gate_pass', 0) or 0)
-            _ai_ranked = int(meta.get('ai_ranked', 0) or 0)
-            _cancel = bool(meta.get('cancelled', False))
-            _status = (
-                f"Live preview: processed {_processed}/{_total} | "
-                f"hard-gate pass {_pass} | AI-ranked {_ai_ranked}"
-            )
-            if _cancel:
-                _status += " | cancel requested"
-            _stream_meta.caption(_status)
-            if preview_rows:
-                _preview_df = pd.DataFrame(
-                    [
-                        {
-                            "Ticker": str(_r.get("ticker", "")).upper(),
-                            "Verdict": str(_r.get("ai_buy_recommendation", "")),
-                            "Score": round(float(_r.get("trade_score", 0.0) or 0.0), 2),
-                            "R:R": f"{float(_r.get('risk_reward', 0.0) or 0.0):.2f}:1",
-                            "Earn(d)": int(_r.get("earn_days", 999) or 999),
-                            "Sector": str(_r.get("sector", "") or "-"),
-                        }
-                        for _r in (preview_rows or [])
-                    ]
-                )
-                _stream_table.dataframe(_preview_df, hide_index=True, width="stretch")
-
-        try:
-            _run_trade_finder_workflow(
-                find_progress_cb=_find_progress_cb,
-                ai_progress_cb=_ai_progress_cb,
-                stream_rows_cb=_stream_rows_cb,
-                rerank_only=rerank_only,
-            )
-        except Exception as _e:
-            _run_error = str(_e)
-            st.session_state['trade_finder_last_status'] = {
-                'level': 'error',
-                'message': f"Trade Finder run failed: {_run_error}",
-                'ts': time.time(),
-            }
-        finally:
-            st.session_state['trade_finder_running'] = False
-
-        _rows_done = len((st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or [])
-        if _run_error:
-            _find_bar.progress(100, text="Find New: failed.")
-            _ai_bar.progress(100, text="AI ranking: stopped due to error.")
-        else:
-            if not rerank_only:
-                _find_bar.progress(100, text="Find New: complete.")
-            _ai_bar.progress(
-                100,
-                text=(
-                    f"AI rerank complete ({_rows_done} ranked)."
-                    if rerank_only else
-                    f"AI ranking: complete ({_rows_done} ranked)."
-                ),
-            )
-        st.rerun()
 
     _b1, _b2, _b3 = st.columns([3, 2, 2])
     with _b1:
