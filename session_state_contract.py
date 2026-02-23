@@ -30,6 +30,8 @@ CORE_DEFAULT_FACTORIES: Dict[str, Factory] = {
     "trade_finder_last_status": dict,
     "trade_finder_running": _const(False),
     "trade_finder_cancel_requested": _const(False),
+    "trade_finder_bg_job_id": _const(""),
+    "_trade_finder_bg_last_terminal_job_id": _const(""),
     "trade_finder_ai_top_n": _const(0),
     "trade_finder_ai_budget_sec": _const(30.0),
     "trade_breakout_min_dist_pct": _const(0.2),

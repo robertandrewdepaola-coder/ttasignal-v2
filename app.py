@@ -20,6 +20,7 @@ import streamlit as st
 import pandas as pd
 import re
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -225,6 +226,29 @@ except (ImportError, AttributeError, KeyError):
             "stop_basis": "model_stop_fallback",
         },
     )
+
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+except Exception:
+    def get_script_run_ctx():
+        return None
+
+try:
+    from background_jobs import (
+        cleanup_jobs as cleanup_background_jobs,
+        get_job as get_background_job,
+        request_cancel as cancel_background_job,
+        start_trade_finder_job as start_background_trade_finder_job,
+    )
+except Exception:
+    def cleanup_background_jobs(*args, **kwargs):
+        return None
+    def get_background_job(*args, **kwargs):
+        return {}
+    def cancel_background_job(*args, **kwargs):
+        return False
+    def start_background_trade_finder_job(*args, **kwargs):
+        return ""
 
 
 # =============================================================================
@@ -1792,7 +1816,12 @@ def render_sidebar():
         help="Scan ALL watchlists and return a ranked list of new trade candidates.",
         disabled=(len(all_watch_tickers) == 0),
     ):
-        _run_find_new_trades()
+        _jid = _start_trade_finder_background_run(rerank_only=False)
+        if _jid:
+            st.sidebar.success("Background Trade Finder started.")
+        else:
+            st.sidebar.warning("Unable to start background Trade Finder.")
+        st.rerun()
 
     # ── Open Positions (clickable) ────────────────────────────────────
     open_trades = jm.get_open_trades()
@@ -2670,7 +2699,12 @@ def _format_eta(seconds: float) -> str:
     return f"{h}h {m2}m"
 
 
-def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = None):
+def _run_find_new_trades(
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    *,
+    ui_mode: bool = True,
+    cancel_checker: Optional[Callable[[], bool]] = None,
+):
     """
     Scan the union of ALL watchlists and build a consolidated "new trades" report.
     This does not replace active-watchlist scanner results.
@@ -2704,7 +2738,10 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
     _cache_ttl_sec = max(60.0, _cache_ttl_min * 60.0)
     _fetch_batch_size = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
     _fetch_batch_size = max(10, min(250, _fetch_batch_size))
-    _cancel_flag = lambda: bool(st.session_state.get('trade_finder_cancel_requested', False))
+    if callable(cancel_checker):
+        _cancel_flag = lambda: bool(cancel_checker())
+    else:
+        _cancel_flag = lambda: bool(st.session_state.get('trade_finder_cancel_requested', False))
 
     _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
     _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
@@ -2803,7 +2840,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
             ),
             'ts': time.time(),
         }
-        st.sidebar.warning("No eligible tickers after scope filters.")
+        if ui_mode:
+            st.sidebar.warning("No eligible tickers after scope filters.")
         _append_audit_event(
             "FIND_NEW_EMPTY",
             f"requested={len(ticker_sources)} effective=0",
@@ -2812,7 +2850,7 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         return
 
     _progress = None
-    if not callable(progress_cb):
+    if ui_mode and not callable(progress_cb):
         _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
 
     def _set_find_progress(pct: int, text: str):
@@ -2830,7 +2868,8 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 st.sidebar.caption(text)
 
     _start = time.time()
-    with st.spinner(f"Finding new trades across {len(universe)} tickers..."):
+    _scan_ctx = st.spinner(f"Finding new trades across {len(universe)} tickers...") if ui_mode else nullcontext()
+    with _scan_ctx:
         _append_audit_event(
             "FIND_NEW_START",
             f"watchlists={len(all_watchlists)} universe={len(universe)} in_rotation_only={_only_in_rotation} "
@@ -2930,17 +2969,19 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
                 )
                 if len(_fetched_batch) < len(_batch):
                     _cancelled = True
-                    st.warning(
-                        f"Find New fetch stopped early in batch {_batch_idx}/{_batch_count}: "
-                        f"fetched {len(_fetched_batch)}/{len(_batch)}."
-                    )
+                    if ui_mode:
+                        st.warning(
+                            f"Find New fetch stopped early in batch {_batch_idx}/{_batch_count}: "
+                            f"fetched {len(_fetched_batch)}/{len(_batch)}."
+                        )
                     break
             _filtered_counts["fetched_live"] = _fetched_live
             if _cancelled:
-                st.warning(
-                    f"Find New fetch interrupted: fetched {_processed_missing}/{missing_total} missing tickers. "
-                    "Continuing with partial results."
-                )
+                if ui_mode:
+                    st.warning(
+                        f"Find New fetch interrupted: fetched {_processed_missing}/{missing_total} missing tickers. "
+                        "Continuing with partial results."
+                    )
         _set_find_progress(63, "Analyzing trade candidates...")
         _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
         results = scan_watchlist(all_data, macd_profile=_macd_profile)
@@ -3385,15 +3426,16 @@ def _run_find_new_trades(progress_cb: Optional[Callable[[int, str], None]] = Non
         f"watchlists={len(all_watchlists)} universe={len(universe)} candidates={len(candidates)} sec={elapsed:.1f}",
         source="find_new",
     )
-    if _cancelled:
-        st.warning(
-            f"Find New stopped early: {len(candidates)} candidate(s) from partial run "
-            f"({len(universe)} ticker universe)."
-        )
-    else:
-        st.success(
-            f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists."
-        )
+    if ui_mode:
+        if _cancelled:
+            st.warning(
+                f"Find New stopped early: {len(candidates)} candidate(s) from partial run "
+                f"({len(universe)} ticker universe)."
+            )
+        else:
+            st.success(
+                f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists."
+            )
 
 
 def _extract_first_json_object(raw: str) -> Dict[str, Any]:
@@ -4962,6 +5004,9 @@ def _run_trade_finder_workflow(
     ai_progress_cb: Optional[Callable[[int, str], None]] = None,
     stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
     rerank_only: bool = False,
+    *,
+    ui_mode: bool = True,
+    cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> None:
     """
     Executes scanner candidate discovery + Grok scoring.
@@ -5009,7 +5054,11 @@ def _run_trade_finder_workflow(
             'message': 'Running Find New Trades and AI ranking...',
             'ts': time.time(),
         }
-        _run_find_new_trades(progress_cb=find_progress_cb)
+        _run_find_new_trades(
+            progress_cb=find_progress_cb,
+            ui_mode=ui_mode,
+            cancel_checker=cancel_checker,
+        )
         _report = st.session_state.get('find_new_trades_report', {}) or {}
 
     report = _report
@@ -5076,7 +5125,7 @@ def _run_trade_finder_workflow(
     relaxed_settings['monthly_near_ao_floor'] = float(quality_settings.get('monthly_near_ao_floor', -0.25) or -0.25) - 0.20
     _t0 = time.time()
     _tf_progress = None
-    if not callable(ai_progress_cb):
+    if ui_mode and not callable(ai_progress_cb):
         _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(base_candidates)}")
     elif callable(ai_progress_cb):
         try:
@@ -5099,7 +5148,13 @@ def _run_trade_finder_workflow(
                 _tf_progress.progress(pct)
 
     for i, c in enumerate(base_candidates):
-        if bool(st.session_state.get('trade_finder_cancel_requested', False)):
+        _cancel_req = bool(st.session_state.get('trade_finder_cancel_requested', False))
+        if callable(cancel_checker):
+            try:
+                _cancel_req = _cancel_req or bool(cancel_checker())
+            except Exception:
+                pass
+        if _cancel_req:
             _cancelled = True
             break
         ticker = str(c.get('ticker', '')).upper().strip()
@@ -5521,6 +5576,88 @@ def _run_trade_finder_workflow(
     st.session_state['trade_finder_running'] = False
 
 
+def _start_trade_finder_background_run(*, rerank_only: bool = False) -> str:
+    """Start non-blocking Trade Finder run in a background thread."""
+    cleanup_background_jobs()
+    _ctx = get_script_run_ctx()
+
+    def _worker(find_cb, ai_cb, stream_cb, cancel_cb):
+        _run_trade_finder_workflow(
+            find_progress_cb=find_cb,
+            ai_progress_cb=ai_cb,
+            stream_rows_cb=stream_cb,
+            rerank_only=rerank_only,
+            ui_mode=False,
+            cancel_checker=cancel_cb,
+        )
+
+    _name = "tf_rerank_bg" if rerank_only else "tf_full_bg"
+    _job_id = start_background_trade_finder_job(_worker, script_ctx=_ctx, name=_name)
+    if _job_id:
+        st.session_state['trade_finder_bg_job_id'] = _job_id
+        st.session_state['trade_finder_running'] = True
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': (
+                "Background re-rank started."
+                if rerank_only else
+                "Background Trade Finder scan started."
+            ),
+            'ts': time.time(),
+        }
+    return str(_job_id or "")
+
+
+def _get_trade_finder_background_status() -> Dict[str, Any]:
+    _job_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    if not _job_id:
+        return {}
+    _job = get_background_job(_job_id) or {}
+    if not _job:
+        st.session_state.pop('trade_finder_bg_job_id', None)
+        return {}
+    _status = str(_job.get('status', '') or '').lower()
+    if _status in {"done", "failed", "canceled"}:
+        st.session_state['trade_finder_running'] = False
+        _last_terminal = str(st.session_state.get('_trade_finder_bg_last_terminal_job_id', '') or '')
+        if _last_terminal != _job_id:
+            if _status == "done":
+                _msg = "Background Trade Finder run complete."
+                _lvl = "success"
+            elif _status == "canceled":
+                _msg = "Background Trade Finder run canceled."
+                _lvl = "warning"
+            else:
+                _err = str(_job.get('error', '') or '').strip()
+                _msg = f"Background Trade Finder run failed: {_err}" if _err else "Background Trade Finder run failed."
+                _lvl = "error"
+            st.session_state['trade_finder_last_status'] = {
+                'level': _lvl,
+                'message': _msg,
+                'ts': time.time(),
+            }
+            st.session_state['_trade_finder_bg_last_terminal_job_id'] = _job_id
+    else:
+        st.session_state['trade_finder_running'] = True
+    return _job
+
+
+def _request_trade_finder_background_cancel() -> bool:
+    _job_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    if not _job_id:
+        return False
+    _ok = bool(cancel_background_job(_job_id))
+    if _ok:
+        st.session_state['trade_finder_cancel_requested'] = True
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': "Cancel requested. Background job will stop at the next checkpoint.",
+            'ts': time.time(),
+        }
+    return _ok
+
+
 def _render_green_on_red_sector_finder(
     source_rows: List[Dict[str, Any]],
     *,
@@ -5846,23 +5983,74 @@ def render_trade_finder_tab():
     if _scope_bits:
         st.caption("Active scope: " + " | ".join(_scope_bits))
 
-    _run_active = bool(st.session_state.get('trade_finder_running', False))
+    cleanup_background_jobs()
+    _bg_job = _get_trade_finder_background_status()
+    _bg_status = str((_bg_job or {}).get('status', '') or '').lower()
+    _bg_active = _bg_status == "running"
+    _run_active = bool(st.session_state.get('trade_finder_running', False)) or _bg_active
     _cancel_requested = bool(st.session_state.get('trade_finder_cancel_requested', False))
     _rc1, _rc2 = st.columns([4, 1])
     with _rc1:
-        if _run_active:
+        if _bg_active:
+            _find_pct = int((_bg_job or {}).get('find_pct', 0) or 0)
+            _find_txt = str((_bg_job or {}).get('find_text', '') or 'Find New running...')
+            _ai_pct = int((_bg_job or {}).get('ai_pct', 0) or 0)
+            _ai_txt = str((_bg_job or {}).get('ai_text', '') or 'AI ranking running...')
+            _processed = int((_bg_job or {}).get('processed', 0) or 0)
+            _total = int((_bg_job or {}).get('total', 0) or 0)
+            _pass = int((_bg_job or {}).get('hard_gate_pass', 0) or 0)
+            _ranked = int((_bg_job or {}).get('ai_ranked', 0) or 0)
+            st.warning("Background Trade Finder run active. UI remains responsive.")
+            st.progress(_find_pct, text=_find_txt)
+            st.progress(_ai_pct, text=_ai_txt)
+            st.caption(
+                f"Background progress: {_processed}/{_total} processed | "
+                f"hard-gate pass {_pass} | AI-ranked {_ranked}"
+            )
+            _preview_rows = (_bg_job or {}).get('preview_rows', []) or []
+            if _preview_rows:
+                _preview_df = pd.DataFrame(
+                    [
+                        {
+                            "Ticker": str(_r.get("ticker", "")).upper(),
+                            "Verdict": str(_r.get("ai_buy_recommendation", "")),
+                            "Score": round(float(_r.get("trade_score", 0.0) or 0.0), 2),
+                            "R:R": f"{float(_r.get('risk_reward', 0.0) or 0.0):.2f}:1",
+                            "Earn(d)": int(_r.get("earn_days", 999) or 999),
+                            "Sector": str(_r.get("sector", "") or "-"),
+                        }
+                        for _r in _preview_rows[:8]
+                    ]
+                )
+                st.dataframe(_preview_df, hide_index=True, width="stretch")
+            # Lightweight polling while background job is active.
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <script>
+                setTimeout(function () {
+                  try { window.parent.location.reload(); } catch (e) {}
+                }, 1800);
+                </script>
+                """,
+                height=0,
+            )
+        elif _run_active:
             st.warning("Trade Finder run is active. You can request stop; it will halt at the next safe checkpoint.")
         elif _cancel_requested:
             st.info("A cancel request is queued for the next running workflow.")
     with _rc2:
         if _run_active:
             if st.button("🛑 Cancel Run", key="tf_cancel_run_btn", width="stretch"):
-                st.session_state['trade_finder_cancel_requested'] = True
-                st.session_state['trade_finder_last_status'] = {
-                    'level': 'warning',
-                    'message': "Cancel requested. Trade Finder will stop at the next batch/checkpoint.",
-                    'ts': time.time(),
-                }
+                if _bg_active:
+                    _request_trade_finder_background_cancel()
+                else:
+                    st.session_state['trade_finder_cancel_requested'] = True
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'warning',
+                        'message': "Cancel requested. Trade Finder will stop at the next batch/checkpoint.",
+                        'ts': time.time(),
+                    }
                 st.rerun()
 
     with st.expander("🧠 Green-on-Red Sector Finder", expanded=False):
@@ -5978,19 +6166,30 @@ def render_trade_finder_tab():
             )
         st.rerun()
 
-    _b1, _b2 = st.columns([3, 2])
+    _b1, _b2, _b3 = st.columns([3, 2, 2])
     with _b1:
-        if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn"):
+        if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn", disabled=_run_active):
             _run_trade_finder_from_ui(rerank_only=False)
     with _b2:
         if st.button(
             "⚡ Re-rank Cached",
             width="stretch",
             key="tf_rerank_cached_btn",
-            disabled=not bool(_cached_report),
+            disabled=(not bool(_cached_report)) or _run_active,
             help="Re-ranks the existing Find New snapshot without any data fetch.",
         ):
             _run_trade_finder_from_ui(rerank_only=True)
+    with _b3:
+        if st.button(
+            "🧵 Run In Background",
+            width="stretch",
+            key="tf_run_background_btn",
+            disabled=_run_active,
+            help="Starts Trade Finder in a non-blocking background worker with live progress.",
+        ):
+            _job_id = _start_trade_finder_background_run(rerank_only=False)
+            if _job_id:
+                st.rerun()
 
     _last_status = st.session_state.get('trade_finder_last_status', {}) or {}
     _last_level = str(_last_status.get('level', 'info') or 'info').lower()
@@ -13127,8 +13326,9 @@ def _render_decision_contract(
                     st.rerun()
             elif not actionable and gate.allow_new_trades:
                 if st.button("🧭 Find New Trades Now", key="decision_contract_find_new", width="stretch"):
-                    with st.spinner("Running Trade Finder workflow..."):
-                        _run_trade_finder_workflow()
+                    _job_id = _start_trade_finder_background_run(rerank_only=False)
+                    if _job_id:
+                        st.info("Background Trade Finder run started.")
                     st.rerun()
             elif close_now:
                 if st.button("🛑 Auto-Manage Positions", key="decision_contract_auto_manage", width="stretch"):
@@ -13572,9 +13772,11 @@ def render_executive_dashboard():
             st.rerun()
     with c6:
         if st.button("🧭 Find New Trades", key="exec_find_new_trades", width="stretch"):
-            with st.spinner("Scanning all watchlists and ranking candidates..."):
-                _run_trade_finder_workflow()
-            st.success("Trade Finder updated from all watchlists.")
+            _job_id = _start_trade_finder_background_run(rerank_only=False)
+            if _job_id:
+                st.success("Background Trade Finder run started.")
+            else:
+                st.warning("Unable to start background Trade Finder run.")
             st.rerun()
 
     last_auto_ts = float(st.session_state.get('_auto_exit_last_ts', 0.0) or 0.0)
