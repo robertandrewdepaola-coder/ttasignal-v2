@@ -214,28 +214,6 @@
     "triggered_volume_ratio": 0
   },
   {
-    "ticker": "AEM",
-    "condition_type": "breakout_volume",
-    "trigger_price": 230.0,
-    "volume_multiplier": 1.5,
-    "stop_price": 209.0,
-    "target_price": 266.78,
-    "position_size_pct": 12.5,
-    "notes": "[Chart] resistance trigger $230.00 | $230 \u2014 Round number psychological level",
-    "conviction": 0,
-    "signal_type": "",
-    "quality_grade": "?",
-    "created_date": "2026-02-22",
-    "created_at": "2026-02-22T08:18:42.718997+00:00",
-    "updated_at": "2026-02-22T08:18:42.718997+00:00",
-    "expires_date": "2026-03-24",
-    "status": "PENDING",
-    "triggered_date": "",
-    "triggered_at": "",
-    "triggered_price": 0,
-    "triggered_volume_ratio": 0
-  },
-  {
     "ticker": "ORLA",
     "condition_type": "breakout_volume",
     "trigger_price": 20.05,
