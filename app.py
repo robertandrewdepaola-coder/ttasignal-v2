@@ -2734,6 +2734,53 @@ def _format_eta(seconds: float) -> str:
     return f"{h}h {m2}m"
 
 
+def _find_new_scope_signature_from_state() -> Dict[str, Any]:
+    """Scope knobs that change universe membership for Find New scans."""
+    _sectors = sorted(
+        [
+            str(x).strip()
+            for x in (st.session_state.get('find_new_selected_sectors', []) or [])
+            if str(x).strip()
+        ]
+    )
+    return {
+        'max_tickers': int(st.session_state.get('find_new_max_tickers', 0) or 0),
+        'in_rotation_only': bool(st.session_state.get('find_new_in_rotation_only', False)),
+        'include_unknown_sector': bool(st.session_state.get('find_new_include_unknown_sector', False)),
+        'selected_sectors': _sectors,
+    }
+
+
+def _find_new_scope_signature_from_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    _scope = (report or {}).get('scan_scope', {}) or {}
+    _sig = (report or {}).get('scope_signature', {}) or {}
+    _sig_sectors = _sig.get('selected_sectors', _scope.get('selected_sectors', []))
+    return {
+        'max_tickers': int(_sig.get('max_tickers', _scope.get('max_tickers', 0)) or 0),
+        'in_rotation_only': bool(
+            _sig.get('in_rotation_only', _scope.get('only_in_rotation', False))
+        ),
+        'include_unknown_sector': bool(
+            _sig.get('include_unknown_sector', _scope.get('include_unknown_sector', False))
+        ),
+        'selected_sectors': sorted(
+            [
+                str(x).strip()
+                for x in (_sig_sectors or [])
+                if str(x).strip()
+            ]
+        ),
+    }
+
+
+def _find_new_scope_unchanged(report: Dict[str, Any]) -> bool:
+    """True when current scope knobs match the snapshot scope."""
+    _report = report or {}
+    if not _report:
+        return False
+    return _find_new_scope_signature_from_report(_report) == _find_new_scope_signature_from_state()
+
+
 def _run_find_new_trades(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
@@ -2885,6 +2932,7 @@ def _run_find_new_trades(
             'scan_scope': {
                 'max_tickers': _max_tickers,
                 'only_in_rotation': _only_in_rotation,
+                'include_unknown_sector': _include_unknown_sector,
                 'selected_sectors': sorted(list(_selected_sectors)),
                 'cache_ttl_min': _cache_ttl_min,
                 'fetch_batch_size': _fetch_batch_size,
@@ -2893,6 +2941,7 @@ def _run_find_new_trades(
                 'requested_universe': len(ticker_sources),
                 'effective_universe': 0,
             },
+            'scope_signature': _find_new_scope_signature_from_state(),
         }
         st.session_state['find_new_trades_report'] = report
         st.session_state['_find_new_trades_ts'] = time.time()
@@ -3609,6 +3658,7 @@ def _run_find_new_trades(
         'scan_scope': {
             'max_tickers': _max_tickers,
             'only_in_rotation': _only_in_rotation,
+            'include_unknown_sector': _include_unknown_sector,
             'selected_sectors': sorted(list(_selected_sectors)),
             'cache_ttl_min': _cache_ttl_min,
             'fetch_batch_size': _fetch_batch_size,
@@ -3617,6 +3667,7 @@ def _run_find_new_trades(
             'requested_universe': len(ticker_sources),
             'effective_universe': len(universe),
         },
+        'scope_signature': _find_new_scope_signature_from_state(),
         'interrupted': bool(_cancelled),
     }
     st.session_state['find_new_trades_report'] = report
@@ -6509,6 +6560,7 @@ def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
     _pending_gate = st.session_state.pop('trade_gate_pending_apply', None)
     if isinstance(_pending_gate, dict) and _pending_gate:
+        _auto_rerank_note = ""
         try:
             _applied_max = float(
                 _pending_gate.get('trade_breakout_max_dist_pct', st.session_state.get('trade_breakout_max_dist_pct', 4.0))
@@ -6528,9 +6580,24 @@ def render_trade_finder_tab():
                 'trade_monthly_near_ao_floor': _applied_ao,
                 'applied_ts': today_utc_str(),
             }
+            _cached_report = st.session_state.get('find_new_trades_report', {}) or {}
+            _can_rerank_cached = bool(
+                _cached_report
+                and int(_cached_report.get('results_count', 0) or 0) > 0
+                and _find_new_scope_unchanged(_cached_report)
+            )
+            if _can_rerank_cached:
+                st.session_state['trade_gate_auto_rerank_requested'] = True
+                st.session_state['trade_gate_auto_rerank_requested_ts'] = time.time()
+                _auto_rerank_note = " Filters applied. Starting cached re-rank automatically (no rescan)."
+            else:
+                st.session_state.pop('trade_gate_auto_rerank_requested', None)
+                _auto_rerank_note = " Filters applied. Cached rerank skipped (scope changed or no cached analysis rows)."
         except Exception:
             pass
         _pending_reason = str(_pending_gate.get('_reason', '') or '').strip()
+        if _auto_rerank_note:
+            _pending_reason = f"{_pending_reason}{_auto_rerank_note}".strip()
         if _pending_reason:
             st.session_state['trade_gate_pending_notice'] = _pending_reason
 
@@ -6658,6 +6725,17 @@ def render_trade_finder_tab():
     _bg_preview_rows = (_bg_job or {}).get('preview_rows', []) or []
     _run_active = bool(st.session_state.get('trade_finder_running', False)) or _bg_active
     _cancel_requested = bool(st.session_state.get('trade_finder_cancel_requested', False))
+    if bool(st.session_state.get('trade_gate_auto_rerank_requested', False)):
+        _queued_job = _start_trade_finder_background_run(rerank_only=True, queue_if_running=True)
+        if _queued_job:
+            st.session_state.pop('trade_gate_auto_rerank_requested', None)
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'info',
+                'message': "Auto-calibrated filters applied. Cached re-rank started/queued (no rescan).",
+                'ts': time.time(),
+            }
+            st.rerun()
+
     _rc1, _rc2 = st.columns([4, 1])
     with _rc1:
         if _bg_active:
@@ -6681,9 +6759,33 @@ def render_trade_finder_tab():
             _fetch_cooldown = int((_bg_job or {}).get('fetch_cooldown_sec', 0) or 0)
             _fetch_gov = float((_bg_job or {}).get('fetch_governor_interval_sec', 0.08) or 0.08)
             _fetch_req = int((_bg_job or {}).get('fetch_requests_last_1s', 0) or 0)
+            _fetch_pct = int(round((100.0 * _fetched_done / max(1, _fetched_total)))) if _fetched_total > 0 else 0
+            _analysis_pct = int(round((100.0 * _analysis_done / max(1, _analysis_total)))) if _analysis_total > 0 else 0
+            _rank_pct = int(round((100.0 * _processed / max(1, _total)))) if _total > 0 else 0
+            _phase_label = {
+                'queued': 'Queued',
+                'find_scope': 'Scope',
+                'find_fetch': 'Fetch',
+                'find_analyze': 'Analyze',
+                'ai_seed': 'Seed',
+                'ai_rank': 'AI Rank',
+                'done': 'Done',
+                'canceled': 'Canceled',
+            }.get(_phase, (_phase or 'running').replace('_', ' ').title())
+            _overall_pct = int(round((_find_pct * 0.6) + (_ai_pct * 0.4)))
             st.warning("Background Trade Finder run active. UI remains responsive.")
+            st.progress(
+                max(0, min(100, _overall_pct)),
+                text=(
+                    f"Overall {_overall_pct}% | phase {_phase_label} | "
+                    f"elapsed {_format_eta(_elapsed_sec)} | ETA {_format_eta(_eta_sec)}"
+                ),
+            )
             st.progress(_find_pct, text=_find_txt)
             st.progress(_ai_pct, text=_ai_txt)
+            st.progress(_fetch_pct, text=f"Fetch {_fetched_done}/{_fetched_total} ({_fetch_pct}%)")
+            st.progress(_analysis_pct, text=f"Analyze {_analysis_done}/{_analysis_total} ({_analysis_pct}%)")
+            st.progress(_rank_pct, text=f"Rank {_processed}/{_total} ({_rank_pct}%)")
             st.caption(
                 f"Background progress: {_processed}/{_total} processed | "
                 f"hard-gate pass {_pass} | AI-ranked {_ranked}"
@@ -6761,10 +6863,12 @@ def render_trade_finder_tab():
     _cached_is_fresh = bool(_cached_age is not None and _cached_age <= _cached_ttl_sec)
     _cached_analyzed = int(_cached_report.get('results_count', 0) or 0)
     _cached_candidates = int(_cached_report.get('candidate_count', 0) or 0)
+    _cached_scope_match = _find_new_scope_unchanged(_cached_report) if _cached_report else False
     if _cached_ts:
         st.caption(
             f"Cached Find New snapshot: analyzed={_cached_analyzed}, candidates={_cached_candidates}, "
-            f"age={_format_eta(_cached_age or 0)} ({'fresh' if _cached_is_fresh else 'stale'})."
+            f"age={_format_eta(_cached_age or 0)} ({'fresh' if _cached_is_fresh else 'stale'}) | "
+            f"scope {'match' if _cached_scope_match else 'changed'}."
         )
     else:
         st.caption("Cached Find New snapshot: none yet.")
@@ -6868,8 +6972,16 @@ def render_trade_finder_tab():
             width="stretch",
             key="tf_find_btn",
             disabled=(_run_active or bool(_data_gate.get('hard_block', False))),
+            help="Starts a non-blocking background full scan with live phase progress and ETA.",
         ):
-            _run_trade_finder_from_ui(rerank_only=False)
+            _job_id = _start_trade_finder_background_run(rerank_only=False)
+            if _job_id:
+                st.rerun()
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': "Unable to start background Trade Finder run.",
+                'ts': time.time(),
+            }
     with _b2:
         _rerank_label = "🕒 Queue Re-rank" if _bg_full_active else "⚡ Re-rank Cached"
         _rerank_help = (
@@ -6893,18 +7005,34 @@ def render_trade_finder_tab():
                 }
                 st.rerun()
             else:
-                _run_trade_finder_from_ui(rerank_only=True)
+                _job_id = _start_trade_finder_background_run(rerank_only=True)
+                if _job_id:
+                    st.rerun()
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'warning',
+                    'message': "Unable to start background re-rank.",
+                    'ts': time.time(),
+                }
     with _b3:
         if st.button(
-            "🧵 Run In Background",
+            "⏹ Stop + Clear Queue",
             width="stretch",
-            key="tf_run_background_btn",
-            disabled=(_run_active or bool(_data_gate.get('hard_block', False))),
-            help="Starts Trade Finder in a non-blocking background worker with live progress.",
+            key="tf_stop_clear_queue_btn",
+            disabled=(not _run_active),
+            help="Requests stop at next safe checkpoint and clears queued reranks/auto-rerank requests.",
         ):
-            _job_id = _start_trade_finder_background_run(rerank_only=False)
-            if _job_id:
-                st.rerun()
+            if _bg_active:
+                _request_trade_finder_background_cancel()
+            else:
+                st.session_state['trade_finder_cancel_requested'] = True
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'warning',
+                    'message': "Stop requested. Foreground workflow will halt at the next checkpoint.",
+                    'ts': time.time(),
+                }
+            st.session_state['trade_finder_bg_rerank_queued'] = False
+            st.session_state.pop('trade_gate_auto_rerank_requested', None)
+            st.rerun()
         if _bg_active and _bg_preview_rows:
             if st.button(
                 "✅ Use Best Current Results Now",
