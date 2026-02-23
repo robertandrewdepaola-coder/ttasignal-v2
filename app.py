@@ -953,6 +953,25 @@ if 'trade_finder_results' not in st.session_state:
     except Exception:
         pass
 
+if '_trade_finder_bg_recovered' not in st.session_state:
+    st.session_state['_trade_finder_bg_recovered'] = True
+    try:
+        _bg_state = get_journal().load_trade_finder_bg_state() or {}
+        if isinstance(_bg_state, dict) and _bg_state:
+            st.session_state['_trade_finder_bg_persisted'] = _bg_state
+            _bg_status = str(_bg_state.get('status', '') or '').lower()
+            if _bg_status == "running":
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'warning',
+                    'message': (
+                        "Recovered Trade Finder background progress from last session. "
+                        "Previous job was interrupted by reload/reboot; start a new run to continue."
+                    ),
+                    'ts': time.time(),
+                }
+    except Exception:
+        pass
+
 
 # =============================================================================
 # =============================================================================
@@ -2701,6 +2720,7 @@ def _format_eta(seconds: float) -> str:
 
 def _run_find_new_trades(
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
     *,
     ui_mode: bool = True,
     cancel_checker: Optional[Callable[[], bool]] = None,
@@ -2847,6 +2867,27 @@ def _run_find_new_trades(
             f"requested={len(ticker_sources)} effective=0",
             source="find_new",
         )
+        if callable(stream_rows_cb):
+            try:
+                stream_rows_cb(
+                    [],
+                    {
+                        'phase': 'find_scope',
+                        'scoped_total': 0,
+                        'fetched_done': 0,
+                        'fetched_total': 0,
+                        'analysis_done': 0,
+                        'analysis_total': 0,
+                        'processed': 0,
+                        'total': 0,
+                        'hard_gate_pass': 0,
+                        'ai_ranked': 0,
+                        'eta_sec': 0.0,
+                        'run_elapsed_sec': 0.0,
+                    },
+                )
+            except Exception:
+                pass
         return
 
     _progress = None
@@ -2867,6 +2908,39 @@ def _run_find_new_trades(
                 _progress.progress(_pct)
                 st.sidebar.caption(text)
 
+    def _emit_find_metrics(
+        *,
+        phase: str,
+        scoped_total: int = 0,
+        fetched_done: int = 0,
+        fetched_total: int = 0,
+        analysis_done: int = 0,
+        analysis_total: int = 0,
+        eta_sec: float = 0.0,
+    ) -> None:
+        if not callable(stream_rows_cb):
+            return
+        try:
+            stream_rows_cb(
+                [],
+                {
+                    'phase': str(phase or 'find'),
+                    'scoped_total': int(scoped_total or 0),
+                    'fetched_done': int(fetched_done or 0),
+                    'fetched_total': int(fetched_total or 0),
+                    'analysis_done': int(analysis_done or 0),
+                    'analysis_total': int(analysis_total or 0),
+                    'processed': int(analysis_done or 0),
+                    'total': int(analysis_total or 0),
+                    'hard_gate_pass': 0,
+                    'ai_ranked': 0,
+                    'eta_sec': float(eta_sec or 0.0),
+                    'run_elapsed_sec': max(0.0, time.time() - _start),
+                },
+            )
+        except Exception:
+            pass
+
     _start = time.time()
     _scan_ctx = st.spinner(f"Finding new trades across {len(universe)} tickers...") if ui_mode else nullcontext()
     with _scan_ctx:
@@ -2877,6 +2951,15 @@ def _run_find_new_trades(
             source="find_new",
         )
         _set_find_progress(5, f"Scope ready: {len(universe)} tickers")
+        _emit_find_metrics(
+            phase='find_scope',
+            scoped_total=len(universe),
+            fetched_done=0,
+            fetched_total=len(universe),
+            analysis_done=0,
+            analysis_total=0,
+            eta_sec=0.0,
+        )
         # Reuse incremental Trade Finder cache first, then fresh scanner cache; fetch only stale/missing.
         all_data: Dict[str, Dict[str, Any]] = {}
         _now = time.time()
@@ -2914,6 +2997,15 @@ def _run_find_new_trades(
                 f"Reused cache for {len(all_data)}/{len(universe)} "
                 f"(TF {_filtered_counts['cache_reused_find']}, scanner {_filtered_counts['cache_reused_scan']})",
             )
+            _emit_find_metrics(
+                phase='find_fetch',
+                scoped_total=len(universe),
+                fetched_done=len(all_data),
+                fetched_total=len(universe),
+                analysis_done=0,
+                analysis_total=0,
+                eta_sec=0.0,
+            )
         _cancelled = False
         if missing:
             missing_total = len(missing)
@@ -2934,6 +3026,15 @@ def _run_find_new_trades(
                     15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45),
                     f"Fetching batch {_batch_idx}/{_batch_count} ({len(_batch)} tickers)...",
                 )
+                _emit_find_metrics(
+                    phase='find_fetch',
+                    scoped_total=len(universe),
+                    fetched_done=len(all_data),
+                    fetched_total=len(universe),
+                    analysis_done=0,
+                    analysis_total=0,
+                    eta_sec=0.0,
+                )
 
                 def _find_progress_cb(i: int, total: int, ticker: str) -> bool:
                     if _cancel_flag():
@@ -2951,6 +3052,15 @@ def _run_find_new_trades(
                         f"Fetching {_global_done}/{missing_total} — {ticker} "
                         f"| ETA {_format_eta(_eta_sec)}",
                     )
+                    _emit_find_metrics(
+                        phase='find_fetch',
+                        scoped_total=len(universe),
+                        fetched_done=min(len(universe), len(all_data) + max(0, _global_done)),
+                        fetched_total=len(universe),
+                        analysis_done=0,
+                        analysis_total=0,
+                        eta_sec=float(_eta_sec or 0.0),
+                    )
                     return True
 
                 _fetched_batch = fetch_scan_data(_batch, progress_cb=_find_progress_cb)
@@ -2966,6 +3076,15 @@ def _run_find_new_trades(
                     _pct_done,
                     f"Fetched {_processed_missing}/{missing_total} missing tickers "
                     f"(live {_fetched_live}) | ETA {_format_eta(_eta_sec)}",
+                )
+                _emit_find_metrics(
+                    phase='find_fetch',
+                    scoped_total=len(universe),
+                    fetched_done=min(len(universe), len(all_data)),
+                    fetched_total=len(universe),
+                    analysis_done=0,
+                    analysis_total=0,
+                    eta_sec=float(_eta_sec or 0.0),
                 )
                 if len(_fetched_batch) < len(_batch):
                     _cancelled = True
@@ -2983,6 +3102,15 @@ def _run_find_new_trades(
                         "Continuing with partial results."
                     )
         _set_find_progress(63, "Analyzing trade candidates...")
+        _emit_find_metrics(
+            phase='find_analyze',
+            scoped_total=len(universe),
+            fetched_done=len(all_data),
+            fetched_total=len(universe),
+            analysis_done=0,
+            analysis_total=0,
+            eta_sec=0.0,
+        )
         _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
         results = scan_watchlist(all_data, macd_profile=_macd_profile)
         # Reuse scan-time price history for Trade Finder chart opens to avoid
@@ -3082,7 +3210,8 @@ def _run_find_new_trades(
         rows = []
         candidates = []
         _set_find_progress(92, "Scoring opportunities...")
-        for r in results:
+        _analysis_total = len(results)
+        for _ri, r in enumerate(results):
             if _cancel_flag():
                 _cancelled = True
                 break
@@ -3287,6 +3416,20 @@ def _run_find_new_trades(
                     'watchlists': row['watchlists'],
                     'score': round(score, 2),
                 })
+            if (_ri + 1) % 25 == 0 or (_ri + 1) == _analysis_total:
+                _elapsed_an = max(0.001, time.time() - _start)
+                _rate_an = float(_ri + 1) / _elapsed_an if (_ri + 1) > 0 else 0.0
+                _remain_an = max(0, _analysis_total - (_ri + 1))
+                _eta_an = (_remain_an / _rate_an) if _rate_an > 0 else 0.0
+                _emit_find_metrics(
+                    phase='find_analyze',
+                    scoped_total=len(universe),
+                    fetched_done=len(all_data),
+                    fetched_total=len(universe),
+                    analysis_done=_ri + 1,
+                    analysis_total=_analysis_total,
+                    eta_sec=float(_eta_an or 0.0),
+                )
 
         # Candidate-focused earnings backfill:
         # run slower per-ticker verification only for top candidates still missing dates.
@@ -3347,6 +3490,15 @@ def _run_find_new_trades(
             _set_find_progress(100, f"Find New interrupted: {len(candidates)} candidates from partial run")
         else:
             _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
+        _emit_find_metrics(
+            phase='find_done',
+            scoped_total=len(universe),
+            fetched_done=len(all_data),
+            fetched_total=len(universe),
+            analysis_done=len(results),
+            analysis_total=len(results),
+            eta_sec=0.0,
+        )
 
     elapsed = max(0.0, time.time() - _start)
     report = {
@@ -5056,6 +5208,7 @@ def _run_trade_finder_workflow(
         }
         _run_find_new_trades(
             progress_cb=find_progress_cb,
+            stream_rows_cb=stream_rows_cb,
             ui_mode=ui_mode,
             cancel_checker=cancel_checker,
         )
@@ -5102,6 +5255,44 @@ def _run_trade_finder_workflow(
         st.session_state['trade_finder_running'] = False
         return
 
+    if callable(stream_rows_cb):
+        try:
+            _seed_preview = []
+            for _bc in base_candidates[:10]:
+                _seed_preview.append(
+                    {
+                        'ticker': str(_bc.get('ticker', '')).upper().strip(),
+                        'company_name': str(_bc.get('company_name', '') or '').strip() or "Unknown company",
+                        'price': float(_bc.get('price', 0) or 0),
+                        'ai_buy_recommendation': str(_bc.get('recommendation', 'Watch Only') or 'Watch Only'),
+                        'risk_reward': 0.0,
+                        'trade_score': float(_bc.get('score', 0.0) or 0.0),
+                        'rank_score': float(_bc.get('score', 0.0) or 0.0),
+                        'earn_days': int(_bc.get('earn_days', 999) or 999),
+                        'sector': str(_bc.get('sector', '') or '-'),
+                        'source': 'find_new_seed',
+                    }
+                )
+            stream_rows_cb(
+                _seed_preview,
+                {
+                    'phase': 'ai_seed',
+                    'processed': 0,
+                    'total': int(len(base_candidates)),
+                    'hard_gate_pass': 0,
+                    'ai_ranked': 0,
+                    'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                    'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                    'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                    'eta_sec': 0.0,
+                    'run_elapsed_sec': 0.0,
+                },
+            )
+        except Exception:
+            pass
+
     ai_clients = _get_ai_clients()
     snap = _build_dashboard_snapshot()
     gate = _evaluate_trade_gate(snap)
@@ -5135,7 +5326,11 @@ def _run_trade_finder_workflow(
 
     def _set_tf_progress(i: int, total: int, ticker: str):
         pct = int((max(0, i) / max(1, total)) * 100)
-        _txt = f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker}"
+        _elapsed = max(0.001, time.time() - _t0)
+        _rate = float(i) / _elapsed if i > 0 else 0.0
+        _remain = max(0, total - i)
+        _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+        _txt = f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker} | ETA {_format_eta(_eta_sec)}"
         if callable(ai_progress_cb):
             try:
                 ai_progress_cb(pct, _txt)
@@ -5469,6 +5664,10 @@ def _run_trade_finder_workflow(
             fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
         if callable(stream_rows_cb) and ((i + 1) % 5 == 0 or (i + 1) == len(base_candidates)):
             try:
+                _elapsed = max(0.001, time.time() - _t0)
+                _rate = float(i + 1) / _elapsed if (i + 1) > 0 else 0.0
+                _remain = max(0, len(base_candidates) - (i + 1))
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
                 _preview = sorted(
                     rows,
                     key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
@@ -5477,10 +5676,49 @@ def _run_trade_finder_workflow(
                 stream_rows_cb(
                     _preview,
                     {
+                        'phase': 'ai_rank',
                         'processed': int(i + 1),
                         'total': int(len(base_candidates)),
                         'hard_gate_pass': int(hard_gate_pass_count),
                         'ai_ranked': int(ai_ranked_count),
+                        'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                        'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                        'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                        'eta_sec': float(_eta_sec or 0.0),
+                        'run_elapsed_sec': float(_elapsed or 0.0),
+                        'cancelled': bool(_cancelled),
+                    },
+                )
+            except Exception:
+                pass
+        elif callable(stream_rows_cb) and i == 0:
+            try:
+                _elapsed = max(0.001, time.time() - _t0)
+                _rate = 1.0 / _elapsed if _elapsed > 0 else 0.0
+                _remain = max(0, len(base_candidates) - 1)
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                _preview = sorted(
+                    rows,
+                    key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+                    reverse=True,
+                )[:8]
+                stream_rows_cb(
+                    _preview,
+                    {
+                        'phase': 'ai_rank',
+                        'processed': 1,
+                        'total': int(len(base_candidates)),
+                        'hard_gate_pass': int(hard_gate_pass_count),
+                        'ai_ranked': int(ai_ranked_count),
+                        'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                        'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                        'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                        'eta_sec': float(_eta_sec or 0.0),
+                        'run_elapsed_sec': float(_elapsed or 0.0),
                         'cancelled': bool(_cancelled),
                     },
                 )
@@ -5499,6 +5737,28 @@ def _run_trade_finder_workflow(
     )
     qualified_count = sum(1 for _r in rows if _trade_candidate_is_qualified(_r, quality_settings))
     elapsed = max(0.0, time.time() - _t0)
+    if callable(stream_rows_cb):
+        try:
+            stream_rows_cb(
+                rows[:8],
+                {
+                    'phase': 'done' if not _cancelled else 'canceled',
+                    'processed': int(len(base_candidates)),
+                    'total': int(len(base_candidates)),
+                    'hard_gate_pass': int(hard_gate_pass_count),
+                    'ai_ranked': int(ai_ranked_count),
+                    'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                    'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                    'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                    'eta_sec': 0.0,
+                    'run_elapsed_sec': float(elapsed),
+                    'cancelled': bool(_cancelled),
+                },
+            )
+        except Exception:
+            pass
     st.session_state['trade_finder_results'] = {
         'run_id': run_id,
         'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -5585,6 +5845,41 @@ def _trade_finder_bg_mode(job: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def _persist_trade_finder_bg_state(state: Optional[Dict[str, Any]]) -> None:
+    """Persist compact Trade Finder background status for restart visibility."""
+    _state = dict(state or {})
+    if not _state:
+        return
+    _safe = {
+        'job_id': str(_state.get('id', '') or _state.get('job_id', '') or ''),
+        'name': str(_state.get('name', '') or ''),
+        'status': str(_state.get('status', '') or ''),
+        'status_text': str(_state.get('status_text', '') or ''),
+        'phase': str(_state.get('phase', '') or ''),
+        'find_pct': int(_state.get('find_pct', 0) or 0),
+        'ai_pct': int(_state.get('ai_pct', 0) or 0),
+        'processed': int(_state.get('processed', 0) or 0),
+        'total': int(_state.get('total', 0) or 0),
+        'hard_gate_pass': int(_state.get('hard_gate_pass', 0) or 0),
+        'ai_ranked': int(_state.get('ai_ranked', 0) or 0),
+        'scoped_total': int(_state.get('scoped_total', 0) or 0),
+        'fetched_done': int(_state.get('fetched_done', 0) or 0),
+        'fetched_total': int(_state.get('fetched_total', 0) or 0),
+        'analysis_done': int(_state.get('analysis_done', 0) or 0),
+        'analysis_total': int(_state.get('analysis_total', 0) or 0),
+        'eta_sec': float(_state.get('eta_sec', 0.0) or 0.0),
+        'run_elapsed_sec': float(_state.get('run_elapsed_sec', 0.0) or 0.0),
+        'created_ts': float(_state.get('created_ts', time.time()) or time.time()),
+        'updated_ts': float(_state.get('updated_ts', time.time()) or time.time()),
+        'done_ts': float(_state.get('done_ts', 0.0) or 0.0),
+    }
+    st.session_state['_trade_finder_bg_persisted'] = _safe
+    try:
+        get_journal().save_trade_finder_bg_state(_safe)
+    except Exception:
+        pass
+
+
 def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_running: bool = True) -> str:
     """Start non-blocking Trade Finder run in a background thread.
 
@@ -5602,6 +5897,7 @@ def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_ru
         st.session_state['trade_finder_running'] = True
         st.session_state['trade_finder_cancel_requested'] = False
         st.session_state['trade_finder_bg_job_id'] = _active_id
+        _persist_trade_finder_bg_state(_active_job)
         if queue_if_running and rerank_only and _active_mode == "full":
             st.session_state['trade_finder_bg_rerank_queued'] = True
             _msg = "Background full scan already running. Re-rank queued for auto-start on completion."
@@ -5647,17 +5943,48 @@ def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_ru
             ),
             'ts': time.time(),
         }
+        _persist_trade_finder_bg_state({
+            'id': _job_id,
+            'name': _name,
+            'status': 'running',
+            'status_text': (
+                "Background re-rank started."
+                if rerank_only else
+                "Background Trade Finder scan started."
+            ),
+            'phase': 'queued',
+            'find_pct': 0,
+            'ai_pct': 0,
+            'processed': 0,
+            'total': 0,
+            'hard_gate_pass': 0,
+            'ai_ranked': 0,
+            'created_ts': time.time(),
+            'updated_ts': time.time(),
+        })
     return str(_job_id or "")
 
 
 def _get_trade_finder_background_status() -> Dict[str, Any]:
     _job_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
     if not _job_id:
-        return {}
+        _persisted = st.session_state.get('_trade_finder_bg_persisted', {}) or {}
+        return dict(_persisted) if isinstance(_persisted, dict) else {}
     _job = get_background_job(_job_id) or {}
     if not _job:
+        _persisted = {
+            'id': _job_id,
+            'name': str(st.session_state.get('trade_finder_bg_last_started_mode', '') or ''),
+            'status': 'interrupted',
+            'status_text': 'Background worker not found (likely interrupted by app reload/reboot).',
+            'updated_ts': time.time(),
+            'done_ts': time.time(),
+        }
+        _persist_trade_finder_bg_state(_persisted)
+        st.session_state['trade_finder_running'] = False
+        st.session_state['trade_finder_cancel_requested'] = False
         st.session_state.pop('trade_finder_bg_job_id', None)
-        return {}
+        return _persisted
     _status = str(_job.get('status', '') or '').lower()
     if _status in {"done", "failed", "canceled"}:
         st.session_state['trade_finder_running'] = False
@@ -5695,6 +6022,7 @@ def _get_trade_finder_background_status() -> Dict[str, Any]:
                     _job = get_background_job(_next_job) or {}
     else:
         st.session_state['trade_finder_running'] = True
+    _persist_trade_finder_bg_state(_job)
     return _job
 
 
@@ -5711,6 +6039,12 @@ def _request_trade_finder_background_cancel() -> bool:
             'message': "Cancel requested. Background job will stop at the next checkpoint.",
             'ts': time.time(),
         }
+        _persist_trade_finder_bg_state({
+            'id': _job_id,
+            'status': 'cancel_requested',
+            'status_text': "Cancel requested. Waiting for checkpoint.",
+            'updated_ts': time.time(),
+        })
     return _ok
 
 
@@ -6055,6 +6389,7 @@ def render_trade_finder_tab():
     _bg_mode = _trade_finder_bg_mode(_bg_job)
     _bg_full_active = bool(_bg_status == "running" and _bg_mode == "full")
     _bg_active = _bg_status == "running"
+    _bg_preview_rows = (_bg_job or {}).get('preview_rows', []) or []
     _run_active = bool(st.session_state.get('trade_finder_running', False)) or _bg_active
     _cancel_requested = bool(st.session_state.get('trade_finder_cancel_requested', False))
     _rc1, _rc2 = st.columns([4, 1])
@@ -6068,6 +6403,14 @@ def render_trade_finder_tab():
             _total = int((_bg_job or {}).get('total', 0) or 0)
             _pass = int((_bg_job or {}).get('hard_gate_pass', 0) or 0)
             _ranked = int((_bg_job or {}).get('ai_ranked', 0) or 0)
+            _phase = str((_bg_job or {}).get('phase', '') or '').strip()
+            _scoped_total = int((_bg_job or {}).get('scoped_total', 0) or 0)
+            _fetched_done = int((_bg_job or {}).get('fetched_done', 0) or 0)
+            _fetched_total = int((_bg_job or {}).get('fetched_total', 0) or 0)
+            _analysis_done = int((_bg_job or {}).get('analysis_done', 0) or 0)
+            _analysis_total = int((_bg_job or {}).get('analysis_total', 0) or 0)
+            _eta_sec = float((_bg_job or {}).get('eta_sec', 0.0) or 0.0)
+            _elapsed_sec = float((_bg_job or {}).get('run_elapsed_sec', 0.0) or 0.0)
             st.warning("Background Trade Finder run active. UI remains responsive.")
             st.progress(_find_pct, text=_find_txt)
             st.progress(_ai_pct, text=_ai_txt)
@@ -6075,8 +6418,12 @@ def render_trade_finder_tab():
                 f"Background progress: {_processed}/{_total} processed | "
                 f"hard-gate pass {_pass} | AI-ranked {_ranked}"
             )
-            _preview_rows = (_bg_job or {}).get('preview_rows', []) or []
-            if _preview_rows:
+            st.caption(
+                f"Scope {_scoped_total} | fetched {_fetched_done}/{_fetched_total} | "
+                f"analyzed {_analysis_done}/{_analysis_total} | "
+                f"phase {(_phase or 'n/a')} | elapsed {_format_eta(_elapsed_sec)} | ETA {_format_eta(_eta_sec)}"
+            )
+            if _bg_preview_rows:
                 _preview_df = pd.DataFrame(
                     [
                         {
@@ -6087,7 +6434,7 @@ def render_trade_finder_tab():
                             "Earn(d)": int(_r.get("earn_days", 999) or 999),
                             "Sector": str(_r.get("sector", "") or "-"),
                         }
-                        for _r in _preview_rows[:8]
+                        for _r in _bg_preview_rows[:8]
                     ]
                 )
                 st.dataframe(_preview_df, hide_index=True, width="stretch")
@@ -6105,6 +6452,10 @@ def render_trade_finder_tab():
             )
         elif _run_active:
             st.warning("Trade Finder run is active. You can request stop; it will halt at the next safe checkpoint.")
+        elif _bg_status == "interrupted":
+            _bg_upd = float((_bg_job or {}).get('updated_ts', 0.0) or 0.0)
+            _when = _fmt_last_update(_bg_upd, fallback="unknown")
+            st.warning(f"Recovered interrupted background run ({_when}). Start a new run to continue.")
         elif _cancel_requested:
             st.info("A cancel request is queued for the next running workflow.")
     with _rc2:
@@ -6272,6 +6623,32 @@ def render_trade_finder_tab():
         ):
             _job_id = _start_trade_finder_background_run(rerank_only=False)
             if _job_id:
+                st.rerun()
+        if _bg_active and _bg_preview_rows:
+            if st.button(
+                "✅ Use Best Current Results Now",
+                key="tf_use_best_current_now_btn",
+                width="stretch",
+                help="Load current background preview into Trade Finder cards/table immediately while run continues.",
+            ):
+                _curr = st.session_state.get('trade_finder_results', {}) or {}
+                st.session_state['trade_finder_results'] = {
+                    'run_id': str(_curr.get('run_id', '') or str((_bg_job or {}).get('id', '') or 'bg_live')),
+                    'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'rows': list(_bg_preview_rows),
+                    'provider': str(_curr.get('provider', 'system') or 'system'),
+                    'run_mode': 'background_preview',
+                    'elapsed_sec': float((_bg_job or {}).get('run_elapsed_sec', 0.0) or 0.0),
+                    'input_candidates': int((_bg_job or {}).get('total', 0) or len(_bg_preview_rows)),
+                }
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'info',
+                    'message': (
+                        f"Loaded {len(_bg_preview_rows)} live preview row(s). "
+                        "Background run is still active and will keep improving results."
+                    ),
+                    'ts': time.time(),
+                }
                 st.rerun()
 
     _last_status = st.session_state.get('trade_finder_last_status', {}) or {}

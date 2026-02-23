@@ -290,6 +290,7 @@ class JournalManager:
         self.scan_results_file = self.data_dir / "v2_last_scan.json"
         self.planned_trades_file = self.data_dir / "v2_planned_trades.json"
         self.trade_finder_snapshot_file = self.data_dir / "v2_trade_finder_snapshot.json"
+        self.trade_finder_bg_state_file = self.data_dir / "v2_trade_finder_bg_state.json"
 
         self.watchlist: List[Dict] = self._load(self.watchlist_file, [])
         if not isinstance(self.watchlist, list):
@@ -1144,6 +1145,17 @@ class JournalManager:
     def load_trade_finder_snapshot(self) -> Optional[Dict]:
         """Load latest Trade Finder snapshot payload or None."""
         data = self._load(self.trade_finder_snapshot_file, None)
+        return data if isinstance(data, dict) else None
+
+    def save_trade_finder_bg_state(self, state: Dict[str, Any]):
+        """Persist lightweight background Trade Finder state for restart recovery."""
+        payload = dict(state or {})
+        payload['updated_at'] = now_utc_str()
+        self._save(self.trade_finder_bg_state_file, payload)
+
+    def load_trade_finder_bg_state(self) -> Optional[Dict[str, Any]]:
+        """Load last persisted background Trade Finder state."""
+        data = self._load(self.trade_finder_bg_state_file, None)
         return data if isinstance(data, dict) else None
 
     def get_all_tracked_tickers(self) -> Dict[str, str]:

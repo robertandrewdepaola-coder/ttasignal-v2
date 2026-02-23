@@ -95,6 +95,14 @@ def start_trade_finder_job(worker: JobWorker, *, script_ctx: Any = None, name: s
             "total": 0,
             "hard_gate_pass": 0,
             "ai_ranked": 0,
+            "phase": "queued",
+            "scoped_total": 0,
+            "fetched_done": 0,
+            "fetched_total": 0,
+            "analysis_done": 0,
+            "analysis_total": 0,
+            "eta_sec": 0.0,
+            "run_elapsed_sec": 0.0,
             "preview_rows": [],
             "cancel_requested": False,
             "error": "",
@@ -124,13 +132,24 @@ def start_trade_finder_job(worker: JobWorker, *, script_ctx: Any = None, name: s
         _set_job_fields(ai_pct=max(0, min(100, int(pct))), ai_text=str(text or ""))
 
     def _stream_rows_cb(rows: list[dict[str, Any]], meta: dict[str, Any]) -> None:
-        _set_job_fields(
-            preview_rows=list(rows or [])[:10],
-            processed=int((meta or {}).get("processed", 0) or 0),
-            total=int((meta or {}).get("total", 0) or 0),
-            hard_gate_pass=int((meta or {}).get("hard_gate_pass", 0) or 0),
-            ai_ranked=int((meta or {}).get("ai_ranked", 0) or 0),
-        )
+        _meta = dict(meta or {})
+        _payload: Dict[str, Any] = {
+            "processed": int(_meta.get("processed", 0) or 0),
+            "total": int(_meta.get("total", 0) or 0),
+            "hard_gate_pass": int(_meta.get("hard_gate_pass", 0) or 0),
+            "ai_ranked": int(_meta.get("ai_ranked", 0) or 0),
+            "phase": str(_meta.get("phase", "") or ""),
+            "scoped_total": int(_meta.get("scoped_total", 0) or 0),
+            "fetched_done": int(_meta.get("fetched_done", 0) or 0),
+            "fetched_total": int(_meta.get("fetched_total", 0) or 0),
+            "analysis_done": int(_meta.get("analysis_done", 0) or 0),
+            "analysis_total": int(_meta.get("analysis_total", 0) or 0),
+            "eta_sec": float(_meta.get("eta_sec", 0.0) or 0.0),
+            "run_elapsed_sec": float(_meta.get("run_elapsed_sec", 0.0) or 0.0),
+        }
+        if rows:
+            _payload["preview_rows"] = list(rows or [])[:10]
+        _set_job_fields(**_payload)
 
     def _runner() -> None:
         try:
@@ -170,4 +189,3 @@ def start_trade_finder_job(worker: JobWorker, *, script_ctx: Any = None, name: s
             _JOBS[job_id]["_thread"] = th
     th.start()
     return job_id
-
