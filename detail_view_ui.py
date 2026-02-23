@@ -12,8 +12,11 @@ import streamlit as st
 
 from navigation_state import (
     KEY_DEFAULT_DETAIL_TAB,
+    KEY_DETAIL_NAV_INTENT,
     consume_detail_tab_with_lock,
+    consume_detail_nav_intent,
     detail_selector_key_for_ticker,
+    detail_tab_for_target,
 )
 
 
@@ -91,12 +94,20 @@ def render_detail_view_shell(
     tab_labels_by_key = {key: name for name, key in tab_defs}
     tab_keys = [key for _name, key in tab_defs]
     has_explicit_tab_intent = KEY_DEFAULT_DETAIL_TAB in st.session_state
+    has_nav_intent = bool(st.session_state.get(KEY_DETAIL_NAV_INTENT))
     default_tab = consume_detail_tab_with_lock(
         st.session_state,
         ticker=ticker,
         fallback_tab=0,
-        max_age_sec=8.0,
+        max_age_sec=60.0,
     )
+    nav_target = consume_detail_nav_intent(
+        st.session_state,
+        ticker=ticker,
+        max_age_sec=90.0,
+    )
+    if nav_target:
+        default_tab = detail_tab_for_target(nav_target, fallback="chart")
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
     target_tab_key = tab_defs[default_tab][1]
@@ -104,7 +115,7 @@ def render_detail_view_shell(
     selected_tab_key = st.session_state.get(selector_key)
     if selected_tab_key not in tab_keys:
         st.session_state[selector_key] = target_tab_key
-    elif has_explicit_tab_intent:
+    elif has_explicit_tab_intent or has_nav_intent or bool(nav_target):
         st.session_state[selector_key] = target_tab_key
 
     selected_tab_key = st.radio(

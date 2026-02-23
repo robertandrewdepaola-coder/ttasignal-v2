@@ -12,6 +12,7 @@ from typing import Any, MutableMapping
 # Session-state keys
 KEY_DEFAULT_DETAIL_TAB = "default_detail_tab"
 KEY_DETAIL_TAB_LOCK = "_detail_tab_lock"
+KEY_DETAIL_NAV_INTENT = "_detail_nav_intent"
 KEY_SWITCH_TO_SCANNER_TAB = "_switch_to_scanner_tab"
 KEY_SWITCH_TO_SCANNER_TARGET_TAB = "_switch_to_scanner_target_tab"
 KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = "_switch_to_scanner_focus_detail"
@@ -84,6 +85,26 @@ def set_detail_tab_lock(
     }
 
 
+def set_detail_nav_intent(
+    state: MutableMapping[str, Any],
+    *,
+    ticker: Any,
+    target: Any,
+    lock_runs: int = 4,
+    now_ts: float | None = None,
+) -> None:
+    """Set short-lived detail-nav intent (signal/chart/trade) for a ticker."""
+    _ticker = str(ticker or "").upper().strip()
+    _target = normalize_nav_target(target, fallback="chart")
+    _now = float(time.time() if now_ts is None else now_ts)
+    state[KEY_DETAIL_NAV_INTENT] = {
+        "ticker": _ticker,
+        "target": _target,
+        "remaining": max(0, int(lock_runs)),
+        "set_at": _now,
+    }
+
+
 def consume_detail_tab_with_lock(
     state: MutableMapping[str, Any],
     *,
@@ -119,6 +140,36 @@ def consume_detail_tab_with_lock(
         state.pop(KEY_DETAIL_TAB_LOCK, None)
         return _fallback
     return _default
+
+
+def consume_detail_nav_intent(
+    state: MutableMapping[str, Any],
+    *,
+    ticker: Any,
+    max_age_sec: float = 60.0,
+    now_ts: float | None = None,
+) -> str:
+    """Consume per-ticker nav intent and return target label if still valid."""
+    _ticker = str(ticker or "").upper().strip()
+    _intent = state.get(KEY_DETAIL_NAV_INTENT)
+    if not isinstance(_intent, dict):
+        return ""
+
+    _intent_ticker = str(_intent.get("ticker", "") or "").upper().strip()
+    _target = normalize_nav_target(_intent.get("target"), fallback="chart")
+    _remaining = int(_intent.get("remaining", 0) or 0)
+    _age = float(time.time() if now_ts is None else now_ts) - float(_intent.get("set_at", 0) or 0)
+
+    if _intent_ticker != _ticker or _age > float(max_age_sec) or _remaining <= 0:
+        state.pop(KEY_DETAIL_NAV_INTENT, None)
+        return ""
+
+    _intent["remaining"] = _remaining - 1
+    if int(_intent["remaining"]) <= 0:
+        state.pop(KEY_DETAIL_NAV_INTENT, None)
+    else:
+        state[KEY_DETAIL_NAV_INTENT] = _intent
+    return _target
 
 
 def set_scanner_switch_state(

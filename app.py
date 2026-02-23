@@ -113,6 +113,18 @@ def set_detail_tab_lock(state, *, ticker, tab_index, lock_runs=3, now_ts=None):
     state["default_detail_tab"] = int(tab_index or 0)
 
 
+def set_detail_nav_intent(state, *, ticker, target, lock_runs=4, now_ts=None):
+    _tk = str(ticker or "").upper().strip()
+    _target = normalize_nav_target(target, fallback="chart")
+    _now = float(time.time() if now_ts is None else now_ts)
+    state["_detail_nav_intent"] = {
+        "ticker": _tk,
+        "target": _target,
+        "remaining": max(0, int(lock_runs)),
+        "set_at": _now,
+    }
+
+
 def set_detail_tab_selector_target(state, *, ticker, target):
     _tk = str(ticker or "").upper().strip()
     _target = normalize_nav_target(target, fallback="chart")
@@ -135,6 +147,7 @@ try:
         clear_scanner_switch_state as _clear_scanner_switch_state,
         detail_tab_for_target as _detail_tab_for_target,
         normalize_nav_target as _normalize_nav_target,
+        set_detail_nav_intent as _set_detail_nav_intent,
         set_detail_tab_lock as _set_detail_tab_lock,
         set_detail_tab_selector_target as _set_detail_tab_selector_target,
         set_scanner_switch_state as _set_scanner_switch_state,
@@ -146,6 +159,7 @@ try:
     clear_scanner_switch_state = _clear_scanner_switch_state
     detail_tab_for_target = _detail_tab_for_target
     normalize_nav_target = _normalize_nav_target
+    set_detail_nav_intent = _set_detail_nav_intent
     set_detail_tab_lock = _set_detail_tab_lock
     set_detail_tab_selector_target = _set_detail_tab_selector_target
     set_scanner_switch_state = _set_scanner_switch_state
@@ -2229,8 +2243,10 @@ def _navigate_to_scanner_ticker(
         )
         return False
 
-    # One-shot lock is enough now that detail tab selection is state-driven.
-    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=1)
+    # Keep intent sticky across a few reruns so chart/trade clicks cannot
+    # bounce back to Signal under heavy refresh or fragment rerenders.
+    set_detail_nav_intent(st.session_state, ticker=_tk, target=_target, lock_runs=6)
+    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=6)
     # Force the per-ticker detail selector state so scanner-origin chart/trade clicks
     # cannot fall back to a stale previously selected tab on rerun.
     set_detail_tab_selector_target(st.session_state, ticker=_tk, target=_target)
