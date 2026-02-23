@@ -5576,9 +5576,46 @@ def _run_trade_finder_workflow(
     st.session_state['trade_finder_running'] = False
 
 
-def _start_trade_finder_background_run(*, rerank_only: bool = False) -> str:
-    """Start non-blocking Trade Finder run in a background thread."""
+def _trade_finder_bg_mode(job: Optional[Dict[str, Any]]) -> str:
+    _name = str((job or {}).get('name', '') or '').strip().lower()
+    if "rerank" in _name:
+        return "rerank"
+    if "full" in _name:
+        return "full"
+    return ""
+
+
+def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_running: bool = True) -> str:
+    """Start non-blocking Trade Finder run in a background thread.
+
+    Dedupes duplicate starts while a job is active and can queue one rerank to
+    launch after a full background scan finishes.
+    """
     cleanup_background_jobs()
+    _requested_mode = "rerank" if rerank_only else "full"
+
+    _active_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    _active_job = get_background_job(_active_id) if _active_id else {}
+    _active_status = str((_active_job or {}).get('status', '') or '').lower()
+    _active_mode = _trade_finder_bg_mode(_active_job)
+    if _active_id and _active_job and _active_status == "running":
+        st.session_state['trade_finder_running'] = True
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_bg_job_id'] = _active_id
+        if queue_if_running and rerank_only and _active_mode == "full":
+            st.session_state['trade_finder_bg_rerank_queued'] = True
+            _msg = "Background full scan already running. Re-rank queued for auto-start on completion."
+        elif queue_if_running and not rerank_only and _active_mode == "rerank":
+            _msg = "Background re-rank already running. Start full scan when current job completes."
+        else:
+            _msg = "Background Trade Finder already running; using the current job."
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': _msg,
+            'ts': time.time(),
+        }
+        return _active_id
+
     _ctx = get_script_run_ctx()
 
     def _worker(find_cb, ai_cb, stream_cb, cancel_cb):
@@ -5597,6 +5634,10 @@ def _start_trade_finder_background_run(*, rerank_only: bool = False) -> str:
         st.session_state['trade_finder_bg_job_id'] = _job_id
         st.session_state['trade_finder_running'] = True
         st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_bg_last_started_mode'] = _requested_mode
+        if not rerank_only:
+            # Queue flag is only for manual queueing behind a running full scan.
+            st.session_state['trade_finder_bg_rerank_queued'] = False
         st.session_state['trade_finder_last_status'] = {
             'level': 'info',
             'message': (
@@ -5620,6 +5661,8 @@ def _get_trade_finder_background_status() -> Dict[str, Any]:
     _status = str(_job.get('status', '') or '').lower()
     if _status in {"done", "failed", "canceled"}:
         st.session_state['trade_finder_running'] = False
+        st.session_state['trade_finder_cancel_requested'] = False
+        _mode = _trade_finder_bg_mode(_job)
         _last_terminal = str(st.session_state.get('_trade_finder_bg_last_terminal_job_id', '') or '')
         if _last_terminal != _job_id:
             if _status == "done":
@@ -5638,6 +5681,18 @@ def _get_trade_finder_background_status() -> Dict[str, Any]:
                 'ts': time.time(),
             }
             st.session_state['_trade_finder_bg_last_terminal_job_id'] = _job_id
+            st.session_state.pop('trade_finder_bg_job_id', None)
+
+            _manual_queue = bool(st.session_state.get('trade_finder_bg_rerank_queued', False))
+            _auto_enabled = bool(st.session_state.get('trade_finder_bg_auto_rerank', True))
+            _should_auto_rerank = (_status == "done" and _mode == "full" and (_manual_queue or _auto_enabled))
+            if _status != "done" and _mode == "full":
+                st.session_state['trade_finder_bg_rerank_queued'] = False
+            if _should_auto_rerank:
+                _next_job = _start_trade_finder_background_run(rerank_only=True, queue_if_running=False)
+                if _next_job:
+                    st.session_state['trade_finder_bg_rerank_queued'] = False
+                    _job = get_background_job(_next_job) or {}
     else:
         st.session_state['trade_finder_running'] = True
     return _job
@@ -5650,6 +5705,7 @@ def _request_trade_finder_background_cancel() -> bool:
     _ok = bool(cancel_background_job(_job_id))
     if _ok:
         st.session_state['trade_finder_cancel_requested'] = True
+        st.session_state['trade_finder_bg_rerank_queued'] = False
         st.session_state['trade_finder_last_status'] = {
             'level': 'warning',
             'message': "Cancel requested. Background job will stop at the next checkpoint.",
@@ -5982,10 +6038,22 @@ def render_trade_finder_tab():
     _scope_bits.append(f"batch {int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)}")
     if _scope_bits:
         st.caption("Active scope: " + " | ".join(_scope_bits))
+    st.checkbox(
+        "Auto re-rank after background full scan",
+        key="trade_finder_bg_auto_rerank",
+        help=(
+            "When enabled, a background re-rank automatically starts after each completed "
+            "background full scan."
+        ),
+    )
+    if bool(st.session_state.get('trade_finder_bg_rerank_queued', False)):
+        st.caption("🕒 Queued: one background re-rank will auto-start after the current full scan completes.")
 
     cleanup_background_jobs()
     _bg_job = _get_trade_finder_background_status()
     _bg_status = str((_bg_job or {}).get('status', '') or '').lower()
+    _bg_mode = _trade_finder_bg_mode(_bg_job)
+    _bg_full_active = bool(_bg_status == "running" and _bg_mode == "full")
     _bg_active = _bg_status == "running"
     _run_active = bool(st.session_state.get('trade_finder_running', False)) or _bg_active
     _cancel_requested = bool(st.session_state.get('trade_finder_cancel_requested', False))
@@ -6171,14 +6239,29 @@ def render_trade_finder_tab():
         if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn", disabled=_run_active):
             _run_trade_finder_from_ui(rerank_only=False)
     with _b2:
+        _rerank_label = "🕒 Queue Re-rank" if _bg_full_active else "⚡ Re-rank Cached"
+        _rerank_help = (
+            "Queue one rerank to run immediately after the active background full scan completes."
+            if _bg_full_active else
+            "Re-ranks the existing Find New snapshot without any data fetch."
+        )
         if st.button(
-            "⚡ Re-rank Cached",
+            _rerank_label,
             width="stretch",
             key="tf_rerank_cached_btn",
-            disabled=(not bool(_cached_report)) or _run_active,
-            help="Re-ranks the existing Find New snapshot without any data fetch.",
+            disabled=(not bool(_cached_report)) or (_run_active and not _bg_full_active),
+            help=_rerank_help,
         ):
-            _run_trade_finder_from_ui(rerank_only=True)
+            if _bg_full_active:
+                st.session_state['trade_finder_bg_rerank_queued'] = True
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'info',
+                    'message': "Queued one background rerank after current full scan.",
+                    'ts': time.time(),
+                }
+                st.rerun()
+            else:
+                _run_trade_finder_from_ui(rerank_only=True)
     with _b3:
         if st.button(
             "🧵 Run In Background",
