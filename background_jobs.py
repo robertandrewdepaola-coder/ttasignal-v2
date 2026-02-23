@@ -103,6 +103,10 @@ def start_trade_finder_job(worker: JobWorker, *, script_ctx: Any = None, name: s
             "analysis_total": 0,
             "eta_sec": 0.0,
             "run_elapsed_sec": 0.0,
+            "fetch_rate_limited": False,
+            "fetch_cooldown_sec": 0,
+            "fetch_governor_interval_sec": 0.08,
+            "fetch_requests_last_1s": 0,
             "preview_rows": [],
             "cancel_requested": False,
             "error": "",
@@ -146,6 +150,10 @@ def start_trade_finder_job(worker: JobWorker, *, script_ctx: Any = None, name: s
             "analysis_total": int(_meta.get("analysis_total", 0) or 0),
             "eta_sec": float(_meta.get("eta_sec", 0.0) or 0.0),
             "run_elapsed_sec": float(_meta.get("run_elapsed_sec", 0.0) or 0.0),
+            "fetch_rate_limited": bool(_meta.get("fetch_rate_limited", False)),
+            "fetch_cooldown_sec": int(_meta.get("fetch_cooldown_sec", 0) or 0),
+            "fetch_governor_interval_sec": float(_meta.get("fetch_governor_interval_sec", 0.08) or 0.08),
+            "fetch_requests_last_1s": int(_meta.get("fetch_requests_last_1s", 0) or 0),
         }
         if rows:
             _payload["preview_rows"] = list(rows or [])[:10]

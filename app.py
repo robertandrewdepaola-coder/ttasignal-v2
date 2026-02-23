@@ -2758,6 +2758,13 @@ def _run_find_new_trades(
     _cache_ttl_sec = max(60.0, _cache_ttl_min * 60.0)
     _fetch_batch_size = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
     _fetch_batch_size = max(10, min(250, _fetch_batch_size))
+    _fetch_health = get_fetch_health_status() or {}
+    _cooldown_now = int(_fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    _hits_now = int(_fetch_health.get('hits', 0) or 0)
+    if _cooldown_now > 0 or _hits_now >= 3:
+        _fetch_batch_size = min(_fetch_batch_size, 20)
+    elif _hits_now >= 1:
+        _fetch_batch_size = min(_fetch_batch_size, 30)
     if callable(cancel_checker):
         _cancel_flag = lambda: bool(cancel_checker())
     else:
@@ -2781,14 +2788,25 @@ def _run_find_new_trades(
         "cache_reused_scan": 0,
         "stale_evicted": 0,
         "fetched_live": 0,
+        "priority_leading": 0,
+        "priority_emerging": 0,
+        "priority_other": 0,
+        "governor_hits": 0,
+        "governor_cooldown_sec": 0,
+        "effective_batch_size": 0,
     }
+    _filtered_counts["governor_hits"] = _hits_now
+    _filtered_counts["governor_cooldown_sec"] = _cooldown_now
+    _filtered_counts["effective_batch_size"] = _fetch_batch_size
 
     # Validate symbols before data fetch.
     import re as _re
     universe = []
+    _prioritized_universe: List[Tuple[int, str]] = []
     rejected = []
     for t in sorted(ticker_sources.keys()):
         _sector_name = str(_ticker_sectors.get(t, '') or _scan_sector_map.get(t, '') or '').strip()
+        _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper().strip()
         if _selected_sectors:
             if not _sector_name:
                 _filtered_counts["unknown_sector"] += 1
@@ -2804,7 +2822,6 @@ def _run_find_new_trades(
                 else:
                     continue
             else:
-                _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper()
                 if _phase and _phase not in {"LEADING", "EMERGING"}:
                     _filtered_counts["rotation_filter"] += 1
                     continue
@@ -2816,9 +2833,20 @@ def _run_find_new_trades(
         is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
         is_index = t.startswith('^')
         if is_base or is_class or is_index:
-            universe.append(t)
+            if _phase == "LEADING":
+                _priority = 0
+                _filtered_counts["priority_leading"] += 1
+            elif _phase == "EMERGING":
+                _priority = 1
+                _filtered_counts["priority_emerging"] += 1
+            else:
+                _priority = 2
+                _filtered_counts["priority_other"] += 1
+            _prioritized_universe.append((_priority, t))
         else:
             rejected.append(t)
+
+    universe = [t for _, t in sorted(_prioritized_universe, key=lambda x: (x[0], x[1]))]
 
     if _max_tickers > 0 and len(universe) > _max_tickers:
         _filtered_counts["max_tickers"] = len(universe) - _max_tickers
@@ -2844,6 +2872,7 @@ def _run_find_new_trades(
                 'selected_sectors': sorted(list(_selected_sectors)),
                 'cache_ttl_min': _cache_ttl_min,
                 'fetch_batch_size': _fetch_batch_size,
+                'priority_order': 'LEADING,EMERGING,OTHER',
                 'filtered_counts': _filtered_counts,
                 'requested_universe': len(ticker_sources),
                 'effective_universe': 0,
@@ -2920,6 +2949,7 @@ def _run_find_new_trades(
     ) -> None:
         if not callable(stream_rows_cb):
             return
+        _fh_now = get_fetch_health_status() or {}
         try:
             stream_rows_cb(
                 [],
@@ -2936,6 +2966,10 @@ def _run_find_new_trades(
                     'ai_ranked': 0,
                     'eta_sec': float(eta_sec or 0.0),
                     'run_elapsed_sec': max(0.0, time.time() - _start),
+                    'fetch_rate_limited': bool(_fh_now.get('rate_limited', False)),
+                    'fetch_cooldown_sec': int(_fh_now.get('cooldown_remaining_sec', 0) or 0),
+                    'fetch_governor_interval_sec': float(_fh_now.get('governor_interval_sec', 0.08) or 0.08),
+                    'fetch_requests_last_1s': int(_fh_now.get('requests_last_1s', 0) or 0),
                 },
             )
         except Exception:
@@ -2963,6 +2997,9 @@ def _run_find_new_trades(
         # Reuse incremental Trade Finder cache first, then fresh scanner cache; fetch only stale/missing.
         all_data: Dict[str, Dict[str, Any]] = {}
         _now = time.time()
+        _fresh_horizon_sec = max(_cache_ttl_sec, 15 * 60.0)
+        _stale_horizon_sec = max(_cache_ttl_sec * 3.0, 6 * 60 * 60.0)
+        _ticker_fresh_meta: Dict[str, Dict[str, Any]] = {}
         _find_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
         _find_cache_meta = st.session_state.get('_find_new_ticker_data_cache_meta', {}) or {}
         _find_cache_ts = float(st.session_state.get('_find_new_ticker_data_cache_ts', 0.0) or 0.0)
@@ -2977,6 +3014,12 @@ def _run_find_new_trades(
                 if _age <= _cache_ttl_sec:
                     all_data[_t] = _cached
                     _filtered_counts["cache_reused_find"] += 1
+                    _ticker_fresh_meta[_t] = {
+                        'source': 'find_cache',
+                        'ts': _ts,
+                        'age_sec': max(0.0, float(_age)),
+                        'state': 'fresh' if _age <= _fresh_horizon_sec else ('cached' if _age <= _stale_horizon_sec else 'stale'),
+                    }
                 else:
                     _filtered_counts["stale_evicted"] += 1
         scan_cache = st.session_state.get('ticker_data_cache', {}) or {}
@@ -2990,6 +3033,13 @@ def _run_find_new_trades(
                 if isinstance(_cached, dict) and _cached.get('daily') is not None:
                     all_data[_t] = _cached
                     _filtered_counts["cache_reused_scan"] += 1
+                    _age = max(0.0, float(_now - scan_ts))
+                    _ticker_fresh_meta[_t] = {
+                        'source': 'scan_cache',
+                        'ts': float(scan_ts),
+                        'age_sec': _age,
+                        'state': 'fresh' if _age <= _fresh_horizon_sec else ('cached' if _age <= _stale_horizon_sec else 'stale'),
+                    }
         missing = [t for t in universe if t not in all_data]
         if all_data:
             _set_find_progress(
@@ -3065,6 +3115,14 @@ def _run_find_new_trades(
 
                 _fetched_batch = fetch_scan_data(_batch, progress_cb=_find_progress_cb)
                 all_data.update(_fetched_batch)
+                _fetch_ts = time.time()
+                for _t in (_fetched_batch or {}).keys():
+                    _ticker_fresh_meta[str(_t).upper().strip()] = {
+                        'source': 'live_fetch',
+                        'ts': float(_fetch_ts),
+                        'age_sec': 0.0,
+                        'state': 'fresh',
+                    }
                 _fetched_live += len(_fetched_batch)
                 _processed_missing += len(_batch)
                 _elapsed_fetch = max(0.001, time.time() - _fetch_stage_start)
@@ -3356,6 +3414,22 @@ def _run_find_new_trades(
                 'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
                 'source_watchlists': ticker_sources.get(r.ticker, []),
             }
+            _fresh_meta = _ticker_fresh_meta.get(str(r.ticker).upper().strip(), {}) or {}
+            _data_ts = float(_fresh_meta.get('ts', 0.0) or 0.0)
+            _data_age_sec = max(0.0, (_now - _data_ts)) if _data_ts > 0 else (0.0 if str(_fresh_meta.get('source', '') or '') == 'live_fetch' else (_cache_ttl_sec + 1))
+            _data_state = str(_fresh_meta.get('state', '') or '').strip().lower()
+            if not _data_state:
+                if _data_age_sec <= _fresh_horizon_sec:
+                    _data_state = "fresh"
+                elif _data_age_sec <= _stale_horizon_sec:
+                    _data_state = "cached"
+                else:
+                    _data_state = "stale"
+            row['data_source'] = str(_fresh_meta.get('source', 'unknown') or 'unknown')
+            row['data_ts'] = _data_ts
+            row['data_age_sec'] = round(float(_data_age_sec), 1)
+            row['data_freshness_state'] = _data_state
+            row['data_fresh'] = _data_state in {"fresh", "cached"}
             rows.append(row)
 
             rec_upper = rec_text.upper()
@@ -3409,6 +3483,11 @@ def _run_find_new_trades(
                     'resistance_assessment': row.get('resistance_assessment', ''),
                     'support_price': row.get('support_price'),
                     'support_distance_pct': row.get('support_distance_pct'),
+                    'data_source': row.get('data_source', 'unknown'),
+                    'data_ts': row.get('data_ts', 0.0),
+                    'data_age_sec': row.get('data_age_sec', 0.0),
+                    'data_freshness_state': row.get('data_freshness_state', 'fresh'),
+                    'data_fresh': bool(row.get('data_fresh', True)),
                     'apex_buy': bool(row.get('apex_buy', False)),
                     'apex_signal_days_ago': int(row.get('apex_signal_days_ago', 999) or 999),
                     'apex_signal_tier': str(row.get('apex_signal_tier', '') or ''),
@@ -3517,6 +3596,7 @@ def _run_find_new_trades(
             'selected_sectors': sorted(list(_selected_sectors)),
             'cache_ttl_min': _cache_ttl_min,
             'fetch_batch_size': _fetch_batch_size,
+            'priority_order': 'LEADING,EMERGING,OTHER',
             'filtered_counts': _filtered_counts,
             'requested_universe': len(ticker_sources),
             'effective_universe': len(universe),
@@ -4531,6 +4611,7 @@ def _trade_quality_settings() -> Dict[str, Any]:
         'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
         'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
         'require_ready': bool(st.session_state.get('trade_require_ready', False)),
+        'require_fresh_data': bool(st.session_state.get('trade_require_fresh_data', True)),
         'include_watch_only': bool(st.session_state.get('trade_include_watch_only', True)),
         'breakout_min_dist_pct': float(st.session_state.get('trade_breakout_min_dist_pct', 0.2) or 0.2),
         'breakout_max_dist_pct': float(st.session_state.get('trade_breakout_max_dist_pct', 4.0) or 4.0),
@@ -4539,6 +4620,93 @@ def _trade_quality_settings() -> Dict[str, Any]:
         'apex_primary': bool(st.session_state.get('trade_apex_primary', True)),
         'apex_bear_vix_threshold': float(st.session_state.get('trade_apex_bear_vix_threshold', 20.0) or 20.0),
     }
+
+
+def _trade_finder_data_gate_state(*, rerank_only: bool = False) -> Dict[str, Any]:
+    """
+    Pre-run health gate for Trade Finder.
+
+    Full scans are blocked when provider cooldown is active or when both market
+    and sector context are stale. Re-rank mode remains available so users can
+    still work with existing snapshots.
+    """
+    fetch_health = get_fetch_health_status() or {}
+    rate_limited = bool(fetch_health.get('rate_limited', False))
+    cooldown_sec = int(fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    hits = int(fetch_health.get('hits', 0) or 0)
+    governor_interval_sec = float(fetch_health.get('governor_interval_sec', 0.08) or 0.08)
+    requests_last_1s = int(fetch_health.get('requests_last_1s', 0) or 0)
+
+    stale = {
+        'scan': False,
+        'market': False,
+        'sector': False,
+        'positions': False,
+        'alerts': False,
+        'tags': [],
+        'count': 0,
+    }
+    try:
+        snap = _build_dashboard_snapshot()
+        stale = _stale_stream_status(snap)
+    except Exception:
+        # Keep gate permissive if snapshot cannot be built in this call path.
+        pass
+
+    stale_market = bool(stale.get('market', False))
+    stale_sector = bool(stale.get('sector', False))
+
+    warnings: List[str] = []
+    blockers: List[str] = []
+
+    if rate_limited and cooldown_sec > 0 and not rerank_only:
+        blockers.append(f"Provider cooldown active ({cooldown_sec}s)")
+    elif rate_limited and cooldown_sec > 0:
+        warnings.append(f"Provider cooldown active ({cooldown_sec}s) — rerank only")
+
+    if stale_market and stale_sector and not rerank_only:
+        blockers.append("Market + sector context are stale")
+    else:
+        if stale_market:
+            warnings.append("Market context is stale")
+        if stale_sector:
+            warnings.append("Sector rotation context is stale")
+
+    hard_block = len(blockers) > 0
+    reason = "; ".join(blockers) if blockers else ""
+    if not reason and warnings:
+        reason = "; ".join(warnings)
+    if not reason:
+        reason = "Data ready"
+
+    return {
+        'hard_block': hard_block,
+        'reason': reason,
+        'blockers': blockers,
+        'warnings': warnings,
+        'rate_limited': rate_limited,
+        'cooldown_sec': cooldown_sec,
+        'hits': hits,
+        'governor_interval_sec': governor_interval_sec,
+        'requests_last_1s': requests_last_1s,
+        'stale': stale,
+    }
+
+
+def _trade_data_freshness_badge(row: Dict[str, Any]) -> Dict[str, str]:
+    """Compact freshness badge for Trade Finder rows."""
+    state = str(row.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+    age_sec = float(row.get('data_age_sec', 0.0) or 0.0)
+    source = str(row.get('data_source', '') or '').strip()
+    age_txt = _format_eta(age_sec) if age_sec > 0 else "0s"
+
+    if state == "fresh":
+        return {'icon': "🟢", 'text': f"fresh ({age_txt})", 'color': "#22c55e", 'source': source}
+    if state == "cached":
+        return {'icon': "🟡", 'text': f"cached ({age_txt})", 'color': "#f59e0b", 'source': source}
+    if state == "stale":
+        return {'icon': "🔴", 'text': f"stale ({age_txt})", 'color': "#ef4444", 'source': source}
+    return {'icon': "⚪", 'text': "unknown", 'color': "#9ca3af", 'source': source}
 
 
 def _monthly_is_green_or_near(row: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[bool, str]:
@@ -4899,6 +5067,11 @@ def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any])
     if bool(row.get('hard_gate_pass', True)) is False:
         return False
 
+    if bool(settings.get('require_fresh_data', True)):
+        _fresh_state = str(row.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+        if _fresh_state == "stale":
+            return False
+
     entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
     stop = float(row.get('suggested_stop_loss', 0) or 0)
     target = float(row.get('suggested_target', 0) or 0)
@@ -5165,6 +5338,30 @@ def _run_trade_finder_workflow(
     Reuses existing find-new logic, then enriches/ranks candidates.
     """
     st.session_state['trade_finder_running'] = True
+    _data_gate = _trade_finder_data_gate_state(rerank_only=rerank_only)
+    if (not rerank_only) and bool(_data_gate.get('hard_block', False)):
+        _msg = (
+            "Trade Finder blocked until data is ready: "
+            f"{str(_data_gate.get('reason', '') or 'provider/market context not ready')}. "
+            "Run Fast Refresh / Refresh Mkt and retry."
+        )
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': _msg,
+            'ts': time.time(),
+        }
+        if callable(find_progress_cb):
+            try:
+                find_progress_cb(100, _msg)
+            except Exception:
+                pass
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(100, _msg)
+            except Exception:
+                pass
+        st.session_state['trade_finder_running'] = False
+        return
     _cancelled = False
     _report_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
     _report_age_sec = max(0.0, time.time() - _report_ts) if _report_ts else 0.0
@@ -5216,10 +5413,19 @@ def _run_trade_finder_workflow(
 
     report = _report
     base_candidates = report.get('candidates', []) or []
+    _phase_rank = {"LEADING": 0, "EMERGING": 1}
+    ranked_candidates = sorted(
+        base_candidates,
+        key=lambda _c: (
+            _phase_rank.get(str(_c.get('sector_phase', '') or '').upper().strip(), 2),
+            -float(_c.get('score', 0) or 0),
+            str(_c.get('ticker', '') or ''),
+        ),
+    )
     quality_settings = _trade_quality_settings()
     macd_profile = str(quality_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
     run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
-    if not base_candidates:
+    if not ranked_candidates:
         st.session_state['trade_finder_results'] = {
             'run_id': run_id,
             'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -5258,7 +5464,7 @@ def _run_trade_finder_workflow(
     if callable(stream_rows_cb):
         try:
             _seed_preview = []
-            for _bc in base_candidates[:10]:
+            for _bc in ranked_candidates[:10]:
                 _seed_preview.append(
                     {
                         'ticker': str(_bc.get('ticker', '')).upper().strip(),
@@ -5278,7 +5484,7 @@ def _run_trade_finder_workflow(
                 {
                     'phase': 'ai_seed',
                     'processed': 0,
-                    'total': int(len(base_candidates)),
+                    'total': int(len(ranked_candidates)),
                     'hard_gate_pass': 0,
                     'ai_ranked': 0,
                     'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
@@ -5298,7 +5504,7 @@ def _run_trade_finder_workflow(
     gate = _evaluate_trade_gate(snap)
     ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
     # AI ranks only deterministic hard-gate passers.
-    ai_top_n = len(base_candidates) if ai_top_n_cfg <= 0 else max(0, ai_top_n_cfg)
+    ai_top_n = len(ranked_candidates) if ai_top_n_cfg <= 0 else max(0, ai_top_n_cfg)
     ai_budget_sec = float(st.session_state.get('trade_finder_ai_budget_sec', 30.0) or 0.0)
     ai_deadline_ts = (time.time() + ai_budget_sec) if ai_budget_sec > 0 else 0.0
     ai_cache_ttl_sec = 6 * 60 * 60
@@ -5317,10 +5523,10 @@ def _run_trade_finder_workflow(
     _t0 = time.time()
     _tf_progress = None
     if ui_mode and not callable(ai_progress_cb):
-        _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(base_candidates)}")
+        _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(ranked_candidates)}")
     elif callable(ai_progress_cb):
         try:
-            ai_progress_cb(0, f"Scoring candidates with AI: 0/{len(base_candidates)}")
+            ai_progress_cb(0, f"Scoring candidates with AI: 0/{len(ranked_candidates)}")
         except Exception:
             pass
 
@@ -5342,7 +5548,7 @@ def _run_trade_finder_workflow(
             except TypeError:
                 _tf_progress.progress(pct)
 
-    for i, c in enumerate(base_candidates):
+    for i, c in enumerate(ranked_candidates):
         _cancel_req = bool(st.session_state.get('trade_finder_cancel_requested', False))
         if callable(cancel_checker):
             try:
@@ -5353,7 +5559,7 @@ def _run_trade_finder_workflow(
             _cancelled = True
             break
         ticker = str(c.get('ticker', '')).upper().strip()
-        _set_tf_progress(i + 1, len(base_candidates), ticker)
+        _set_tf_progress(i + 1, len(ranked_candidates), ticker)
         company_name = str(c.get('company_name', '') or '').strip()
         if not company_name:
             company_name = _lookup_company_name_for_trade_finder(ticker)
@@ -5510,6 +5716,13 @@ def _run_trade_finder_workflow(
         warnings = []
         fallback_reason = str(ai_rec.get('fallback_reason', '') or '')
         fallback_error = str(ai_rec.get('fallback_error', '') or '')
+        _data_state = str(c.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+        _data_source = str(c.get('data_source', 'unknown') or 'unknown').strip()
+        _data_age_sec = float(c.get('data_age_sec', 0.0) or 0.0)
+        _data_ts = float(c.get('data_ts', 0.0) or 0.0)
+        _data_fresh = bool(c.get('data_fresh', _data_state != "stale"))
+        if _data_state == "stale":
+            warnings.append(f"Source data is stale ({_format_eta(_data_age_sec)} old, {_data_source})")
         if ai_rr > 0 and abs(ai_rr - rr) > 0.15:
             warnings.append(f"AI R:R {ai_rr:.2f} differs from level-based R:R {rr:.2f}")
         hinted_earn_days = _extract_earn_days_hint(rationale)
@@ -5579,6 +5792,11 @@ def _run_trade_finder_workflow(
             'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
             'scanner_summary': str(c.get('summary', '') or ''),
             'watchlists': str(c.get('watchlists', '') or ''),
+            'data_source': _data_source,
+            'data_ts': _data_ts,
+            'data_age_sec': round(_data_age_sec, 1),
+            'data_freshness_state': _data_state or 'fresh',
+            'data_fresh': bool(_data_fresh),
             'ai_buy_recommendation': gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')),
             'suggested_entry': round(entry, 2),
             'suggested_stop_loss': round(stop, 2),
@@ -5662,11 +5880,11 @@ def _run_trade_finder_workflow(
         provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
         if fallback_reason:
             fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
-        if callable(stream_rows_cb) and ((i + 1) % 5 == 0 or (i + 1) == len(base_candidates)):
+        if callable(stream_rows_cb) and ((i + 1) % 5 == 0 or (i + 1) == len(ranked_candidates)):
             try:
                 _elapsed = max(0.001, time.time() - _t0)
                 _rate = float(i + 1) / _elapsed if (i + 1) > 0 else 0.0
-                _remain = max(0, len(base_candidates) - (i + 1))
+                _remain = max(0, len(ranked_candidates) - (i + 1))
                 _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
                 _preview = sorted(
                     rows,
@@ -5678,7 +5896,7 @@ def _run_trade_finder_workflow(
                     {
                         'phase': 'ai_rank',
                         'processed': int(i + 1),
-                        'total': int(len(base_candidates)),
+                        'total': int(len(ranked_candidates)),
                         'hard_gate_pass': int(hard_gate_pass_count),
                         'ai_ranked': int(ai_ranked_count),
                         'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
@@ -5697,7 +5915,7 @@ def _run_trade_finder_workflow(
             try:
                 _elapsed = max(0.001, time.time() - _t0)
                 _rate = 1.0 / _elapsed if _elapsed > 0 else 0.0
-                _remain = max(0, len(base_candidates) - 1)
+                _remain = max(0, len(ranked_candidates) - 1)
                 _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
                 _preview = sorted(
                     rows,
@@ -5709,7 +5927,7 @@ def _run_trade_finder_workflow(
                     {
                         'phase': 'ai_rank',
                         'processed': 1,
-                        'total': int(len(base_candidates)),
+                        'total': int(len(ranked_candidates)),
                         'hard_gate_pass': int(hard_gate_pass_count),
                         'ai_ranked': int(ai_ranked_count),
                         'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
@@ -5743,8 +5961,8 @@ def _run_trade_finder_workflow(
                 rows[:8],
                 {
                     'phase': 'done' if not _cancelled else 'canceled',
-                    'processed': int(len(base_candidates)),
-                    'total': int(len(base_candidates)),
+                    'processed': int(len(ranked_candidates)),
+                    'total': int(len(ranked_candidates)),
                     'hard_gate_pass': int(hard_gate_pass_count),
                     'ai_ranked': int(ai_ranked_count),
                     'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
@@ -5767,9 +5985,9 @@ def _run_trade_finder_workflow(
         'macd_profile': macd_profile,
         'run_mode': 'rerank_only' if rerank_only else 'full_scan',
         'elapsed_sec': elapsed,
-        'input_candidates': len(base_candidates),
+        'input_candidates': len(ranked_candidates),
         'hard_gate_pass_count': int(hard_gate_pass_count),
-        'hard_gate_fail_count': int(max(0, len(base_candidates) - hard_gate_pass_count)),
+        'hard_gate_fail_count': int(max(0, len(ranked_candidates) - hard_gate_pass_count)),
         'hard_gate_fail_counts': hard_gate_fail_counts,
         'hard_gate_relaxed_pass_count': int(hard_gate_relaxed_pass_count),
         'qualified_count': int(qualified_count),
@@ -5786,7 +6004,7 @@ def _run_trade_finder_workflow(
             'run_id': run_id,
             'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
             'elapsed_sec': float(elapsed),
-            'input_candidates': int(len(base_candidates)),
+            'input_candidates': int(len(ranked_candidates)),
             'rows': rows,
             'find_new_report': report,
         })
@@ -5794,7 +6012,7 @@ def _run_trade_finder_workflow(
         pass
     _append_perf_metric({
         'kind': 'trade_finder',
-        'candidates_in': len(base_candidates),
+        'candidates_in': len(ranked_candidates),
         'candidates_out': len(rows),
         'hard_gate_pass': int(hard_gate_pass_count),
         'ai_ranked': int(ai_ranked_count),
@@ -5805,13 +6023,13 @@ def _run_trade_finder_workflow(
         'level': 'warning' if _cancelled else ('success' if len(rows) > 0 else 'info'),
         'message': (
             (
-                f"{'Re-rank' if rerank_only else 'Trade Finder'} canceled: processed {len(rows)}/{len(base_candidates)}; "
+                f"{'Re-rank' if rerank_only else 'Trade Finder'} canceled: processed {len(rows)}/{len(ranked_candidates)}; "
                 f"hard-gate pass {hard_gate_pass_count}; qualified {qualified_count}; AI ranked {ai_ranked_count}."
             )
             if _cancelled else
             (
                 f"{'Re-rank' if rerank_only else 'Trade Finder'} complete: "
-                f"{hard_gate_pass_count}/{len(base_candidates)} passed hard gate; "
+                f"{hard_gate_pass_count}/{len(ranked_candidates)} passed hard gate; "
                 f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
                 f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
             )
@@ -5823,10 +6041,10 @@ def _run_trade_finder_workflow(
             ai_progress_cb(
                 100,
                 (
-                    f"Trade Finder canceled: processed {len(rows)}/{len(base_candidates)}, "
+                    f"Trade Finder canceled: processed {len(rows)}/{len(ranked_candidates)}, "
                     f"hard-gate pass {hard_gate_pass_count}, qualified {qualified_count}, AI ranked {ai_ranked_count}."
                     if _cancelled else
-                    f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(base_candidates)}, "
+                    f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(ranked_candidates)}, "
                     f"qualified {qualified_count}, AI ranked {ai_ranked_count}, "
                     f"relaxed-profile passers {hard_gate_relaxed_pass_count}."
                 ),
@@ -5869,6 +6087,10 @@ def _persist_trade_finder_bg_state(state: Optional[Dict[str, Any]]) -> None:
         'analysis_total': int(_state.get('analysis_total', 0) or 0),
         'eta_sec': float(_state.get('eta_sec', 0.0) or 0.0),
         'run_elapsed_sec': float(_state.get('run_elapsed_sec', 0.0) or 0.0),
+        'fetch_rate_limited': bool(_state.get('fetch_rate_limited', False)),
+        'fetch_cooldown_sec': int(_state.get('fetch_cooldown_sec', 0) or 0),
+        'fetch_governor_interval_sec': float(_state.get('fetch_governor_interval_sec', 0.08) or 0.08),
+        'fetch_requests_last_1s': int(_state.get('fetch_requests_last_1s', 0) or 0),
         'created_ts': float(_state.get('created_ts', time.time()) or time.time()),
         'updated_ts': float(_state.get('updated_ts', time.time()) or time.time()),
         'done_ts': float(_state.get('done_ts', 0.0) or 0.0),
@@ -5911,6 +6133,20 @@ def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_ru
             'ts': time.time(),
         }
         return _active_id
+
+    if not rerank_only:
+        _gate = _trade_finder_data_gate_state(rerank_only=False)
+        if bool(_gate.get('hard_block', False)):
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': (
+                    "Background Trade Finder blocked: "
+                    f"{str(_gate.get('reason', '') or 'data not ready')}. "
+                    "Run Fast Refresh / Refresh Mkt and retry."
+                ),
+                'ts': time.time(),
+            }
+            return ""
 
     _ctx = get_script_run_ctx()
 
@@ -6288,11 +6524,25 @@ def render_trade_finder_tab():
     if _pending_notice:
         st.success(_pending_notice)
     _fh = get_fetch_health_status() or {}
+    _data_gate = _trade_finder_data_gate_state(rerank_only=False)
     if bool(_fh.get('rate_limited', False)):
         st.warning(
             f"Data provider is rate-limited ({int(_fh.get('cooldown_remaining_sec', 0) or 0)}s cooldown). "
             "Trade Finder is running in partial-data mode using cache/fallbacks."
         )
+    if bool(_data_gate.get('hard_block', False)):
+        st.error(
+            f"Trade Finder data gate: BLOCKED — {_data_gate.get('reason', 'data not ready')}. "
+            "Use Fast Refresh / Refresh Mkt, then rerun."
+        )
+    elif list(_data_gate.get('warnings', []) or []):
+        st.info("Trade Finder data gate: " + "; ".join([str(x) for x in (_data_gate.get('warnings', []) or [])]))
+    st.caption(
+        "Fetch governor: "
+        f"interval {float(_data_gate.get('governor_interval_sec', _fh.get('governor_interval_sec', 0.08)) or 0.08):.2f}s | "
+        f"req/s {int(_data_gate.get('requests_last_1s', _fh.get('requests_last_1s', 0)) or 0)} | "
+        f"429 hits {int(_data_gate.get('hits', _fh.get('hits', 0)) or 0)}"
+    )
     jm = get_journal()
     alert_tickers = {
         str(c.get('ticker', '')).upper().strip()
@@ -6411,6 +6661,10 @@ def render_trade_finder_tab():
             _analysis_total = int((_bg_job or {}).get('analysis_total', 0) or 0)
             _eta_sec = float((_bg_job or {}).get('eta_sec', 0.0) or 0.0)
             _elapsed_sec = float((_bg_job or {}).get('run_elapsed_sec', 0.0) or 0.0)
+            _fetch_rate_limited = bool((_bg_job or {}).get('fetch_rate_limited', False))
+            _fetch_cooldown = int((_bg_job or {}).get('fetch_cooldown_sec', 0) or 0)
+            _fetch_gov = float((_bg_job or {}).get('fetch_governor_interval_sec', 0.08) or 0.08)
+            _fetch_req = int((_bg_job or {}).get('fetch_requests_last_1s', 0) or 0)
             st.warning("Background Trade Finder run active. UI remains responsive.")
             st.progress(_find_pct, text=_find_txt)
             st.progress(_ai_pct, text=_ai_txt)
@@ -6422,6 +6676,11 @@ def render_trade_finder_tab():
                 f"Scope {_scoped_total} | fetched {_fetched_done}/{_fetched_total} | "
                 f"analyzed {_analysis_done}/{_analysis_total} | "
                 f"phase {(_phase or 'n/a')} | elapsed {_format_eta(_elapsed_sec)} | ETA {_format_eta(_eta_sec)}"
+            )
+            st.caption(
+                "Fetch governor: "
+                f"interval {_fetch_gov:.2f}s | req/s {_fetch_req} | "
+                f"{'cooldown ' + str(_fetch_cooldown) + 's' if _fetch_rate_limited else 'no cooldown'}"
             )
             if _bg_preview_rows:
                 _preview_df = pd.DataFrame(
@@ -6587,7 +6846,13 @@ def render_trade_finder_tab():
 
     _b1, _b2, _b3 = st.columns([3, 2, 2])
     with _b1:
-        if st.button("🧭 Find New Trades", type="primary", width="stretch", key="tf_find_btn", disabled=_run_active):
+        if st.button(
+            "🧭 Find New Trades",
+            type="primary",
+            width="stretch",
+            key="tf_find_btn",
+            disabled=(_run_active or bool(_data_gate.get('hard_block', False))),
+        ):
             _run_trade_finder_from_ui(rerank_only=False)
     with _b2:
         _rerank_label = "🕒 Queue Re-rank" if _bg_full_active else "⚡ Re-rank Cached"
@@ -6618,7 +6883,7 @@ def render_trade_finder_tab():
             "🧵 Run In Background",
             width="stretch",
             key="tf_run_background_btn",
-            disabled=_run_active,
+            disabled=(_run_active or bool(_data_gate.get('hard_block', False))),
             help="Starts Trade Finder in a non-blocking background worker with live progress.",
         ):
             _job_id = _start_trade_finder_background_run(rerank_only=False)
@@ -6774,7 +7039,12 @@ def render_trade_finder_tab():
                     f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
                     f"unknown_sector_seen={int(_flt.get('unknown_sector', 0) or 0)}, "
                     f"rotation_unknown_kept={int(_flt.get('rotation_unknown_kept', 0) or 0)}, "
-                    f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}"
+                    f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}, "
+                    f"priority(L/E/O)={int(_flt.get('priority_leading', 0) or 0)}/"
+                    f"{int(_flt.get('priority_emerging', 0) or 0)}/"
+                    f"{int(_flt.get('priority_other', 0) or 0)}, "
+                    f"governor_hits={int(_flt.get('governor_hits', 0) or 0)}, "
+                    f"batch={int(_flt.get('effective_batch_size', 0) or 0)}"
                 )
         st.info("Click Find New Trades to generate ranked candidates.")
         return
@@ -6806,11 +7076,19 @@ def render_trade_finder_tab():
             key="trade_require_ready",
             help="Only include decision-card READY candidates.",
         )
-    st.checkbox(
-        "Include Watch Only ideas",
-        key="trade_include_watch_only",
-        help="When enabled, Watch Only AI ratings are included if other gates pass.",
-    )
+    fcx1, fcx2 = st.columns(2)
+    with fcx1:
+        st.checkbox(
+            "Include Watch Only ideas",
+            key="trade_include_watch_only",
+            help="When enabled, Watch Only AI ratings are included if other gates pass.",
+        )
+    with fcx2:
+        st.checkbox(
+            "Require fresh data",
+            key="trade_require_fresh_data",
+            help="Filters out stale candidates so Ready list uses current/fresh inputs only.",
+        )
     with st.expander("🎯 Breakout Hard Gate Rules", expanded=False):
         _gate_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
         if _gate_profile == MACD_PROFILE_HPOTTER_ZONE:
@@ -7185,6 +7463,7 @@ def render_trade_finder_tab():
             'earnings_untrusted': 0,
             'earnings_blocked': 0,
             'not_ready': 0,
+            'stale_data': 0,
         }
         hard_gate_reason_counts: Dict[str, int] = {}
         for r in rows:
@@ -7209,6 +7488,10 @@ def render_trade_finder_tab():
                 post_gate_fail['invalid_level_order'] += 1
             if rr < float(settings.get('min_rr', 2.0)):
                 post_gate_fail['rr_below_threshold'] += 1
+            if bool(settings.get('require_fresh_data', True)):
+                _fresh_state = str(r.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+                if _fresh_state == "stale":
+                    post_gate_fail['stale_data'] += 1
             earn_days = int(r.get('earn_days', 999) or 999)
             earn_source = str(r.get('earn_source', '') or '').strip()
             earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
@@ -7389,6 +7672,7 @@ def render_trade_finder_tab():
                         confidence=earn_confidence,
                         earn_date=str(r.get('earn_date', '') or ''),
                     )
+                    fresh_disp = _trade_data_freshness_badge(r)
                     signal_reason = str(r.get('reason', '') or '')
                     rationale = str(
                         r.get('analysis_note', '')
@@ -7440,6 +7724,8 @@ def render_trade_finder_tab():
                             f"S ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
                             f"T ${float(r.get('suggested_target', 0) or 0):.2f}"
                         )
+                        _fresh_src = f" | source {fresh_disp['source']}" if fresh_disp.get('source') else ""
+                        st.caption(f"{ticker} Data: {fresh_disp['icon']} {fresh_disp['text']}{_fresh_src}")
                         if class_reason:
                             st.caption(f"{ticker} Class reason: {class_reason}")
                         _sup = float(r.get('support_price', 0) or 0)
@@ -7487,6 +7773,8 @@ def render_trade_finder_tab():
                                 f"Earnings: {earn_disp['icon']} {earn_disp['text']} | "
                                 f"Signal source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
                             )
+                            _fresh_src = f" | source {fresh_disp['source']}" if fresh_disp.get('source') else ""
+                            st.caption(f"Data freshness: {fresh_disp['icon']} {fresh_disp['text']}{_fresh_src}")
                             st.caption(f"Sector: {sector_name} ({sector_phase or 'n/a'})")
                             if earn_source:
                                 _ec = f" [{earn_confidence}]" if earn_confidence else ""

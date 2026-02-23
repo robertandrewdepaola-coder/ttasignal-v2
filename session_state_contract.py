@@ -48,6 +48,7 @@ TRADE_QUALITY_DEFAULT_FACTORIES: Dict[str, Factory] = {
     "trade_min_rr_threshold": _const(1.2),
     "trade_earnings_block_days": _const(7),
     "trade_require_ready": _const(False),
+    "trade_require_fresh_data": _const(True),
     "trade_include_watch_only": _const(True),
     "trade_breakout_min_dist_pct": _const(0.2),
     "trade_breakout_max_dist_pct": _const(4.0),
