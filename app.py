@@ -7471,7 +7471,15 @@ def render_trade_finder_tab():
             st.success(f"Staged {staged} qualified trade(s).")
             st.rerun()
 
-    planned = jm.get_planned_trades()
+    # Hot-reload safety: ensure journal handle exists even if a partial rerun
+    # skips earlier initialization in this render cycle.
+    try:
+        _jm = jm
+    except NameError:
+        _jm = get_journal()
+        jm = _jm
+
+    planned = _jm.get_planned_trades()
     if planned:
         st.divider()
         st.markdown(f"### 🗂️ Planned Trade Tickets ({len(planned)})")
