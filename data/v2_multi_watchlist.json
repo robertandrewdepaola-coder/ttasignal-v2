@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "56655af2-0f28-4b21-9985-0986dc721f58",
+  "active_watchlist_id": "628d1a1e-ce3e-46b8-9173-e77ab4cabcd4",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -565,6 +565,7 @@
       "is_system": false,
       "tickers": [
         "APA",
+        "BE",
         "BKR",
         "COP",
         "CTRA",
@@ -574,7 +575,9 @@
         "EQT",
         "EXE",
         "FANG",
+        "GEV",
         "HAL",
+        "ICLN",
         "KMI",
         "MPC",
         "OKE",
@@ -588,7 +591,7 @@
         "XOM"
       ],
       "created_at": "2026-02-18T19:27:49.871426",
-      "last_updated": "2026-02-18T19:33:38.147576"
+      "last_updated": "2026-02-24T03:05:58.637004"
     },
     {
       "id": "181e9f19-4c6e-4698-b034-0ad4fd8e86b4",
@@ -1708,6 +1711,43 @@
       ],
       "created_at": "2026-02-24T03:03:36.390094",
       "last_updated": "2026-02-24T03:03:51.887833"
+    },
+    {
+      "id": "68409169-5726-4cf3-8bf7-917da52d1e3c",
+      "name": "Uranium",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "CCJ",
+        "DNN",
+        "UEC",
+        "UUUU"
+      ],
+      "created_at": "2026-02-24T03:04:30.097016",
+      "last_updated": "2026-02-24T03:04:46.178029"
+    },
+    {
+      "id": "65bd3858-3a1a-4755-b0ec-c52d297fc94b",
+      "name": "Lithium",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "ALB",
+        "LAR",
+        "LIT",
+        "RIO"
+      ],
+      "created_at": "2026-02-24T03:04:57.973407",
+      "last_updated": "2026-02-24T03:05:13.962787"
+    },
+    {
+      "id": "628d1a1e-ce3e-46b8-9173-e77ab4cabcd4",
+      "name": "Metal Miners",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [],
+      "created_at": "2026-02-24T03:06:16.728027",
+      "last_updated": "2026-02-24T03:06:16.728027"
     }
   ]
 }
