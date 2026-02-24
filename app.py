@@ -6558,6 +6558,7 @@ def render_trade_finder_tab():
         alert_tickers: Set[str] = set(_top_state.get('alert_tickers', set()) or set())
     else:
         alert_tickers = set(getattr(_top_state, 'alert_tickers', set()) or set())
+    jm = get_journal()
 
     results = st.session_state.get('trade_finder_results', {}) or {}
     rows = results.get('rows', []) or []
