@@ -39,6 +39,8 @@ CORE_DEFAULT_FACTORIES: Dict[str, Factory] = {
     "trade_gate_auto_rerank_requested_ts": _const(0.0),
     "trade_finder_ai_top_n": _const(0),
     "trade_finder_ai_budget_sec": _const(30.0),
+    "trade_scan_profile": _const("Balanced"),
+    "_trade_scan_profile_applied": _const(""),
     "trade_breakout_min_dist_pct": _const(0.2),
     "trade_breakout_max_dist_pct": _const(4.0),
     "trade_monthly_near_macd_pct": _const(0.08),

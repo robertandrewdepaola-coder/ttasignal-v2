@@ -4675,6 +4675,72 @@ def _trade_quality_settings() -> Dict[str, Any]:
     }
 
 
+def _trade_scan_profile_presets() -> Dict[str, Dict[str, Any]]:
+    """Named scan/filter bundles for simple Strict/Balanced/Loose operation."""
+    return {
+        "Strict": {
+            "find_new_max_tickers": 150,
+            "find_new_in_rotation_only": True,
+            "find_new_include_unknown_sector": False,
+            "find_new_max_minutes": 5.0,
+            "find_new_fetch_batch_size": 30,
+            "trade_min_rr_threshold": 2.0,
+            "trade_earnings_block_days": 7,
+            "trade_require_ready": True,
+            "trade_include_watch_only": False,
+            "trade_require_fresh_data": True,
+            "trade_breakout_min_dist_pct": 0.2,
+            "trade_breakout_max_dist_pct": 2.5,
+            "trade_monthly_near_macd_pct": 0.08,
+            "trade_monthly_near_ao_floor": -0.25,
+        },
+        "Balanced": {
+            "find_new_max_tickers": 250,
+            "find_new_in_rotation_only": True,
+            "find_new_include_unknown_sector": False,
+            "find_new_max_minutes": 5.0,
+            "find_new_fetch_batch_size": 40,
+            "trade_min_rr_threshold": 1.2,
+            "trade_earnings_block_days": 3,
+            "trade_require_ready": False,
+            "trade_include_watch_only": True,
+            "trade_require_fresh_data": True,
+            "trade_breakout_min_dist_pct": 0.2,
+            "trade_breakout_max_dist_pct": 4.0,
+            "trade_monthly_near_macd_pct": 0.08,
+            "trade_monthly_near_ao_floor": -0.25,
+        },
+        "Loose": {
+            "find_new_max_tickers": 500,
+            "find_new_in_rotation_only": False,
+            "find_new_include_unknown_sector": True,
+            "find_new_max_minutes": 10.0,
+            "find_new_fetch_batch_size": 50,
+            "trade_min_rr_threshold": 1.0,
+            "trade_earnings_block_days": 0,
+            "trade_require_ready": False,
+            "trade_include_watch_only": True,
+            "trade_require_fresh_data": False,
+            "trade_breakout_min_dist_pct": 0.0,
+            "trade_breakout_max_dist_pct": 8.0,
+            "trade_monthly_near_macd_pct": 0.18,
+            "trade_monthly_near_ao_floor": -1.50,
+        },
+    }
+
+
+def _apply_trade_scan_profile(profile_name: str) -> str:
+    """Apply profile settings into session state and return applied profile name."""
+    presets = _trade_scan_profile_presets()
+    chosen = str(profile_name or "Balanced").strip().title()
+    if chosen not in presets:
+        chosen = "Balanced"
+    for k, v in (presets.get(chosen, {}) or {}).items():
+        st.session_state[k] = v
+    st.session_state["_trade_scan_profile_applied"] = chosen
+    return chosen
+
+
 def _trade_finder_data_gate_state(*, rerank_only: bool = False) -> Dict[str, Any]:
     """
     Pre-run health gate for Trade Finder.
@@ -6559,6 +6625,37 @@ def render_trade_finder_tab():
     else:
         alert_tickers = set(getattr(_top_state, 'alert_tickers', set()) or set())
     jm = get_journal()
+
+    # Simple scan profile presets for fast user control.
+    _profiles = list(_trade_scan_profile_presets().keys())
+    _profile_default = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+    if _profile_default not in _profiles:
+        _profile_default = "Balanced"
+    st.radio(
+        "Scan Profile",
+        options=_profiles,
+        horizontal=True,
+        key="trade_scan_profile",
+        help=(
+            "Strict = highest quality/lowest count. "
+            "Balanced = default. "
+            "Loose = broader search to avoid empty candidate lists."
+        ),
+    )
+    _profile_selected = str(st.session_state.get("trade_scan_profile", _profile_default) or _profile_default).strip().title()
+    _profile_applied = str(st.session_state.get("_trade_scan_profile_applied", "") or "").strip().title()
+    if _profile_selected not in _profiles:
+        _profile_selected = "Balanced"
+    if _profile_applied not in _profiles:
+        _profile_applied = ""
+    if _profile_selected != _profile_applied:
+        _applied = _apply_trade_scan_profile(_profile_selected)
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': f"Scan profile applied: {_applied}.",
+            'ts': time.time(),
+        }
+        st.rerun()
 
     results = st.session_state.get('trade_finder_results', {}) or {}
     rows = results.get('rows', []) or []
