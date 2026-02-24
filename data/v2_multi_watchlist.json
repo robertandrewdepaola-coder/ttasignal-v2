@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "3ce73fdb-10c5-46da-90cc-6400150883b9",
+  "active_watchlist_id": "56655af2-0f28-4b21-9985-0986dc721f58",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -1672,10 +1672,42 @@
       "type": "manual",
       "is_system": false,
       "tickers": [
-        "NBIS"
+        "CIFR",
+        "CRWV",
+        "IREN",
+        "NBIS",
+        "WULF"
       ],
       "created_at": "2026-02-24T02:59:58.557515",
-      "last_updated": "2026-02-24T03:02:20.214427"
+      "last_updated": "2026-02-24T03:02:22.007570"
+    },
+    {
+      "id": "0f7a116e-fb90-49c8-92e2-aebfc8de5c5f",
+      "name": "Drones",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "KTOS",
+        "ONDS",
+        "RCAT",
+        "UMAC"
+      ],
+      "created_at": "2026-02-24T03:02:44.273563",
+      "last_updated": "2026-02-24T03:03:15.233042"
+    },
+    {
+      "id": "56655af2-0f28-4b21-9985-0986dc721f58",
+      "name": "Aerospace",
+      "type": "manual",
+      "is_system": false,
+      "tickers": [
+        "FTAI",
+        "LMT",
+        "LUNR",
+        "RKLB"
+      ],
+      "created_at": "2026-02-24T03:03:36.390094",
+      "last_updated": "2026-02-24T03:03:51.887833"
     }
   ]
 }
