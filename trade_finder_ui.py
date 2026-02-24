@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Set
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 @dataclass
@@ -302,16 +301,7 @@ def render_trade_finder_top_panel(
                     ]
                 )
                 st.dataframe(_preview_df, hide_index=True, width="stretch")
-            components.html(
-                """
-                <script>
-                setTimeout(function () {
-                  try { window.parent.location.reload(); } catch (e) {}
-                }, 1800);
-                </script>
-                """,
-                height=0,
-            )
+            st.caption("Live progress updates are available. Use Refresh Status to poll without tab flicker.")
         elif _run_active:
             st.warning("Trade Finder run is active. You can request stop; it will halt at the next safe checkpoint.")
         elif _bg_status == "interrupted":
@@ -332,6 +322,8 @@ def render_trade_finder_top_panel(
                         'message': "Cancel requested. Trade Finder will stop at the next batch/checkpoint.",
                         'ts': time.time(),
                     }
+                st.rerun()
+            if _bg_active and st.button("🔄 Refresh Status", key="tf_refresh_run_btn", width="stretch"):
                 st.rerun()
 
     with st.expander("🧠 Green-on-Red Sector Finder", expanded=False):
