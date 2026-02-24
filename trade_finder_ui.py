@@ -213,14 +213,14 @@ def render_trade_finder_top_panel(
 
     if bool(st.session_state.get('trade_gate_auto_rerank_requested', False)):
         _queued_job = start_trade_finder_background_run_fn(rerank_only=True, queue_if_running=True)
+        # Always clear this one-shot trigger so it cannot create rerun loops.
+        st.session_state.pop('trade_gate_auto_rerank_requested', None)
         if _queued_job:
-            st.session_state.pop('trade_gate_auto_rerank_requested', None)
             st.session_state['trade_finder_last_status'] = {
                 'level': 'info',
                 'message': "Auto-calibrated filters applied. Cached re-rank started/queued (no rescan).",
                 'ts': time.time(),
             }
-            st.rerun()
 
     _rc1, _rc2 = st.columns([4, 1])
     with _rc1:
