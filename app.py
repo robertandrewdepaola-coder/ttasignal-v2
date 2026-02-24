@@ -6605,6 +6605,17 @@ def _render_green_on_red_sector_finder(
 
 def render_trade_finder_tab():
     """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
+    # Apply queued scan profile before top-panel widgets are instantiated.
+    _profile_presets = _trade_scan_profile_presets()
+    _pending_profile = str(st.session_state.pop("_trade_scan_profile_pending", "") or "").strip().title()
+    if _pending_profile in _profile_presets:
+        _applied_profile = _apply_trade_scan_profile(_pending_profile)
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': f"Scan profile applied: {_applied_profile}.",
+            'ts': time.time(),
+        }
+
     _top_state = render_trade_finder_top_panel(
         can_auto_rerank_cached_fn=can_auto_rerank_cached,
         today_utc_str_fn=lambda: datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
@@ -6627,7 +6638,7 @@ def render_trade_finder_tab():
     jm = get_journal()
 
     # Simple scan profile presets for fast user control.
-    _profiles = list(_trade_scan_profile_presets().keys())
+    _profiles = list(_profile_presets.keys())
     _profile_default = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
     if _profile_default not in _profiles:
         _profile_default = "Balanced"
@@ -6649,12 +6660,7 @@ def render_trade_finder_tab():
     if _profile_applied not in _profiles:
         _profile_applied = ""
     if _profile_selected != _profile_applied:
-        _applied = _apply_trade_scan_profile(_profile_selected)
-        st.session_state['trade_finder_last_status'] = {
-            'level': 'info',
-            'message': f"Scan profile applied: {_applied}.",
-            'ts': time.time(),
-        }
+        st.session_state["_trade_scan_profile_pending"] = _profile_selected
         st.rerun()
 
     results = st.session_state.get('trade_finder_results', {}) or {}
