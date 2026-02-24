@@ -4,7 +4,7 @@
     "migration_date": "2026-02-18T06:24:06.975207",
     "schema_version": "2.0"
   },
-  "active_watchlist_id": "798ec300-ff3a-45d1-9015-6b971854382e",
+  "active_watchlist_id": "3ce73fdb-10c5-46da-90cc-6400150883b9",
   "watchlists": [
     {
       "id": "system-master-00000",
@@ -1671,9 +1671,11 @@
       "name": "Data centre",
       "type": "manual",
       "is_system": false,
-      "tickers": [],
+      "tickers": [
+        "NBIS"
+      ],
       "created_at": "2026-02-24T02:59:58.557515",
-      "last_updated": "2026-02-24T02:59:58.557515"
+      "last_updated": "2026-02-24T03:02:20.214427"
     }
   ]
 }
