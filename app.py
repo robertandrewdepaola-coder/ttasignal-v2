@@ -4695,20 +4695,20 @@ def _trade_scan_profile_presets() -> Dict[str, Dict[str, Any]]:
             "trade_monthly_near_ao_floor": -0.25,
         },
         "Balanced": {
-            "find_new_max_tickers": 250,
+            "find_new_max_tickers": 350,
             "find_new_in_rotation_only": True,
-            "find_new_include_unknown_sector": False,
+            "find_new_include_unknown_sector": True,
             "find_new_max_minutes": 5.0,
             "find_new_fetch_batch_size": 40,
-            "trade_min_rr_threshold": 1.2,
-            "trade_earnings_block_days": 3,
+            "trade_min_rr_threshold": 1.0,
+            "trade_earnings_block_days": 1,
             "trade_require_ready": False,
             "trade_include_watch_only": True,
-            "trade_require_fresh_data": True,
-            "trade_breakout_min_dist_pct": 0.2,
-            "trade_breakout_max_dist_pct": 4.0,
-            "trade_monthly_near_macd_pct": 0.08,
-            "trade_monthly_near_ao_floor": -0.25,
+            "trade_require_fresh_data": False,
+            "trade_breakout_min_dist_pct": 0.1,
+            "trade_breakout_max_dist_pct": 5.0,
+            "trade_monthly_near_macd_pct": 0.10,
+            "trade_monthly_near_ao_floor": -0.50,
         },
         "Loose": {
             "find_new_max_tickers": 500,
@@ -7155,7 +7155,7 @@ def render_trade_finder_tab():
                         'ts': time.time(),
                     }
                     st.rerun()
-            with st.expander(f"🔎 Hard-Gate Passers ({len(_hard_pass_rows)})", expanded=False):
+            with st.expander(f"🔎 Hard-Gate Passers ({len(_hard_pass_rows)})", expanded=True):
                 for _i, _r in enumerate(_hard_pass_rows[:20]):
                     _t = str(_r.get('ticker', '')).upper().strip()
                     _ai = str(_r.get('ai_buy_recommendation', '') or 'n/a')
