@@ -7095,7 +7095,10 @@ def render_trade_finder_tab():
             st.info("Chart focus mode is active. Click Back to return to Trade Finder candidates.")
             return
 
-    if not qualified_rows:
+    _profile_mode = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+    _auto_fallback_rows = [r for r in rows if bool(r.get('hard_gate_pass', False))]
+
+    if not qualified_rows and not (_profile_mode in {"Balanced", "Loose"} and _auto_fallback_rows):
         st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
         _hard_pass_rows = [r for r in rows if bool(r.get('hard_gate_pass', False))]
         _not_ready_rows = []
@@ -7256,6 +7259,12 @@ def render_trade_finder_tab():
         if not _hard_diag and not _post_diag and not hard_gate_reason_counts:
             st.caption("Filter diagnostics: no blocking failures detected (check data freshness).")
     else:
+        if not qualified_rows and _auto_fallback_rows:
+            qualified_rows = list(_auto_fallback_rows)
+            st.warning(
+                f"No rows passed final filters. Showing {len(qualified_rows)} hard-gate passers "
+                f"as fallback candidates ({_profile_mode} profile)."
+            )
         st.markdown("### Qualified Signals")
         st.caption("Signal Verdict uses model/system scoring. Use actions to review chart or place trade.")
 
