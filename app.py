@@ -1179,9 +1179,14 @@ def _render_factual_market_brief():
         st.session_state['market_filter_data'] = fetch_market_filter()
         st.session_state['_market_filter_ts'] = time.time()
     mkt = st.session_state['market_filter_data']
-    _sector_ctx = st.session_state.get('sector_rotation', {}) or {}
+
+    # Single source of truth for regime + execution gate (same path as executive dashboard).
+    _snap = None
     try:
-        _regime_u, _reg_conf = _infer_exec_regime(mkt, _sector_ctx)
+        _snap = _build_dashboard_snapshot()
+        mkt = _snap.market_filter or mkt
+        _regime_u = str(_snap.regime or "UNKNOWN")
+        _reg_conf = int(_snap.regime_confidence or 0)
     except Exception:
         _regime_u, _reg_conf = "UNKNOWN", 0
     spy_ok = mkt.get('spy_above_200', True)
@@ -1213,7 +1218,7 @@ def _render_factual_market_brief():
     # Single execution authority: should we be trading at all?
     _gate_ctx = None
     try:
-        gate = _evaluate_trade_gate(_build_dashboard_snapshot())
+        gate = _evaluate_trade_gate(_snap if _snap is not None else _build_dashboard_snapshot())
         _gate_ctx = gate
         if gate.severity == "danger":
             st.sidebar.error(f"**{gate.label}**")
@@ -1233,7 +1238,8 @@ def _render_factual_market_brief():
     if narrative_data and narrative_date == today:
         regime = narrative_data.get('regime', 'Neutral')
         with st.sidebar.expander("📓 Market Brief (Context Only)"):
-            st.caption(f"Brief regime model: {regime}")
+            _brief_norm = _normalize_brief_regime(regime)
+            st.caption(f"Narrative bias (context): {regime} → {_brief_norm}")
             if _gate_ctx is not None:
                 st.caption(f"Execution authority remains: {_gate_ctx.label}")
             st.caption(narrative_data.get('narrative', '')[:400])
