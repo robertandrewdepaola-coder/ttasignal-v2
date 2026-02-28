@@ -2301,9 +2301,11 @@ def _navigate_to_scanner_ticker(
     # bounce back to Signal under heavy refresh or fragment rerenders.
     set_detail_nav_intent(st.session_state, ticker=_tk, target=_target, lock_runs=6)
     set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=6)
-    # Force the per-ticker detail selector state so scanner-origin chart/trade clicks
-    # cannot fall back to a stale previously selected tab on rerun.
-    set_detail_tab_selector_target(st.session_state, ticker=_tk, target=_target)
+    # Defer per-ticker selector state application to detail render.
+    # Writing directly to detail_view_tab_* during the same rerun can raise
+    # StreamlitAPIException if that widget key is already instantiated.
+    _selector = {"signal": "signal", "trade": "trade"}.get(_target, "chart")
+    st.session_state[detail_selector_pending_key_for_ticker(_tk)] = _selector
     if bool(switch_to_scanner_tab):
         # Ensure post-switch UX lands on detail panel (not just scanner table top).
         set_scanner_switch_state(st.session_state, target=_target, focus_detail=True)
