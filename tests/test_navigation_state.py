@@ -3,13 +3,16 @@ from navigation_state import (
     KEY_DETAIL_NAV_INTENT,
     KEY_DETAIL_TAB_LOCK,
     KEY_DETAIL_TAB_SELECTOR_PREFIX,
+    KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX,
     KEY_SWITCH_TO_SCANNER_TAB,
     KEY_SWITCH_TO_SCANNER_TARGET_TAB,
     KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
     clear_scanner_switch_state,
+    consume_detail_tab_selector_pending,
     consume_detail_tab_with_lock,
     consume_detail_nav_intent,
     detail_selector_key_for_ticker,
+    detail_selector_pending_key_for_ticker,
     detail_tab_for_target,
     normalize_nav_target,
     set_detail_tab_lock,
@@ -32,6 +35,7 @@ def test_normalize_target_and_tab_mapping():
 def test_detail_selector_key_and_target_mapping():
     state = {}
     assert detail_selector_key_for_ticker("au") == f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"
+    assert detail_selector_pending_key_for_ticker("au") == f"{KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX}AU"
     target = set_detail_tab_selector_target(state, ticker="au", target="chart")
     assert target == "chart"
     assert state[f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"] == "chart"
@@ -41,6 +45,24 @@ def test_detail_selector_key_and_target_mapping():
 
     set_detail_tab_selector_target(state, ticker="au", target="bad-value")
     assert state[f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU"] == "chart"
+
+
+def test_detail_selector_defers_when_direct_assignment_fails():
+    class FailOnSelectorSet(dict):
+        def __setitem__(self, key, value):
+            if str(key).startswith(KEY_DETAIL_TAB_SELECTOR_PREFIX):
+                raise RuntimeError("selector key locked")
+            return super().__setitem__(key, value)
+
+    state = FailOnSelectorSet()
+    out = set_detail_tab_selector_target(state, ticker="au", target="trade")
+    assert out == "trade"
+    assert f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}AU" not in state
+    assert state[f"{KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX}AU"] == "trade"
+
+    pending = consume_detail_tab_selector_pending(state, ticker="au")
+    assert pending == "trade"
+    assert f"{KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX}AU" not in state
 
 
 def test_lock_consumed_for_same_ticker():

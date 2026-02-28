@@ -13,6 +13,7 @@ import streamlit as st
 from navigation_state import (
     KEY_DEFAULT_DETAIL_TAB,
     KEY_DETAIL_NAV_INTENT,
+    consume_detail_tab_selector_pending,
     consume_detail_tab_with_lock,
     consume_detail_nav_intent,
     detail_selector_key_for_ticker,
@@ -111,11 +112,14 @@ def render_detail_view_shell(
     if default_tab < 0 or default_tab >= len(tab_defs):
         default_tab = 0
     target_tab_key = tab_defs[default_tab][1]
+    _pending_target = consume_detail_tab_selector_pending(st.session_state, ticker=ticker)
+    if _pending_target in tab_keys:
+        target_tab_key = _pending_target
     selector_key = detail_selector_key_for_ticker(ticker)
     selected_tab_key = st.session_state.get(selector_key)
     if selected_tab_key not in tab_keys:
         st.session_state[selector_key] = target_tab_key
-    elif has_explicit_tab_intent or has_nav_intent or bool(nav_target):
+    elif has_explicit_tab_intent or has_nav_intent or bool(nav_target) or bool(_pending_target):
         st.session_state[selector_key] = target_tab_key
 
     selected_tab_key = st.radio(

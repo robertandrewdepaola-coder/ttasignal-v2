@@ -17,6 +17,7 @@ KEY_SWITCH_TO_SCANNER_TAB = "_switch_to_scanner_tab"
 KEY_SWITCH_TO_SCANNER_TARGET_TAB = "_switch_to_scanner_target_tab"
 KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = "_switch_to_scanner_focus_detail"
 KEY_DETAIL_TAB_SELECTOR_PREFIX = "detail_view_tab_"
+KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX = "_pending_detail_view_tab_"
 
 # Supported navigation targets -> detail tab index
 _TARGET_TO_TAB = {
@@ -51,17 +52,46 @@ def detail_selector_key_for_ticker(ticker: Any) -> str:
     return f"{KEY_DETAIL_TAB_SELECTOR_PREFIX}{_ticker}"
 
 
+def detail_selector_pending_key_for_ticker(ticker: Any) -> str:
+    """Canonical per-ticker deferred selector key."""
+    _ticker = str(ticker or "").upper().strip()
+    return f"{KEY_DETAIL_TAB_SELECTOR_PENDING_PREFIX}{_ticker}"
+
+
 def set_detail_tab_selector_target(
     state: MutableMapping[str, Any],
     *,
     ticker: Any,
     target: Any,
 ) -> str:
-    """Set per-ticker detail selector target (signal/chart/trade) and return value."""
+    """Set per-ticker detail selector target (signal/chart/trade) and return value.
+
+    If the selector widget key is already instantiated in the current Streamlit
+    pass, direct assignment can raise StreamlitAPIException. In that case we
+    store the desired selector in a deferred key and apply it next rerun before
+    radio render.
+    """
     _target = normalize_nav_target(target, fallback="chart")
     _selector = _TARGET_TO_SELECTOR.get(_target, "chart")
-    state[detail_selector_key_for_ticker(ticker)] = _selector
+    _selector_key = detail_selector_key_for_ticker(ticker)
+    _pending_key = detail_selector_pending_key_for_ticker(ticker)
+    try:
+        state[_selector_key] = _selector
+        state.pop(_pending_key, None)
+    except Exception:
+        state[_pending_key] = _selector
     return _selector
+
+
+def consume_detail_tab_selector_pending(
+    state: MutableMapping[str, Any],
+    *,
+    ticker: Any,
+) -> str:
+    """Consume deferred selector target for a ticker (returns signal/chart/trade or '')."""
+    _pending_key = detail_selector_pending_key_for_ticker(ticker)
+    _raw = str(state.pop(_pending_key, "") or "").strip().lower()
+    return _raw if _raw in _TARGET_TO_SELECTOR.values() else ""
 
 
 def set_detail_tab_lock(

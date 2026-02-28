@@ -109,6 +109,11 @@ def detail_tab_for_target(target, fallback="chart"):
     return {"signal": 0, "chart": 1, "trade": 4}.get(normalize_nav_target(target, fallback=fallback), 1)
 
 
+def detail_selector_pending_key_for_ticker(ticker):
+    _tk = str(ticker or "").upper().strip()
+    return f"_pending_detail_view_tab_{_tk}"
+
+
 def set_detail_tab_lock(state, *, ticker, tab_index, lock_runs=3, now_ts=None):
     state["default_detail_tab"] = int(tab_index or 0)
 
@@ -129,7 +134,13 @@ def set_detail_tab_selector_target(state, *, ticker, target):
     _tk = str(ticker or "").upper().strip()
     _target = normalize_nav_target(target, fallback="chart")
     _selector = {"signal": "signal", "trade": "trade"}.get(_target, "chart")
-    state[f"detail_view_tab_{_tk}"] = _selector
+    _selector_key = f"detail_view_tab_{_tk}"
+    _pending_key = detail_selector_pending_key_for_ticker(_tk)
+    try:
+        state[_selector_key] = _selector
+        state.pop(_pending_key, None)
+    except Exception:
+        state[_pending_key] = _selector
     return _selector
 
 
@@ -146,6 +157,7 @@ try:
         KEY_SWITCH_TO_SCANNER_TARGET_TAB as _KEY_SWITCH_TO_SCANNER_TARGET_TAB,
         clear_scanner_switch_state as _clear_scanner_switch_state,
         detail_tab_for_target as _detail_tab_for_target,
+        detail_selector_pending_key_for_ticker as _detail_selector_pending_key_for_ticker,
         normalize_nav_target as _normalize_nav_target,
         set_detail_nav_intent as _set_detail_nav_intent,
         set_detail_tab_lock as _set_detail_tab_lock,
@@ -158,6 +170,7 @@ try:
     KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = _KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL
     clear_scanner_switch_state = _clear_scanner_switch_state
     detail_tab_for_target = _detail_tab_for_target
+    detail_selector_pending_key_for_ticker = _detail_selector_pending_key_for_ticker
     normalize_nav_target = _normalize_nav_target
     set_detail_nav_intent = _set_detail_nav_intent
     set_detail_tab_lock = _set_detail_tab_lock
@@ -193,6 +206,13 @@ except (ImportError, AttributeError, KeyError):
             "chat": lambda: render_chat_tab(ticker, signal, rec, analysis),
             "trade": lambda: render_trade_tab(ticker, signal, analysis),
         }
+        _selector_key = f"detail_view_tab_{str(ticker).upper().strip()}"
+        _pending_sel = str(st.session_state.pop(detail_selector_pending_key_for_ticker(ticker), "") or "").strip().lower()
+        if _pending_sel in {"signal", "chart", "ai", "chat", "trade"}:
+            try:
+                st.session_state[_selector_key] = _pending_sel
+            except Exception:
+                pass
         choice = st.radio(
             "Detail View",
             options=["signal", "chart", "ai", "chat", "trade"],
@@ -205,7 +225,7 @@ except (ImportError, AttributeError, KeyError):
                 "trade": "💼 Trade",
             }.get(k, k),
             label_visibility="collapsed",
-            key=f"detail_view_tab_{str(ticker).upper().strip()}",
+            key=_selector_key,
         )
         tab_map.get(choice, tab_map["signal"])()
 try:
