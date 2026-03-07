@@ -2783,6 +2783,107 @@ def fetch_all_ticker_data(ticker: str, include_fundamentals: bool = False) -> Di
     return data
 
 
+def _batch_download_timeframe(
+    tickers: List[str],
+    period: str,
+    interval: str,
+    chunk_size: int = 40,
+) -> Dict[str, Optional[pd.DataFrame]]:
+    """
+    Batch-download price data for many tickers in one yf.download call.
+    Falls back to individual fetches for tickers that fail in the batch.
+    Returns dict of ticker -> normalized DataFrame (or None).
+    """
+    out: Dict[str, Optional[pd.DataFrame]] = {t: None for t in tickers}
+    if not tickers:
+        return out
+
+    # Check cache first — skip tickers already cached
+    remaining: List[str] = []
+    cache_suffix = {'1d': 'daily', '1wk': 'weekly', '1mo': 'monthly'}.get(interval, interval)
+    for tk in tickers:
+        cache_key = f"{tk}:{cache_suffix}:{period}"
+        cached = _cache.get(cache_key)
+        if cached is not None:
+            out[tk] = cached
+        else:
+            remaining.append(tk)
+
+    if not remaining:
+        return out
+
+    # Download in chunks to avoid timeouts on large watchlists
+    for i in range(0, len(remaining), chunk_size):
+        chunk = remaining[i:i + chunk_size]
+        scope = f"batch:{cache_suffix}:{i // chunk_size}"
+        try:
+            if not _governed_request_acquire(scope):
+                continue
+            dl = yf.download(
+                tickers=" ".join(chunk),
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=True,  # yfinance internal threading for this batch
+            )
+            if dl is None or dl.empty:
+                continue
+            dl = normalize_columns(dl)
+
+            for tk in chunk:
+                try:
+                    # Single ticker returns flat columns; multi returns MultiIndex
+                    if len(chunk) == 1:
+                        if 'Close' in dl.columns:
+                            df = dl.copy()
+                        else:
+                            continue
+                    elif isinstance(dl.columns, pd.MultiIndex):
+                        # Try (ticker, field) grouping first
+                        lvl0 = set(str(x) for x in dl.columns.get_level_values(0))
+                        if tk in lvl0:
+                            df = dl[tk].copy()
+                        elif any((tk, c) in dl.columns for c in ['Close', 'close']):
+                            cols = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume']
+                                    if (tk, c) in dl.columns]
+                            df = dl[[( tk, c) for c in cols]].droplevel(0, axis=1)
+                        else:
+                            continue
+                    else:
+                        continue
+
+                    if df is not None and not df.empty and 'Close' in df.columns:
+                        df = df.dropna(subset=['Close'])
+                        if not df.empty:
+                            cache_key = f"{tk}:{cache_suffix}:{period}"
+                            ttl = {'daily': 15 * 60, 'weekly': 2 * 60 * 60, 'monthly': 6 * 60 * 60}.get(cache_suffix, 300)
+                            _cache.set(cache_key, df, ttl_sec=ttl)
+                            out[tk] = df
+                except Exception:
+                    pass  # Individual ticker extraction failed; will fallback below
+
+            _mark_fetch_success(scope)
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(scope, e)
+                break
+            print(f"[data_fetcher] Batch {cache_suffix} download error ({len(chunk)} tickers): {e}")
+
+    # Fallback: individually fetch any tickers that the batch missed
+    fetch_fn = {'daily': fetch_daily, 'weekly': fetch_weekly, 'monthly': fetch_monthly}.get(cache_suffix)
+    if fetch_fn:
+        for tk in remaining:
+            if out[tk] is None:
+                try:
+                    out[tk] = fetch_fn(tk)
+                except Exception:
+                    pass
+
+    return out
+
+
 def fetch_scan_data(
     tickers: List[str],
     force_refresh: bool = False,
@@ -2791,40 +2892,80 @@ def fetch_scan_data(
     """
     Batch fetch data for multiple tickers (scan mode).
     
-    Fetches only price data (daily/weekly/monthly), not fundamentals.
-    SPY and market filter are fetched once and shared.
+    Uses batch yf.download() for each timeframe — typically 3 API calls
+    instead of 3×N individual calls. Falls back to individual fetches
+    for any tickers that fail in the batch.
     
     Returns dict of ticker -> data dict.
     """
     if force_refresh:
         clear_cache(clear_rate_limits=False)
     
+    total = len(tickers)
+    if progress_cb is not None:
+        try:
+            progress_cb(0, total, "Pre-fetching shared data...")
+        except Exception:
+            pass
+
     # Pre-fetch shared data once
     spy_daily = fetch_spy_daily()
     market_filter = fetch_market_filter()
     
+    # ── Batch download all three timeframes ──────────────────────────
+    if progress_cb is not None:
+        try:
+            should_continue = progress_cb(1, total, f"Batch downloading daily data ({total} tickers)...")
+            if should_continue is False:
+                return {}
+        except Exception:
+            pass
+
+    daily_map = _batch_download_timeframe(tickers, DAILY_PERIOD, '1d')
+
+    if progress_cb is not None:
+        try:
+            should_continue = progress_cb(int(total * 0.35), total, f"Batch downloading weekly data ({total} tickers)...")
+            if should_continue is False:
+                return {}
+        except Exception:
+            pass
+
+    weekly_map = _batch_download_timeframe(tickers, WEEKLY_PERIOD, '1wk')
+
+    if progress_cb is not None:
+        try:
+            should_continue = progress_cb(int(total * 0.65), total, f"Batch downloading monthly data ({total} tickers)...")
+            if should_continue is False:
+                return {}
+        except Exception:
+            pass
+
+    monthly_map = _batch_download_timeframe(tickers, MONTHLY_PERIOD, '1mo')
+
+    # ── Assemble per-ticker results ──────────────────────────────────
     results = {}
-    total = len(tickers)
     for idx, ticker in enumerate(tickers, start=1):
         if progress_cb is not None:
             try:
-                should_continue = progress_cb(idx, total, str(ticker))
+                should_continue = progress_cb(int(total * 0.85) + int(idx / total * total * 0.15), total, f"Assembling {ticker}...")
                 if should_continue is False:
-                    print(f"[data_fetcher] Scan fetch interrupted at {idx-1}/{total}")
                     break
             except Exception:
                 pass
+
+        daily = daily_map.get(ticker)
         data = {
             'ticker': ticker,
-            'daily': fetch_daily(ticker),
-            'weekly': fetch_weekly(ticker),
-            'monthly': fetch_monthly(ticker),
+            'daily': daily,
+            'weekly': weekly_map.get(ticker),
+            'monthly': monthly_map.get(ticker),
             'spy_daily': spy_daily,
             'market_filter': market_filter,
         }
         
-        if data['daily'] is not None and len(data['daily']) > 0:
-            data['current_price'] = float(data['daily']['Close'].iloc[-1])
+        if daily is not None and len(daily) > 0:
+            data['current_price'] = float(daily['Close'].iloc[-1])
         else:
             data['current_price'] = None
         
