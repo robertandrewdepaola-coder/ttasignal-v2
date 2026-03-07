@@ -36,44 +36,44 @@ from signal_engine import (
     MACD_PROFILE_HPOTTER_ZONE,
     MACD_PROFILE_SHADOW,
 )
-try:
-    from data_fetcher import (
-        fetch_all_ticker_data, fetch_scan_data, fetch_market_filter,
-        fetch_current_price, fetch_daily, fetch_weekly, fetch_monthly,
-        clear_cache, get_fetch_health_status, fetch_batch_session_change,
-    )
-except (KeyError, ImportError, AttributeError):
-    # Streamlit Cloud can race module loading during hot-reload after git pulls.
-    # Retry via importlib to recover from transient sys.modules inconsistencies.
-    import importlib as _importlib
-    _df = _importlib.import_module("data_fetcher")
-    fetch_all_ticker_data = _df.fetch_all_ticker_data
-    fetch_scan_data = _df.fetch_scan_data
-    fetch_market_filter = _df.fetch_market_filter
-    fetch_current_price = _df.fetch_current_price
-    fetch_daily = _df.fetch_daily
-    fetch_weekly = _df.fetch_weekly
-    fetch_monthly = _df.fetch_monthly
-    clear_cache = _df.clear_cache
-    get_fetch_health_status = getattr(_df, "get_fetch_health_status", lambda: {})
-    fetch_batch_session_change = getattr(_df, "fetch_batch_session_change", lambda tickers, **kwargs: {})
-try:
-    from scanner_engine import analyze_ticker, scan_watchlist, TickerAnalysis
-except KeyError:
-    # Streamlit Cloud hot-reload can leave transient stale sys.modules entries.
-    import importlib as _importlib
-    _se = _importlib.import_module("scanner_engine")
-    analyze_ticker = _se.analyze_ticker
-    scan_watchlist = _se.scan_watchlist
-    TickerAnalysis = _se.TickerAnalysis
 
-try:
-    from ai_analysis import analyze as run_ai_analysis
-except KeyError:
-    # Same hot-reload race protection as data_fetcher/scanner_engine imports.
-    import importlib as _importlib
-    _ai = _importlib.import_module("ai_analysis")
-    run_ai_analysis = _ai.analyze
+def _safe_import(module_name: str, *attr_names: str, fallbacks: dict = None):
+    """Import with hot-reload resilience. Returns module or raises on total failure."""
+    import importlib
+    fallbacks = fallbacks or {}
+    try:
+        mod = __import__(module_name, fromlist=attr_names or ['__name__'])
+    except (KeyError, ImportError, AttributeError):
+        mod = importlib.import_module(module_name)
+    results = {}
+    for attr in attr_names:
+        results[attr] = getattr(mod, attr, fallbacks.get(attr))
+    return mod, results
+
+_, _df_attrs = _safe_import("data_fetcher",
+    "fetch_all_ticker_data", "fetch_scan_data", "fetch_market_filter",
+    "fetch_current_price", "fetch_daily", "fetch_weekly", "fetch_monthly",
+    "clear_cache", "get_fetch_health_status", "fetch_batch_session_change",
+    fallbacks={"get_fetch_health_status": lambda: {}, "fetch_batch_session_change": lambda tickers, **kwargs: {}})
+fetch_all_ticker_data = _df_attrs["fetch_all_ticker_data"]
+fetch_scan_data = _df_attrs["fetch_scan_data"]
+fetch_market_filter = _df_attrs["fetch_market_filter"]
+fetch_current_price = _df_attrs["fetch_current_price"]
+fetch_daily = _df_attrs["fetch_daily"]
+fetch_weekly = _df_attrs["fetch_weekly"]
+fetch_monthly = _df_attrs["fetch_monthly"]
+clear_cache = _df_attrs["clear_cache"]
+get_fetch_health_status = _df_attrs["get_fetch_health_status"]
+fetch_batch_session_change = _df_attrs["fetch_batch_session_change"]
+
+_, _se_attrs = _safe_import("scanner_engine", "analyze_ticker", "scan_watchlist", "TickerAnalysis")
+analyze_ticker = _se_attrs["analyze_ticker"]
+scan_watchlist = _se_attrs["scan_watchlist"]
+TickerAnalysis = _se_attrs["TickerAnalysis"]
+
+_, _ai_attrs = _safe_import("ai_analysis", "analyze")
+run_ai_analysis = _ai_attrs["analyze"]
+
 from chart_engine import render_tv_chart, render_mtf_chart
 from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry, PlannedTrade
 from watchlist_manager import WatchlistManager
@@ -970,14 +970,19 @@ if 'sector_rotation' not in st.session_state:
         st.session_state['sector_rotation'] = {}
 
 # Pre-fetch SPY/VIX for APEX chart signals (avoids mid-render fetch on chart tab)
-if 'apex_spy_data' not in st.session_state:
+# Refresh if stale (>15 min) to keep market data current during long sessions
+_SHARED_DATA_TTL = 15 * 60  # 15 minutes
+_shared_data_age = time.time() - st.session_state.get('_shared_data_ts', 0)
+if 'apex_spy_data' not in st.session_state or _shared_data_age > _SHARED_DATA_TTL:
     try:
         from data_fetcher import fetch_daily
         st.session_state['apex_spy_data'] = fetch_daily("SPY")
         st.session_state['apex_vix_data'] = fetch_daily("^VIX")
+        st.session_state['_shared_data_ts'] = time.time()
     except Exception:
-        st.session_state['apex_spy_data'] = None
-        st.session_state['apex_vix_data'] = None
+        if 'apex_spy_data' not in st.session_state:
+            st.session_state['apex_spy_data'] = None
+            st.session_state['apex_vix_data'] = None
 
 # Centralized session-state defaults for scanner/trade-finder controls.
 ensure_core_defaults(st.session_state)
@@ -12825,6 +12830,7 @@ def _render_position_management(ticker: str, jm: JournalManager):
 # PERFORMANCE VIEW
 # =============================================================================
 
+@st.fragment
 def render_performance():
     """Trade history and performance stats."""
     jm = get_journal()
@@ -13052,6 +13058,7 @@ def render_performance():
 # POSITION MANAGER — Exit Advisor Tab
 # =============================================================================
 
+@st.fragment
 def render_position_manager():
     """Position Manager: AI-driven exit analysis for all open positions."""
     jm = get_journal()
@@ -15892,6 +15899,7 @@ def main():
         components.html(_switch_js, height=0)
 
 
+@st.fragment
 def _render_alerts_panel():
     """Dedicated alerts panel — moved from sidebar."""
     jm = get_journal()
