@@ -969,20 +969,48 @@ if 'sector_rotation' not in st.session_state:
     except Exception:
         st.session_state['sector_rotation'] = {}
 
-# Pre-fetch SPY/VIX for APEX chart signals (avoids mid-render fetch on chart tab)
-# Refresh if stale (>15 min) to keep market data current during long sessions
+# =============================================================================
+# SHARED MARKET DATA — Single source of truth for SPY, VIX, market filter
+# =============================================================================
+# Fetched once per session, auto-refreshes when stale. Every function that
+# needs SPY/VIX/market_filter should call get_shared_*() instead of fetching.
+
 _SHARED_DATA_TTL = 15 * 60  # 15 minutes
-_shared_data_age = time.time() - st.session_state.get('_shared_data_ts', 0)
-if 'apex_spy_data' not in st.session_state or _shared_data_age > _SHARED_DATA_TTL:
+
+def _refresh_shared_market_data(force: bool = False):
+    """Refresh shared market data if stale or forced. Called once at startup and on scan."""
+    age = time.time() - st.session_state.get('_shared_data_ts', 0)
+    if not force and age < _SHARED_DATA_TTL and 'apex_spy_data' in st.session_state:
+        return
     try:
-        from data_fetcher import fetch_daily
-        st.session_state['apex_spy_data'] = fetch_daily("SPY")
-        st.session_state['apex_vix_data'] = fetch_daily("^VIX")
+        spy = fetch_daily("SPY")
+        vix = fetch_daily("^VIX")
+        mkt = fetch_market_filter()
+        st.session_state['apex_spy_data'] = spy
+        st.session_state['apex_vix_data'] = vix
+        st.session_state['market_filter_data'] = mkt
         st.session_state['_shared_data_ts'] = time.time()
+        st.session_state['_market_filter_ts'] = time.time()
     except Exception:
         if 'apex_spy_data' not in st.session_state:
             st.session_state['apex_spy_data'] = None
             st.session_state['apex_vix_data'] = None
+        if 'market_filter_data' not in st.session_state:
+            st.session_state['market_filter_data'] = {}
+
+def get_shared_spy_daily():
+    """Get cached SPY daily data. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('apex_spy_data')
+
+def get_shared_vix_daily():
+    """Get cached VIX daily data. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('apex_vix_data')
+
+def get_shared_market_filter():
+    """Get cached market filter. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('market_filter_data') or {}
+
+_refresh_shared_market_data()
 
 # Centralized session-state defaults for scanner/trade-finder controls.
 ensure_core_defaults(st.session_state)
@@ -1165,7 +1193,7 @@ def _run_deep_analysis():
             from ai_analysis import generate_deep_market_analysis
 
             macro_data = fetch_macro_narrative_data()
-            market_filter = fetch_market_filter()
+            market_filter = get_shared_market_filter()
             sector_rotation = fetch_sector_rotation()
 
             ai_clients = _get_ai_clients()
@@ -1199,11 +1227,8 @@ def _render_factual_market_brief():
     """
     today = datetime.now().strftime('%Y-%m-%d')
 
-    # Cache market filter in session_state (survives reruns, refreshes via data_fetcher's 5min TTL)
-    if 'market_filter_data' not in st.session_state:
-        st.session_state['market_filter_data'] = fetch_market_filter()
-        st.session_state['_market_filter_ts'] = time.time()
-    mkt = st.session_state['market_filter_data']
+    # Market filter already loaded by shared data manager at startup
+    mkt = get_shared_market_filter()
 
     # Single source of truth for regime + execution gate (same path as executive dashboard).
     _snap = None
@@ -1577,9 +1602,8 @@ def render_sidebar():
                 key="sidebar_wl_selector", label_visibility="collapsed",
             )
         with sel_col2:
-            if st.button("➕", key="sidebar_wl_create", help="Create new watchlist"):
-                st.session_state['show_wl_create'] = True
-                st.rerun()
+            st.button("➕", key="sidebar_wl_create", help="Create new watchlist",
+                      on_click=lambda: st.session_state.update({'show_wl_create': True}))
 
         selected_id = wl_id_map.get(selected)
         if selected_id and selected_id != active_wl["id"]:
@@ -1616,9 +1640,8 @@ def render_sidebar():
         with wl_col1:
             st.sidebar.caption(f"📋 {active_wl['name']}")
         with wl_col2:
-            if st.button("➕", key="sidebar_wl_create", help="Create new watchlist"):
-                st.session_state['show_wl_create'] = True
-                st.rerun()
+            st.button("➕", key="sidebar_wl_create", help="Create new watchlist",
+                      on_click=lambda: st.session_state.update({'show_wl_create': True}))
 
     # ── Create Watchlist Dialog (inline sidebar) ───────────────────────
     if st.session_state.get('show_wl_create'):
@@ -1689,9 +1712,8 @@ def render_sidebar():
                     else:
                         st.error("Enter a name")
             with c2:
-                if st.button("Cancel", key="create_wl_cancel", width="stretch"):
-                    st.session_state['show_wl_create'] = False
-                    st.rerun()
+                st.button("Cancel", key="create_wl_cancel", width="stretch",
+                          on_click=lambda: st.session_state.update({'show_wl_create': False}))
 
     # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
     if active_wl.get("type") == "auto":
@@ -1842,9 +1864,9 @@ def render_sidebar():
             # Delete
             st.caption(f"⚠️ Delete **{active_wl['name']}** permanently")
             if st.button("🗑️ Delete This Watchlist", key="wl_delete_sidebar",
-                         type="secondary", width="stretch"):
-                st.session_state['confirm_delete_wl'] = True
-                st.rerun()
+                         type="secondary", width="stretch",
+                         on_click=lambda: st.session_state.update({'confirm_delete_wl': True})):
+                pass
             if st.session_state.get('confirm_delete_wl'):
                 st.warning("Are you sure? This cannot be undone.")
                 d1, d2 = st.columns(2)
@@ -1861,9 +1883,8 @@ def render_sidebar():
                             st.toast(f"✅ {msg}")
                             st.rerun()
                 with d2:
-                    if st.button("Cancel", key="wl_cancel_del"):
-                        st.session_state['confirm_delete_wl'] = False
-                        st.rerun()
+                    st.button("Cancel", key="wl_cancel_del",
+                              on_click=lambda: st.session_state.update({'confirm_delete_wl': False}))
 
     # ── Scan Controls ─────────────────────────────────────────────────
     watchlist_tickers = bridge.get_watchlist_tickers()
@@ -2157,10 +2178,7 @@ def _ensure_ticker_chart_cache(
             data['monthly'] = None
 
     if include_market_context and data.get('market_filter') is None:
-        try:
-            data['market_filter'] = fetch_market_filter()
-        except Exception:
-            data['market_filter'] = {}
+        data['market_filter'] = get_shared_market_filter()
 
     if data.get('daily') is not None:
         try:
@@ -2240,7 +2258,7 @@ def _load_ticker_for_view(
             data_cache = st.session_state.get('ticker_data_cache', {}) or {}
             data = dict((data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}) or {})
             data['ticker'] = ticker
-            data.setdefault('market_filter', fetch_market_filter() or {})
+            data.setdefault('market_filter', get_shared_market_filter())
         else:
             data = fetch_all_ticker_data(ticker)
 
@@ -6450,7 +6468,7 @@ def _render_green_on_red_sector_finder(
         if (time.time() - _spy_cached_ts) < 300:
             _spy_day_change = st.session_state.get(_spy_key)
         else:
-            _spy_df = fetch_daily("SPY")
+            _spy_df = get_shared_spy_daily()
             if _spy_df is not None and len(_spy_df) >= 2:
                 _prev = float(_spy_df["Close"].iloc[-2] or 0)
                 _last = float(_spy_df["Close"].iloc[-1] or 0)
@@ -6675,11 +6693,16 @@ def render_trade_finder_tab():
     _profile_default = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
     if _profile_default not in _profiles:
         _profile_default = "Balanced"
+    def _on_profile_change():
+        _sel = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+        st.session_state["_trade_scan_profile_pending"] = _sel
+
     st.radio(
         "Scan Profile",
         options=_profiles,
         horizontal=True,
         key="trade_scan_profile",
+        on_change=_on_profile_change,
         help=(
             "Strict = highest quality/lowest count. "
             "Balanced = default. "
@@ -6692,9 +6715,6 @@ def render_trade_finder_tab():
         _profile_selected = "Balanced"
     if _profile_applied not in _profiles:
         _profile_applied = ""
-    if _profile_selected != _profile_applied:
-        st.session_state["_trade_scan_profile_pending"] = _profile_selected
-        st.rerun()
 
     results = st.session_state.get('trade_finder_results', {}) or {}
     rows = results.get('rows', []) or []
@@ -7107,7 +7127,7 @@ def render_trade_finder_tab():
                     if not _have_daily or _tf_data.get('daily') is None:
                         raise ValueError("No daily chart data available")
                     _tf_data['ticker'] = _inline_chart_ticker
-                    _tf_data.setdefault('market_filter', fetch_market_filter() or {})
+                    _tf_data.setdefault('market_filter', get_shared_market_filter())
                     _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
                     _tf_analysis = analyze_ticker(_tf_data, macd_profile=_macd_profile)
                     _tf_cache[_inline_chart_ticker] = _tf_analysis
@@ -8540,25 +8560,24 @@ def render_scanner_table():
 
     # ── Bottom pagination ─────────────────────────────────────────────
     if total_pages > 1:
+        def _set_page(page: int):
+            st.session_state['scanner_page'] = page
+
         bpg1, bpg2, bpg3, bpg4, bpg5 = st.columns([1, 1, 3, 1, 1])
         with bpg1:
-            if st.button("⏮", key="bpage_first", disabled=current_page == 0):
-                st.session_state['scanner_page'] = 0
-                st.rerun()
+            st.button("⏮", key="bpage_first", disabled=current_page == 0,
+                      on_click=_set_page, args=(0,))
         with bpg2:
-            if st.button("◀", key="bpage_prev", disabled=current_page == 0):
-                st.session_state['scanner_page'] = current_page - 1
-                st.rerun()
+            st.button("◀", key="bpage_prev", disabled=current_page == 0,
+                      on_click=_set_page, args=(max(0, current_page - 1),))
         with bpg3:
             st.caption(f"Page {current_page + 1}/{total_pages}")
         with bpg4:
-            if st.button("▶", key="bpage_next", disabled=current_page >= total_pages - 1):
-                st.session_state['scanner_page'] = current_page + 1
-                st.rerun()
+            st.button("▶", key="bpage_next", disabled=current_page >= total_pages - 1,
+                      on_click=_set_page, args=(min(total_pages - 1, current_page + 1),))
         with bpg5:
-            if st.button("⏭", key="bpage_last", disabled=current_page >= total_pages - 1):
-                st.session_state['scanner_page'] = total_pages - 1
-                st.rerun()
+            st.button("⏭", key="bpage_last", disabled=current_page >= total_pages - 1,
+                      on_click=_set_page, args=(total_pages - 1,))
 
     # ── Quick Actions for selected ticker ─────────────────────────────
     st.divider()
@@ -10937,8 +10956,7 @@ def _fetch_external_research(ticker: str) -> str:
         _mkt_lines = []
         _mkt_lines.append("🌍 OVERALL MARKET CONDITIONS:")
         try:
-            from data_fetcher import fetch_daily, fetch_market_filter
-            market = fetch_market_filter()
+            market = get_shared_market_filter()
 
             spy_close = market.get('spy_close')
             spy_sma200 = market.get('spy_sma200')
@@ -10952,7 +10970,7 @@ def _fetch_external_research(ticker: str) -> str:
                 _mkt_lines.append(f"  VIX: {vix_close:.1f} | {'LOW fear ✅' if vix_close < 20 else 'ELEVATED ⚠️' if vix_close < 30 else 'HIGH FEAR ❌'}")
 
             # SPY recent performance (risk-on vs risk-off)
-            spy_df = fetch_daily("SPY")
+            spy_df = get_shared_spy_daily()
             if spy_df is not None and len(spy_df) >= 50:
                 spy_5d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
                 spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
@@ -14191,8 +14209,7 @@ def _fast_refresh_dashboard() -> None:
     _t0 = time.time()
     from data_fetcher import fetch_sector_rotation
 
-    st.session_state['market_filter_data'] = fetch_market_filter()
-    st.session_state['_market_filter_ts'] = time.time()
+    _refresh_shared_market_data(force=True)
 
     st.session_state['sector_rotation'] = fetch_sector_rotation()
     st.session_state['_sector_rotation_ts'] = time.time()
