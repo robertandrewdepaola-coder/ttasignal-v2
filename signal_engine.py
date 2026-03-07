@@ -18,6 +18,16 @@ Version: 2.1.0 (2026-02-22)
 import os
 import pandas as pd
 import numpy as np
+
+# Conditional Streamlit caching — works without Streamlit for testing/standalone use.
+try:
+    from streamlit import cache_data as _cache_data
+except ImportError:
+    def _cache_data(func=None, *, ttl=None, max_entries=None, show_spinner=False):
+        """No-op decorator when Streamlit is not available."""
+        if func is not None:
+            return func
+        return lambda f: f
 from typing import Dict, Tuple, Optional, Any, List
 from dataclasses import dataclass, field
 
@@ -272,6 +282,7 @@ def calculate_ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 
+@_cache_data(ttl=600, show_spinner=False)
 def add_all_indicators(df: pd.DataFrame, macd_profile: Optional[str] = None) -> pd.DataFrame:
     """
     Add all standard indicators to a DataFrame in one call.
@@ -495,6 +506,7 @@ def _empty_ao_result() -> Dict[str, Any]:
 # DIVERGENCE DETECTION
 # =============================================================================
 
+@_cache_data(ttl=600, show_spinner=False)
 def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
     """
     Detect bearish divergence using AO wave structure.
@@ -643,6 +655,7 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
 # VOLATILITY CONTRACTION PATTERN (VCP)
 # =============================================================================
 
+@_cache_data(ttl=600, show_spinner=False)
 def detect_vcp(
     df: pd.DataFrame,
     lookback: int = 60,
@@ -1013,6 +1026,7 @@ def check_timeframe_ao(df: pd.DataFrame) -> Dict[str, Any]:
 # WEINSTEIN STAGE DETECTION
 # =============================================================================
 
+@_cache_data(ttl=600, show_spinner=False)
 def detect_weinstein_stage(df: pd.DataFrame) -> Dict[str, Any]:
     """
     Classify stock into Weinstein Stage (1-4) using 150-day SMA (~30 weeks).
@@ -1277,6 +1291,7 @@ def analyze_key_levels(df: pd.DataFrame) -> Dict[str, Any]:
 # OVERHEAD RESISTANCE ANALYSIS
 # =============================================================================
 
+@_cache_data(ttl=600, show_spinner=False)
 def find_overhead_resistance(df: pd.DataFrame, num_levels: int = 5) -> Dict[str, Any]:
     """
     Identify major overhead resistance levels the stock must break through
@@ -1534,6 +1549,7 @@ def find_overhead_resistance(df: pd.DataFrame, num_levels: int = 5) -> Dict[str,
 # RELATIVE STRENGTH
 # =============================================================================
 
+@_cache_data(ttl=600, show_spinner=False)
 def analyze_relative_strength(df: pd.DataFrame, spy_df: pd.DataFrame) -> Dict[str, Any]:
     """
     Calculate relative strength vs SPY over multiple periods.
