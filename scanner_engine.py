@@ -1129,20 +1129,3 @@ def scan_watchlist(all_ticker_data: Dict[str, Dict], macd_profile: Optional[str]
     ))
 
     return results
-    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
-        zone = classify_macd_zone(df, lookback_cross=3).get('zone', 'neutral')
-        if zone in {'bearish', 'extended'}:
-            result['reason'] = f'Daily MACD zone disallowed ({zone})'
-            return result
-
-    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
-        zone = classify_macd_zone(df, lookback_cross=4).get('zone', 'neutral')
-        if zone in {'bearish', 'extended'}:
-            result['reason'] = f'Daily MACD zone disallowed ({zone})'
-            return result
-
-    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
-        zone = classify_macd_zone(df, lookback_cross=5).get('zone', 'neutral')
-        if zone in {'bearish', 'extended'}:
-            result['reason'] = f'Daily MACD zone disallowed ({zone})'
-            return result
