@@ -1846,13 +1846,15 @@ def validate_entry(daily_df: pd.DataFrame,
             'spy_close': round(spy_close, 2),
             'spy_sma200': round(spy_sma200, 2) if not pd.isna(spy_sma200) else None,
             # VIX needs separate fetch — handled by data_fetcher
-            'vix_below_30': signal.market_filter.get('vix_below_30', True),
+            'vix_below_30': signal.market_filter.get('vix_below_30', False),
             'vix_close': signal.market_filter.get('vix_close', None),
         }
 
     # ── FINAL DETERMINATION ───────────────────────────────────────────
-    spy_ok = signal.market_filter.get('spy_above_200', True)
-    vix_ok = signal.market_filter.get('vix_below_30', True)
+    # Conservative: missing market data = unconfirmed, not assumed safe.
+    _has_market = bool(signal.market_filter) and signal.market_filter.get('spy_close') is not None
+    spy_ok = signal.market_filter.get('spy_above_200', False) if _has_market else False
+    vix_ok = signal.market_filter.get('vix_below_30', False) if _has_market else False
 
     legacy_valid = all([
         signal.macd['cross_recent'],
