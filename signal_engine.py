@@ -658,18 +658,18 @@ def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFr
 @_cache_data(ttl=600, show_spinner=False)
 def detect_vcp(
     df: pd.DataFrame,
-    lookback: int = 60,
+    lookback: int = 120,
     n_segments: int = 4,
     min_contractions: int = 2,
-    volume_contraction_threshold: float = 0.75,
+    volume_contraction_threshold: float = 0.80,
 ) -> Dict[str, Any]:
     """
     Detect Minervini-style Volatility Contraction Pattern (VCP).
 
     Pattern requirements:
     1) Left-to-right base range contraction (successively tighter swings)
-    2) Volume contraction in the right-side tight zone
-    3) Uptrend context (price > MA50 > MA150)
+    2) Volume contraction in the right-side tight zone vs the rest of the base
+    3) Uptrend context (price > MA50 > MA150 using FULL history, not truncated)
     """
     out = {
         'vcp_detected': False,
@@ -683,22 +683,56 @@ def detect_vcp(
         'contractions_found': 0,
         'range_ratio': 1.0,
         'volume_ratio': 1.0,
-        'pivot_price': None,  # Tight-zone breakout trigger
+        'pivot_price': None,
     }
-    if df is None or len(df) < 30:
+    if df is None or len(df) < 60:
         return out
 
-    data = normalize_columns(df).copy()
+    full_df = normalize_columns(df).copy()
     required_cols = {'High', 'Low', 'Close', 'Volume'}
-    if not required_cols.issubset(set(data.columns)):
+    if not required_cols.issubset(set(full_df.columns)):
         return out
 
-    data = data.tail(max(lookback, n_segments * 8)).copy()
+    # ── Uptrend check using FULL history (Minervini Stage 2 criteria) ──
+    # A VCP forms during base-building after a strong advance. During the
+    # consolidation, MA50 can temporarily dip below MA150. The key is that
+    # the stock is still in a long-term uptrend and near its highs.
+    full_close = pd.to_numeric(full_df['Close'], errors='coerce')
+    current_price = float(full_close.iloc[-1]) if len(full_close) > 0 else 0.0
+    ma50 = float(full_close.rolling(50).mean().iloc[-1]) if len(full_close) >= 50 else float('nan')
+    ma150 = float(full_close.rolling(150).mean().iloc[-1]) if len(full_close) >= 150 else float('nan')
+    ma200 = float(full_close.rolling(200).mean().iloc[-1]) if len(full_close) >= 200 else float('nan')
+
+    # 52-week high proximity
+    high_52w_len = min(252, len(full_close))
+    high_52w = float(full_close.tail(high_52w_len).max())
+    pct_from_high = (current_price - high_52w) / high_52w * 100 if high_52w > 0 else -100
+
+    # MA200 trending up (rising over last 20 bars)
+    ma200_rising = False
+    if len(full_close) >= 220:
+        ma200_20ago = float(full_close.rolling(200).mean().iloc[-21])
+        if not pd.isna(ma200_20ago) and not pd.isna(ma200):
+            ma200_rising = ma200 > ma200_20ago
+
+    # Uptrend = Minervini Stage 2 or recent Stage 2:
+    #   Primary: price > MA200 AND MA200 trending up
+    #   OR: price > MA150 AND within 25% of 52-week high
+    #   Strict bonus: price > MA50 > MA150 (full alignment)
+    in_uptrend = False
+    if current_price > 0:
+        if not pd.isna(ma200) and current_price > ma200 and ma200_rising:
+            in_uptrend = True
+        elif not pd.isna(ma150) and current_price > ma150 and pct_from_high > -25:
+            in_uptrend = True
+        elif not pd.isna(ma50) and not pd.isna(ma150) and current_price > ma50 > ma150:
+            in_uptrend = True  # Classic stacking still works
+
+    # ── Base window for contraction analysis ─────────────────────────
+    base_len = min(max(lookback, n_segments * 15), len(full_df))
+    data = full_df.tail(base_len).copy()
     data = data.reset_index(drop=True)
-    if len(data) < (n_segments * 5):
-        return out
 
-    # Segment base and measure peak-to-trough range per segment.
     n_segments = max(3, int(n_segments or 4))
     seg_len = len(data) // n_segments
     if seg_len < 5:
@@ -717,29 +751,18 @@ def detect_vcp(
     contractions = sum(ranges[i] > ranges[i + 1] for i in range(len(ranges) - 1))
     price_contracting = contractions >= int(min_contractions or 2)
 
-    base_avg_volume = float(pd.to_numeric(data['Volume'], errors='coerce').dropna().mean() or 0.0)
+    # ── Volume: compare tight zone vs REST of base (exclude tight zone) ──
     tight_zone = data.tail(seg_len)
+    base_excl_tight = data.head(len(data) - seg_len)
+    base_excl_volume = float(pd.to_numeric(base_excl_tight['Volume'], errors='coerce').dropna().mean() or 0.0)
     tight_avg_volume = float(pd.to_numeric(tight_zone['Volume'], errors='coerce').dropna().mean() or 0.0)
     volume_contracting = (
-        base_avg_volume > 0
-        and tight_avg_volume < (base_avg_volume * float(volume_contraction_threshold or 0.75))
-    )
-
-    # Trend context: require price > MA50 > MA150 (or full-window MA when <150 bars).
-    close = pd.to_numeric(data['Close'], errors='coerce')
-    current_price = float(close.iloc[-1]) if len(close) > 0 else 0.0
-    ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else float('nan')
-    ma150_window = min(150, len(close))
-    ma150 = float(close.rolling(ma150_window).mean().iloc[-1]) if ma150_window >= 2 else float('nan')
-    in_uptrend = (
-        current_price > 0
-        and not pd.isna(ma50)
-        and not pd.isna(ma150)
-        and current_price > ma50 > ma150
+        base_excl_volume > 0
+        and tight_avg_volume < (base_excl_volume * float(volume_contraction_threshold or 0.80))
     )
 
     range_ratio = (ranges[-1] / ranges[0]) if ranges[0] > 0 else 1.0
-    volume_ratio = (tight_avg_volume / base_avg_volume) if base_avg_volume > 0 else 1.0
+    volume_ratio = (tight_avg_volume / base_excl_volume) if base_excl_volume > 0 else 1.0
     raw_score = ((1 - range_ratio) * 50.0) + ((1 - volume_ratio) * 50.0)
     vcp_score = max(0.0, min(100.0, round(float(raw_score), 1)))
 
@@ -753,7 +776,7 @@ def detect_vcp(
         'volume_contracting': bool(volume_contracting),
         'in_uptrend': bool(in_uptrend),
         'segment_ranges': [round(float(r), 4) for r in ranges],
-        'base_avg_volume': int(round(base_avg_volume)) if base_avg_volume > 0 else 0,
+        'base_avg_volume': int(round(base_excl_volume)) if base_excl_volume > 0 else 0,
         'tight_zone_volume': int(round(tight_avg_volume)) if tight_avg_volume > 0 else 0,
         'contractions_found': int(contractions),
         'range_ratio': round(float(range_ratio), 4),
