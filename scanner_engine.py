@@ -209,19 +209,34 @@ def calculate_quality_score(daily_df: pd.DataFrame,
     result['weekly_confirmed_pct'] = round((df['weekly_confirmed'].sum() / len(df)) * 100, 1)
     result['details'] = signals[-5:]
 
-    # Quality score (0-100)
-    wr_score = min(result['win_rate'], 80) / 80 * 40
-    ret_score = min(max(result['avg_return'], 0), 30) / 30 * 30
-    sig_score = min(result['signals_found'], 20) / 20 * 20
-    loss_score = max(0, 10 + result['worst_return'] / 3)
+    # Compute expectancy: (win_rate × avg_win) - (loss_rate × avg_loss)
+    wins = df[df['win']]
+    losses = df[~df['win']]
+    avg_win = float(wins['return_pct'].mean()) if len(wins) > 0 else 0.0
+    avg_loss = abs(float(losses['return_pct'].mean())) if len(losses) > 0 else 0.0
+    wr_frac = result['win_rate'] / 100.0
+    expectancy = (wr_frac * avg_win) - ((1 - wr_frac) * avg_loss)
+    result['avg_win'] = round(avg_win, 1)
+    result['avg_loss'] = round(avg_loss, 1)
+    result['expectancy'] = round(expectancy, 2)
 
-    result['quality_score'] = int(wr_score + ret_score + sig_score + loss_score)
+    # Quality score (0-100) — expectancy-weighted
+    # Expectancy is the single best predictor of whether a strategy makes money.
+    # A 40% WR with +20% avg win / -5% avg loss = +5% expectancy (profitable)
+    # An 80% WR with +1.5% avg win / -8% avg loss = -0.4% expectancy (unprofitable)
+    expect_score = min(max(expectancy, 0), 10) / 10 * 30    # 30 pts max, caps at 10% expectancy
+    wr_score = min(result['win_rate'], 80) / 80 * 25         # 25 pts max
+    ret_score = min(max(result['avg_return'], 0), 15) / 15 * 20  # 20 pts max, caps at 15% avg
+    sig_score = min(result['signals_found'], 20) / 20 * 15   # 15 pts max
+    loss_score = max(0, 10 + result['worst_return'] / 3)     # 10 pts max
 
-    if result['quality_score'] >= 70 and result['win_rate'] >= 60:
+    result['quality_score'] = int(expect_score + wr_score + ret_score + sig_score + loss_score)
+
+    if result['quality_score'] >= 60 and result['win_rate'] >= 55 and expectancy >= 2.0:
         result['quality_grade'] = 'A'
-    elif result['quality_score'] >= 50 and result['win_rate'] >= 50:
+    elif result['quality_score'] >= 42 and result['win_rate'] >= 45 and expectancy >= 0.5:
         result['quality_grade'] = 'B'
-    elif result['quality_score'] >= 30 and result['win_rate'] >= 40:
+    elif result['quality_score'] >= 25 and result['win_rate'] >= 35:
         result['quality_grade'] = 'C'
     else:
         result['quality_grade'] = 'F'
@@ -349,14 +364,14 @@ def check_ao_confirmation(daily_df: pd.DataFrame,
             result['reason'] = f'Entry premium too high ({premium:.1f}% > {AO_CONFIRM_MAX_PREMIUM}%)'
             return result
 
-    # Market filter
-    if market_filter:
-        if not market_filter.get('spy_above_200', True):
-            result['reason'] = 'Market filter: SPY below 200 SMA'
-            return result
-        if not market_filter.get('vix_below_30', True):
-            result['reason'] = 'Market filter: VIX above 30'
-            return result
+    # Market filter — conservative: reject if missing or bearish
+    _mf = market_filter or {}
+    if not _mf.get('spy_above_200', False):
+        result['reason'] = 'Market filter: SPY below 200 SMA (or data missing)'
+        return result
+    if not _mf.get('vix_below_30', False):
+        result['reason'] = 'Market filter: VIX above 30 (or data missing)'
+        return result
 
     # VALID
     result['is_valid'] = True
@@ -481,14 +496,14 @@ def check_reentry_signal(daily_df: pd.DataFrame,
                 result['reason'] = 'AO had recent zero-cross — primary signal applies'
                 return result
 
-    # Market filter
-    if market_filter:
-        if not market_filter.get('spy_above_200', True):
-            result['reason'] = 'Market filter: SPY below 200 SMA'
-            return result
-        if not market_filter.get('vix_below_30', True):
-            result['reason'] = 'Market filter: VIX above 30'
-            return result
+    # Market filter — conservative: reject if missing or bearish
+    _mf = market_filter or {}
+    if not _mf.get('spy_above_200', False):
+        result['reason'] = 'Market filter: SPY below 200 SMA (or data missing)'
+        return result
+    if not _mf.get('vix_below_30', False):
+        result['reason'] = 'Market filter: VIX above 30 (or data missing)'
+        return result
 
     # VALID
     result['is_valid'] = True
@@ -601,11 +616,11 @@ def check_late_entry(daily_df: pd.DataFrame,
             result['reason'] = 'MACD no longer bullish'
             return result
 
-        # Market filter
-        if market_filter:
-            if not market_filter.get('spy_above_200', True) or not market_filter.get('vix_below_30', True):
-                result['reason'] = 'Market filter failed'
-                return result
+        # Market filter — conservative: reject if missing or bearish
+        _mf = market_filter or {}
+        if not _mf.get('spy_above_200', False) or not _mf.get('vix_below_30', False):
+            result['reason'] = 'Market filter failed (or data missing)'
+            return result
 
         result['is_valid'] = True
         result['reason'] = f'Signal {lookback}d ago at ${cross_price:.2f}, premium {premium:.1f}%'
@@ -641,8 +656,10 @@ def generate_recommendation(signal: EntrySignal,
     grade = quality.get('quality_grade', 'N/A')
     q_score = quality.get('quality_score', 0)  # 0-100 for fine-tuning
     weekly_bullish = signal.weekly_macd.get('bullish', False)
-    monthly_macd_bullish = signal.monthly_macd.get('bullish', True)
-    monthly_ao_positive = signal.monthly_ao.get('positive', True)
+    # Conservative: missing monthly data = unconfirmed, not assumed bullish.
+    _has_monthly = bool(signal.monthly_macd) and signal.monthly_macd.get('error') is None
+    monthly_macd_bullish = signal.monthly_macd.get('bullish', False) if _has_monthly else False
+    monthly_ao_positive = signal.monthly_ao.get('positive', False) if bool(signal.monthly_ao) else False
     monthly_bullish = bool(monthly_macd_bullish and monthly_ao_positive)
     monthly_warning = ""
     if not monthly_macd_bullish:
@@ -692,8 +709,15 @@ def generate_recommendation(signal: EntrySignal,
     def _apply_mtf_zone_guard(out: Dict[str, Any]) -> Dict[str, Any]:
         """
         Hard guardrail: prevent bullish entry recommendations when MTF MACD zone check rejects.
-        This enforces "not extended/bearish" and daily just_cross requirements for entry timing.
+        Only applies to HPotter Zone profile where zone approval is the primary timing mechanism.
+        Legacy profile uses MACD cross + context modifiers instead.
         """
+        # Legacy profile: zone check is informational, not a gate.
+        # Context modifiers already penalize extended/declining conditions.
+        _profile = str(signal.macd_profile or '').lower()
+        if _profile not in (MACD_PROFILE_HPOTTER_ZONE,):
+            return out
+
         zone = signal.mtf_zone_check or {}
         buy_approved = bool(zone.get('buy_approved', False))
         if buy_approved:
@@ -841,22 +865,45 @@ def generate_recommendation(signal: EntrySignal,
     if signal.is_valid:
         result['signal_type'] = 'PRIMARY'
 
-        if grade in ['A', 'B'] and weekly_bullish and monthly_bullish:
+        # Volume context for gating STRONG BUY
+        _vol = signal.volume or {}
+        _cross_vol = _vol.get('cross_volume_ratio')  # None if no cross bar
+        _ad_trend = _vol.get('accum_dist_trend', 'unknown')
+        _vol_ok = (
+            _ad_trend != 'distributing'
+            and (_cross_vol is None or _cross_vol >= 0.8)
+        )
+        _vol_strong = _cross_vol is not None and _cross_vol >= 1.5
+        _vol_tag = ""
+        if not _vol_ok:
+            _vol_tag = " ⚠️ Volume concern"
+        elif _vol_strong:
+            _vol_tag = " 📊 Strong volume"
+
+        if grade in ['A', 'B'] and weekly_bullish and monthly_bullish and _vol_ok:
             result['recommendation'] = 'STRONG BUY'
-            result['summary'] = f"✅ Entry signal valid, Weekly + Monthly bullish, Quality {grade}"
-            # A grade: 8-10, B grade: 7-9, refined by quality_score
+            result['summary'] = f"✅ Entry signal valid, Weekly + Monthly bullish, Quality {grade}{_vol_tag}"
             if grade == 'A':
                 result['conviction'] = _q_refine(8, 10, q_score)
             else:
                 result['conviction'] = _q_refine(7, 9, q_score)
+            # Bonus for strong breakout volume
+            if _vol_strong:
+                result['conviction'] = min(10, result['conviction'] + 1)
+        elif grade in ['A', 'B'] and weekly_bullish and monthly_bullish and not _vol_ok:
+            # All timeframes aligned but volume is distributing or weak — downgrade to BUY
+            result['recommendation'] = 'BUY'
+            result['summary'] = f"✅ Entry valid, all TFs bullish but volume weak, Quality {grade}{_vol_tag}"
+            result['conviction'] = _q_refine(6, 8, q_score)
         elif grade in ['A', 'B'] and weekly_bullish:
             result['recommendation'] = 'BUY'
-            result['summary'] = f"✅ Entry valid, Weekly bullish, Quality {grade}{monthly_warning}"
+            result['summary'] = f"✅ Entry valid, Weekly bullish, Quality {grade}{monthly_warning}{_vol_tag}"
             result['conviction'] = _q_refine(6, 8, q_score)
         elif grade in ['A', 'B']:
-            result['recommendation'] = 'BUY'
-            result['summary'] = f"✅ Entry valid, Quality {grade}, Weekly pending{monthly_warning}"
-            result['conviction'] = _q_refine(5, 7, q_score)
+            # No weekly confirmation — WATCH not BUY
+            result['recommendation'] = 'WATCH'
+            result['summary'] = f"🟡 Entry valid, Quality {grade}, awaiting Weekly confirmation{monthly_warning}{_vol_tag}"
+            result['conviction'] = _q_refine(4, 6, q_score)
         elif grade == 'C':
             result['recommendation'] = 'WAIT'
             result['summary'] = f"⚠️ Entry valid but Quality {grade}{monthly_warning}"
@@ -1053,8 +1100,10 @@ def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = No
     signal.market_filter = mkt
     
     # Re-evaluate validity with full market filter
-    spy_ok = mkt.get('spy_above_200', True)
-    vix_ok = mkt.get('vix_below_30', True)
+    # Conservative: missing market data = unconfirmed
+    _has_mkt = bool(mkt) and mkt.get('spy_close') is not None
+    spy_ok = mkt.get('spy_above_200', False) if _has_mkt else False
+    vix_ok = mkt.get('vix_below_30', False) if _has_mkt else False
     
     legacy_valid = all([
         signal.macd['cross_recent'],
