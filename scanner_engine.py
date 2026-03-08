@@ -730,9 +730,111 @@ def generate_recommendation(signal: EntrySignal,
         out['mtf_zone_reject_reason'] = reason_txt
         return out
 
+    def _apply_context_modifiers(out: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Adjust conviction using contextual data the signal already carries.
+        Wires volume, relative strength, VCP, Weinstein stage, and overhead
+        resistance into the decision path instead of display-only.
+        """
+        if out.get('conviction', 0) <= 0:
+            return out  # Don't modify SKIP/no-signal
+
+        modifiers = []
+        delta = 0
+
+        # ── 1. Weinstein Stage guard ─────────────────────────────────
+        w = signal.weinstein or {}
+        stage = w.get('stage', 0)
+        maturity = w.get('trend_maturity', '')
+
+        if stage == 4:
+            delta -= 3
+            modifiers.append("Stage 4 decline ⚠️")
+            rec_u = str(out.get('recommendation', '')).upper()
+            if 'BUY' in rec_u or 'ENTRY' in rec_u:
+                if 'WATCH' not in rec_u and 'WAIT' not in rec_u and 'SKIP' not in rec_u:
+                    out['recommendation'] = 'WATCH (STAGE 4)'
+                    out['stage4_downgrade'] = True
+        elif stage == 3:
+            delta -= 1
+            modifiers.append("Stage 3 topping")
+        elif stage == 2:
+            if maturity == 'early':
+                delta += 1
+                modifiers.append("Early Stage 2 advance ✅")
+            elif maturity == 'extended':
+                delta -= 1
+                modifiers.append("Stage 2 extended")
+
+        # ── 2. Volume confirmation ───────────────────────────────────
+        vol = signal.volume or {}
+        cross_vol = vol.get('cross_volume_ratio')
+        ad_trend = vol.get('accum_dist_trend', 'unknown')
+
+        if cross_vol is not None:
+            if cross_vol >= 2.0:
+                delta += 1
+                modifiers.append(f"Strong breakout volume ({cross_vol:.1f}x) ✅")
+            elif cross_vol < 0.7:
+                delta -= 1
+                modifiers.append(f"Weak volume on cross ({cross_vol:.1f}x) ⚠️")
+
+        if ad_trend == 'distributing':
+            delta -= 1
+            modifiers.append("Distribution pattern ⚠️")
+        elif ad_trend == 'accumulating':
+            delta += 1
+            modifiers.append("Accumulation ✅")
+
+        # ── 3. Relative strength vs SPY ──────────────────────────────
+        rs = signal.relative_strength or {}
+        rs_1mo = rs.get('rs_1mo')
+        rs_3mo = rs.get('rs_3mo')
+        rs_trend = rs.get('rs_trend', 'unknown')
+
+        if rs_1mo is not None and rs_3mo is not None:
+            if rs_1mo > 5 and rs_3mo > 5:
+                delta += 1
+                modifiers.append(f"Strong RS vs SPY ✅")
+            elif rs_1mo < -5 and rs_3mo < -5:
+                delta -= 1
+                modifiers.append(f"Weak RS vs SPY ⚠️")
+
+        if rs_trend == 'deteriorating':
+            delta -= 1
+            modifiers.append("RS deteriorating ⚠️")
+
+        # ── 4. VCP detection bonus ───────────────────────────────────
+        vcp = signal.vcp or {}
+        if vcp.get('vcp_detected'):
+            delta += 1
+            vcp_score = vcp.get('vcp_score', 0)
+            modifiers.append(f"VCP pattern ({vcp_score:.0f}) ✅")
+
+        # ── 5. Overhead resistance proximity ─────────────────────────
+        ores = signal.overhead_resistance or {}
+        dist = ores.get('distance_to_critical_pct')
+        if dist is not None and 0 < dist < 2.0:
+            delta -= 1
+            modifiers.append(f"Near resistance ({dist:.1f}%) ⚠️")
+
+        # ── Apply with bounds ────────────────────────────────────────
+        if delta != 0 or modifiers:
+            original = out['conviction']
+            out['conviction'] = max(0, min(10, out['conviction'] + delta))
+            out['context_modifiers'] = modifiers
+            out['conviction_delta'] = delta
+            # Append key modifiers to summary
+            flags = [m for m in modifiers if '✅' in m or '⚠️' in m][:3]
+            if flags:
+                out['summary'] += ' | ' + ', '.join(flags)
+
+        return out
+
     def _apply_signal_guards(out: Dict[str, Any]) -> Dict[str, Any]:
         out = _apply_monthly_ao_guard(out)
         out = _apply_mtf_zone_guard(out)
+        out = _apply_context_modifiers(out)
         return out
 
     # --- PRIMARY SIGNAL ---
@@ -836,7 +938,7 @@ def generate_recommendation(signal: EntrySignal,
         result['summary'] = f"❌ {', '.join(failed)}" if failed else "❌ No signal"
         result['conviction'] = 0
 
-    return _apply_monthly_ao_guard(result)
+    return _apply_signal_guards(result)
 
 
 # =============================================================================
