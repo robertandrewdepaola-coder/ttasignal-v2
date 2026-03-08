@@ -1,0 +1,15257 @@
+"""
+TTA v2 — Main Streamlit UI
+============================
+
+Single-mode interface. No Analysis/Journal toggle.
+Flow: Watchlist → Scan → Click Ticker → Tabs (Signal, Chart, AI Intel, Trade Mgmt)
+
+This is a THIN LAYER. All logic lives in the backend modules:
+- signal_engine: calculations
+- data_fetcher: yfinance calls
+- scanner_engine: analysis & recommendations
+- ai_analysis: AI-enhanced insights
+- chart_engine: Plotly charts
+- journal_manager: trade CRUD & P&L
+
+Version: 2.0.0 (2026-02-08)
+"""
+
+import streamlit as st
+import pandas as pd
+import re
+import time
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import datetime, timedelta, UTC
+from typing import Any, Dict, List, Optional, Callable, Set, Tuple
+from zoneinfo import ZoneInfo
+
+# Backend imports
+from signal_engine import (
+    EntrySignal,
+    get_active_macd_profile,
+    get_macd_indicator_label,
+    set_active_macd_profile,
+    MACD_PROFILE_LEGACY,
+    MACD_PROFILE_HPOTTER_ZONE,
+    MACD_PROFILE_SHADOW,
+)
+
+def _safe_import(module_name: str, *attr_names: str, fallbacks: dict = None):
+    """Import with hot-reload resilience. Returns module or raises on total failure."""
+    import importlib
+    fallbacks = fallbacks or {}
+    try:
+        mod = __import__(module_name, fromlist=attr_names or ['__name__'])
+    except (KeyError, ImportError, AttributeError):
+        mod = importlib.import_module(module_name)
+    results = {}
+    for attr in attr_names:
+        results[attr] = getattr(mod, attr, fallbacks.get(attr))
+    return mod, results
+
+_, _df_attrs = _safe_import("data_fetcher",
+    "fetch_all_ticker_data", "fetch_scan_data", "fetch_market_filter",
+    "fetch_current_price", "fetch_daily", "fetch_weekly", "fetch_monthly",
+    "clear_cache", "get_fetch_health_status", "fetch_batch_session_change",
+    fallbacks={"get_fetch_health_status": lambda: {}, "fetch_batch_session_change": lambda tickers, **kwargs: {}})
+fetch_all_ticker_data = _df_attrs["fetch_all_ticker_data"]
+fetch_scan_data = _df_attrs["fetch_scan_data"]
+fetch_market_filter = _df_attrs["fetch_market_filter"]
+fetch_current_price = _df_attrs["fetch_current_price"]
+fetch_daily = _df_attrs["fetch_daily"]
+fetch_weekly = _df_attrs["fetch_weekly"]
+fetch_monthly = _df_attrs["fetch_monthly"]
+clear_cache = _df_attrs["clear_cache"]
+get_fetch_health_status = _df_attrs["get_fetch_health_status"]
+fetch_batch_session_change = _df_attrs["fetch_batch_session_change"]
+
+_, _se_attrs = _safe_import("scanner_engine", "analyze_ticker", "scan_watchlist", "TickerAnalysis")
+analyze_ticker = _se_attrs["analyze_ticker"]
+scan_watchlist = _se_attrs["scan_watchlist"]
+TickerAnalysis = _se_attrs["TickerAnalysis"]
+
+_, _ai_attrs = _safe_import("ai_analysis", "analyze")
+run_ai_analysis = _ai_attrs["analyze"]
+
+from chart_engine import render_tv_chart, render_mtf_chart
+from journal_manager import JournalManager, WatchlistItem, Trade, ConditionalEntry, PlannedTrade
+from watchlist_manager import WatchlistManager
+from watchlist_bridge import WatchlistBridge
+from apex_signals import detect_apex_signals, get_apex_markers, get_apex_summary
+from scan_utils import resolve_tickers_to_scan
+from trade_decision import build_trade_decision_card
+from backup_health import get_backup_health_status, run_backup_now
+from system_self_test import run_system_self_test
+from alert_manager import (
+    create_alert_from_candidate,
+    create_breakout_alert,
+    create_alert_from_form,
+    check_alerts_now as _alert_check_alerts_now,
+    build_alert_status_rows,
+    get_alert_summary,
+    get_alert_tickers,
+    extract_resistance_info,
+    format_alert_timestamp,
+    AlertStatusRow,
+    AlertCheckResult,
+    AlertSummary,
+)
+from alert_dashboard_ui import render_alerts_dashboard
+
+# ── Extracted business logic modules ──────────────────────────────────────────
+from earnings_sector_logic import (
+    extract_first_json_object as _extract_first_json_object,
+    extract_earn_days_hint as _extract_earn_days_hint,
+    canonicalize_sector_name as _canonicalize_sector_name,
+    parse_earnings_date as _parse_earnings_date,
+    normalize_earnings_days as _normalize_earnings_days,
+    earnings_confidence_rank as _earnings_confidence_rank,
+    is_estimated_earnings_source as _is_estimated_earnings_source,
+    is_earnings_data_trusted as _is_earnings_data_trusted,
+    earnings_badge as _earnings_badge,
+    adjust_recommendation_for_sector as _adjust_recommendation_for_sector,
+    calc_rr as _calc_rr,
+    extract_rr_from_text as _extract_rr_from_text,
+    infer_sector_from_text as _infer_sector_from_text,
+    infer_sector_phase_from_text as _infer_sector_phase_from_text,
+    sector_phase_display as _sector_phase_display,
+    format_eta as _format_eta,
+)
+from exec_logic import (
+    RiskBudgetPolicy, DashboardSnapshot, TradeGateDecision,
+    infer_exec_regime as _infer_exec_regime,
+    risk_budget_for_regime as _risk_budget_for_regime,
+    normalize_brief_regime as _normalize_brief_regime,
+    normalize_gate_status as _normalize_gate_status,
+    recommendation_score as _recommendation_score,
+    score_candidate_with_policy as _score_candidate_with_policy,
+    classify_trade_candidate_color as _classify_trade_candidate_color,
+    fmt_last_update as _fmt_last_update,
+    is_stale as _is_stale,
+    stale_stream_status as _stale_stream_status,
+)
+
+# Startup-safe defaults for navigation helpers.
+# If navigation_state cannot import for any reason (missing module, stale hot-reload,
+# syntax/attribute errors), these keep the app bootable.
+KEY_SWITCH_TO_SCANNER_TAB = "_switch_to_scanner_tab"
+KEY_SWITCH_TO_SCANNER_TARGET_TAB = "_switch_to_scanner_target_tab"
+KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = "_switch_to_scanner_focus_detail"
+
+
+def clear_scanner_switch_state(state):
+    state.pop(KEY_SWITCH_TO_SCANNER_TAB, None)
+    state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None)
+    state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, None)
+
+
+def normalize_nav_target(target, fallback="chart"):
+    _t = str(target or "").strip().lower()
+    if _t in {"signal", "chart", "trade"}:
+        return _t
+    _fb = str(fallback or "").strip().lower()
+    return _fb if _fb in {"signal", "chart", "trade"} else "chart"
+
+
+def detail_tab_for_target(target, fallback="chart"):
+    return {"signal": 0, "chart": 1, "trade": 4}.get(normalize_nav_target(target, fallback=fallback), 1)
+
+
+def detail_selector_pending_key_for_ticker(ticker):
+    _tk = str(ticker or "").upper().strip()
+    return f"_pending_detail_view_tab_{_tk}"
+
+
+def set_detail_tab_lock(state, *, ticker, tab_index, lock_runs=3, now_ts=None):
+    state["default_detail_tab"] = int(tab_index or 0)
+
+
+def set_detail_nav_intent(state, *, ticker, target, lock_runs=4, now_ts=None):
+    _tk = str(ticker or "").upper().strip()
+    _target = normalize_nav_target(target, fallback="chart")
+    _now = float(time.time() if now_ts is None else now_ts)
+    state["_detail_nav_intent"] = {
+        "ticker": _tk,
+        "target": _target,
+        "remaining": max(0, int(lock_runs)),
+        "set_at": _now,
+    }
+
+
+def set_detail_tab_selector_target(state, *, ticker, target):
+    _tk = str(ticker or "").upper().strip()
+    _target = normalize_nav_target(target, fallback="chart")
+    _selector = {"signal": "signal", "trade": "trade"}.get(_target, "chart")
+    _selector_key = f"detail_view_tab_{_tk}"
+    _pending_key = detail_selector_pending_key_for_ticker(_tk)
+    try:
+        state[_selector_key] = _selector
+        state.pop(_pending_key, None)
+    except Exception:
+        state[_pending_key] = _selector
+    return _selector
+
+
+def set_scanner_switch_state(state, *, target, focus_detail=True):
+    state[KEY_SWITCH_TO_SCANNER_TAB] = True
+    state[KEY_SWITCH_TO_SCANNER_TARGET_TAB] = normalize_nav_target(target, fallback="chart")
+    state[KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL] = bool(focus_detail)
+
+
+try:
+    from navigation_state import (
+        KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL as _KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL,
+        KEY_SWITCH_TO_SCANNER_TAB as _KEY_SWITCH_TO_SCANNER_TAB,
+        KEY_SWITCH_TO_SCANNER_TARGET_TAB as _KEY_SWITCH_TO_SCANNER_TARGET_TAB,
+        clear_scanner_switch_state as _clear_scanner_switch_state,
+        detail_tab_for_target as _detail_tab_for_target,
+        detail_selector_pending_key_for_ticker as _detail_selector_pending_key_for_ticker,
+        normalize_nav_target as _normalize_nav_target,
+        set_detail_nav_intent as _set_detail_nav_intent,
+        set_detail_tab_lock as _set_detail_tab_lock,
+        set_detail_tab_selector_target as _set_detail_tab_selector_target,
+        set_scanner_switch_state as _set_scanner_switch_state,
+    )
+
+    KEY_SWITCH_TO_SCANNER_TAB = _KEY_SWITCH_TO_SCANNER_TAB
+    KEY_SWITCH_TO_SCANNER_TARGET_TAB = _KEY_SWITCH_TO_SCANNER_TARGET_TAB
+    KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL = _KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL
+    clear_scanner_switch_state = _clear_scanner_switch_state
+    detail_tab_for_target = _detail_tab_for_target
+    detail_selector_pending_key_for_ticker = _detail_selector_pending_key_for_ticker
+    normalize_nav_target = _normalize_nav_target
+    set_detail_nav_intent = _set_detail_nav_intent
+    set_detail_tab_lock = _set_detail_tab_lock
+    set_detail_tab_selector_target = _set_detail_tab_selector_target
+    set_scanner_switch_state = _set_scanner_switch_state
+except Exception:
+    pass
+try:
+    from detail_view_ui import render_detail_view_shell
+except (ImportError, AttributeError, KeyError):
+    # Startup-safe fallback if detail_view_ui is temporarily unavailable during reload.
+    def render_detail_view_shell(
+        *,
+        analysis,
+        render_signal_tab,
+        render_chart_tab,
+        render_ai_tab,
+        render_chat_tab,
+        render_trade_tab,
+    ):
+        if not analysis:
+            return
+        ticker = analysis.ticker
+        signal = analysis.signal
+        rec = analysis.recommendation or {}
+        st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
+        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+        st.caption(rec.get("summary", ""))
+        tab_map = {
+            "signal": lambda: render_signal_tab(ticker, signal, rec, analysis),
+            "chart": lambda: render_chart_tab(ticker, signal),
+            "ai": lambda: render_ai_tab(ticker, signal, rec, analysis),
+            "chat": lambda: render_chat_tab(ticker, signal, rec, analysis),
+            "trade": lambda: render_trade_tab(ticker, signal, analysis),
+        }
+        _selector_key = f"detail_view_tab_{str(ticker).upper().strip()}"
+        _pending_sel = str(st.session_state.pop(detail_selector_pending_key_for_ticker(ticker), "") or "").strip().lower()
+        if _pending_sel in {"signal", "chart", "ai", "chat", "trade"}:
+            try:
+                st.session_state[_selector_key] = _pending_sel
+            except Exception:
+                pass
+        choice = st.radio(
+            "Detail View",
+            options=["signal", "chart", "ai", "chat", "trade"],
+            horizontal=True,
+            format_func=lambda k: {
+                "signal": "📊 Signal",
+                "chart": "📈 Chart",
+                "ai": "🤖 AI Intel",
+                "chat": "💬 Ask AI",
+                "trade": "💼 Trade",
+            }.get(k, k),
+            label_visibility="collapsed",
+            key=_selector_key,
+        )
+        tab_map.get(choice, tab_map["signal"])()
+try:
+    from trade_finder_ui import render_trade_finder_top_panel
+except (ImportError, AttributeError, KeyError):
+    # Startup-safe fallback if trade_finder_ui is temporarily unavailable.
+    def render_trade_finder_top_panel(**_kwargs):
+        st.subheader("🧭 Trade Finder")
+        st.caption("Runs cross-watchlist scan and ranks model/system trade signals with clear actions.")
+        return {"alert_tickers": set()}
+from session_state_contract import (
+    ensure_core_defaults,
+    ensure_exec_dashboard_defaults,
+    ensure_exec_queue_defaults,
+    ensure_portfolio_defaults,
+    ensure_scanner_defaults,
+    ensure_trade_quality_defaults,
+)
+try:
+    from trade_finder_helpers import (
+        build_planned_trade,
+        build_trade_finder_selection,
+        compute_trade_score,
+        derive_support_stop_levels,
+    )
+except (ImportError, AttributeError, KeyError):
+    import importlib as _importlib
+    _tfh = _importlib.import_module("trade_finder_helpers")
+    build_planned_trade = _tfh.build_planned_trade
+    build_trade_finder_selection = _tfh.build_trade_finder_selection
+    compute_trade_score = _tfh.compute_trade_score
+    derive_support_stop_levels = getattr(
+        _tfh,
+        "derive_support_stop_levels",
+        lambda entry, current_stop, support_price, **_: {
+            "support_price": float(support_price or 0.0),
+            "support_distance_pct": 0.0,
+            "support_stop_price": 0.0,
+            "recommended_stop": float(current_stop or 0.0),
+            "stop_basis": "model_stop_fallback",
+        },
+    )
+try:
+    from trade_finder_state import (
+        adaptive_fetch_batch_size_for_health,
+        bg_mode_from_job,
+        can_auto_rerank_cached,
+        evaluate_active_background_start,
+        scope_signature_from_state,
+        scope_unchanged,
+        should_auto_rerank_after_terminal,
+    )
+except (ImportError, AttributeError, KeyError):
+    import importlib as _importlib
+    _tfs = _importlib.import_module("trade_finder_state")
+    adaptive_fetch_batch_size_for_health = _tfs.adaptive_fetch_batch_size_for_health
+    bg_mode_from_job = _tfs.bg_mode_from_job
+    can_auto_rerank_cached = _tfs.can_auto_rerank_cached
+    evaluate_active_background_start = _tfs.evaluate_active_background_start
+    scope_signature_from_state = _tfs.scope_signature_from_state
+    scope_unchanged = _tfs.scope_unchanged
+    should_auto_rerank_after_terminal = _tfs.should_auto_rerank_after_terminal
+
+try:
+    from streamlit.runtime.scriptrunner import get_script_run_ctx
+except Exception:
+    def get_script_run_ctx():
+        return None
+
+try:
+    from background_jobs import (
+        cleanup_jobs as cleanup_background_jobs,
+        get_job as get_background_job,
+        request_cancel as cancel_background_job,
+        start_trade_finder_job as start_background_trade_finder_job,
+    )
+except Exception:
+    def cleanup_background_jobs(*args, **kwargs):
+        return None
+    def get_background_job(*args, **kwargs):
+        return {}
+    def cancel_background_job(*args, **kwargs):
+        return False
+    def start_background_trade_finder_job(*args, **kwargs):
+        return ""
+
+
+# =============================================================================
+# AI TEXT CLEANUP — fix garbled formatting from LLM outputs
+# =============================================================================
+
+def clean_ai_formatting(text: str) -> str:
+    """Fix common AI output formatting issues with currency, percentages, spacing, and markdown.
+    
+    Handles:
+    - Markdown bold/italic stripping (***text***, **text**, *text* → text with proper spacing)
+    - Missing spaces after dollar amounts ($184.54Buy → $184.54 Buy)
+    - Missing spaces before dollar amounts (target$210 → target $210)
+    - Letter-number concatenation (gained27% → gained 27%)
+    - Percentage concatenation (27%gains → 27% gains)
+    - Punctuation spacing (end.Start → end. Start)
+    - Em-dash spacing (word—word → word — word)
+    - Number-letter concatenation (27times → 27 times)
+    - Preserves: 200d, 50d, 1x, $15.2K, $3.2B, Q3, 1st/2nd/3rd
+    """
+    if not text:
+        return text
+
+    # ── Strip markdown bold/italic markers with space preservation ──
+    # Handle ***bold italic*** first (most greedy)
+    text = re.sub(r'(\w)\*{3}(\w)', r'\1 \2', text)   # word***word → word word
+    text = re.sub(r'\*{3}', '', text)                    # remaining ***
+
+    # Handle **bold**
+    text = re.sub(r'(\w)\*{2}(\w)', r'\1 \2', text)    # word**word → word word
+    text = re.sub(r'\*{2}', '', text)                    # remaining **
+
+    # Handle *italic* — careful not to hit multiplication
+    # Pattern: *word(s)* where content has letters
+    text = re.sub(r'(\w)\*([a-zA-Z])', r'\1 \2', text)  # word*text → word text
+    text = re.sub(r'([a-zA-Z])\*(\w)', r'\1 \2', text)  # text*word → text word
+    text = re.sub(r'(?<!\*)\*(?!\*)', '', text)          # remaining lone *
+
+    # Fix dollar amounts followed by words: $184.54Buy → $184.54 Buy
+    text = re.sub(r'(\$\d+[\d,.]*[KMBkmb]?)([A-Z][a-z])', r'\1 \2', text)
+    text = re.sub(r'(\$\d+\.?\d{2})([a-z])', r'\1 \2', text)
+
+    # Fix missing spaces before dollar amounts
+    text = re.sub(r'([a-zA-Z])(\$\d)', r'\1 \2', text)
+
+    # Fix letter-number concatenation (gained27 → gained 27)
+    text = re.sub(r'([a-z])(\d)', r'\1 \2', text)
+
+    # Fix percentage spacing
+    text = re.sub(r'(\d+\.?\d*)%([a-zA-Z])', r'\1% \2', text)
+
+    # Fix missing spaces after sentence-ending punctuation
+    text = re.sub(r'([.!?])([A-Z])', r'\1 \2', text)
+    text = re.sub(r'([,;:])([a-zA-Z])', r'\1 \2', text)
+
+    # Fix camelCase word boundaries from AI word-smashing (e.g. "dataWithout" → "data Without")
+    # But preserve intentional camelCase (single uppercase after lowercase is a word boundary)
+    text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', text)
+
+    # Fix em-dash spacing
+    text = re.sub(r'([a-zA-Z])—([a-zA-Z])', r'\1 — \2', text)
+
+    # Fix number-letter concatenation (27times → 27 times)
+    text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)
+
+    # Restore common abbreviations that should NOT have spaces
+    text = re.sub(r'(\d+) ([dxwDXW])\b', r'\1\2', text)   # 200d, 2.5x, 52w
+    text = re.sub(r'(\d+) ([KMBkmb])\b', r'\1\2', text)   # $15.2K, $3.2B
+    text = re.sub(r'(\d) (st|nd|rd|th)\b', r'\1\2', text)  # 1st, 2nd, 3rd
+    text = re.sub(r'\bQ (\d)\b', r'Q\1', text)             # Q1, Q2, Q3, Q4
+    text = re.sub(r'\bR: R\b', r'R:R', text)               # R:R ratio
+    text = re.sub(r'(\d) : (\d)', r'\1:\2', text)          # 5.9:1
+
+    # Clean multiple spaces (preserve markdown indentation)
+    text = re.sub(r'(?<!\n) {2,}', ' ', text)
+
+    return text.strip()
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+st.set_page_config(
+    page_title="TTA v2",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# =============================================================================
+# AI PROVIDER AUTO-DETECTION — supports Groq (gsk_) and xAI/Grok (xai-)
+# =============================================================================
+
+def _detect_ai_provider(api_key: str) -> Dict:
+    """
+    Auto-detect AI provider from API key prefix.
+    Returns config dict with base_url, models, and provider name.
+    
+    Supported:
+      - Groq (groq.com): keys start with 'gsk_', endpoint api.groq.com
+      - xAI/Grok (x.ai): keys start with 'xai-', endpoint api.x.ai
+    """
+    key = (api_key or "").strip().strip('"').strip("'").strip()
+    
+    if key.startswith("gsk_"):
+        return {
+            'provider': 'groq',
+            'base_url': 'https://api.groq.com/openai/v1',
+            'model': 'llama-3.3-70b-versatile',
+            'fallback_model': 'llama-3.1-8b-instant',
+            'key': key,
+            'display': f'Groq (gsk_...{key[-4:]})',
+        }
+    elif key.startswith("xai-") or key.startswith("xai_"):
+        return {
+            'provider': 'xai',
+            'base_url': 'https://api.x.ai/v1',
+            'model': 'grok-3-fast',
+            'fallback_model': 'grok-3-mini-fast',
+            'key': key,
+            'display': f'xAI/Grok (xai-...{key[-4:]})',
+        }
+    elif key:
+        # Unknown prefix — try Groq format as default
+        return {
+            'provider': 'unknown',
+            'base_url': 'https://api.groq.com/openai/v1',
+            'model': 'llama-3.3-70b-versatile',
+            'fallback_model': 'llama-3.1-8b-instant',
+            'key': key,
+            'display': f'Unknown ({key[:6]}...{key[-4:]})',
+        }
+    else:
+        return {
+            'provider': 'none',
+            'base_url': '',
+            'model': '',
+            'fallback_model': '',
+            'key': '',
+            'display': 'Not configured',
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CENTRALIZED AI CLIENT — initialized once, cached in session_state
+# Eliminates ~500ms of repeated imports + client creation on every rerun
+# ═══════════════════════════════════════════════════════════════════════
+
+def _get_ai_clients() -> Dict:
+    """
+    Get cached AI clients (OpenAI-compatible + Gemini).
+    Creates clients once per session, validates once per key.
+    Returns dict: {openai_client, gemini, ai_config, primary_error, gemini_error}
+    """
+    # Return cached if available and key hasn't changed and not invalidated
+    cached = st.session_state.get('_ai_clients_cache')
+    if cached:
+        # Check if key changed (user updated secrets) or key was invalidated
+        current_key = ""
+        try:
+            current_key = st.secrets.get("GROQ_API_KEY", "")
+        except Exception:
+            pass
+        key_invalidated = st.session_state.get('_groq_key_status') == 'invalid'
+        if cached.get('_raw_key') == current_key and not key_invalidated:
+            return cached
+
+    result = {
+        'openai_client': None,
+        'gemini': None,
+        'ai_config': {'model': '', 'fallback_model': '', 'provider': 'none', 'display': 'Not configured'},
+        'primary_error': None,
+        'gemini_error': None,
+        '_raw_key': '',
+    }
+
+    # ── Primary provider (OpenAI-compatible: Groq or xAI) ─────────────
+    try:
+        raw_key = st.secrets.get("GROQ_API_KEY", "")
+        result['_raw_key'] = raw_key
+        ai_config = _detect_ai_provider(raw_key)
+        result['ai_config'] = ai_config
+        api_key = ai_config['key']
+
+        if api_key and ai_config['provider'] != 'none':
+            cached_status = st.session_state.get('_groq_key_status')
+            cached_key_val = st.session_state.get('_groq_key_cached', '')
+            if cached_status == 'invalid' and cached_key_val == api_key:
+                result['primary_error'] = f"Key previously failed (401). Click 🔑 Reset API after updating. [{ai_config['display']}]"
+            else:
+                from openai import OpenAI
+                client = OpenAI(api_key=api_key, base_url=ai_config['base_url'])
+                # Pre-flight validation (once per key)
+                validation_key = f'_ai_validated_{api_key[:8]}'
+                if validation_key not in st.session_state:
+                    try:
+                        client.chat.completions.create(
+                            model=ai_config['model'],
+                            messages=[{"role": "user", "content": "hi"}],
+                            max_tokens=1,
+                        )
+                        st.session_state[validation_key] = True
+                    except Exception as val_err:
+                        val_str = str(val_err)
+                        if 'Invalid API Key' in val_str or '401' in val_str or 'Unauthorized' in val_str:
+                            st.session_state['_groq_key_status'] = 'invalid'
+                            st.session_state['_groq_key_cached'] = api_key
+                            client = None
+                            result['primary_error'] = f"Key validation failed (401). {ai_config['display']}"
+                        else:
+                            st.session_state[validation_key] = True
+                result['openai_client'] = client
+                st.session_state['_ai_config'] = ai_config
+        else:
+            result['primary_error'] = "No GROQ_API_KEY in secrets (supports Groq gsk_ or xAI xai- keys)"
+    except ImportError:
+        result['primary_error'] = "openai package not installed — add to requirements.txt"
+    except Exception as e:
+        result['primary_error'] = str(e)[:200]
+
+    # ── Gemini fallback ───────────────────────────────────────────────
+    try:
+        import warnings
+        # Suppress the deprecation warning from google-generativeai package
+        # TODO: Migrate to google.genai when ready (google-generativeai is deprecated)
+        warnings.filterwarnings("ignore", category=FutureWarning,
+                                 module="google.*")
+        warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                 module="google.*")
+        import google.generativeai as genai
+        gkey = st.secrets.get("GEMINI_API_KEY", "")
+        if gkey:
+            genai.configure(api_key=gkey)
+            result['gemini'] = genai.GenerativeModel('gemini-2.0-flash')
+        else:
+            result['gemini_error'] = "No GEMINI_API_KEY in secrets"
+    except ImportError:
+        result['gemini_error'] = "google-generativeai not installed"
+    except Exception as e:
+        result['gemini_error'] = str(e)[:200]
+
+    # Cache for all subsequent reruns
+    # Keep legacy session keys in sync for older call sites.
+    st.session_state['openai_client'] = result.get('openai_client')
+    st.session_state['gemini_model'] = result.get('gemini')
+    st.session_state['_ai_clients_cache'] = result
+    return result
+
+
+def _get_perplexity_api_key() -> str:
+    """Resolve Perplexity key from session override or Streamlit secrets."""
+    _override = str(st.session_state.get("PERPLEXITY_API_KEY_OVERRIDE", "") or "").strip()
+    if _override:
+        return _override
+    for _name in ("PERPLEXITY_API_KEY", "PPLX_API_KEY", "PERPLEXITY_KEY"):
+        try:
+            _val = str(st.secrets.get(_name, "") or "").strip()
+            if _val:
+                return _val
+        except Exception:
+            continue
+    return ""
+
+
+def _run_perplexity_research_prompt(ticker: str, prompt_template: str, max_tokens: int = 700) -> Dict[str, Any]:
+    """Run a concise research prompt through Perplexity (OpenAI-compatible API)."""
+    _key = _get_perplexity_api_key()
+    if not _key:
+        return {"ok": False, "error": "PERPLEXITY_API_KEY is not configured in secrets."}
+
+    try:
+        from openai import OpenAI
+    except Exception as e:
+        return {"ok": False, "error": f"openai package unavailable: {str(e)[:120]}"}
+
+    _ticker = str(ticker or "").upper().strip()
+    if not _ticker:
+        return {"ok": False, "error": "Ticker is missing."}
+
+    _prompt = str(prompt_template or "").replace("[TICKER]", _ticker)
+    _system = (
+        "You are a professional equity research analyst. "
+        "Be concise, factual, and include dates where requested. "
+        "Do not include investment advice disclaimers."
+    )
+    _client = OpenAI(api_key=_key, base_url="https://api.perplexity.ai")
+    _models = ["sonar-pro", "sonar", "sonar-reasoning-pro"]
+    _errors: List[str] = []
+
+    for _model in _models:
+        try:
+            _resp = _client.chat.completions.create(
+                model=_model,
+                messages=[
+                    {"role": "system", "content": _system},
+                    {"role": "user", "content": _prompt},
+                ],
+                temperature=0.1,
+                max_tokens=max_tokens,
+            )
+            _text = str((_resp.choices[0].message.content if _resp and _resp.choices else "") or "").strip()
+            if _text:
+                return {
+                    "ok": True,
+                    "ticker": _ticker,
+                    "model": _model,
+                    "text": _text,
+                    "prompt": _prompt,
+                    "timestamp_utc": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                }
+            _errors.append(f"{_model}: empty response")
+        except Exception as e:
+            _errors.append(f"{_model}: {str(e)[:140]}")
+
+    return {"ok": False, "error": " | ".join(_errors[:3])}
+
+
+def _render_perplexity_research_controls(
+    ticker: str,
+    *,
+    key_ns: str = "default",
+    show_results: bool = True,
+    heading: str = "#### 🔎 Perplexity Research",
+) -> None:
+    """Render one-click Perplexity research buttons and cached results for a ticker."""
+    if heading:
+        st.markdown(heading)
+    _pplx_key = _get_perplexity_api_key()
+    st.caption(f"Perplexity status: {'configured' if _pplx_key else 'not configured'}")
+    if not _pplx_key:
+        st.info("Add `PERPLEXITY_API_KEY` in Streamlit secrets to enable one-click fundamental/news research.")
+
+    _pplx_prompts = {
+        "fundamental_research": (
+            "For [TICKER], give me: last 4 quarters of EPS and revenue growth rates with acceleration "
+            "or deceleration trend, gross and operating margin trend over the same period, the primary "
+            "business catalyst driving current growth, any near-term risks or headwinds including secondary "
+            "offerings or insider selling, and industry group strength and main competitors. Be concise and factual."
+        ),
+        "fundamental_narrative": (
+            "For [TICKER], what is the core investment thesis that institutional investors are using to justify "
+            "buying at current levels? What would need to be true for that thesis to break down? Be concise and specific."
+        ),
+        "news_thesis": (
+            "For [TICKER], search for recent news from the last 30 days. Include the date of each development. "
+            "Summarize only: (1) any developments that confirm or threaten the core growth thesis, "
+            "(2) sector or competitor news that directly affects this company, "
+            "(3) any notable institutional activity including large fund disclosures or insider buying. "
+            "Be concise and factual."
+        ),
+    }
+    _pplx_labels = {
+        "fundamental_research": "Fundamental Research",
+        "fundamental_narrative": "Fundamental Research — Narrative",
+        "news_thesis": "News Thesis",
+    }
+    _pplx_key_state = f"pplx_research_results_{ticker}"
+    if _pplx_key_state not in st.session_state:
+        st.session_state[_pplx_key_state] = {}
+    _pplx_results = dict(st.session_state.get(_pplx_key_state, {}) or {})
+
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        _run_fund = st.button(
+            "📚 Fundamental Research",
+            key=f"pplx_run_fund_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+    with p2:
+        _run_narr = st.button(
+            "🧠 Fundamental Research — Narrative",
+            key=f"pplx_run_narr_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+    with p3:
+        _run_news = st.button(
+            "📰 News Thesis",
+            key=f"pplx_run_news_{key_ns}_{ticker}",
+            width="stretch",
+            disabled=(not bool(_pplx_key)),
+        )
+
+    _run_mode = ""
+    if _run_fund:
+        _run_mode = "fundamental_research"
+    elif _run_narr:
+        _run_mode = "fundamental_narrative"
+    elif _run_news:
+        _run_mode = "news_thesis"
+
+    if _run_mode:
+        with st.spinner(f"Running {_pplx_labels.get(_run_mode, 'Perplexity research')} for {ticker}..."):
+            _out = _run_perplexity_research_prompt(ticker, _pplx_prompts[_run_mode], max_tokens=850)
+        _pplx_results[_run_mode] = _out
+        st.session_state[_pplx_key_state] = _pplx_results
+        if bool(_out.get("ok")):
+            st.toast(f"✅ {_pplx_labels.get(_run_mode)} updated.")
+        else:
+            st.warning(f"Perplexity request failed: {str(_out.get('error', 'unknown error'))[:220]}")
+        st.rerun()
+
+    if not show_results:
+        if _pplx_results:
+            st.caption("Latest Perplexity outputs are saved for this ticker and visible in 🤖 AI Intel.")
+        return
+
+    for _mode in ("fundamental_research", "fundamental_narrative", "news_thesis"):
+        _res = _pplx_results.get(_mode)
+        if not _res:
+            continue
+        _title = _pplx_labels.get(_mode, _mode)
+        if bool(_res.get("ok")):
+            _ts = str(_res.get("timestamp_utc", "") or "").strip()
+            _model = str(_res.get("model", "") or "").strip()
+            _meta = f" ({_ts}{' | ' + _model if _model else ''})" if (_ts or _model) else ""
+            with st.expander(f"{_title}{_meta}", expanded=False):
+                st.markdown(clean_ai_formatting(str(_res.get("text", "") or "")))
+        else:
+            st.caption(f"{_title}: {str(_res.get('error', 'failed'))[:220]}")
+
+
+def _run_perplexity_weekly_market_read(max_tokens: int = 1400) -> Dict[str, Any]:
+    """Run the executive weekly market-read prompt through Perplexity."""
+    _today_et = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    _prompt = (
+        "Analyze the current U.S. stock market environment as of today and provide a structured weekly "
+        "market read for a growth stock trader. Use real-time data and recent price action to complete the "
+        "following:\n"
+        "Overall Market Bias State the current market environment in one word: Risk-On, Risk-Off, or Neutral. "
+        "Follow with 2-3 sentences explaining why, referencing recent SPY, QQQ, and IWM price action and any "
+        "relevant macro context.\n\n"
+        "Sector ETF Leaderboard Rank the following 10 sector ETFs from strongest to weakest based on 1-week "
+        "performance: XLK (Technology), XLY (Consumer Discret.), XLC (Comm. Services), XLF (Financials), "
+        "XLI (Industrials), XLE (Energy), XLU (Utilities), XLP (Consumer Staples), XHB (Homebuilders), "
+        "XAR (Aerospace & Defense). For each show: Rank, Sector name, ETF ticker, 1-week % change, and a "
+        "one-line characterization (Leading / Neutral / Lagging).\n\n"
+        "Growth ETF Leaderboard Rank the following 10 growth-focused ETFs from strongest to weakest based on "
+        "1-week performance: SMH (Semiconductors), IGV (Software), ROBO (Robotics & AI), XBI (Biotech), "
+        "CIBR (Cybersecurity), TAN (Solar Energy), QTUM (Quantum Computing), VUG (Growth), ARKK (ARK Innovation), "
+        "FFTY (IBD 50). For each show: Rank, Theme name, ETF ticker, 1-week % change, and a one-line "
+        "characterization (Leading / Neutral / Lagging).\n\n"
+        "Growth Stock Opportunities This Week Based on both leaderboards above, identify the 2-3 sectors or themes "
+        "currently showing the strongest conditions for growth stock setups. For each: explain why it is attracting "
+        "institutional interest, what type of growth stocks within that area are worth watching, and what would "
+        "confirm or invalidate the opportunity heading into the week.\n\n"
+        "Weekly Bias Statement In 2-3 sentences, summarize what this environment means for a growth stock trader "
+        "heading into the week. Should they be aggressive, selective, or defensive? What is the single most "
+        "important thing to watch?"
+    )
+    _out = _run_perplexity_research_prompt("SPY", _prompt, max_tokens=max_tokens)
+    if bool(_out.get("ok")):
+        _out["as_of_et"] = _today_et
+    return _out
+
+# ── Restore data files from GitHub backup (before any data managers load) ──
+if '_github_backup_restored' not in st.session_state:
+    try:
+        import github_backup
+        restored = github_backup.restore_all()
+        if restored:
+            files_restored = [k for k, v in restored.items() if v]
+            if files_restored:
+                print(f"[startup] Restored from GitHub: {', '.join(files_restored)}")
+    except Exception as e:
+        print(f"[startup] GitHub restore skipped: {e}")
+    st.session_state['_github_backup_restored'] = True
+
+# Initialize journal
+if 'journal' not in st.session_state:
+    st.session_state['journal'] = JournalManager(data_dir=".")
+
+# Initialize watchlist bridge (routes jm.get_watchlist_tickers() → new JSON system)
+if 'watchlist_bridge' not in st.session_state:
+    _wm = WatchlistManager()
+    st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, st.session_state['journal'])
+
+# =============================================================================
+# PER-WATCHLIST SCAN CACHE — persist scan results per watchlist
+# =============================================================================
+import json as _json
+from pathlib import Path as _Path
+
+_SCAN_CACHE_FILE = _Path("v2_scan_cache.json")
+_AUDIT_FILE = _Path("v2_watchlist_audit.json")
+_PERF_FILE = _Path("v2_perf_metrics.jsonl")
+_AUDIT_MAX_ENTRIES = 500
+
+def _load_scan_cache_file() -> dict:
+    """Load the per-watchlist scan cache from disk."""
+    if _SCAN_CACHE_FILE.exists():
+        try:
+            with open(_SCAN_CACHE_FILE, 'r') as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_scan_cache_file(cache: dict):
+    """Save the per-watchlist scan cache to disk (atomic write)."""
+    tmp = str(_SCAN_CACHE_FILE) + ".tmp"
+    try:
+        with open(tmp, 'w') as f:
+            _json.dump(cache, f)
+        import os
+        os.replace(tmp, str(_SCAN_CACHE_FILE))
+        # Queue for GitHub backup
+        try:
+            import github_backup
+            github_backup.mark_dirty(_SCAN_CACHE_FILE.name)
+        except ImportError:
+            pass
+    except Exception:
+        pass
+
+
+def _load_audit_file() -> list:
+    """Load persistent watchlist/scan audit events."""
+    if _AUDIT_FILE.exists():
+        try:
+            with open(_AUDIT_FILE, 'r') as f:
+                data = _json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+    return []
+
+
+def _save_audit_file(events: list):
+    """Persist audit events to disk (atomic write)."""
+    tmp = str(_AUDIT_FILE) + ".tmp"
+    try:
+        with open(tmp, 'w') as f:
+            _json.dump(events, f)
+        import os
+        os.replace(tmp, str(_AUDIT_FILE))
+        try:
+            import github_backup
+            github_backup.mark_dirty(_AUDIT_FILE.name)
+        except ImportError:
+            pass
+    except Exception:
+        pass
+
+
+def _get_audit_events() -> list:
+    """Get cached audit events, loading from disk once per session."""
+    if '_watchlist_audit_events' not in st.session_state:
+        st.session_state['_watchlist_audit_events'] = _load_audit_file()
+    return st.session_state['_watchlist_audit_events']
+
+
+def _append_audit_event(action: str, details: str = '', source: str = 'ui'):
+    """Append a watchlist/scan activity event."""
+    wl_id = ''
+    wl_name = ''
+    try:
+        active = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+        wl_id = active.get('id', '')
+        wl_name = active.get('name', '')
+    except Exception:
+        pass
+
+    events = _get_audit_events()
+    events.insert(0, {
+        'ts': datetime.now().isoformat(timespec='seconds'),
+        'action': action,
+        'source': source,
+        'wl_id': wl_id,
+        'wl_name': wl_name,
+        'details': details[:300] if details else '',
+    })
+    if len(events) > _AUDIT_MAX_ENTRIES:
+        del events[_AUDIT_MAX_ENTRIES:]
+    st.session_state['_watchlist_audit_events'] = events
+    _save_audit_file(events)
+
+
+def _clear_audit_events():
+    """Clear all audit events."""
+    st.session_state['_watchlist_audit_events'] = []
+    _save_audit_file([])
+
+
+def _count_today_trade_entries() -> int:
+    """Count today's entered trades from audit trail."""
+    today = datetime.now().strftime('%Y-%m-%d')
+    return sum(
+        1 for e in _get_audit_events()
+        if e.get('action') == 'ENTER_TRADE' and str(e.get('ts', '')).startswith(today)
+    )
+
+
+def _append_perf_metric(metric: Dict[str, Any]):
+    """Append performance telemetry row as JSONL."""
+    try:
+        row = {
+            "ts": datetime.now().isoformat(timespec='seconds'),
+            **metric,
+        }
+        with open(_PERF_FILE, "a") as f:
+            f.write(_json.dumps(row) + "\n")
+        try:
+            import github_backup
+            github_backup.mark_dirty(_PERF_FILE.name)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def save_scan_for_watchlist(wl_id: str):
+    """Save current session scan results to per-watchlist cache (session + disk)."""
+    scan_data = {
+        'results': st.session_state.get('scan_results_summary', []),
+        'timestamp': st.session_state.get('scan_timestamp', ''),
+    }
+    # Session state cache (instant switching)
+    st.session_state[f'_scan_cache_{wl_id}'] = scan_data
+    # Disk cache (survives restarts)
+    disk_cache = _load_scan_cache_file()
+    disk_cache[wl_id] = scan_data
+    _save_scan_cache_file(disk_cache)
+
+def load_scan_for_watchlist(wl_id: str):
+    """Load scan results for a watchlist into session state."""
+    # Try session state cache first (fast)
+    cached = st.session_state.get(f'_scan_cache_{wl_id}')
+    if not cached:
+        # Try disk cache (restart recovery)
+        disk_cache = _load_scan_cache_file()
+        cached = disk_cache.get(wl_id)
+
+    if cached and cached.get('results'):
+        st.session_state['scan_results'] = []  # No live TickerAnalysis objects
+        st.session_state['scan_results_summary'] = cached['results']
+        st.session_state['scan_timestamp'] = cached.get('timestamp', '')
+    else:
+        st.session_state['scan_results'] = []
+        st.session_state['scan_results_summary'] = []
+        st.session_state['scan_timestamp'] = ''
+
+# Initialize scan results — restore from per-watchlist disk cache
+if 'scan_results' not in st.session_state:
+    _active_wl_init = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+    load_scan_for_watchlist(_active_wl_init["id"])
+
+# Fetch sector rotation on startup if not already loaded (critical for sector colors)
+if 'sector_rotation' not in st.session_state:
+    try:
+        from data_fetcher import fetch_sector_rotation
+        st.session_state['sector_rotation'] = fetch_sector_rotation()
+        st.session_state['_sector_rotation_ts'] = time.time()
+    except Exception:
+        st.session_state['sector_rotation'] = {}
+
+# =============================================================================
+# SHARED MARKET DATA — Single source of truth for SPY, VIX, market filter
+# =============================================================================
+# Fetched once per session, auto-refreshes when stale. Every function that
+# needs SPY/VIX/market_filter should call get_shared_*() instead of fetching.
+
+_SHARED_DATA_TTL = 15 * 60  # 15 minutes
+
+def _refresh_shared_market_data(force: bool = False):
+    """Refresh shared market data if stale or forced. Called once at startup and on scan."""
+    age = time.time() - st.session_state.get('_shared_data_ts', 0)
+    if not force and age < _SHARED_DATA_TTL and 'apex_spy_data' in st.session_state:
+        return
+    try:
+        spy = fetch_daily("SPY")
+        vix = fetch_daily("^VIX")
+        mkt = fetch_market_filter()
+        st.session_state['apex_spy_data'] = spy
+        st.session_state['apex_vix_data'] = vix
+        st.session_state['market_filter_data'] = mkt
+        st.session_state['_shared_data_ts'] = time.time()
+        st.session_state['_market_filter_ts'] = time.time()
+    except Exception:
+        if 'apex_spy_data' not in st.session_state:
+            st.session_state['apex_spy_data'] = None
+            st.session_state['apex_vix_data'] = None
+        if 'market_filter_data' not in st.session_state:
+            st.session_state['market_filter_data'] = {}
+
+def get_shared_spy_daily():
+    """Get cached SPY daily data. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('apex_spy_data')
+
+def get_shared_vix_daily():
+    """Get cached VIX daily data. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('apex_vix_data')
+
+def get_shared_market_filter():
+    """Get cached market filter. Never triggers a fetch — uses pre-loaded data."""
+    return st.session_state.get('market_filter_data') or {}
+
+_refresh_shared_market_data()
+
+# Centralized session-state defaults for scanner/trade-finder controls.
+ensure_core_defaults(st.session_state)
+ensure_scanner_defaults(st.session_state)
+
+
+def get_journal() -> JournalManager:
+    return st.session_state['journal']
+
+def get_bridge() -> WatchlistBridge:
+    return st.session_state['watchlist_bridge']
+
+def get_watchlist_bridge() -> WatchlistBridge:
+    """Backward-compatible alias for legacy call sites."""
+    return get_bridge()
+
+
+if 'trade_finder_results' not in st.session_state:
+    try:
+        _tf_snapshot_payload = get_journal().load_trade_finder_snapshot() or {}
+        _tf_latest = _tf_snapshot_payload.get('latest', {}) if isinstance(_tf_snapshot_payload, dict) else {}
+        if isinstance(_tf_latest, dict) and _tf_latest:
+            _rows = _tf_latest.get('rows', []) or []
+            st.session_state['trade_finder_results'] = {
+                'run_id': _tf_latest.get('run_id', ''),
+                'generated_at_iso': _tf_latest.get('generated_at_iso', ''),
+                'rows': _rows if isinstance(_rows, list) else [],
+                'provider': _tf_latest.get('provider', 'system'),
+                'elapsed_sec': float(_tf_latest.get('elapsed_sec', 0) or 0),
+                'input_candidates': int(_tf_latest.get('input_candidates', 0) or 0),
+            }
+            _find_new = _tf_latest.get('find_new_report', {}) or {}
+            if isinstance(_find_new, dict) and _find_new:
+                st.session_state['find_new_trades_report'] = _find_new
+    except Exception:
+        pass
+
+if '_trade_finder_bg_recovered' not in st.session_state:
+    st.session_state['_trade_finder_bg_recovered'] = True
+    try:
+        _bg_state = get_journal().load_trade_finder_bg_state() or {}
+        if isinstance(_bg_state, dict) and _bg_state:
+            st.session_state['_trade_finder_bg_persisted'] = _bg_state
+            _bg_status = str(_bg_state.get('status', '') or '').lower()
+            if _bg_status == "running":
+                st.session_state['trade_finder_last_status'] = {
+                    'level': 'warning',
+                    'message': (
+                        "Recovered Trade Finder background progress from last session. "
+                        "Previous job was interrupted by reload/reboot; start a new run to continue."
+                    ),
+                    'ts': time.time(),
+                }
+    except Exception:
+        pass
+
+
+# =============================================================================
+# =============================================================================
+# MORNING BRIEFING — AI Market Narrative (sidebar)
+# =============================================================================
+
+def _render_morning_briefing():
+    """
+    DUAL ANALYSIS SYSTEM:
+    Part B — Deep Structural Analysis with Sector ETF Rotation ("Juan's Market Filter")
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # ══════════════════════════════════════════════════════════════════
+    # DEEP STRUCTURAL ANALYSIS — Sector Rotation + 5-Factor Score
+    # ══════════════════════════════════════════════════════════════════
+    deep_data = st.session_state.get('deep_market_analysis')
+    deep_date = st.session_state.get('deep_analysis_date', '')
+
+    with st.sidebar.expander("🏛️ Market Structure", expanded=True):
+        st.caption("Context only. Final execution decision uses the Unified Trade Gate below.")
+        if deep_data and deep_date == today:
+            score = deep_data.get('score', 0)
+            label = deep_data.get('score_label', 'Neutral')
+            factors = deep_data.get('factors', {})
+            phases = deep_data.get('sectors_by_phase', {})
+
+            # ── Score Banner ──────────────────────────────────────────
+            if score >= 2:
+                st.success(f"**{score:+d}/5 {label}**")
+            elif score <= -2:
+                st.error(f"**{score:+d}/5 {label}**")
+            elif score >= 1:
+                st.info(f"**{score:+d}/5 {label}**")
+            elif score <= -1:
+                st.warning(f"**{score:+d}/5 {label}**")
+            else:
+                st.info(f"**{score:+d}/5 {label}**")
+
+            # ── 5-Factor Scores (compact) ─────────────────────────────
+            factor_labels = {
+                'sp500': 'S&P 500',
+                'vix': 'VIX/Commercials',
+                'dollar': 'US Dollar',
+                'cost_of_money': 'Cost of Money',
+                'rotation': 'Rotation/Breadth',
+            }
+            for key, display_name in factor_labels.items():
+                val = factors.get(key, '')
+                if val:
+                    st.markdown(f"**{display_name}:** {val}")
+
+            # ── Sector ETF Rotation Table ─────────────────────────────
+            st.divider()
+            st.markdown("**📊 Sector ETF Rotation**")
+
+            def _show_phase(emoji, phase_name, items):
+                if items:
+                    for s in sorted(items, key=lambda x: x.get('vs_spy_20d', 0), reverse=True):
+                        vs5 = s.get('vs_spy_5d', 0)
+                        vs20 = s.get('vs_spy_20d', 0)
+                        st.caption(
+                            f"{emoji} **{s['etf']}** {s['short']}  "
+                            f"5d:{vs5:+.1f}% 20d:{vs20:+.1f}%"
+                        )
+
+            leading = phases.get('LEADING', [])
+            emerging = phases.get('EMERGING', [])
+            fading = phases.get('FADING', [])
+            lagging = phases.get('LAGGING', [])
+
+            if leading:
+                st.markdown("🟢 **Leading** — trade these")
+                _show_phase("🟢", "LEADING", leading)
+            if emerging:
+                st.markdown("🔵 **Emerging** — watch for entries")
+                _show_phase("🔵", "EMERGING", emerging)
+            if fading:
+                st.markdown("🟡 **Fading** — tighten stops")
+                _show_phase("🟡", "FADING", fading)
+            if lagging:
+                st.markdown("🔴 **Lagging** — avoid")
+                _show_phase("🔴", "LAGGING", lagging)
+
+            # ── AI Narrative (expandable) ─────────────────────────────
+            analysis_text = deep_data.get('analysis', '')
+            if analysis_text:
+                with st.expander("📝 Full Analysis"):
+                    # Extract narrative sections
+                    for section_header in ['SECTOR ROTATION NARRATIVE:', 'WHAT TO TRADE:', 'WHAT TO AVOID:',
+                                           'STRUCTURAL READ:', 'ACTIONABLE GUIDANCE:']:
+                        if section_header in analysis_text:
+                            idx = analysis_text.index(section_header)
+                            remaining = analysis_text[idx + len(section_header):]
+                            # Find end of section
+                            end = len(remaining)
+                            for marker in ['FACTOR SCORES:', 'SECTOR ROTATION NARRATIVE:',
+                                           'WHAT TO TRADE:', 'WHAT TO AVOID:', 'STRUCTURAL READ:',
+                                           'ACTIONABLE GUIDANCE:', 'SCORE:', 'LABEL:']:
+                                if marker in remaining and remaining.index(marker) > 0:
+                                    end = min(end, remaining.index(marker))
+                            section_text = remaining[:end].strip()
+                            if section_text:
+                                st.markdown(f"**{section_header.replace(':', '')}**")
+                                st.caption(section_text)
+
+                    # Provider info
+                    provider = deep_data.get('provider', '?')
+                    st.caption(f"_via {provider}_")
+        else:
+            st.caption("Click refresh to generate sector rotation analysis")
+
+        # Refresh button
+        if st.button("🔄 Refresh Analysis", width="stretch",
+                     key="refresh_deep_analysis"):
+            _run_deep_analysis()
+
+
+def _run_deep_analysis():
+    """Run the deep structural market analysis with sector ETF rotation."""
+    with st.spinner("Analyzing market structure & sector rotation..."):
+        try:
+            from data_fetcher import fetch_macro_narrative_data, fetch_market_filter, fetch_sector_rotation
+            from ai_analysis import generate_deep_market_analysis
+
+            macro_data = fetch_macro_narrative_data()
+            market_filter = get_shared_market_filter()
+            sector_rotation = fetch_sector_rotation()
+
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
+            ai_cfg = ai_clients.get('ai_config', {}) or {}
+            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
+            fallback_model = ai_cfg.get('fallback_model', '')
+
+            result = generate_deep_market_analysis(
+                macro_data,
+                market_filter=market_filter,
+                sector_rotation=sector_rotation,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+                ai_model=ai_model,
+            )
+
+            result['macro_data'] = macro_data
+            st.session_state['deep_market_analysis'] = result
+            st.session_state['deep_analysis_date'] = datetime.now().strftime('%Y-%m-%d')
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Analysis error: {e}")
+
+
+def _render_factual_market_brief():
+    """
+    PART A: Factual market brief — replaces the old green/yellow/red market health rectangle.
+    Shows indices, VIX, breadth data + AI narrative summary.
+    """
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    # Market filter already loaded by shared data manager at startup
+    mkt = get_shared_market_filter()
+
+    # Single source of truth for regime + execution gate (same path as executive dashboard).
+    _snap = None
+    try:
+        _snap = _build_dashboard_snapshot()
+        mkt = _snap.market_filter or mkt
+        _regime_u = str(_snap.regime or "UNKNOWN")
+        _reg_conf = int(_snap.regime_confidence or 0)
+    except Exception:
+        _regime_u, _reg_conf = "UNKNOWN", 0
+    spy_ok = mkt.get('spy_above_200', True)
+    vix_close = mkt.get('vix_close', 0) or 0
+
+    # ── Market Status Line (compact) ──────────────────────────────────
+    spy_str = f"SPY {'✅' if spy_ok else '❌'} ${mkt.get('spy_close', '?')}"
+
+    if vix_close < 15:
+        vix_icon = "🟢"
+    elif vix_close < 20:
+        vix_icon = "🟡"
+    elif vix_close < 25:
+        vix_icon = "🟠"
+    elif vix_close < 30:
+        vix_icon = "🔴"
+    else:
+        vix_icon = "🔴🔴"
+    vix_str = f"VIX {vix_icon} {vix_close}"
+
+    if spy_ok and vix_close < 20:
+        st.sidebar.success(f"**{spy_str} | {vix_str}**")
+    elif spy_ok and vix_close < 30:
+        st.sidebar.warning(f"**{spy_str} | {vix_str}**")
+    else:
+        st.sidebar.error(f"**{spy_str} | {vix_str}**")
+    st.sidebar.caption(f"Unified Regime: **{_regime_u}** ({_reg_conf}%)")
+
+    # Single execution authority: should we be trading at all?
+    _gate_ctx = None
+    try:
+        gate = _evaluate_trade_gate(_snap if _snap is not None else _build_dashboard_snapshot())
+        _gate_ctx = gate
+        if gate.severity == "danger":
+            st.sidebar.error(f"**{gate.label}**")
+        elif gate.severity == "warning":
+            st.sidebar.warning(f"**{gate.label}**")
+        else:
+            st.sidebar.success(f"**{gate.label}**")
+        st.sidebar.caption(f"Reason: {gate.reason}")
+        st.sidebar.caption(f"Model alignment: {gate.model_alignment}")
+    except Exception:
+        pass
+
+    # ── AI Narrative (if generated) ───────────────────────────────────
+    narrative_data = st.session_state.get('morning_narrative')
+    narrative_date = st.session_state.get('morning_narrative_date', '')
+
+    if narrative_data and narrative_date == today:
+        regime = narrative_data.get('regime', 'Neutral')
+        with st.sidebar.expander("📓 Market Brief (Context Only)"):
+            _brief_norm = _normalize_brief_regime(regime)
+            st.caption(f"Narrative bias (context): {regime} → {_brief_norm}")
+            if _gate_ctx is not None:
+                st.caption(f"Execution authority remains: {_gate_ctx.label}")
+            st.caption(narrative_data.get('narrative', '')[:400])
+
+            # Raw data — multi-timeframe momentum analysis
+            macro = narrative_data.get('macro_data', {})
+            if macro:
+                st.divider()
+                st.caption("**Index Momentum**")
+                for name, info in macro.get('indices', {}).items():
+                    d1 = info.get('1d', 0)
+                    d5 = info.get('5d', 0)
+                    d20 = info.get('20d', 0)
+                    price = info.get('price', '?')
+
+                    # Color based on multi-timeframe health:
+                    # Green = strong (positive on all), Yellow = mixed, Red = weak
+                    pos_count = sum(1 for x in [d1, d5, d20] if x > 0)
+                    if pos_count == 3 and d5 > 1.0:
+                        ic = '🟢'  # Strong uptrend
+                    elif pos_count >= 2:
+                        ic = '🟡'  # Mixed — momentum fading or just starting
+                    elif pos_count == 1:
+                        ic = '🟠'  # Mostly negative — caution
+                    else:
+                        ic = '🔴'  # Downtrend on all timeframes
+
+                    # Show directional arrows for each timeframe
+                    d1_arrow = '↑' if d1 > 0.3 else ('↓' if d1 < -0.3 else '→')
+                    d5_arrow = '↑' if d5 > 0.5 else ('↓' if d5 < -0.5 else '→')
+                    d20_arrow = '↑' if d20 > 1.0 else ('↓' if d20 < -1.0 else '→')
+
+                    st.caption(
+                        f"{ic} **{name}**: ${price} — "
+                        f"1d:{d1_arrow}{d1:+.1f}% | 5d:{d5_arrow}{d5:+.1f}% | 20d:{d20_arrow}{d20:+.1f}%"
+                    )
+
+                vix_data = macro.get('vix', {})
+                if vix_data:
+                    vix_lvl = vix_data.get('level', 0)
+                    vix_chg = vix_data.get('change_5d', 0)
+                    vix_regime = vix_data.get('regime', '')
+                    vix_ic = '🟢' if vix_lvl < 15 else ('🟡' if vix_lvl < 20 else ('🟠' if vix_lvl < 25 else '🔴'))
+                    chg_arrow = '↑' if vix_chg > 1 else ('↓' if vix_chg < -1 else '→')
+                    st.caption(f"{vix_ic} **VIX**: {vix_lvl} ({vix_regime}) | 5d:{chg_arrow}{vix_chg:+.1f}")
+
+                sectors = macro.get('sectors', {})
+                if sectors:
+                    spread = sectors.get('spread', 0)
+                    regime_str = sectors.get('regime', '')
+                    sec_ic = '🟢' if spread > 2 else ('🔴' if spread < -2 else '🟡')
+                    st.caption(f"{sec_ic} **Rotation**: {regime_str} (Off-Def: {spread:+.1f}%)")
+
+                breadth = macro.get('breadth', {})
+                if breadth:
+                    br_spread = breadth.get('spread', 0)
+                    br_regime = breadth.get('regime', '')
+                    br_ic = '🟢' if br_spread > 1 else ('🔴' if br_spread < -1 else '🟡')
+                    st.caption(f"{br_ic} **Breadth**: {br_regime} (RSP-SPY: {br_spread:+.1f}%)")
+
+        # Refresh button
+        if st.sidebar.button("🔄 Refresh Brief", width="stretch", key="refresh_brief"):
+            _run_factual_brief()
+    else:
+        if st.sidebar.button("📊 Generate Market Brief", width="stretch", key="gen_brief"):
+            _run_factual_brief()
+
+
+def _run_factual_brief():
+    """Generate the factual morning brief."""
+    with st.spinner("Generating market brief..."):
+        try:
+            from data_fetcher import fetch_macro_narrative_data
+            from ai_analysis import generate_market_narrative
+
+            macro_data = fetch_macro_narrative_data()
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
+
+            narrative_result = generate_market_narrative(
+                macro_data,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+                ai_model=st.session_state.get('_ai_config', {}).get('model', 'llama-3.3-70b-versatile'),
+            )
+
+            narrative_result['macro_data'] = macro_data
+            st.session_state['morning_narrative'] = narrative_result
+            st.session_state['morning_narrative_date'] = datetime.now().strftime('%Y-%m-%d')
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Brief error: {e}")
+
+
+def _compute_system_health(force: bool = False) -> Dict[str, Any]:
+    """Compute cached system health snapshot (AI + price feed + heartbeat)."""
+    now = time.time()
+    ttl_sec = 60
+    cached = st.session_state.get('_system_health_snapshot')
+    if cached and not force and (now - float(cached.get('ts_epoch', 0.0))) < ttl_sec:
+        return cached
+
+    ai_clients = _get_ai_clients()
+    ai_cfg = ai_clients.get('ai_config', {}) or {}
+    has_openai_compat = ai_clients.get('openai_client') is not None
+    has_gemini = ai_clients.get('gemini') is not None
+    ai_key = str(ai_cfg.get('key', '') or '')
+    ai_validation_ok = False
+    if ai_key:
+        ai_validation_ok = bool(st.session_state.get(f"_ai_validated_{ai_key[:8]}"))
+    ai_ok = bool((has_openai_compat and ai_validation_ok) or has_gemini)
+
+    fetch_health = get_fetch_health_status() or {}
+    rate_limited = bool(fetch_health.get('rate_limited', False))
+    cooldown_sec = int(fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    # Prefer live quote; if provider is briefly rate-limited, keep last good SPY
+    # for status continuity so transient 429 windows do not hard-fail health.
+    spy_px_live = fetch_current_price("SPY")
+    last_good_spy = st.session_state.get('_system_health_last_good_spy_price')
+    last_good_spy_ts = float(st.session_state.get('_system_health_last_good_spy_ts', 0.0) or 0.0)
+    spy_px = spy_px_live
+    price_feed_source = "live"
+    if spy_px_live is not None and float(spy_px_live) > 0:
+        st.session_state['_system_health_last_good_spy_price'] = float(spy_px_live)
+        st.session_state['_system_health_last_good_spy_ts'] = now
+    elif rate_limited and last_good_spy is not None:
+        # 30-minute stale window keeps UI stable while respecting data freshness.
+        if (now - last_good_spy_ts) <= (30 * 60):
+            spy_px = float(last_good_spy)
+            price_feed_source = "cached"
+    price_feed_ok = bool(spy_px is not None and float(spy_px) > 0)
+    price_feed_stale = bool(price_feed_ok and price_feed_source == "cached")
+
+    ts_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    ts_utc = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC')
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    market_open = (
+        now_et.weekday() < 5
+        and ((now_et.hour > 9) or (now_et.hour == 9 and now_et.minute >= 30))
+        and (now_et.hour < 16)
+    )
+    market_session = "OPEN" if market_open else "CLOSED"
+    market_et_time = now_et.strftime('%Y-%m-%d %H:%M:%S ET')
+
+    issues = []
+    warnings = []
+    if not ai_ok:
+        issues.append("AI connection unavailable")
+    if not price_feed_ok:
+        issues.append("Price feed unavailable")
+    elif price_feed_stale:
+        warnings.append("Price feed temporarily rate-limited — showing cached SPY quote")
+    if rate_limited:
+        warnings.append(f"Data provider rate-limited ({cooldown_sec}s cooldown) — using cached/partial data")
+
+    overall_ok = len(issues) == 0 and not rate_limited
+    snapshot = {
+        'ts_epoch': now,
+        'ts_local': ts_local,
+        'ts_utc': ts_utc,
+        'overall_ok': overall_ok,
+        'issues': issues,
+        'ai_ok': ai_ok,
+        'ai_validation_ok': ai_validation_ok,
+        'provider': ai_cfg.get('provider', 'none'),
+        'model': ai_cfg.get('model', ''),
+        'has_openai_compat': has_openai_compat,
+        'has_gemini': has_gemini,
+        'primary_error': ai_clients.get('primary_error'),
+        'gemini_error': ai_clients.get('gemini_error'),
+        'price_feed_ok': price_feed_ok,
+        'spy_price': float(spy_px) if price_feed_ok else None,
+        'price_feed_source': price_feed_source,
+        'price_feed_stale': price_feed_stale,
+        'rate_limited': rate_limited,
+        'cooldown_sec': cooldown_sec,
+        'fetch_hits': int(fetch_health.get('hits', 0) or 0),
+        'fetch_last_error': str(fetch_health.get('last_error', '') or ''),
+        'warnings': warnings,
+        'market_session': market_session,
+        'market_et_time': market_et_time,
+    }
+    st.session_state['_system_health_snapshot'] = snapshot
+
+    last_log = float(st.session_state.get('_last_system_health_log_ts', 0.0) or 0.0)
+    if force or (now - last_log) > 300:
+        st.session_state['_last_system_health_log_ts'] = now
+        _append_perf_metric({
+            "kind": "system_health",
+            "ok": overall_ok,
+            "ai_ok": ai_ok,
+            "price_feed_ok": price_feed_ok,
+            "rate_limited": rate_limited,
+            "rate_limit_cooldown_sec": cooldown_sec,
+            "provider": snapshot['provider'],
+            "model": snapshot['model'],
+        })
+
+    return snapshot
+
+
+def _render_system_status_panel():
+    """Persistent sidebar system status panel with clear health indicator."""
+    st.sidebar.divider()
+    health = _compute_system_health(force=False)
+
+    with st.sidebar.container(border=True):
+        has_warnings = bool(health.get('warnings'))
+        if health.get('overall_ok'):
+            st.sidebar.success("🟢 System Status: ALL SYSTEMS OPERATIONAL")
+        elif has_warnings and not health.get('issues'):
+            st.sidebar.warning("🟠 System Status: DEGRADED (PARTIAL DATA MODE)")
+            st.sidebar.warning("Alert: " + "; ".join(health.get('warnings', [])))
+        else:
+            st.sidebar.error("🔴 System Status: DEGRADED")
+            msg = "; ".join((health.get('issues', []) or []) + (health.get('warnings', []) or []))
+            st.sidebar.error("Alert: " + msg)
+        prev_ok = st.session_state.get('_system_health_last_ok')
+        now_ok = bool(health.get('overall_ok'))
+        if prev_ok is None:
+            st.session_state['_system_health_last_ok'] = now_ok
+        elif prev_ok != now_ok:
+            if now_ok:
+                st.toast("🟢 System recovered: feeds and AI are operational.")
+            else:
+                st.toast("🔴 System degraded: check AI/feed status.")
+            st.session_state['_system_health_last_ok'] = now_ok
+
+        c1, c2 = st.sidebar.columns([2, 1])
+        with c1:
+            st.sidebar.caption(
+                f"AI: {'OK' if health.get('ai_ok') else 'FAIL'} "
+                f"({health.get('provider', 'none')} / {health.get('model', '') or 'n/a'})"
+            )
+            st.sidebar.caption(
+                f"AI validation: {'tested' if health.get('ai_validation_ok') else 'not tested'}"
+            )
+            st.sidebar.caption(
+                f"Price Feed: {'OK' if health.get('price_feed_ok') else 'FAIL'} "
+                + (
+                    f"(SPY ${health.get('spy_price', 0):.2f}"
+                    + (" cached" if health.get('price_feed_stale') else "")
+                    + ")"
+                    if health.get('price_feed_ok') else ""
+                )
+            )
+            if health.get('rate_limited'):
+                st.sidebar.caption(
+                    f"Data Fetch: DEGRADED (429 cooldown {int(health.get('cooldown_sec', 0) or 0)}s, "
+                    f"hits {int(health.get('fetch_hits', 0) or 0)})"
+                )
+            else:
+                st.sidebar.caption("Data Fetch: OK")
+            st.sidebar.caption(
+                f"Market: {health.get('market_session', 'n/a')} | {health.get('market_et_time', '')}"
+            )
+            st.sidebar.caption(f"Heartbeat: {health.get('ts_local', '')} | {health.get('ts_utc', '')}")
+        with c2:
+            if st.sidebar.button("↻ Check", key="system_health_recheck"):
+                _compute_system_health(force=True)
+                st.rerun()
+
+
+# =============================================================================
+# SIDEBAR — Slim: Scan controls, Open Positions, Alerts, Market
+# =============================================================================
+
+def render_sidebar():
+    jm = get_journal()
+    bridge = get_bridge()
+
+    st.sidebar.title("📊 TTA v2")
+    st.sidebar.caption("Technical Trading Assistant")
+
+    # ══════════════════════════════════════════════════════════════════
+    # PART B: Deep Structural Analysis ("Juan's Market Filter")
+    # ══════════════════════════════════════════════════════════════════
+    _render_morning_briefing()
+
+    st.sidebar.divider()
+
+    # ── Watchlist Selector ─────────────────────────────────────────────
+    _wm = st.session_state['watchlist_bridge'].manager
+    all_wls = _wm.get_all_watchlists()
+    active_wl = _wm.get_active_watchlist()
+
+    if len(all_wls) > 1:
+        # Multiple watchlists — show selector
+        st.sidebar.caption("**Active Watchlist**")
+        wl_labels = []
+        wl_id_map = {}
+        for wl in all_wls:
+            icon = "🔒" if wl.get("is_system") else ("🔄" if wl.get("type") == "auto" else "✏️")
+            label = f"{icon} {wl['name']} ({len(wl.get('tickers', []))})"
+            wl_labels.append(label)
+            wl_id_map[label] = wl["id"]
+
+        active_label = None
+        for label, wl_id in wl_id_map.items():
+            if wl_id == active_wl["id"]:
+                active_label = label
+                break
+        current_idx = wl_labels.index(active_label) if active_label in wl_labels else 0
+
+        sel_col1, sel_col2 = st.sidebar.columns([4, 1])
+        with sel_col1:
+            selected = st.selectbox(
+                "Watchlist", wl_labels, index=current_idx,
+                key="sidebar_wl_selector", label_visibility="collapsed",
+            )
+        with sel_col2:
+            st.button("➕", key="sidebar_wl_create", help="Create new watchlist",
+                      on_click=lambda: st.session_state.update({'show_wl_create': True}))
+
+        selected_id = wl_id_map.get(selected)
+        if selected_id and selected_id != active_wl["id"]:
+            # Save current watchlist's scan results before switching
+            save_scan_for_watchlist(active_wl["id"])
+            # Switch active watchlist
+            ok, msg = _wm.set_active_watchlist(selected_id)
+            if not ok:
+                st.sidebar.error(f"Watchlist switch failed: {msg}")
+                # Self-heal stale in-memory manager state by reloading from disk.
+                _wm = WatchlistManager()
+                st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, get_journal())
+                ok, msg = _wm.set_active_watchlist(selected_id)
+                if not ok:
+                    st.sidebar.error(f"Watchlist recovery failed: {msg}")
+                    st.rerun()
+            # Load target watchlist's scan results
+            load_scan_for_watchlist(selected_id)
+            st.session_state['ticker_data_cache'] = {}
+            st.session_state['selected_analysis'] = None
+            st.session_state['selected_ticker'] = None
+            st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1
+            # Verify active watchlist actually switched (guards stale bridge/session references).
+            _active_post = st.session_state['watchlist_bridge'].manager.get_active_watchlist()
+            if str(_active_post.get("id", "")) != str(selected_id):
+                _wm2 = WatchlistManager()
+                st.session_state['watchlist_bridge'] = WatchlistBridge(_wm2, get_journal())
+                _wm2.set_active_watchlist(selected_id)
+                load_scan_for_watchlist(selected_id)
+            st.rerun()
+    else:
+        # Single watchlist — just show create button
+        wl_col1, wl_col2 = st.sidebar.columns([3, 1])
+        with wl_col1:
+            st.sidebar.caption(f"📋 {active_wl['name']}")
+        with wl_col2:
+            st.button("➕", key="sidebar_wl_create", help="Create new watchlist",
+                      on_click=lambda: st.session_state.update({'show_wl_create': True}))
+
+    # ── Create Watchlist Dialog (inline sidebar) ───────────────────────
+    if st.session_state.get('show_wl_create'):
+        from scraping_bridge import ETF_SHORTCUTS
+        with st.sidebar.container(border=True):
+            st.markdown("**New Watchlist**")
+            wl_name = st.text_input("Name", placeholder="e.g. ARKK Holdings", key="create_wl_name")
+            wl_type = st.radio("Type", ["Manual", "Auto (ETF)"], horizontal=True, key="create_wl_type")
+
+            source_type = None
+            source = None
+            if wl_type == "Auto (ETF)":
+                shortcuts = list(ETF_SHORTCUTS.keys())
+                choice = st.selectbox("Select ETF", shortcuts, key="create_wl_etf")
+                source_type = "etf_shortcut"
+                source = ETF_SHORTCUTS.get(choice, "")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Create", type="primary", key="create_wl_submit", width="stretch"):
+                    # Auto-fill name from ETF selection if left blank
+                    final_name = wl_name.strip() if wl_name and wl_name.strip() else ""
+                    if not final_name and wl_type == "Auto (ETF)" and choice:
+                        final_name = choice.split(" - ")[0].strip()  # e.g. "ARKK"
+                    
+                    if final_name:
+                        try:
+                            actual_type = "manual" if wl_type == "Manual" else "auto"
+                            new_id = _wm.create_watchlist(
+                                name=final_name, wl_type=actual_type,
+                                source_type=source_type, source=source,
+                            )
+                            if new_id:
+                                # Save current watchlist's scan before switching
+                                save_scan_for_watchlist(active_wl["id"])
+                                _wm.set_active_watchlist(new_id)
+                                st.session_state['wl_version'] = st.session_state.get('wl_version', 0) + 1  # FIX: Force text_area refresh
+                                st.session_state['show_wl_create'] = False
+                                st.session_state['scan_results'] = []
+                                st.session_state['scan_results_summary'] = []
+                                st.session_state['scan_timestamp'] = ''
+
+                                # Auto-fetch tickers for auto watchlists
+                                if actual_type == "auto" and source_type:
+                                    from scraping_bridge import ScrapingBridge
+                                    _scraper = st.session_state.get('scraping_bridge')
+                                    if not _scraper:
+                                        _scraper = ScrapingBridge()
+                                        st.session_state['scraping_bridge'] = _scraper
+                                    new_wl = _wm.get_watchlist(new_id)
+                                    if new_wl:
+                                        _wm.record_refresh_request(new_id)
+                                        success, msg, tickers = _scraper.fetch_tickers(new_wl)
+                                        if success and tickers:
+                                            _wm.update_tickers(new_id, tickers, backup_old=False)
+                                            _wm.record_refresh_success(new_id)
+                                            st.toast(f"✅ Created '{final_name}' with {len(tickers)} tickers")
+                                        else:
+                                            _wm.record_refresh_failure(new_id, msg)
+                                            st.toast(f"⚠️ Created '{final_name}' but fetch failed: {msg}")
+                                else:
+                                    st.toast(f"✅ Created '{final_name}'")
+
+                                _append_audit_event("CREATE_WATCHLIST", f"name={final_name} type={actual_type}", source="sidebar_create")
+                                st.rerun()
+                        except ValueError as e:
+                            st.error(str(e))
+                    else:
+                        st.error("Enter a name")
+            with c2:
+                st.button("Cancel", key="create_wl_cancel", width="stretch",
+                          on_click=lambda: st.session_state.update({'show_wl_create': False}))
+
+    # ── Auto-Refresh Controls (for auto watchlists) ────────────────────
+    if active_wl.get("type") == "auto":
+        from scraping_bridge import ScrapingBridge, ETF_CSV_URLS
+
+        # Show source info
+        src = active_wl.get("source", "")
+        url_override = active_wl.get("url_override", "")
+        if active_wl.get("source_type") == "etf_shortcut" and src:
+            configured_url = ETF_CSV_URLS.get(src.lower(), "")
+            display_url = url_override or configured_url
+            st.sidebar.caption(f"Source: ARK ETF `{src.upper()}` (auto-populated)")
+            if url_override:
+                st.sidebar.caption(f"🔗 Using custom URL override")
+
+        # Show last error if any
+        stats = active_wl.get("scraping_stats", {})
+        last_error = stats.get("last_error")
+        if last_error:
+            st.sidebar.warning(f"⚠️ Last fetch: {last_error[:120]}")
+
+        # Skip cooldown if last attempt failed (let user retry immediately)
+        can_refresh, remaining = _wm.can_refresh_auto(active_wl["id"])
+        if last_error:
+            can_refresh = True  # Allow retry after failure
+
+        if can_refresh:
+            if st.sidebar.button("🔄 Refresh Tickers", key="sidebar_refresh_wl"):
+                _wm.record_refresh_request(active_wl["id"])
+                try:
+                    _bridge_scraper = st.session_state.get('scraping_bridge')
+                    if not _bridge_scraper:
+                        _bridge_scraper = ScrapingBridge()
+                        st.session_state['scraping_bridge'] = _bridge_scraper
+                    with st.sidebar:
+                        with st.spinner("Validating URL and fetching tickers..."):
+                            success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
+                    if success and tickers:
+                        ok, update_msg, cleaned = _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                        if ok:
+                            _wm.record_refresh_success(active_wl["id"])
+                            st.sidebar.success(f"✅ {update_msg}")
+                        else:
+                            _wm.record_refresh_failure(active_wl["id"], update_msg)
+                            st.sidebar.error(update_msg)
+                    else:
+                        _wm.record_refresh_failure(active_wl["id"], msg)
+                        st.sidebar.error(f"✗ {msg}")
+                except Exception as e:
+                    _wm.record_refresh_failure(active_wl["id"], str(e))
+                    st.sidebar.error(f"Fetch failed: {str(e)[:100]}")
+                st.rerun()
+        else:
+            st.sidebar.caption(f"⏳ Retry in {remaining}s")
+
+        # ── URL Fix / CSV Upload Fallback (shown when last fetch failed) ──
+        if last_error and ("URL" in last_error or "404" in last_error or "403" in last_error
+                          or "unreachable" in last_error or "timed out" in last_error):
+            with st.sidebar.expander("🔧 Fix Source", expanded=True):
+                st.caption("The auto-fetch URL may have changed. Choose a fix:")
+
+                # Show current URL for reference
+                _src_key = active_wl.get("source", "").lower()
+                _current_url = url_override or ETF_CSV_URLS.get(_src_key, "unknown")
+                st.code(_current_url, language=None)
+
+                # Option 1: Custom URL override
+                st.markdown("**Option 1: Paste corrected URL**")
+                new_url = st.text_input(
+                    "CSV URL", value=url_override or "",
+                    placeholder="https://assets.ark-funds.com/...",
+                    key="url_override_input", label_visibility="collapsed",
+                )
+                if new_url and new_url.strip() != url_override:
+                    if st.button("✅ Save URL & Fetch", key="save_url_override"):
+                        _bridge_scraper = st.session_state.get('scraping_bridge')
+                        if not _bridge_scraper:
+                            _bridge_scraper = ScrapingBridge()
+                            st.session_state['scraping_bridge'] = _bridge_scraper
+                        # Validate first
+                        ok, check_msg, status = _bridge_scraper.validate_url(new_url.strip())
+                        if ok:
+                            _wm.update_watchlist_metadata(active_wl["id"], url_override=new_url.strip())
+                            # Fetch with override
+                            active_wl["url_override"] = new_url.strip()
+                            success, msg, tickers = _bridge_scraper.fetch_tickers(active_wl)
+                            if success and tickers:
+                                _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                                _wm.record_refresh_success(active_wl["id"])
+                                st.toast(f"✅ Fetched {len(tickers)} tickers from new URL")
+                            else:
+                                st.error(f"URL reachable but no tickers found: {msg}")
+                        else:
+                            st.error(f"❌ {check_msg}")
+                        st.rerun()
+
+                # Clear override if one exists
+                if url_override:
+                    if st.button("🔄 Reset to default URL", key="clear_url_override"):
+                        _wm.update_watchlist_metadata(active_wl["id"], url_override="")
+                        st.toast("Reset to default URL")
+                        st.rerun()
+
+                st.divider()
+
+                # Option 2: Upload CSV file
+                st.markdown("**Option 2: Upload CSV file**")
+                st.caption("Download holdings CSV from ark-funds.com, then upload here.")
+                csv_file = st.file_uploader(
+                    "Upload CSV", type=["csv"], key="csv_fallback_upload",
+                    label_visibility="collapsed",
+                )
+                if csv_file is not None:
+                    _bridge_scraper = st.session_state.get('scraping_bridge')
+                    if not _bridge_scraper:
+                        _bridge_scraper = ScrapingBridge()
+                        st.session_state['scraping_bridge'] = _bridge_scraper
+                    csv_bytes = csv_file.read()
+                    success, msg, tickers = _bridge_scraper.fetch_from_csv_content(csv_bytes)
+                    if success and tickers:
+                        _wm.update_tickers(active_wl["id"], tickers, backup_old=True)
+                        _wm.record_refresh_success(active_wl["id"])
+                        st.toast(f"✅ Loaded {len(tickers)} tickers from CSV")
+                        st.rerun()
+                    else:
+                        st.error(f"CSV parse failed: {msg}")
+
+        # Rollback option
+        backup = active_wl.get("last_backup")
+        if backup and backup.get("tickers"):
+            if st.sidebar.button(f"↩️ Rollback ({len(backup['tickers'])} tickers)", key="sidebar_rollback_wl"):
+                _wm.rollback_tickers(active_wl["id"])
+                st.rerun()
+
+    # ── Manage Watchlist (rename, delete) ─────────────────────────────
+    if not active_wl.get("is_system"):
+        with st.sidebar.expander("⚙️ Manage Watchlist", expanded=False):
+            # Rename
+            new_name = st.text_input("Rename", value=active_wl["name"], key="wl_rename_input")
+            if new_name and new_name.strip() != active_wl["name"]:
+                if st.button("✏️ Rename", key="wl_rename_btn"):
+                    _wm.update_watchlist_metadata(active_wl["id"], name=new_name.strip())
+                    st.toast(f"✅ Renamed to '{new_name.strip()}'")
+                    st.rerun()
+
+            st.divider()
+
+            # Delete
+            st.caption(f"⚠️ Delete **{active_wl['name']}** permanently")
+            if st.button("🗑️ Delete This Watchlist", key="wl_delete_sidebar",
+                         type="secondary", width="stretch",
+                         on_click=lambda: st.session_state.update({'confirm_delete_wl': True})):
+                pass
+            if st.session_state.get('confirm_delete_wl'):
+                st.warning("Are you sure? This cannot be undone.")
+                d1, d2 = st.columns(2)
+                with d1:
+                    if st.button("Yes, Delete", key="wl_confirm_del", type="primary"):
+                        ok, msg = _wm.delete_watchlist(active_wl["id"])
+                        if ok:
+                            _append_audit_event("DELETE_WATCHLIST", msg, source="sidebar_delete")
+                            st.session_state['confirm_delete_wl'] = False
+                            st.session_state['scan_results'] = []
+                            st.session_state['scan_results_summary'] = []
+                            st.session_state['scan_timestamp'] = ''
+                            st.session_state['ticker_data_cache'] = {}
+                            st.toast(f"✅ {msg}")
+                            st.rerun()
+                with d2:
+                    st.button("Cancel", key="wl_cancel_del",
+                              on_click=lambda: st.session_state.update({'confirm_delete_wl': False}))
+
+    # ── Scan Controls ─────────────────────────────────────────────────
+    watchlist_tickers = bridge.get_watchlist_tickers()
+    ticker_count = len(watchlist_tickers)
+
+    # Count unscanned
+    existing_summary = st.session_state.get('scan_results_summary', [])
+    scanned = {s.get('ticker', '') for s in existing_summary}
+    new_count = len([t for t in watchlist_tickers if t not in scanned])
+
+    st.sidebar.caption(f"📋 **{active_wl['name']}** — {ticker_count} tickers")
+
+    scan_col1, scan_col2 = st.sidebar.columns(2)
+    with scan_col1:
+        if st.button("🔍 Scan All", width="stretch", type="primary",
+                     disabled=(ticker_count == 0)):
+            _run_scan(mode='all')
+    with scan_col2:
+        btn_label = f"⚡ New ({new_count})" if new_count > 0 else "⚡ New"
+        if st.button(btn_label, width="stretch",
+                     disabled=(new_count == 0)):
+            _run_scan(mode='new_only')
+    st.sidebar.number_input(
+        "Scan max minutes (0 = no limit)",
+        min_value=0.0,
+        max_value=30.0,
+        step=0.5,
+        key="scan_max_minutes",
+        help="Stops long watchlist scans when runtime cap is reached.",
+    )
+
+    all_watchlists = bridge.manager.get_all_watchlists() or []
+    all_watch_tickers = set()
+    for _wl in all_watchlists:
+        for _t in (_wl.get('tickers', []) or []):
+            if isinstance(_t, str) and _t.strip():
+                all_watch_tickers.add(_t.upper().strip())
+
+    if st.sidebar.button(
+        f"🧭 Find New Trades ({len(all_watch_tickers)})",
+        width="stretch",
+        help="Scan ALL watchlists and return a ranked list of new trade candidates.",
+        disabled=(len(all_watch_tickers) == 0),
+    ):
+        _jid = _start_trade_finder_background_run(rerank_only=False)
+        if _jid:
+            st.sidebar.success("Background Trade Finder started.")
+        else:
+            st.sidebar.warning("Unable to start background Trade Finder.")
+        st.rerun()
+
+    # ── Open Positions (clickable) ────────────────────────────────────
+    open_trades = jm.get_open_trades()
+    if open_trades:
+        st.sidebar.divider()
+        st.sidebar.subheader(f"📈 Open ({len(open_trades)})")
+
+        # Cache position prices — refresh every 60 seconds, not every rerun
+        _pos_cache = st.session_state.get('_position_prices', {})
+        _pos_ts = st.session_state.get('_position_prices_ts', 0)
+        _now_ts = datetime.now().timestamp()
+        _stale = (_now_ts - _pos_ts) > 60  # 60-second TTL
+
+        if _stale:
+            _new_prices = {}
+            for trade in open_trades:
+                t = trade['ticker']
+                _new_prices[t] = fetch_current_price(t) or trade.get('entry_price', 0)
+            st.session_state['_position_prices'] = _new_prices
+            st.session_state['_position_prices_ts'] = _now_ts
+            _pos_cache = _new_prices
+
+        for trade in open_trades:
+            ticker = trade['ticker']
+            entry = trade.get('entry_price', 0)
+            current = _pos_cache.get(ticker, entry)
+            pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+            icon = "🟢" if pnl_pct >= 0 else "🔴"
+
+            if st.sidebar.button(
+                f"{icon} {ticker}  ${current:.2f}  ({pnl_pct:+.1f}%)",
+                key=f"sidebar_pos_{ticker}",
+                width="stretch",
+            ):
+                _load_ticker_for_view(ticker)
+
+    # ── Market Brief (replaces old green/yellow/red rectangle) ──────
+    st.sidebar.divider()
+    _render_factual_market_brief()
+    _render_system_status_panel()
+
+    # ── Settings (bottom of sidebar) ──────────────────────────────────
+    with st.sidebar.expander("⚙️ Settings", expanded=False):
+        current_beta = bool(st.session_state.get('exec_dashboard_beta_enabled', _is_exec_dashboard_enabled()))
+        beta_enabled = st.checkbox(
+            "Executive Dashboard Beta",
+            value=current_beta,
+            key="exec_dashboard_beta_toggle",
+            help="Toggle phased rollout of Executive Dashboard tab.",
+        )
+        st.session_state['exec_dashboard_beta_enabled'] = beta_enabled
+        if 'trade_macd_profile' not in st.session_state:
+            _p = str(get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+            if _p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+                _p = MACD_PROFILE_LEGACY
+            st.session_state['trade_macd_profile'] = _p
+        _profile_options = {
+            MACD_PROFILE_LEGACY: "Legacy MACD (12/26/9)",
+            MACD_PROFILE_HPOTTER_ZONE: "HPotter Zone (8/16/11)",
+            MACD_PROFILE_SHADOW: "Shadow Compare (legacy + HPotter diagnostics)",
+        }
+        st.selectbox(
+            "MACD Profile",
+            options=[MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW],
+            format_func=lambda x: _profile_options.get(str(x), str(x)),
+            key="trade_macd_profile",
+            help="Controls scanner/trade-finder signal profile. Shadow keeps legacy decisions while logging HPotter zone diffs.",
+        )
+        try:
+            set_active_macd_profile(str(st.session_state.get('trade_macd_profile', MACD_PROFILE_LEGACY)))
+        except Exception:
+            pass
+
+        s1, s2, s3 = st.columns(3)
+        with s1:
+            if st.button("🔑 Reset API", key="reset_api_cache",
+                         help="Clear cached API key status after updating secrets"):
+                for k in list(st.session_state.keys()):
+                    if k.startswith(('_groq_key', '_groq_validated', '_ai_validated', '_ai_clients',
+                                     'ai_result_', 'chat_')):
+                        st.session_state.pop(k, None)
+                st.session_state.pop('_ai_config', None)
+                st.toast("✅ API cache cleared. Click a ticker to re-run.")
+        with s2:
+            if st.button("📊 Refresh Mkt", key="refresh_market_data",
+                         help="Re-fetch SPY, VIX, sector rotation"):
+                st.session_state.pop('market_filter_data', None)
+                st.session_state.pop('_market_filter_ts', None)
+                st.session_state.pop('sector_rotation', None)
+                st.session_state.pop('_sector_rotation_ts', None)
+                st.session_state.pop('_research_market_cache', None)
+                st.session_state.pop('_research_market_cache_ts', None)
+                st.session_state.pop('_position_prices', None)
+                st.session_state.pop('_position_prices_ts', None)
+                # Clear APEX caches (SPY/VIX data + per-ticker detection)
+                st.session_state.pop('apex_spy_data', None)
+                st.session_state.pop('apex_vix_data', None)
+                for k in [k for k in list(st.session_state.keys()) if k.startswith('_apex_cache_')]:
+                    st.session_state.pop(k, None)
+                st.toast("✅ Market data will refresh on next load.")
+        with s3:
+            if st.button("☁ Restore WL", key="restore_watchlists_from_backup",
+                         help="Force-restore watchlist files from GitHub backup branch."):
+                try:
+                    import os
+                    import github_backup
+                    # Force restore by removing local watchlist files first.
+                    for fn in ["v2_multi_watchlist.json", "v2_watchlist.json"]:
+                        try:
+                            if os.path.exists(fn):
+                                os.remove(fn)
+                        except Exception:
+                            pass
+                    restored = github_backup.restore_all() or {}
+
+                    # Reinitialize watchlist manager/bridge in current session.
+                    _wm = WatchlistManager()
+                    st.session_state['watchlist_bridge'] = WatchlistBridge(_wm, get_journal())
+                    _active = _wm.get_active_watchlist()
+                    if _active and _active.get("id"):
+                        load_scan_for_watchlist(_active["id"])
+
+                    restored_count = sum(1 for v in restored.values() if v)
+                    st.toast(f"✅ Restore complete ({restored_count} file(s) restored).")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Restore failed: {str(e)[:180]}")
+
+        # Backup health (watchlist persistence confidence)
+        try:
+            _b = get_backup_health_status()
+            if not _b.get("available", False):
+                raise RuntimeError(str(_b.get("last_error", "backup status unavailable")))
+            _enabled = bool(_b.get("enabled", False))
+            _pending = int(_b.get("pending_count", 0) or 0)
+            _last_ok = float(_b.get("last_success_epoch", 0.0) or 0.0)
+            _branch = str(_b.get("branch", "data-backup") or "data-backup")
+            _berr = str(_b.get("last_error", "") or "")
+            _berr_code = int(_b.get("last_error_code", 0) or 0)
+            _last_txt = datetime.fromtimestamp(_last_ok).strftime('%Y-%m-%d %H:%M:%S') if _last_ok > 0 else "never"
+            st.caption(
+                f"☁ Backup: {'enabled' if _enabled else 'disabled'} | "
+                f"Branch: {_branch} | Pending: {_pending} | Last success: {_last_txt}"
+            )
+            if _enabled and _berr:
+                code_txt = f"{_berr_code} " if _berr_code else ""
+                st.caption(f"☁ Backup error: {code_txt}{_berr[:140]}")
+            if _enabled:
+                if st.button("☁ Backup Now", key="force_backup_now", width="stretch"):
+                    try:
+                        pushed = int(run_backup_now() or 0)
+                        st.toast(f"✅ Backup complete ({pushed} file(s) pushed).")
+                        st.rerun()
+                    except Exception as _be:
+                        st.error(f"Backup flush failed: {str(_be)[:180]}")
+        except Exception:
+            st.caption("☁ Backup status unavailable")
+
+        if st.button("🧪 Run System Self-Test", key="run_system_self_test", width="stretch"):
+            _health = st.session_state.get('_system_health_snapshot') or _compute_system_health(force=True)
+            _backup = get_backup_health_status()
+            _report = run_system_self_test(_health, _backup)
+            st.session_state['_latest_system_self_test'] = _report
+            if _report.get('overall_ok'):
+                st.toast("🟢 System self-test passed.")
+            else:
+                st.toast(f"🔴 System self-test failed ({len(_report.get('failures', []))} issues).")
+            st.rerun()
+        _last_self_test = st.session_state.get('_latest_system_self_test') or {}
+        if _last_self_test:
+            _summary = str(_last_self_test.get('summary', '') or '').strip()
+            st.caption(f"🧪 Self-test: {_summary}")
+            for _f in (_last_self_test.get('failures', []) or [])[:2]:
+                st.caption(f"• {str(_f.get('name', 'check'))}: {str(_f.get('detail', ''))[:110]}")
+
+        # Key diagnostic
+        try:
+            _diag_key = st.secrets.get("GROQ_API_KEY", "")
+            if _diag_key:
+                _diag_cfg = _detect_ai_provider(_diag_key)
+                _diag_clients = _get_ai_clients()
+                _validated = bool(st.session_state.get(f"_ai_validated_{_diag_cfg['key'][:8]}")) if _diag_cfg.get('key') else False
+                if _diag_clients.get('openai_client') is not None:
+                    _status = 'connected/tested' if _validated else 'connected/not-tested'
+                elif _diag_clients.get('primary_error'):
+                    _status = f"error: {_diag_clients.get('primary_error')}"
+                else:
+                    _status = st.session_state.get('_groq_key_status', 'not tested')
+                st.caption(f"🔑 API key: `{_diag_cfg['key'][:8]}...{_diag_cfg['key'][-4:]}` "
+                           f"({len(_diag_cfg['key'])} chars)")
+                st.caption(f"   Provider: **{_diag_cfg['provider'].upper()}** → {_diag_cfg['base_url']} | "
+                           f"Model: {_diag_cfg['model']} | Status: {_status}")
+                if _diag_cfg['provider'] == 'unknown':
+                    st.warning("⚠️ Key prefix not recognized. Expected `gsk_` (Groq) or `xai-` (xAI/Grok).")
+            else:
+                st.caption("🔑 API key: **not set** — add GROQ_API_KEY to secrets")
+            _gem_key = st.secrets.get("GEMINI_API_KEY", "")
+            st.caption(f"🤖 Gemini key: {'set (' + _gem_key[:6] + '...)' if _gem_key else '**not set** (optional fallback)'}")
+        except Exception:
+            st.caption("🔑 Could not read secrets")
+
+
+def _ensure_ticker_chart_cache(
+    ticker: str,
+    include_weekly: bool = False,
+    include_monthly: bool = False,
+    include_market_context: bool = False,
+) -> bool:
+    """Ensure chart data cache exists with minimal required payload for responsive open-chart UX."""
+    _ticker = str(ticker or "").upper().strip()
+    if not _ticker:
+        return False
+
+    cache = st.session_state.get('ticker_data_cache', {}) or {}
+    data = dict((cache.get(_ticker, {}) if isinstance(cache, dict) else {}) or {})
+
+    # Prefer already-fetched Trade Finder scan payload to avoid duplicate API calls.
+    tf_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+    tf_data = dict((tf_cache.get(_ticker, {}) if isinstance(tf_cache, dict) else {}) or {})
+    if tf_data:
+        for _k in ('daily', 'weekly', 'monthly', 'market_filter', 'spy_daily', 'current_price'):
+            if data.get(_k) is None and tf_data.get(_k) is not None:
+                data[_k] = tf_data.get(_k)
+
+    if data.get('daily') is None:
+        try:
+            data['daily'] = fetch_daily(_ticker)
+        except Exception:
+            data['daily'] = None
+
+    if include_weekly and data.get('weekly') is None:
+        try:
+            data['weekly'] = fetch_weekly(_ticker)
+        except Exception:
+            data['weekly'] = None
+
+    if include_monthly and data.get('monthly') is None:
+        try:
+            data['monthly'] = fetch_monthly(_ticker)
+        except Exception:
+            data['monthly'] = None
+
+    if include_market_context and data.get('market_filter') is None:
+        data['market_filter'] = get_shared_market_filter()
+
+    if data.get('daily') is not None:
+        try:
+            data['current_price'] = float(data['daily']['Close'].iloc[-1])
+        except Exception:
+            pass
+
+    cache[_ticker] = data
+    st.session_state['ticker_data_cache'] = cache
+    return bool(data.get('daily') is not None)
+
+
+def _load_ticker_for_view(
+    ticker: str,
+    prefer_chart_fast: bool = False,
+    set_scroll_to_detail: bool = True,
+) -> bool:
+    """Load a ticker for the detail view — works for ANY ticker (open positions, conditionals, etc.).
+    
+    NOTE: No st.rerun() needed here. Button clicks already trigger a Streamlit rerun.
+    Setting session state is enough — render_detail_view() runs later in the same pass
+    and picks up the new state. Avoiding rerun eliminates a full double-repaint of the
+    200+ ticker scanner table.
+    Returns:
+        bool: True when ticker analysis is available for detail/chart rendering.
+    """
+    ticker = ticker.upper().strip()
+    st.session_state.pop('_ticker_load_error', None)
+
+    analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
+
+    # Prefer fresh scan results over cache to avoid stale signal states.
+    results = st.session_state.get('scan_results', [])
+    for r in results:
+        if r.ticker == ticker:
+            st.session_state['selected_ticker'] = ticker
+            st.session_state['selected_analysis'] = r
+            if set_scroll_to_detail:
+                st.session_state['scroll_to_detail'] = True
+            analysis_cache[ticker] = r
+            st.session_state['_ticker_analysis_cache'] = analysis_cache
+            _need_mtf = not bool(prefer_chart_fast)
+            if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
+                # Keep navigation deterministic even when live chart fetch is rate-limited.
+                # Detail view still opens and will show explicit "No chart data available".
+                msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+                st.session_state['_ticker_load_error'] = msg
+                st.sidebar.error(msg)
+            return True  # No rerun — current pass will render detail view
+
+    cached_analysis = analysis_cache.get(ticker)
+    if cached_analysis is not None:
+        st.session_state['selected_ticker'] = ticker
+        st.session_state['selected_analysis'] = cached_analysis
+        if set_scroll_to_detail:
+            st.session_state['scroll_to_detail'] = True
+        _need_mtf = not bool(prefer_chart_fast)
+        if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
+            msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+            st.session_state['_ticker_load_error'] = msg
+            st.sidebar.error(msg)
+        return True
+
+    # Fetch fresh data and analyze on-the-fly (only for tickers not in scan)
+    try:
+        if prefer_chart_fast:
+            if not _ensure_ticker_chart_cache(
+                ticker,
+                include_weekly=False,
+                include_monthly=False,
+                include_market_context=True,
+            ):
+                msg = f"No data for {ticker}"
+                st.session_state['_ticker_load_error'] = msg
+                st.sidebar.error(msg)
+                return False
+            data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+            data = dict((data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}) or {})
+            data['ticker'] = ticker
+            data.setdefault('market_filter', get_shared_market_filter())
+        else:
+            data = fetch_all_ticker_data(ticker)
+
+        if data.get('daily') is not None:
+            _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+            analysis = analyze_ticker(data, macd_profile=_macd_profile)
+            st.session_state['selected_ticker'] = ticker
+            st.session_state['selected_analysis'] = analysis
+            if set_scroll_to_detail:
+                st.session_state['scroll_to_detail'] = True
+            # Cache the data
+            cache = st.session_state.get('ticker_data_cache', {})
+            cache[ticker] = data
+            st.session_state['ticker_data_cache'] = cache
+            analysis_cache[ticker] = analysis
+            st.session_state['_ticker_analysis_cache'] = analysis_cache
+            # Clear stale APEX cache (new data = needs re-detection)
+            st.session_state.pop(f'_apex_cache_{ticker}', None)
+            # No rerun — current pass will render detail view
+            return True
+        else:
+            msg = f"No data for {ticker}"
+            st.session_state['_ticker_load_error'] = msg
+            st.sidebar.error(msg)
+            return False
+    except Exception as e:
+        msg = f"Error loading {ticker}: {e}"
+        st.session_state['_ticker_load_error'] = msg
+        st.sidebar.error(msg)
+        return False
+
+
+def _navigate_to_scanner_ticker(
+    ticker: str,
+    target: str = "chart",
+    switch_to_scanner_tab: bool = True,
+    set_scroll_to_detail: bool = True,
+) -> bool:
+    """
+    Safe cross-tab navigation helper used by heatmap/alerts/executive actions.
+    It only triggers scanner-tab switch after ticker data is successfully loaded.
+    """
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        st.session_state['_scanner_nav_error'] = "No ticker selected."
+        return False
+
+    _target = normalize_nav_target(target, fallback="chart")
+    _detail_tab = detail_tab_for_target(_target)
+
+    _loaded = _load_ticker_for_view(
+        _tk,
+        prefer_chart_fast=(_target == "chart"),
+        set_scroll_to_detail=set_scroll_to_detail,
+    )
+    if not _loaded:
+        st.session_state['_scanner_nav_error'] = str(
+            st.session_state.get('_ticker_load_error', f"Unable to load {_tk}.")
+        )
+        return False
+
+    # Keep intent sticky across a few reruns so chart/trade clicks cannot
+    # bounce back to Signal under heavy refresh or fragment rerenders.
+    set_detail_nav_intent(st.session_state, ticker=_tk, target=_target, lock_runs=6)
+    set_detail_tab_lock(st.session_state, ticker=_tk, tab_index=_detail_tab, lock_runs=6)
+    # Defer per-ticker selector state application to detail render.
+    # Writing directly to detail_view_tab_* during the same rerun can raise
+    # StreamlitAPIException if that widget key is already instantiated.
+    _selector = {"signal": "signal", "trade": "trade"}.get(_target, "chart")
+    st.session_state[detail_selector_pending_key_for_ticker(_tk)] = _selector
+    if bool(switch_to_scanner_tab):
+        # Ensure post-switch UX lands on detail panel (not just scanner table top).
+        set_scanner_switch_state(st.session_state, target=_target, focus_detail=True)
+    else:
+        # Explicitly clear deferred cross-tab navigation when opening from Scanner itself.
+        clear_scanner_switch_state(st.session_state)
+    st.session_state.pop('_ticker_load_error', None)
+    return True
+
+
+def _open_chart_anywhere(
+    ticker: str,
+    warn: bool = True,
+    switch_to_scanner_tab: bool = True,
+    set_scroll_to_detail: bool = True,
+) -> bool:
+    """Open a ticker directly in Scanner -> Chart view from any UI surface."""
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        if warn:
+            st.warning("No ticker selected.")
+        return False
+    _ok = _navigate_to_scanner_ticker(
+        _tk,
+        target="chart",
+        switch_to_scanner_tab=switch_to_scanner_tab,
+        set_scroll_to_detail=set_scroll_to_detail,
+    )
+    if not _ok and warn:
+        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
+    return bool(_ok)
+
+
+def _open_trade_anywhere(
+    ticker: str,
+    warn: bool = True,
+    switch_to_scanner_tab: bool = True,
+) -> bool:
+    """Open a ticker directly in Scanner -> Trade view from any UI surface."""
+    _tk = str(ticker or "").upper().strip()
+    if not _tk:
+        if warn:
+            st.warning("No ticker selected.")
+        return False
+    _ok = _navigate_to_scanner_ticker(
+        _tk,
+        target="trade",
+        switch_to_scanner_tab=switch_to_scanner_tab,
+        set_scroll_to_detail=True,
+    )
+    if not _ok and warn:
+        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {_tk}.")))
+    return bool(_ok)
+
+
+def _resolve_tickers_to_scan(full_list: List[str], existing_summary: List[Dict], mode: str) -> List[str]:
+    """Deterministic scan universe resolver used by scan-all and scan-new paths."""
+    return resolve_tickers_to_scan(full_list, existing_summary, mode)
+
+
+def _run_scan(mode='all'):
+    """
+    Execute watchlist scan with persistence and conditional checking.
+
+    mode='all': Rescan everything (daily refresh, full watchlist)
+    mode='new_only': Only scan tickers not in current results
+    """
+    jm = get_journal()
+    bridge = get_bridge()
+    all_watchlist = bridge.get_watchlist_tickers()
+
+    # Scan universe is strictly the active watchlist.
+    # This avoids re-introducing stale/non-watchlist tickers into scanner results.
+    open_tickers = jm.get_open_tickers()
+    full_list = list(set(all_watchlist))
+    
+    # ── Validate tickers — reject corrupt entries before they hit yfinance ──
+    import re as _re
+    valid_list = []
+    rejected = []
+    for t in full_list:
+        # Valid ticker: 1-5 uppercase alpha, class shares (e.g. BRK.B), or indices (^VIX).
+        if not isinstance(t, str):
+            rejected.append(t)
+            continue
+        t = t.upper().strip()
+
+        if _re.match(r'^[A-Z]{1,5}$', t) or t.startswith('^'):
+            valid_list.append(t)
+            continue
+
+        class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+        if class_match and class_match.group(1) in {'A', 'B', 'C', 'D'}:
+            valid_list.append(t)
+        else:
+            rejected.append(t)
+    if rejected:
+        print(f"[scan] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
+    full_list = valid_list
+
+    if not full_list:
+        _append_audit_event("SCAN_SKIPPED", "empty watchlist", source=f"scan:{mode}")
+        st.sidebar.warning("Add tickers to watchlist first")
+        return
+
+    # Determine which tickers to scan
+    existing_summary = st.session_state.get('scan_results_summary', [])
+    tickers_to_scan = _resolve_tickers_to_scan(full_list, existing_summary, mode)
+    if mode == 'new_only' and not tickers_to_scan:
+        st.sidebar.info("All tickers already scanned")
+        return
+
+    _scan_started = time.time()
+    _max_scan_min = float(st.session_state.get('scan_max_minutes', 0.0) or 0.0)
+    _deadline_ts = (_scan_started + (_max_scan_min * 60.0)) if _max_scan_min > 0 else 0.0
+    _progress = st.sidebar.progress(0, text=f"Preparing scan ({len(tickers_to_scan)} tickers)")
+
+    def _set_scan_progress(pct: int, text: str):
+        _pct = max(0, min(100, int(pct)))
+        try:
+            _progress.progress(_pct, text=text)
+        except TypeError:
+            _progress.progress(_pct)
+            st.sidebar.caption(text)
+
+    with st.spinner(f"Scanning {len(tickers_to_scan)} tickers..."):
+        _timing = {
+            'mode': mode,
+            'universe': len(full_list),
+            'to_scan': len(tickers_to_scan),
+            'fetch_scan_data_sec': 0.0,
+            'scan_watchlist_sec': 0.0,
+            'sector_refresh_sec': 0.0,
+            'earnings_refresh_sec': 0.0,
+            'sector_assign_sec': 0.0,
+            'summary_build_sec': 0.0,
+            'alerts_check_sec': 0.0,
+            'total_sec': 0.0,
+        }
+        _append_audit_event(
+            "SCAN_START",
+            f"mode={mode} universe={len(full_list)} scan_count={len(tickers_to_scan)}",
+            source=f"scan:{mode}",
+        )
+        _set_scan_progress(5, f"Scan started: {len(tickers_to_scan)} tickers")
+        _t = time.time()
+        def _scan_progress_cb(i: int, total: int, ticker: str) -> bool:
+            if _deadline_ts and time.time() > _deadline_ts:
+                return False
+            pct = 5 + int((max(1, i) / max(1, total)) * 45)
+            _set_scan_progress(pct, f"Fetching {i}/{total} ({pct}%) — {ticker}")
+            return True
+
+        all_data = fetch_scan_data(tickers_to_scan, progress_cb=_scan_progress_cb)
+        _timing['fetch_scan_data_sec'] = time.time() - _t
+        if len(all_data) < len(tickers_to_scan):
+            st.warning(
+                f"Scan fetch stopped early: fetched {len(all_data)}/{len(tickers_to_scan)} tickers. "
+                "Results below are partial."
+            )
+            _append_audit_event(
+                "SCAN_FETCH_PARTIAL",
+                f"mode={mode} fetched={len(all_data)} requested={len(tickers_to_scan)}",
+                source=f"scan:{mode}",
+            )
+
+        _t = time.time()
+        _set_scan_progress(55, "Analyzing signals...")
+        _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        new_results = scan_watchlist(all_data, macd_profile=_macd_profile)
+        _timing['scan_watchlist_sec'] = time.time() - _t
+
+        # Defaults keep scan flow resilient if auxiliary fetches fail.
+        sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+        earnings_flags = st.session_state.get('earnings_flags', {}) or {}
+
+        # Fetch sector rotation (independent — failure doesn't block earnings)
+        try:
+            _t = time.time()
+            _set_scan_progress(68, "Refreshing sector rotation...")
+            from data_fetcher import fetch_sector_rotation
+            sector_rotation = fetch_sector_rotation()
+            st.session_state['sector_rotation'] = sector_rotation
+            st.session_state['_sector_rotation_ts'] = time.time()
+            _timing['sector_refresh_sec'] = time.time() - _t
+        except Exception as e:
+            print(f"Sector rotation error: {e}")
+
+        # Fetch earnings flags (independent — failure doesn't block sectors)
+        try:
+            _t = time.time()
+            _set_scan_progress(78, "Refreshing earnings calendar...")
+            from data_fetcher import fetch_batch_earnings_flags
+            all_scan_tickers = [r.ticker for r in new_results]
+            earnings_flags = fetch_batch_earnings_flags(all_scan_tickers, days_ahead=60)
+            if earnings_flags:  # Only update if we got results
+                if mode == 'new_only':
+                    existing_flags = st.session_state.get('earnings_flags', {})
+                    existing_flags.update(earnings_flags)
+                    st.session_state['earnings_flags'] = existing_flags
+                else:
+                    st.session_state['earnings_flags'] = earnings_flags
+            _timing['earnings_refresh_sec'] = time.time() - _t
+        except Exception as e:
+            print(f"Earnings flags error: {e}")
+
+        # Fetch sectors for scanned tickers (independent)
+        try:
+            _t = time.time()
+            _set_scan_progress(86, "Resolving ticker sectors...")
+            from data_fetcher import get_ticker_sector
+            ticker_sectors = st.session_state.get('ticker_sectors', {})
+            for r in new_results:
+                if r.ticker not in ticker_sectors:
+                    sector = get_ticker_sector(r.ticker)
+                    if sector:
+                        ticker_sectors[r.ticker] = sector
+            st.session_state['ticker_sectors'] = ticker_sectors
+            _timing['sector_assign_sec'] = time.time() - _t
+        except Exception as e:
+            print(f"Sector assignment error: {e}")
+
+        # Merge with existing results if new_only mode
+        if mode == 'new_only':
+            existing_results = st.session_state.get('scan_results', [])
+            # Drop stale rows that are no longer in the current scan universe.
+            existing_results = [r for r in existing_results if r.ticker in full_list]
+            existing_tickers = {r.ticker for r in new_results}
+            # Keep old results that aren't being rescanned
+            merged_results = [r for r in existing_results if r.ticker not in existing_tickers]
+            merged_results.extend(new_results)
+            st.session_state['scan_results'] = merged_results
+
+            # Merge data cache
+            existing_cache = st.session_state.get('ticker_data_cache', {})
+            existing_cache.update(all_data)
+            st.session_state['ticker_data_cache'] = existing_cache
+        else:
+            st.session_state['scan_results'] = new_results
+            st.session_state['ticker_data_cache'] = all_data
+
+        # Refresh analysis cache from current scan universe to prevent stale detail panels.
+        st.session_state['_ticker_analysis_cache'] = {
+            r.ticker: r for r in st.session_state.get('scan_results', [])
+        }
+
+        st.session_state['selected_ticker'] = None
+        st.session_state['selected_analysis'] = None
+
+        # Build full summary (merge if new_only)
+        results_for_summary = st.session_state['scan_results']
+
+        ticker_sectors = st.session_state.get('ticker_sectors', {})
+
+        _t = time.time()
+        _set_scan_progress(92, "Building summary & saving...")
+        summary = []
+        for r in results_for_summary:
+            rec = r.recommendation or {}
+            q = r.quality or {}
+            sig = r.signal
+
+            # Volume string for persistence
+            vol = r.volume or 0
+            avg_vol = r.avg_volume_50d or 0
+            vol_ratio = r.volume_ratio or 0
+            if vol >= 1_000_000:
+                vol_str = f"{vol/1_000_000:.1f}M"
+            elif vol >= 1_000:
+                vol_str = f"{vol/1_000:.0f}K"
+            else:
+                vol_str = str(int(vol)) if vol else ""
+            if vol_ratio >= 2.0:
+                vol_str = f"🔥{vol_str}"
+            elif vol_ratio >= 1.5:
+                vol_str = f"📈{vol_str}"
+
+            # Earnings data for persistence (canonical resolver).
+            earn = resolve_earnings_for_ticker(r.ticker)
+            earn_date = str(earn.get('next_earnings', '') or '')
+            earn_days = int(earn.get('days_until', 999) or 999)
+            earn_source = str(earn.get('source', '') or '')
+            earn_confidence = str(earn.get('confidence', '') or '').upper()
+            earn_trusted = _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            )
+
+            # Re-entry recency (bars ago)
+            reentry_bars_ago = 0
+            if r.reentry and r.reentry.get('is_valid'):
+                reentry_bars_ago = r.reentry.get('macd_cross_bars_ago', 0)
+            elif r.late_entry and r.late_entry.get('is_valid'):
+                reentry_bars_ago = r.late_entry.get('days_since_cross', 0)
+
+            # Sector phase for filtering persistence
+            sector_name = ticker_sectors.get(r.ticker, '')
+            sector_info = sector_rotation.get(sector_name, {})
+            sector_phase = sector_info.get('phase', '')
+
+            # Session day-change snapshot (last close vs previous close) for heatmaps.
+            _day_change_pct = None
+            _prev_close = None
+            _price_asof = ''
+            try:
+                _daily_df = ((all_data.get(r.ticker, {}) or {}).get('daily') if isinstance(all_data, dict) else None)
+                if _daily_df is not None and len(_daily_df) >= 2:
+                    _last_close = float(_daily_df['Close'].iloc[-1])
+                    _prev_close = float(_daily_df['Close'].iloc[-2])
+                    if _prev_close > 0:
+                        _day_change_pct = round(((_last_close - _prev_close) / _prev_close) * 100.0, 2)
+                    try:
+                        _price_asof = str(pd.Timestamp(_daily_df.index[-1]).strftime('%Y-%m-%d'))
+                    except Exception:
+                        _price_asof = ''
+            except Exception:
+                _day_change_pct = None
+                _prev_close = None
+                _price_asof = ''
+
+            rec_adj = _adjust_recommendation_for_sector(
+                str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+                int(rec.get('conviction', 0) or 0),
+                sector_phase,
+            )
+            _ores_sig = (getattr(sig, 'overhead_resistance', {}) or {}) if sig else {}
+            _crit_sig = (_ores_sig.get('critical_level', {}) or {})
+            _crit_px = float(_crit_sig.get('price', 0.0) or 0.0)
+            _crit_desc = str(_crit_sig.get('description', '') or '')
+            _crit_dist = float(_ores_sig.get('distance_to_critical_pct', 0.0) or 0.0)
+            _crit_vol_need = float(_ores_sig.get('breakout_volume_needed', 0.0) or 0.0)
+            summary.append({
+                'ticker': r.ticker,
+                'recommendation': rec_adj.get('recommendation', rec.get('recommendation', 'SKIP')),
+                'conviction': rec_adj.get('conviction', rec.get('conviction', 0)),
+                'quality_grade': q.get('quality_grade', '?'),
+                'price': r.current_price,
+                'summary': rec.get('summary', ''),
+                'macd_bullish': sig.macd.get('bullish', False) if sig else False,
+                'ao_positive': sig.ao.get('positive', False) if sig else False,
+                'weekly_bullish': sig.weekly_macd.get('bullish', False) if sig else False,
+                'weekly_available': bool(sig and bool(sig.weekly_macd)),
+                'monthly_bullish': (
+                    bool(sig.monthly_macd.get('bullish', False) and sig.monthly_ao.get('positive', False))
+                    if sig else False
+                ),
+                'monthly_macd_bullish': sig.monthly_macd.get('bullish', False) if sig else False,
+                'monthly_ao_positive': sig.monthly_ao.get('positive', False) if sig else False,
+                'monthly_available': bool(sig and bool(sig.monthly_macd)),
+                'monthly_ao_available': bool(sig and bool(sig.monthly_ao)),
+                'macd_profile': str(getattr(sig, 'macd_profile', '') or ''),
+                'daily_macd_zone': str(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'weekly_macd_zone': str(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'monthly_macd_zone': str(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'daily_macd_hist_pct': float(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'weekly_macd_hist_pct': float(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'monthly_macd_hist_pct': float(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'mtf_zone_buy_approved': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('buy_approved', False)),
+                'mtf_zone_reject_reason': str(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('reject_reason', '') or ''),
+                'mtf_zone_shadow_diff': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('shadow_diff', False)),
+                'vcp_detected': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_detected', False)),
+                'vcp_score': float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('vcp_score', 0.0) or 0.0),
+                'vcp_pivot_price': (
+                    float(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('pivot_price', 0.0) or 0.0)
+                    if sig else 0.0
+                ),
+                'vcp_price_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('price_contracting', False)),
+                'vcp_volume_contracting': bool(((getattr(sig, 'vcp', {}) or {}) if sig else {}).get('volume_contracting', False)),
+                'critical_resistance_price': _crit_px,
+                'critical_resistance_desc': _crit_desc,
+                'critical_resistance_dist_pct': _crit_dist,
+                'critical_breakout_volume_needed': _crit_vol_need,
+                'is_open_position': r.ticker in open_tickers,
+                'sector': sector_name,
+                'sector_phase': sector_phase,
+                'ao_divergence_active': r.ao_divergence_active,
+                'apex_buy': r.apex_buy,
+                'apex_signal_days_ago': int(getattr(r, 'apex_signal_days_ago', 999) or 999),
+                'apex_signal_tier': str(getattr(r, 'apex_signal_tier', '') or ''),
+                'apex_signal_regime': str(getattr(r, 'apex_signal_regime', '') or ''),
+                'volume_str': vol_str,
+                'volume_ratio': vol_ratio,
+                'day_change_pct': _day_change_pct,
+                'previous_close': _prev_close,
+                'price_asof': _price_asof,
+                'earn_date': earn_date,
+                'earn_days': earn_days,
+                'earn_source': earn_source,
+                'earn_confidence': earn_confidence,
+                'earn_trusted': bool(earn_trusted),
+                'reentry_bars_ago': reentry_bars_ago,
+            })
+        _timing['summary_build_sec'] = time.time() - _t
+        jm.save_scan_results(summary)
+        st.session_state['scan_results_summary'] = summary
+        st.session_state['scan_timestamp'] = datetime.now().isoformat()
+        st.session_state['_scan_run_ts'] = time.time()
+        # Save per-watchlist scan cache (for switching + restart)
+        _active_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+        if _active_wl_id:
+            save_scan_for_watchlist(_active_wl_id)
+
+        # Check conditional alerts
+        # Use all cached data (both old and new)
+        full_cache = st.session_state.get('ticker_data_cache', {})
+        current_prices = {}
+        volume_ratios = {}
+        for ticker, data in full_cache.items():
+            daily = data.get('daily')
+            if daily is not None and len(daily) > 0:
+                current_prices[ticker] = float(daily['Close'].iloc[-1])
+                if len(daily) > 50:
+                    avg_vol = daily['Volume'].tail(50).mean()
+                    if avg_vol > 0:
+                        volume_ratios[ticker] = float(daily['Volume'].iloc[-1] / avg_vol)
+
+        _t = time.time()
+        _set_scan_progress(97, "Checking alerts...")
+        triggered = jm.check_conditionals(current_prices, volume_ratios)
+        _timing['alerts_check_sec'] = time.time() - _t
+        if triggered:
+            st.session_state['triggered_alerts'] = triggered
+
+        _append_audit_event(
+            "SCAN_DONE",
+            f"mode={mode} scanned={len(tickers_to_scan)} results={len(summary)} triggered={len(triggered)}",
+            source=f"scan:{mode}",
+        )
+        _set_scan_progress(100, f"Scan complete: {len(summary)} results")
+
+        # Telemetry: runtime history + daily workflow finalize
+        _scan_elapsed = max(0.0, time.time() - _scan_started)
+        _timing['total_sec'] = _scan_elapsed
+        st.session_state['_timing_last_scan'] = _timing
+        _append_perf_metric({
+            "kind": "scan_run",
+            "mode": mode,
+            "universe": _timing.get("universe", 0),
+            "to_scan": _timing.get("to_scan", 0),
+            "total_sec": round(_timing.get("total_sec", 0.0), 3),
+            "fetch_sec": round(_timing.get("fetch_scan_data_sec", 0.0), 3),
+            "analyze_sec": round(_timing.get("scan_watchlist_sec", 0.0), 3),
+            "sectors_sec": round(_timing.get("sector_refresh_sec", 0.0), 3),
+            "earnings_sec": round(_timing.get("earnings_refresh_sec", 0.0), 3),
+            "alerts_sec": round(_timing.get("alerts_check_sec", 0.0), 3),
+        })
+        hist = st.session_state.get('_scan_duration_hist', [])
+        hist.append(_scan_elapsed)
+        st.session_state['_scan_duration_hist'] = hist[-30:]
+        st.session_state['_last_scan_duration_sec'] = _scan_elapsed
+        st.session_state['_last_scan_mode'] = mode
+
+        if st.session_state.get('_daily_workflow_in_progress'):
+            wf_start = float(st.session_state.get('_daily_workflow_start_ts', _scan_started) or _scan_started)
+            wf_sec = max(0.0, time.time() - wf_start)
+            st.session_state['_daily_workflow_sec'] = wf_sec
+            st.session_state['_daily_workflow_ts'] = time.time()
+            st.session_state['_daily_workflow_in_progress'] = False
+            _append_audit_event(
+                "DAILY_WORKFLOW_DONE",
+                f"mode={mode} scan_sec={_scan_elapsed:.1f} total_sec={wf_sec:.1f}",
+                source=f"scan:{mode}",
+            )
+
+    st.rerun()
+
+
+# _format_eta — extracted to earnings_sector_logic.py (imported at top)
+def _run_find_new_trades(
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
+    *,
+    ui_mode: bool = True,
+    cancel_checker: Optional[Callable[[], bool]] = None,
+):
+    """
+    Scan the union of ALL watchlists and build a consolidated "new trades" report.
+    This does not replace active-watchlist scanner results.
+    """
+    jm = get_journal()
+    bridge = get_bridge()
+    all_watchlists = bridge.manager.get_all_watchlists() or []
+
+    # Build ticker -> source watchlists map.
+    ticker_sources: Dict[str, List[str]] = {}
+    for wl in all_watchlists:
+        wl_name = str(wl.get('name', 'Watchlist'))
+        for t in (wl.get('tickers', []) or []):
+            if not isinstance(t, str):
+                continue
+            ticker = t.upper().strip()
+            if not ticker:
+                continue
+            ticker_sources.setdefault(ticker, [])
+            if wl_name not in ticker_sources[ticker]:
+                ticker_sources[ticker].append(wl_name)
+
+    # Scope controls (from sidebar) to limit scan size/load.
+    _max_tickers = int(st.session_state.get('find_new_max_tickers', 0) or 0)
+    _only_in_rotation = bool(st.session_state.get('find_new_in_rotation_only', False))
+    _include_unknown_sector = bool(st.session_state.get('find_new_include_unknown_sector', False))
+    _selected_sectors = set([str(x) for x in (st.session_state.get('find_new_selected_sectors', []) or []) if str(x)])
+    _max_minutes = float(st.session_state.get('find_new_max_minutes', 0.0) or 0.0)
+    _deadline_ts = (time.time() + (_max_minutes * 60.0)) if _max_minutes > 0 else 0.0
+    _cache_ttl_min = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0)
+    _cache_ttl_sec = max(60.0, _cache_ttl_min * 60.0)
+    _fetch_batch_size_cfg = int(st.session_state.get('find_new_fetch_batch_size', 40) or 40)
+    _fetch_health = get_fetch_health_status() or {}
+    _cooldown_now = int(_fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    _hits_now = int(_fetch_health.get('hits', 0) or 0)
+    _fetch_batch_size = adaptive_fetch_batch_size_for_health(_fetch_batch_size_cfg, _fetch_health)
+    if callable(cancel_checker):
+        _cancel_flag = lambda: bool(cancel_checker())
+    else:
+        _cancel_flag = lambda: bool(st.session_state.get('trade_finder_cancel_requested', False))
+
+    _sector_rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
+    _ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+    _scan_sector_map: Dict[str, str] = {}
+    for _s in (st.session_state.get('scan_results_summary', []) or []):
+        _t = str(_s.get('ticker', '') or '').upper().strip()
+        _sec = str(_s.get('sector', '') or '').strip()
+        if _t and _sec:
+            _scan_sector_map[_t] = _sec
+    _filtered_counts = {
+        "sector_filter": 0,
+        "rotation_filter": 0,
+        "unknown_sector": 0,
+        "rotation_unknown_kept": 0,
+        "max_tickers": 0,
+        "cache_reused_find": 0,
+        "cache_reused_scan": 0,
+        "stale_evicted": 0,
+        "fetched_live": 0,
+        "priority_leading": 0,
+        "priority_emerging": 0,
+        "priority_other": 0,
+        "governor_hits": 0,
+        "governor_cooldown_sec": 0,
+        "effective_batch_size": 0,
+    }
+    _filtered_counts["governor_hits"] = _hits_now
+    _filtered_counts["governor_cooldown_sec"] = _cooldown_now
+    _filtered_counts["effective_batch_size"] = _fetch_batch_size
+
+    # Validate symbols before data fetch.
+    import re as _re
+    universe = []
+    _prioritized_universe: List[Tuple[int, str]] = []
+    rejected = []
+    for t in sorted(ticker_sources.keys()):
+        _sector_name = str(_ticker_sectors.get(t, '') or _scan_sector_map.get(t, '') or '').strip()
+        _phase = str((_sector_rotation_ctx.get(_sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+        if _selected_sectors:
+            if not _sector_name:
+                _filtered_counts["unknown_sector"] += 1
+                continue
+            if _sector_name not in _selected_sectors:
+                _filtered_counts["sector_filter"] += 1
+                continue
+        if _only_in_rotation:
+            if not _sector_name:
+                _filtered_counts["unknown_sector"] += 1
+                if _include_unknown_sector:
+                    _filtered_counts["rotation_unknown_kept"] += 1
+                else:
+                    continue
+            else:
+                if _phase and _phase not in {"LEADING", "EMERGING"}:
+                    _filtered_counts["rotation_filter"] += 1
+                    continue
+                if not _phase:
+                    _filtered_counts["rotation_unknown_kept"] += 1
+
+        is_base = bool(_re.match(r'^[A-Z]{1,5}$', t))
+        class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+        is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+        is_index = t.startswith('^')
+        if is_base or is_class or is_index:
+            if _phase == "LEADING":
+                _priority = 0
+                _filtered_counts["priority_leading"] += 1
+            elif _phase == "EMERGING":
+                _priority = 1
+                _filtered_counts["priority_emerging"] += 1
+            else:
+                _priority = 2
+                _filtered_counts["priority_other"] += 1
+            _prioritized_universe.append((_priority, t))
+        else:
+            rejected.append(t)
+
+    universe = [t for _, t in sorted(_prioritized_universe, key=lambda x: (x[0], x[1]))]
+
+    if _max_tickers > 0 and len(universe) > _max_tickers:
+        _filtered_counts["max_tickers"] = len(universe) - _max_tickers
+        universe = universe[:_max_tickers]
+
+    if rejected:
+        print(f"[find_new] Rejected {len(rejected)} invalid tickers: {rejected[:10]}")
+
+    if not universe:
+        report = {
+            'generated_at': time.time(),
+            'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'watchlists_count': len(all_watchlists),
+            'scan_universe': 0,
+            'results_count': 0,
+            'candidate_count': 0,
+            'candidates': [],
+            'rows': [],
+            'elapsed_sec': 0.0,
+            'scan_scope': {
+                'max_tickers': _max_tickers,
+                'only_in_rotation': _only_in_rotation,
+                'include_unknown_sector': _include_unknown_sector,
+                'selected_sectors': sorted(list(_selected_sectors)),
+                'cache_ttl_min': _cache_ttl_min,
+                'fetch_batch_size': _fetch_batch_size,
+                'priority_order': 'LEADING,EMERGING,OTHER',
+                'filtered_counts': _filtered_counts,
+                'requested_universe': len(ticker_sources),
+                'effective_universe': 0,
+            },
+            'scope_signature': scope_signature_from_state(st.session_state),
+        }
+        st.session_state['find_new_trades_report'] = report
+        st.session_state['_find_new_trades_ts'] = time.time()
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': (
+                f"No eligible tickers after scope filters "
+                f"(requested={len(ticker_sources)}, effective=0). "
+                "Relax Find New Scope and run again."
+            ),
+            'ts': time.time(),
+        }
+        if ui_mode:
+            st.sidebar.warning("No eligible tickers after scope filters.")
+        _append_audit_event(
+            "FIND_NEW_EMPTY",
+            f"requested={len(ticker_sources)} effective=0",
+            source="find_new",
+        )
+        if callable(stream_rows_cb):
+            try:
+                stream_rows_cb(
+                    [],
+                    {
+                        'phase': 'find_scope',
+                        'scoped_total': 0,
+                        'fetched_done': 0,
+                        'fetched_total': 0,
+                        'analysis_done': 0,
+                        'analysis_total': 0,
+                        'processed': 0,
+                        'total': 0,
+                        'hard_gate_pass': 0,
+                        'ai_ranked': 0,
+                        'eta_sec': 0.0,
+                        'run_elapsed_sec': 0.0,
+                    },
+                )
+            except Exception:
+                pass
+        return
+
+    _progress = None
+    if ui_mode and not callable(progress_cb):
+        _progress = st.sidebar.progress(0, text=f"Find New Trades: preparing {len(universe)} tickers")
+
+    def _set_find_progress(pct: int, text: str):
+        _pct = max(0, min(100, int(pct)))
+        if callable(progress_cb):
+            try:
+                progress_cb(_pct, text)
+            except Exception:
+                pass
+        if _progress is not None:
+            try:
+                _progress.progress(_pct, text=text)
+            except TypeError:
+                _progress.progress(_pct)
+                st.sidebar.caption(text)
+
+    def _emit_find_metrics(
+        *,
+        phase: str,
+        scoped_total: int = 0,
+        fetched_done: int = 0,
+        fetched_total: int = 0,
+        analysis_done: int = 0,
+        analysis_total: int = 0,
+        eta_sec: float = 0.0,
+    ) -> None:
+        if not callable(stream_rows_cb):
+            return
+        _fh_now = get_fetch_health_status() or {}
+        try:
+            stream_rows_cb(
+                [],
+                {
+                    'phase': str(phase or 'find'),
+                    'scoped_total': int(scoped_total or 0),
+                    'fetched_done': int(fetched_done or 0),
+                    'fetched_total': int(fetched_total or 0),
+                    'analysis_done': int(analysis_done or 0),
+                    'analysis_total': int(analysis_total or 0),
+                    'processed': int(analysis_done or 0),
+                    'total': int(analysis_total or 0),
+                    'hard_gate_pass': 0,
+                    'ai_ranked': 0,
+                    'eta_sec': float(eta_sec or 0.0),
+                    'run_elapsed_sec': max(0.0, time.time() - _start),
+                    'fetch_rate_limited': bool(_fh_now.get('rate_limited', False)),
+                    'fetch_cooldown_sec': int(_fh_now.get('cooldown_remaining_sec', 0) or 0),
+                    'fetch_governor_interval_sec': float(_fh_now.get('governor_interval_sec', 0.08) or 0.08),
+                    'fetch_requests_last_1s': int(_fh_now.get('requests_last_1s', 0) or 0),
+                },
+            )
+        except Exception:
+            pass
+
+    _start = time.time()
+    _scan_ctx = st.spinner(f"Finding new trades across {len(universe)} tickers...") if ui_mode else nullcontext()
+    with _scan_ctx:
+        _append_audit_event(
+            "FIND_NEW_START",
+            f"watchlists={len(all_watchlists)} universe={len(universe)} in_rotation_only={_only_in_rotation} "
+            f"include_unknown={_include_unknown_sector} sectors={len(_selected_sectors)} max={_max_tickers}",
+            source="find_new",
+        )
+        _set_find_progress(5, f"Scope ready: {len(universe)} tickers")
+        _emit_find_metrics(
+            phase='find_scope',
+            scoped_total=len(universe),
+            fetched_done=0,
+            fetched_total=len(universe),
+            analysis_done=0,
+            analysis_total=0,
+            eta_sec=0.0,
+        )
+        # Reuse incremental Trade Finder cache first, then fresh scanner cache; fetch only stale/missing.
+        all_data: Dict[str, Dict[str, Any]] = {}
+        _now = time.time()
+        _fresh_horizon_sec = max(_cache_ttl_sec, 15 * 60.0)
+        _stale_horizon_sec = max(_cache_ttl_sec * 3.0, 6 * 60 * 60.0)
+        _ticker_fresh_meta: Dict[str, Dict[str, Any]] = {}
+        _find_cache = st.session_state.get('_find_new_ticker_data_cache', {}) or {}
+        _find_cache_meta = st.session_state.get('_find_new_ticker_data_cache_meta', {}) or {}
+        _find_cache_ts = float(st.session_state.get('_find_new_ticker_data_cache_ts', 0.0) or 0.0)
+        if isinstance(_find_cache, dict):
+            for _t in universe:
+                _cached = _find_cache.get(_t, {})
+                if not isinstance(_cached, dict) or _cached.get('daily') is None:
+                    continue
+                _meta = _find_cache_meta.get(_t, {}) if isinstance(_find_cache_meta, dict) else {}
+                _ts = float((_meta.get('ts', 0.0) if isinstance(_meta, dict) else 0.0) or _find_cache_ts or 0.0)
+                _age = (_now - _ts) if _ts > 0 else (10**9)
+                if _age <= _cache_ttl_sec:
+                    all_data[_t] = _cached
+                    _filtered_counts["cache_reused_find"] += 1
+                    _ticker_fresh_meta[_t] = {
+                        'source': 'find_cache',
+                        'ts': _ts,
+                        'age_sec': max(0.0, float(_age)),
+                        'state': 'fresh' if _age <= _fresh_horizon_sec else ('cached' if _age <= _stale_horizon_sec else 'stale'),
+                    }
+                else:
+                    _filtered_counts["stale_evicted"] += 1
+        scan_cache = st.session_state.get('ticker_data_cache', {}) or {}
+        scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
+        fresh_scan_cache = bool(scan_ts and (time.time() - scan_ts) <= (15 * 60))
+        if fresh_scan_cache and isinstance(scan_cache, dict):
+            for _t in universe:
+                if _t in all_data:
+                    continue
+                _cached = scan_cache.get(_t, {})
+                if isinstance(_cached, dict) and _cached.get('daily') is not None:
+                    all_data[_t] = _cached
+                    _filtered_counts["cache_reused_scan"] += 1
+                    _age = max(0.0, float(_now - scan_ts))
+                    _ticker_fresh_meta[_t] = {
+                        'source': 'scan_cache',
+                        'ts': float(scan_ts),
+                        'age_sec': _age,
+                        'state': 'fresh' if _age <= _fresh_horizon_sec else ('cached' if _age <= _stale_horizon_sec else 'stale'),
+                    }
+        missing = [t for t in universe if t not in all_data]
+        if all_data:
+            _set_find_progress(
+                15,
+                f"Reused cache for {len(all_data)}/{len(universe)} "
+                f"(TF {_filtered_counts['cache_reused_find']}, scanner {_filtered_counts['cache_reused_scan']})",
+            )
+            _emit_find_metrics(
+                phase='find_fetch',
+                scoped_total=len(universe),
+                fetched_done=len(all_data),
+                fetched_total=len(universe),
+                analysis_done=0,
+                analysis_total=0,
+                eta_sec=0.0,
+            )
+        _cancelled = False
+        if missing:
+            missing_total = len(missing)
+            _fetch_stage_start = time.time()
+            _processed_missing = 0
+            _fetched_live = 0
+            _batch_idx = 0
+            while _processed_missing < missing_total:
+                if _cancel_flag():
+                    _cancelled = True
+                    break
+                if _deadline_ts and time.time() > _deadline_ts:
+                    _cancelled = True
+                    break
+                _fh_loop = get_fetch_health_status() or {}
+                _fetch_batch_size = adaptive_fetch_batch_size_for_health(_fetch_batch_size_cfg, _fh_loop)
+                _filtered_counts["governor_hits"] = int(_fh_loop.get('hits', _filtered_counts["governor_hits"]) or 0)
+                _filtered_counts["governor_cooldown_sec"] = int(
+                    _fh_loop.get('cooldown_remaining_sec', _filtered_counts["governor_cooldown_sec"]) or 0
+                )
+                _filtered_counts["effective_batch_size"] = _fetch_batch_size
+                _batch = missing[_processed_missing:_processed_missing + _fetch_batch_size]
+                if not _batch:
+                    break
+                _batch_idx += 1
+                _set_find_progress(
+                    15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45),
+                    f"Fetching {_processed_missing}/{missing_total} ({len(_batch)} tickers, paced batch {_fetch_batch_size})...",
+                )
+                _emit_find_metrics(
+                    phase='find_fetch',
+                    scoped_total=len(universe),
+                    fetched_done=len(all_data),
+                    fetched_total=len(universe),
+                    analysis_done=0,
+                    analysis_total=0,
+                    eta_sec=0.0,
+                )
+
+                def _find_progress_cb(i: int, total: int, ticker: str) -> bool:
+                    if _cancel_flag():
+                        return False
+                    if _deadline_ts and time.time() > _deadline_ts:
+                        return False
+                    _global_done = _processed_missing + max(0, i - 1)
+                    _elapsed_fetch = max(0.001, time.time() - _fetch_stage_start)
+                    _rate = float(_global_done) / _elapsed_fetch if _global_done > 0 else 0.0
+                    _remain = max(0, missing_total - _global_done)
+                    _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                    pct = 15 + int((max(1, _global_done) / max(1, missing_total)) * 45)
+                    _set_find_progress(
+                        pct,
+                        f"Fetching {_global_done}/{missing_total} — {ticker} "
+                        f"| ETA {_format_eta(_eta_sec)}",
+                    )
+                    _emit_find_metrics(
+                        phase='find_fetch',
+                        scoped_total=len(universe),
+                        fetched_done=min(len(universe), len(all_data) + max(0, _global_done)),
+                        fetched_total=len(universe),
+                        analysis_done=0,
+                        analysis_total=0,
+                        eta_sec=float(_eta_sec or 0.0),
+                    )
+                    return True
+
+                _fetched_batch = fetch_scan_data(_batch, progress_cb=_find_progress_cb)
+                all_data.update(_fetched_batch)
+                _fetch_ts = time.time()
+                for _t in (_fetched_batch or {}).keys():
+                    _ticker_fresh_meta[str(_t).upper().strip()] = {
+                        'source': 'live_fetch',
+                        'ts': float(_fetch_ts),
+                        'age_sec': 0.0,
+                        'state': 'fresh',
+                    }
+                _fetched_live += len(_fetched_batch)
+                _processed_missing += len(_batch)
+                _elapsed_fetch = max(0.001, time.time() - _fetch_stage_start)
+                _rate = float(_processed_missing) / _elapsed_fetch if _processed_missing > 0 else 0.0
+                _remain = max(0, missing_total - _processed_missing)
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                _pct_done = 15 + int((max(1, _processed_missing) / max(1, missing_total)) * 45)
+                _set_find_progress(
+                    _pct_done,
+                    f"Fetched {_processed_missing}/{missing_total} missing tickers "
+                    f"(live {_fetched_live}) | ETA {_format_eta(_eta_sec)}",
+                )
+                _emit_find_metrics(
+                    phase='find_fetch',
+                    scoped_total=len(universe),
+                    fetched_done=min(len(universe), len(all_data)),
+                    fetched_total=len(universe),
+                    analysis_done=0,
+                    analysis_total=0,
+                    eta_sec=float(_eta_sec or 0.0),
+                )
+                if len(_fetched_batch) < len(_batch):
+                    _cancelled = True
+                    if ui_mode:
+                        st.warning(
+                            f"Find New fetch stopped early in batch {_batch_idx}: "
+                            f"fetched {len(_fetched_batch)}/{len(_batch)}."
+                        )
+                    break
+            _filtered_counts["fetched_live"] = _fetched_live
+            if _cancelled:
+                if ui_mode:
+                    st.warning(
+                        f"Find New fetch interrupted: fetched {_processed_missing}/{missing_total} missing tickers. "
+                        "Continuing with partial results."
+                    )
+        _set_find_progress(63, "Analyzing trade candidates...")
+        _emit_find_metrics(
+            phase='find_analyze',
+            scoped_total=len(universe),
+            fetched_done=len(all_data),
+            fetched_total=len(universe),
+            analysis_done=0,
+            analysis_total=0,
+            eta_sec=0.0,
+        )
+        _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        results = scan_watchlist(all_data, macd_profile=_macd_profile)
+        # Reuse scan-time price history for Trade Finder chart opens to avoid
+        # per-click refetch/rate-limit failures.
+        tf_data_cache: Dict[str, Dict[str, Any]] = {}
+        for _t, _d in (all_data or {}).items():
+            if not isinstance(_d, dict):
+                continue
+            _daily = _d.get('daily')
+            if _daily is None:
+                continue
+            tf_data_cache[_t] = {
+                'ticker': _t,
+                'daily': _daily,
+                'weekly': _d.get('weekly'),
+                'monthly': _d.get('monthly'),
+                'current_price': _d.get('current_price'),
+            }
+        st.session_state['_find_new_ticker_data_cache'] = tf_data_cache
+
+        # Pull current supporting context.
+        sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+        try:
+            _set_find_progress(72, "Refreshing sector rotation...")
+            from data_fetcher import fetch_sector_rotation
+            sector_rotation = fetch_sector_rotation()
+            st.session_state['sector_rotation'] = sector_rotation
+            st.session_state['_sector_rotation_ts'] = time.time()
+        except Exception:
+            pass
+
+        earnings_flags = {}
+        try:
+            _set_find_progress(80, "Refreshing earnings data...")
+            from data_fetcher import fetch_batch_earnings_flags
+            earnings_flags = fetch_batch_earnings_flags([r.ticker for r in results], days_ahead=60) or {}
+            if earnings_flags:
+                _existing_earn = st.session_state.get('earnings_flags', {}) or {}
+                _existing_earn.update(earnings_flags)
+                earnings_flags = _existing_earn
+                st.session_state['earnings_flags'] = _existing_earn
+        except Exception:
+            earnings_flags = {}
+
+        ticker_sectors = st.session_state.get('ticker_sectors', {}) or {}
+        # Fallback sector map from latest scanner summary (often fresher than live sector calls).
+        scan_sector_map: Dict[str, str] = {}
+        scan_earn_map: Dict[str, Dict[str, Any]] = {}
+        for _s in (st.session_state.get('scan_results_summary', []) or []):
+            _t = str(_s.get('ticker', '') or '').upper().strip()
+            _sec = str(_s.get('sector', '') or '').strip()
+            if _t and _sec:
+                scan_sector_map[_t] = _sec
+            _ed = str(_s.get('earn_date', _s.get('earnings_date', '')) or '').strip()
+            _days_raw = _s.get('earn_days', _s.get('days_to_earnings', _s.get('days_until_earnings', None)))
+            _src = str(_s.get('earn_source', '') or '').strip()
+            _conf = str(_s.get('earn_confidence', '') or '').strip()
+            _days = None
+            try:
+                if _days_raw is not None and str(_days_raw) != '':
+                    _days = int(_days_raw)
+            except Exception:
+                _days = None
+            if _t and (_ed or _days is not None):
+                scan_earn_map[_t] = {
+                    'next_earnings': _ed,
+                    'days_until': _days,
+                    'source': _src,
+                    'confidence': _conf,
+                }
+        try:
+            _set_find_progress(88, "Resolving sectors...")
+            from data_fetcher import get_ticker_sector, fetch_fundamental_profile
+            for r in results:
+                _existing_sec = _canonicalize_sector_name(str(ticker_sectors.get(r.ticker, '') or ''), sector_rotation)
+                if _existing_sec:
+                    ticker_sectors[r.ticker] = _existing_sec
+                    continue
+                sec = _canonicalize_sector_name(str(get_ticker_sector(r.ticker) or ''), sector_rotation)
+                if not sec:
+                    try:
+                        profile = fetch_fundamental_profile(r.ticker) or {}
+                        sec = _canonicalize_sector_name(str(profile.get('sector', '') or ''), sector_rotation)
+                    except Exception:
+                        sec = ''
+                if not sec and r.ticker in scan_sector_map:
+                    sec = _canonicalize_sector_name(scan_sector_map[r.ticker], sector_rotation)
+                if sec:
+                    ticker_sectors[r.ticker] = sec
+            st.session_state['ticker_sectors'] = ticker_sectors
+        except Exception:
+            # Keep a usable sector label even when provider is rate-limited.
+            for _t, _sec in scan_sector_map.items():
+                ticker_sectors.setdefault(_t, _canonicalize_sector_name(_sec, sector_rotation))
+
+        open_tickers = set(jm.get_open_tickers())
+        rows = []
+        candidates = []
+        _set_find_progress(92, "Scoring opportunities...")
+        _analysis_total = len(results)
+        for _ri, r in enumerate(results):
+            if _cancel_flag():
+                _cancelled = True
+                break
+            rec = r.recommendation or {}
+            q = r.quality or {}
+            sig = r.signal or None
+            _mkt = (sig.market_filter if sig else {}) or {}
+            _batch_earn = earnings_flags.get(r.ticker, {}) if isinstance(earnings_flags, dict) else {}
+            _scan_earn = scan_earn_map.get(r.ticker, {}) if isinstance(scan_earn_map, dict) else {}
+            _persisted_date = str(
+                _batch_earn.get('next_earnings', _scan_earn.get('next_earnings', '')) or ''
+            ).strip()
+            _persisted_days = _batch_earn.get(
+                'days_until',
+                _batch_earn.get('days_until_earnings', _scan_earn.get('days_until', None)),
+            )
+            _persisted_source = str(
+                _batch_earn.get('source', _scan_earn.get('source', '')) or ''
+            ).strip()
+            _persisted_conf = str(
+                _batch_earn.get('confidence', _scan_earn.get('confidence', '')) or ''
+            ).strip()
+            earn = resolve_earnings_for_ticker(
+                r.ticker,
+                persisted_date=_persisted_date,
+                persisted_days=_persisted_days,
+                persisted_source=_persisted_source,
+                persisted_confidence=_persisted_conf,
+                verify_with_fetch=False,
+            )
+            if not str(earn.get('next_earnings', '') or '').strip() and _persisted_date:
+                earn = {
+                    'next_earnings': _persisted_date,
+                    'days_until': _normalize_earnings_days(_persisted_date, _persisted_days),
+                    'source': _persisted_source or 'Batch/Scanner Snapshot',
+                    'confidence': str(_persisted_conf or 'MEDIUM'),
+                }
+            earn_date = str(earn.get('next_earnings', '') or '')
+            earn_days = int(earn.get('days_until', 999) or 999)
+            earn_source = str(earn.get('source', '') or '')
+            earn_confidence = str(earn.get('confidence', '') or '').upper()
+            earn_trusted = _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            )
+
+            sector_name = _canonicalize_sector_name(
+                ticker_sectors.get(r.ticker, scan_sector_map.get(r.ticker, '')),
+                sector_rotation,
+            )
+            if not sector_name:
+                sector_name = _canonicalize_sector_name(
+                    _infer_sector_from_text(str(rec.get('summary', '') or '')),
+                    sector_rotation,
+                )
+            sector_info = sector_rotation.get(sector_name, {}) if sector_name else {}
+            sector_phase = str(sector_info.get('phase', '') or '')
+            rec_adj = _adjust_recommendation_for_sector(
+                str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+                int(rec.get('conviction', 0) or 0),
+                sector_phase,
+            )
+            rec_text = str(rec_adj.get('recommendation', 'SKIP') or 'SKIP')
+            conv_adj = int(rec_adj.get('conviction', int(rec.get('conviction', 0) or 0)) or 0)
+            _ores = (sig.overhead_resistance if sig else {}) or {}
+            _critical = (_ores.get('critical_level', {}) or {}) if isinstance(_ores, dict) else {}
+            _res_price = float(_critical.get('price', 0) or 0)
+            _res_dist = _ores.get('distance_to_critical_pct', None) if isinstance(_ores, dict) else None
+            try:
+                _res_dist = float(_res_dist) if _res_dist is not None else None
+            except Exception:
+                _res_dist = None
+            _klevels = (sig.key_levels if sig else {}) or {}
+            _support_price = float(_klevels.get('nearest_support', 0) or 0)
+            _support_dist = None
+            if _support_price > 0 and float(r.current_price or 0) > 0:
+                try:
+                    _support_dist = ((float(r.current_price or 0) - _support_price) / float(r.current_price or 0)) * 100.0
+                except Exception:
+                    _support_dist = None
+            _monthly_macd = (sig.monthly_macd if sig else {}) or {}
+            _monthly_ao = (sig.monthly_ao if sig else {}) or {}
+            _monthly_bullish = bool(_monthly_macd.get('bullish', False) and _monthly_ao.get('positive', False))
+
+            row = {
+                'ticker': r.ticker,
+                'recommendation': rec_text,
+                'conviction': conv_adj,
+                'quality_grade': q.get('quality_grade', '?'),
+                'price': float(r.current_price or 0),
+                'summary': rec.get('summary', ''),
+                'sector': sector_name,
+                'sector_phase': sector_phase,
+                'earn_date': earn_date,
+                'earn_days': earn_days,
+                'earn_source': earn_source,
+                'earn_confidence': earn_confidence,
+                'earn_trusted': bool(earn_trusted),
+                'daily_macd_cross_recent': bool(sig.macd.get('cross_recent', False)) if sig else False,
+                'daily_macd_bullish': bool(sig.macd.get('bullish', False)) if sig else False,
+                'daily_ao_positive': bool(sig.ao.get('positive', False)) if sig else False,
+                'daily_ao_zero_cross_found': bool(sig.ao.get('zero_cross_found', False)) if sig else False,
+                'macd_profile': str(getattr(sig, 'macd_profile', '') or ''),
+                'daily_macd_zone': str(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'weekly_macd_zone': str(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'monthly_macd_zone': str(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('zone', '') or ''),
+                'daily_macd_hist_pct': float(((getattr(sig, 'daily_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'weekly_macd_hist_pct': float(((getattr(sig, 'weekly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'monthly_macd_hist_pct': float(((getattr(sig, 'monthly_macd_zone', {}) or {}) if sig else {}).get('hist_pct', 0.0) or 0.0),
+                'mtf_zone_buy_approved': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('buy_approved', False)),
+                'mtf_zone_reject_reason': str(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('reject_reason', '') or ''),
+                'mtf_zone_shadow_diff': bool(((getattr(sig, 'mtf_zone_check', {}) or {}) if sig else {}).get('shadow_diff', False)),
+                'weekly_bullish': bool(sig.weekly_macd.get('bullish', False)) if sig else False,
+                'monthly_bullish': _monthly_bullish,
+                'monthly_macd_bullish': bool(_monthly_macd.get('bullish', False)),
+                'monthly_ao_positive': bool(_monthly_ao.get('positive', False)),
+                'monthly_macd_value': float(_monthly_macd.get('macd', 0.0) or 0.0),
+                'monthly_signal_value': float(_monthly_macd.get('signal', 0.0) or 0.0),
+                'monthly_histogram': float(_monthly_macd.get('histogram', 0.0) or 0.0),
+                'monthly_cross_up': bool(_monthly_macd.get('cross_up', False)),
+                'monthly_ao_value': float(_monthly_ao.get('value', 0.0) or 0.0),
+                'monthly_ao_cross_up': bool(_monthly_ao.get('cross_up', False)),
+                'market_spy_above_200': bool(_mkt.get('spy_above_200', True)),
+                'market_vix_below_30': bool(_mkt.get('vix_below_30', True)),
+                'market_vix_close': (
+                    float(_mkt.get('vix_close'))
+                    if _mkt.get('vix_close') is not None and str(_mkt.get('vix_close')) != ''
+                    else None
+                ),
+                'resistance_price': _res_price if _res_price > 0 else None,
+                'resistance_distance_pct': _res_dist,
+                'resistance_assessment': str(_ores.get('assessment', '') or '') if isinstance(_ores, dict) else '',
+                'support_price': round(_support_price, 2) if _support_price > 0 else None,
+                'support_distance_pct': round(float(_support_dist), 2) if _support_dist is not None else None,
+                'apex_buy': bool(getattr(r, 'apex_buy', False)),
+                'apex_signal_days_ago': int(getattr(r, 'apex_signal_days_ago', 999) or 999),
+                'apex_signal_tier': str(getattr(r, 'apex_signal_tier', '') or ''),
+                'apex_signal_regime': str(getattr(r, 'apex_signal_regime', '') or ''),
+                'is_open_position': r.ticker in open_tickers,
+                'watchlists': ", ".join(ticker_sources.get(r.ticker, [])),
+                'source_watchlists': ticker_sources.get(r.ticker, []),
+            }
+            _fresh_meta = _ticker_fresh_meta.get(str(r.ticker).upper().strip(), {}) or {}
+            _data_ts = float(_fresh_meta.get('ts', 0.0) or 0.0)
+            _data_age_sec = max(0.0, (_now - _data_ts)) if _data_ts > 0 else (0.0 if str(_fresh_meta.get('source', '') or '') == 'live_fetch' else (_cache_ttl_sec + 1))
+            _data_state = str(_fresh_meta.get('state', '') or '').strip().lower()
+            if not _data_state:
+                if _data_age_sec <= _fresh_horizon_sec:
+                    _data_state = "fresh"
+                elif _data_age_sec <= _stale_horizon_sec:
+                    _data_state = "cached"
+                else:
+                    _data_state = "stale"
+            row['data_source'] = str(_fresh_meta.get('source', 'unknown') or 'unknown')
+            row['data_ts'] = _data_ts
+            row['data_age_sec'] = round(float(_data_age_sec), 1)
+            row['data_freshness_state'] = _data_state
+            row['data_fresh'] = _data_state in {"fresh", "cached"}
+            rows.append(row)
+
+            rec_upper = rec_text.upper()
+            is_entry = ('BUY' in rec_upper or 'ENTRY' in rec_upper) and 'SKIP' not in rec_upper and 'AVOID' not in rec_upper
+            if not row['is_open_position']:
+                score = _recommendation_score(row)
+                candidates.append({
+                    'ticker': row['ticker'],
+                    'scanner_entry_candidate': bool(is_entry),
+                    'recommendation': row['recommendation'],
+                    'conviction': row['conviction'],
+                    'quality_grade': row['quality_grade'],
+                    'price': row['price'],
+                    'summary': row.get('summary', ''),
+                    'sector': row['sector'],
+                    'sector_phase': row['sector_phase'],
+                    'earn_date': row['earn_date'],
+                    'earn_days': row['earn_days'],
+                    'earn_source': row.get('earn_source', ''),
+                    'earn_confidence': row.get('earn_confidence', ''),
+                    'earn_trusted': bool(row.get('earn_trusted', False)),
+                    'daily_macd_cross_recent': bool(row.get('daily_macd_cross_recent', False)),
+                    'daily_macd_bullish': bool(row.get('daily_macd_bullish', False)),
+                    'daily_ao_positive': bool(row.get('daily_ao_positive', False)),
+                    'daily_ao_zero_cross_found': bool(row.get('daily_ao_zero_cross_found', False)),
+                    'macd_profile': str(row.get('macd_profile', '') or ''),
+                    'daily_macd_zone': str(row.get('daily_macd_zone', '') or ''),
+                    'weekly_macd_zone': str(row.get('weekly_macd_zone', '') or ''),
+                    'monthly_macd_zone': str(row.get('monthly_macd_zone', '') or ''),
+                    'daily_macd_hist_pct': float(row.get('daily_macd_hist_pct', 0.0) or 0.0),
+                    'weekly_macd_hist_pct': float(row.get('weekly_macd_hist_pct', 0.0) or 0.0),
+                    'monthly_macd_hist_pct': float(row.get('monthly_macd_hist_pct', 0.0) or 0.0),
+                    'mtf_zone_buy_approved': bool(row.get('mtf_zone_buy_approved', False)),
+                    'mtf_zone_reject_reason': str(row.get('mtf_zone_reject_reason', '') or ''),
+                    'mtf_zone_shadow_diff': bool(row.get('mtf_zone_shadow_diff', False)),
+                    'weekly_bullish': bool(row.get('weekly_bullish', False)),
+                    'monthly_bullish': bool(row.get('monthly_bullish', False)),
+                    'monthly_macd_bullish': bool(row.get('monthly_macd_bullish', False)),
+                    'monthly_ao_positive': bool(row.get('monthly_ao_positive', False)),
+                    'monthly_macd_value': float(row.get('monthly_macd_value', 0.0) or 0.0),
+                    'monthly_signal_value': float(row.get('monthly_signal_value', 0.0) or 0.0),
+                    'monthly_histogram': float(row.get('monthly_histogram', 0.0) or 0.0),
+                    'monthly_cross_up': bool(row.get('monthly_cross_up', False)),
+                    'monthly_ao_value': float(row.get('monthly_ao_value', 0.0) or 0.0),
+                    'monthly_ao_cross_up': bool(row.get('monthly_ao_cross_up', False)),
+                    'market_spy_above_200': bool(row.get('market_spy_above_200', True)),
+                    'market_vix_below_30': bool(row.get('market_vix_below_30', True)),
+                    'market_vix_close': row.get('market_vix_close'),
+                    'resistance_price': row.get('resistance_price'),
+                    'resistance_distance_pct': row.get('resistance_distance_pct'),
+                    'resistance_assessment': row.get('resistance_assessment', ''),
+                    'support_price': row.get('support_price'),
+                    'support_distance_pct': row.get('support_distance_pct'),
+                    'data_source': row.get('data_source', 'unknown'),
+                    'data_ts': row.get('data_ts', 0.0),
+                    'data_age_sec': row.get('data_age_sec', 0.0),
+                    'data_freshness_state': row.get('data_freshness_state', 'fresh'),
+                    'data_fresh': bool(row.get('data_fresh', True)),
+                    'apex_buy': bool(row.get('apex_buy', False)),
+                    'apex_signal_days_ago': int(row.get('apex_signal_days_ago', 999) or 999),
+                    'apex_signal_tier': str(row.get('apex_signal_tier', '') or ''),
+                    'apex_signal_regime': str(row.get('apex_signal_regime', '') or ''),
+                    'watchlists': row['watchlists'],
+                    'score': round(score, 2),
+                })
+            if (_ri + 1) % 25 == 0 or (_ri + 1) == _analysis_total:
+                _elapsed_an = max(0.001, time.time() - _start)
+                _rate_an = float(_ri + 1) / _elapsed_an if (_ri + 1) > 0 else 0.0
+                _remain_an = max(0, _analysis_total - (_ri + 1))
+                _eta_an = (_remain_an / _rate_an) if _rate_an > 0 else 0.0
+                _emit_find_metrics(
+                    phase='find_analyze',
+                    scoped_total=len(universe),
+                    fetched_done=len(all_data),
+                    fetched_total=len(universe),
+                    analysis_done=_ri + 1,
+                    analysis_total=_analysis_total,
+                    eta_sec=float(_eta_an or 0.0),
+                )
+
+        # Candidate-focused earnings backfill:
+        # run slower per-ticker verification only for top candidates still missing dates.
+        missing_candidate_tickers = [
+            str(c.get('ticker', '')).upper().strip()
+            for c in candidates
+            if not _is_earnings_data_trusted(
+                int(c.get('earn_days', 999) or 999),
+                source=str(c.get('earn_source', '') or ''),
+                confidence=str(c.get('earn_confidence', '') or ''),
+                next_earnings=str(c.get('earn_date', '') or ''),
+            )
+        ]
+        if missing_candidate_tickers:
+            _set_find_progress(96, "Backfilling missing earnings for top candidates...")
+            row_by_ticker = {str(rw.get('ticker', '')).upper().strip(): rw for rw in rows}
+            cand_by_ticker = {str(cd.get('ticker', '')).upper().strip(): cd for cd in candidates}
+            for _t in missing_candidate_tickers[:25]:
+                if _cancel_flag():
+                    _cancelled = True
+                    break
+                _row_seed = row_by_ticker.get(_t, {}) or {}
+                _earn2 = resolve_earnings_for_ticker(
+                    _t,
+                    persisted_date=str(_row_seed.get('earn_date', '') or ''),
+                    persisted_days=_row_seed.get('earn_days'),
+                    persisted_source=str(_row_seed.get('earn_source', '') or ''),
+                    persisted_confidence=str(_row_seed.get('earn_confidence', '') or ''),
+                    verify_with_fetch=True,
+                )
+                _date2 = str(_earn2.get('next_earnings', '') or '').strip()
+                if not _date2:
+                    continue
+                _days2 = int(_earn2.get('days_until', 999) or 999)
+                _src2 = str(_earn2.get('source', '') or '')
+                _conf2 = str(_earn2.get('confidence', '') or '').upper()
+                _trusted2 = _is_earnings_data_trusted(
+                    _days2,
+                    source=_src2,
+                    confidence=_conf2,
+                    next_earnings=_date2,
+                )
+                if _t in row_by_ticker:
+                    row_by_ticker[_t]['earn_date'] = _date2
+                    row_by_ticker[_t]['earn_days'] = _days2
+                    row_by_ticker[_t]['earn_source'] = _src2
+                    row_by_ticker[_t]['earn_confidence'] = _conf2
+                    row_by_ticker[_t]['earn_trusted'] = bool(_trusted2)
+                if _t in cand_by_ticker:
+                    cand_by_ticker[_t]['earn_date'] = _date2
+                    cand_by_ticker[_t]['earn_days'] = _days2
+                    cand_by_ticker[_t]['earn_source'] = _src2
+                    cand_by_ticker[_t]['earn_confidence'] = _conf2
+                    cand_by_ticker[_t]['earn_trusted'] = bool(_trusted2)
+
+        candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+        if _cancelled:
+            _set_find_progress(100, f"Find New interrupted: {len(candidates)} candidates from partial run")
+        else:
+            _set_find_progress(100, f"Find New complete: {len(candidates)} candidates")
+        _emit_find_metrics(
+            phase='find_done',
+            scoped_total=len(universe),
+            fetched_done=len(all_data),
+            fetched_total=len(universe),
+            analysis_done=len(results),
+            analysis_total=len(results),
+            eta_sec=0.0,
+        )
+
+    elapsed = max(0.0, time.time() - _start)
+    report = {
+        'generated_at': time.time(),
+        'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'watchlists_count': len(all_watchlists),
+        'scan_universe': len(universe),
+        'results_count': len(rows),
+        'candidate_count': len(candidates),
+        'candidates': candidates,
+        'rows': rows,
+        'elapsed_sec': elapsed,
+        'scan_scope': {
+            'max_tickers': _max_tickers,
+            'only_in_rotation': _only_in_rotation,
+            'include_unknown_sector': _include_unknown_sector,
+            'selected_sectors': sorted(list(_selected_sectors)),
+            'cache_ttl_min': _cache_ttl_min,
+            'fetch_batch_size': _fetch_batch_size,
+            'priority_order': 'LEADING,EMERGING,OTHER',
+            'filtered_counts': _filtered_counts,
+            'requested_universe': len(ticker_sources),
+            'effective_universe': len(universe),
+        },
+        'scope_signature': scope_signature_from_state(st.session_state),
+        'interrupted': bool(_cancelled),
+    }
+    st.session_state['find_new_trades_report'] = report
+    st.session_state['_find_new_trades_ts'] = time.time()
+    st.session_state['_find_new_ticker_data_cache_ts'] = time.time()
+    st.session_state['_find_new_ticker_data_cache_meta'] = {
+        str(_t).upper().strip(): {'ts': time.time()}
+        for _t in tf_data_cache.keys()
+    }
+    st.session_state['trade_finder_last_status'] = {
+        'level': 'warning' if _cancelled else ('success' if len(candidates) > 0 else 'info'),
+        'message': (
+            (
+                f"Find New interrupted: scanned {len(universe)} ticker(s), "
+                f"scored {len(rows)} result(s), {len(candidates)} candidate(s), "
+                f"live fetched {_filtered_counts.get('fetched_live', 0)}."
+            )
+            if _cancelled else
+            (
+                f"Find New complete: scanned {len(universe)} ticker(s), "
+                f"scored {len(rows)} result(s), {len(candidates)} candidate(s), "
+                f"cache reuse TF/scan={_filtered_counts.get('cache_reused_find', 0)}/"
+                f"{_filtered_counts.get('cache_reused_scan', 0)}."
+            )
+        ),
+        'ts': time.time(),
+    }
+    try:
+        _existing_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        get_journal().save_trade_finder_snapshot({
+            'generated_at_iso': report.get('generated_at_iso', ''),
+            'run_id': (st.session_state.get('trade_finder_results', {}) or {}).get('run_id', ''),
+            'provider': (st.session_state.get('trade_finder_results', {}) or {}).get('provider', 'system'),
+            'elapsed_sec': float(report.get('elapsed_sec', 0) or 0),
+            'input_candidates': int(report.get('candidate_count', 0) or 0),
+            'rows': _existing_rows,
+            'find_new_report': report,
+        })
+    except Exception:
+        pass
+    _append_perf_metric({
+        'kind': 'find_new_trades',
+        'watchlists': len(all_watchlists),
+        'universe': len(universe),
+        'results': len(rows),
+        'candidates': len(candidates),
+        'interrupted': bool(_cancelled),
+        'cache_reused_find': int(_filtered_counts.get('cache_reused_find', 0) or 0),
+        'cache_reused_scan': int(_filtered_counts.get('cache_reused_scan', 0) or 0),
+        'fetched_live': int(_filtered_counts.get('fetched_live', 0) or 0),
+        'sec': round(elapsed, 3),
+    })
+    _append_audit_event(
+        "FIND_NEW_DONE",
+        f"watchlists={len(all_watchlists)} universe={len(universe)} candidates={len(candidates)} sec={elapsed:.1f}",
+        source="find_new",
+    )
+    if ui_mode:
+        if _cancelled:
+            st.warning(
+                f"Find New stopped early: {len(candidates)} candidate(s) from partial run "
+                f"({len(universe)} ticker universe)."
+            )
+        else:
+            st.success(
+                f"Found {len(candidates)} candidate(s) from {len(universe)} tickers across {len(all_watchlists)} watchlists."
+            )
+
+
+# _extract_first_json_object — extracted to earnings_sector_logic.py (imported at top)
+# _extract_earn_days_hint — extracted to earnings_sector_logic.py (imported at top)
+# _canonicalize_sector_name — extracted to earnings_sector_logic.py (imported at top)
+# _parse_earnings_date — extracted to earnings_sector_logic.py (imported at top)
+# _normalize_earnings_days — extracted to earnings_sector_logic.py (imported at top)
+def resolve_earnings_for_ticker(
+    ticker: str,
+    *,
+    persisted_date: str = "",
+    persisted_days: Optional[int] = None,
+    persisted_source: str = "",
+    persisted_confidence: str = "",
+    verify_with_fetch: bool = False,
+) -> Dict[str, Any]:
+    """
+    Canonical earnings resolver used by scanner and AI paths.
+    Priority: session earnings_flags -> persisted scan snapshot -> optional live fetch.
+    """
+    t = str(ticker or "").upper().strip()
+    empty = {'next_earnings': '', 'days_until': None, 'source': '', 'confidence': ''}
+    if not t:
+        return empty
+
+    earnings_flags = st.session_state.get('earnings_flags', {}) or {}
+    session_rec = earnings_flags.get(t, {}) if isinstance(earnings_flags, dict) else {}
+
+    sess_date = str(session_rec.get('next_earnings', '') or '').strip()
+    sess_days = _normalize_earnings_days(
+        sess_date,
+        session_rec.get('days_until', session_rec.get('days_until_earnings')),
+    )
+
+    per_date = str(persisted_date or '').strip()
+    per_days = _normalize_earnings_days(per_date, persisted_days)
+
+    # Treat stale past dates as missing so fallback sources can repair them.
+    if sess_date and sess_days is None:
+        sess_date = ""
+    if per_date and per_days is None:
+        per_date = ""
+
+    if sess_date:
+        resolved = {
+            'next_earnings': sess_date,
+            'days_until': sess_days,
+            'source': str(session_rec.get('source', 'TTA Scanner') or 'TTA Scanner'),
+            'confidence': str(session_rec.get('confidence', persisted_confidence) or persisted_confidence or ''),
+        }
+    elif per_date:
+        resolved = {
+            'next_earnings': per_date,
+            'days_until': per_days,
+            'source': str(persisted_source or 'Scan Snapshot'),
+            'confidence': str(persisted_confidence or ''),
+        }
+    else:
+        resolved = dict(empty)
+
+    # Optional live verification (single-ticker, AI/research path only).
+    conflict = bool(sess_date and per_date and sess_date != per_date)
+    if verify_with_fetch and (not resolved.get('next_earnings') or conflict):
+        try:
+            from data_fetcher import fetch_earnings_date
+            fetched = fetch_earnings_date(t) or {}
+            fetch_date = str(fetched.get('next_earnings', '') or '').strip()
+            if fetch_date:
+                fetch_days = _normalize_earnings_days(fetch_date, fetched.get('days_until_earnings'))
+                resolved = {
+                    'next_earnings': fetch_date,
+                    'days_until': fetch_days,
+                    'source': str(fetched.get('source', 'Yahoo Finance') or 'Yahoo Finance'),
+                    'confidence': str(fetched.get('confidence', '') or ''),
+                }
+                # Keep scanner/session aligned after AI lookup.
+                earnings_flags[t] = {
+                    'next_earnings': fetch_date,
+                    'days_until': fetch_days,
+                    'within_window': bool(fetch_days is not None and fetch_days <= 60),
+                    'source': resolved['source'],
+                    'confidence': resolved['confidence'],
+                }
+                st.session_state['earnings_flags'] = earnings_flags
+            else:
+                # Secondary fallback sources for cases where primary earnings endpoint
+                # is empty/rate-limited but profile/history has a usable date.
+                try:
+                    from data_fetcher import fetch_fundamental_profile
+                    profile = fetch_fundamental_profile(t) or {}
+                    raw_prof_date = profile.get('next_earnings') or profile.get('earnings_date')
+                    prof_dt = _parse_earnings_date(raw_prof_date)
+                    if prof_dt is not None:
+                        prof_date = prof_dt.strftime('%Y-%m-%d')
+                        prof_days = _normalize_earnings_days(prof_date, None)
+                        resolved = {
+                            'next_earnings': prof_date,
+                            'days_until': prof_days,
+                            'source': 'Fundamental Profile',
+                            'confidence': 'LOW',
+                        }
+                        earnings_flags[t] = {
+                            'next_earnings': prof_date,
+                            'days_until': prof_days,
+                            'within_window': bool(prof_days is not None and prof_days <= 60),
+                            'source': resolved['source'],
+                            'confidence': resolved['confidence'],
+                        }
+                        st.session_state['earnings_flags'] = earnings_flags
+                except Exception:
+                    pass
+
+            if not resolved.get('next_earnings'):
+                try:
+                    from data_fetcher import fetch_earnings_history
+                    hist = fetch_earnings_history(t) or {}
+                    hist_date = str(hist.get('next_earnings', '') or '').strip()
+                    hist_dt = _parse_earnings_date(hist_date)
+                    if hist_dt is not None:
+                        hist_date = hist_dt.strftime('%Y-%m-%d')
+                        hist_days = _normalize_earnings_days(hist_date, hist.get('days_until_earnings'))
+                        resolved = {
+                            'next_earnings': hist_date,
+                            'days_until': hist_days,
+                            'source': str(hist.get('source', 'Earnings History') or 'Earnings History'),
+                            'confidence': str(hist.get('confidence', 'LOW') or 'LOW'),
+                        }
+                        earnings_flags[t] = {
+                            'next_earnings': hist_date,
+                            'days_until': hist_days,
+                            'within_window': bool(hist_days is not None and hist_days <= 60),
+                            'source': resolved['source'],
+                            'confidence': resolved['confidence'],
+                        }
+                        st.session_state['earnings_flags'] = earnings_flags
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Normalize metadata so downstream gates can consistently trust/reject rows.
+    if resolved.get('next_earnings'):
+        _src = str(resolved.get('source', '') or '').strip() or 'TTA Scanner'
+        _conf = str(resolved.get('confidence', '') or '').strip().upper()
+        _src_l = _src.lower()
+        _estimated = (
+            "estimated" in _src_l
+            or "historical + 91d" in _src_l
+            or "last + 91d" in _src_l
+        )
+        if not _conf:
+            _conf = 'LOW' if _estimated else 'MEDIUM'
+        resolved['source'] = _src
+        resolved['confidence'] = _conf
+    else:
+        resolved['source'] = str(resolved.get('source', '') or '')
+        resolved['confidence'] = str(resolved.get('confidence', '') or '')
+
+    return resolved
+
+
+# _earnings_confidence_rank — extracted to earnings_sector_logic.py (imported at top)
+# _is_estimated_earnings_source — extracted to earnings_sector_logic.py (imported at top)
+# _is_earnings_data_trusted — extracted to earnings_sector_logic.py (imported at top)
+
+# _adjust_recommendation_for_sector — extracted to earnings_sector_logic.py (imported at top)
+
+# _calc_rr — extracted to earnings_sector_logic.py (imported at top)
+# _extract_rr_from_text — extracted to earnings_sector_logic.py (imported at top)
+def _lookup_company_name_for_trade_finder(ticker: str) -> str:
+    """
+    Best-effort company-name lookup for Trade Finder rows.
+
+    Uses cached fundamental profile by ticker. Never infers names from ticker string.
+    """
+    t = str(ticker or '').upper().strip()
+    if not t:
+        return "Unknown company"
+
+    cache = st.session_state.get('_tf_company_name_cache')
+    if not isinstance(cache, dict):
+        cache = {}
+        st.session_state['_tf_company_name_cache'] = cache
+    if t in cache:
+        return str(cache.get(t, "Unknown company") or "Unknown company")
+
+    name = ""
+    try:
+        from data_fetcher import fetch_fundamental_profile
+        profile = fetch_fundamental_profile(t) or {}
+        name = str(profile.get('name', '') or '').strip()
+    except Exception:
+        name = ""
+    if not name:
+        # Secondary fallback: yfinance chart metadata often has shortName/longName
+        try:
+            import yfinance as yf
+            meta = getattr(yf.Ticker(t), "history_metadata", {}) or {}
+            name = str(meta.get("longName") or meta.get("shortName") or "").strip()
+        except Exception:
+            name = ""
+
+    if not name:
+        # Do not cache unknown forever; retry on future runs.
+        return "Unknown company"
+    cache[t] = name
+    st.session_state['_tf_company_name_cache'] = cache
+    return name
+
+
+def _normalize_gold_ai_contract(
+    ticker: str,
+    row: Dict[str, Any],
+    *,
+    fallback_ai_buy: str,
+    fallback_confidence: int = 0,
+    fallback_rank_score: float,
+    sector_phase: str = "",
+) -> Dict[str, Any]:
+    """
+    Unified AI recommendation contract.
+    Gold source: Ask AI cached analysis (ai_result_<ticker>) when available.
+    """
+    entry = float(row.get('entry', row.get('price', 0)) or 0)
+    stop = float(row.get('stop', 0) or 0)
+    target = float(row.get('target', 0) or 0)
+    level_rr = _calc_rr(entry, stop, target)
+
+    ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
+    action_text = str(
+        ai_result.get('action', '')
+        or ai_result.get('timing', '')
+        or ai_result.get('recommendation', '')
+        or ai_result.get('synthesized_recommendation', '')
+        or ''
+    ).upper()
+    raw_text = str(ai_result.get('raw_text', '') or '')
+    analysis_text = str(ai_result.get('analysis', '') or '')
+    text_blob = " ".join([action_text, raw_text, analysis_text]).strip().upper()
+    conv_raw = int(ai_result.get('conviction', 0) or 0)
+    fallback_conv = max(0, min(10, int(fallback_confidence or 0)))
+    conv = conv_raw if conv_raw > 0 else fallback_conv
+    pos_size = str(ai_result.get('position_sizing', '') or '').lower()
+    provider = str(ai_result.get('provider', 'system') or 'system')
+    earn_days = int(row.get('earn_days', 999) or 999)
+
+    verdict = fallback_ai_buy if fallback_ai_buy in {"Strong Buy", "Buy", "Watch Only", "Skip"} else "Watch Only"
+    if text_blob:
+        if any(k in text_blob for k in ["PASS", "SKIP", "ENTRY IS NOT ADVISED", "NOT ADVISED", "AVOID ENTRY"]):
+            verdict = "Skip"
+        elif "HOLD" in text_blob:
+            verdict = "Watch Only"
+        elif "BUY" in text_blob:
+            verdict = "Strong Buy" if conv >= 8 else "Buy"
+    if "skip" in pos_size:
+        verdict = "Skip"
+
+    # Ensure confidence is coherent with verdict in model/fallback paths.
+    if conv <= 0:
+        if verdict == "Strong Buy":
+            conv = max(8, fallback_conv)
+        elif verdict == "Buy":
+            conv = max(6, fallback_conv)
+        elif verdict == "Watch Only":
+            conv = max(4, fallback_conv)
+        else:
+            conv = max(2, fallback_conv)
+
+    # Sector-rotation guardrail: cap aggressiveness when sector is lagging/fading.
+    phase_u = str(sector_phase or "").upper()
+    sector_penalty = 0.0
+    if phase_u == "LAGGING":
+        if verdict == "Strong Buy":
+            verdict = "Buy"
+        elif verdict == "Buy" and conv < 9:
+            verdict = "Watch Only"
+        sector_penalty = -1.0
+    elif phase_u == "FADING":
+        if verdict == "Strong Buy":
+            verdict = "Buy"
+        sector_penalty = -0.5
+
+    # Earnings risk guardrail:
+    # - hard block aggressive entries inside 7d
+    # - also honor model text when it flags gap/binary risk
+    earnings_risk_phrase = (
+        "EARNINGS" in text_blob and
+        any(k in text_blob for k in ["GAP RISK", "BINARY RISK", "NOT ADVISED", "PASS", "SKIP"])
+    )
+    if 0 <= earn_days <= 7 and verdict in {"Strong Buy", "Buy"}:
+        verdict = "Skip"
+    elif 0 <= earn_days <= 14 and verdict == "Strong Buy":
+        verdict = "Buy"
+    if 0 <= earn_days <= 7 and earnings_risk_phrase and verdict in {"Strong Buy", "Buy"}:
+        verdict = "Skip"
+
+    rr_from_text = _extract_rr_from_text(raw_text)
+    rr = rr_from_text if rr_from_text and rr_from_text > 0 else level_rr
+
+    size_adj = 0.0
+    if "full" in pos_size:
+        size_adj = 1.0
+    elif "reduced" in pos_size:
+        size_adj = 0.4
+    elif "small" in pos_size:
+        size_adj = 0.15
+    elif "skip" in pos_size:
+        size_adj = -0.6
+
+    verdict_adj = {"Strong Buy": 1.1, "Buy": 0.5, "Watch Only": -0.2, "Skip": -1.0}.get(verdict, 0.0)
+    conv_adj = max(-0.5, min(0.9, (conv - 5) * 0.1))
+    rr_adj = max(-0.5, min(1.2, (rr - 1.5) * 0.35))
+    unified_score = round(float(fallback_rank_score or 0) + verdict_adj + conv_adj + rr_adj + size_adj + sector_penalty, 2)
+
+    note = str(
+        ai_result.get('synthesized_recommendation', '')
+        or ai_result.get('analysis', '')
+        or ai_result.get('raw_text', '')
+        or ai_result.get('why_moving', '')
+        or ai_result.get('smart_money', '')
+        or ''
+    ).strip()[:220]
+    return {
+        'verdict': verdict,
+        'confidence': conv,
+        'risk_reward': round(rr, 2),
+        'provider': provider,
+        'position_sizing': ai_result.get('position_sizing', ''),
+        'unified_rank_score': unified_score,
+        'note': note,
+        'is_gold_source': bool(ai_result),
+    }
+
+
+def _build_trade_finder_analysis_note(
+    *,
+    scanner_summary: str,
+    ai_note: str,
+    ai_verdict: str,
+    ai_confidence: int,
+    sector: str,
+    sector_phase: str,
+    earn_days: int,
+    earn_trusted: bool = True,
+    fallback_reason: str = "",
+    is_gold_source: bool = False,
+    support_price: float = 0.0,
+    stop_price: float = 0.0,
+    stop_basis: str = "",
+    apex_buy: bool = False,
+    apex_days_ago: int = 999,
+    apex_tier: str = "",
+    apex_regime: str = "",
+) -> str:
+    """Build consistent, trader-readable Trade Finder decision note."""
+    parts: List[str] = []
+
+    verdict = str(ai_verdict or "").strip().upper()
+    conf = int(ai_confidence or 0)
+    d = int(earn_days or 999)
+    if verdict:
+        source_label = "AI decision" if bool(is_gold_source) else "Model decision"
+        if conf > 0:
+            parts.append(f"{source_label}: {verdict} ({conf}/10 confidence)")
+        else:
+            parts.append(f"{source_label}: {verdict}")
+
+    base = str(ai_note or "").strip()
+    if base:
+        # Avoid contradiction: don't keep sector/earnings claims when core fields are unavailable.
+        base_sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', base) if s.strip()]
+        filtered_sentences: List[str] = []
+        for s in base_sentences:
+            s_l = s.lower()
+            if (not str(sector or "").strip()) and ("sector" in s_l or "rotation" in s_l):
+                continue
+            if (not bool(earn_trusted)) and "earn" in s_l:
+                continue
+            if d == 999 and ("earn" in s_l and (re.search(r"\b\d+\s*d\b", s_l) or "day" in s_l)):
+                continue
+            filtered_sentences.append(s)
+        base = " ".join(filtered_sentences).strip() or base
+
+    if base:
+        parts.append(base.rstrip("."))
+    else:
+        ss = str(scanner_summary or "").strip().replace("🔁", "Re-entry")
+        if ss:
+            parts.append(ss.rstrip("."))
+
+    sec = str(sector or "").strip()
+    phase = str(sector_phase or "").upper().strip()
+    if phase == "LAGGING":
+        parts.append(f"Sector status: OUT OF ROTATION ({sec} lagging)" if sec else "Sector status: OUT OF ROTATION")
+    elif phase == "FADING":
+        parts.append(f"Sector status: TRANSITION ({sec} fading)" if sec else "Sector status: TRANSITION")
+    elif phase == "EMERGING":
+        parts.append(f"Sector status: IN ROTATION ({sec} emerging)" if sec else "Sector status: IN ROTATION")
+    elif phase == "LEADING":
+        parts.append(f"Sector status: IN ROTATION ({sec} leading)" if sec else "Sector status: IN ROTATION")
+    elif sec:
+        parts.append(f"Sector: {sec}")
+
+    if apex_buy:
+        _tier = str(apex_tier or "").strip()
+        _regime = str(apex_regime or "").strip().replace("_", " ")
+        _days = int(apex_days_ago or 0)
+        _apex_bits = [f"APEX setup active ({_days}d)"]
+        if _tier:
+            _apex_bits.append(_tier)
+        if _regime:
+            _apex_bits.append(_regime)
+        parts.append(" | ".join(_apex_bits))
+
+    if not bool(earn_trusted):
+        parts.append("Earnings data unverified — refresh earnings before entry")
+    elif d == 999:
+        parts.append("Earnings date unavailable")
+    elif d <= 7:
+        parts.append(f"Earnings risk high ({d}d) — avoid new entries pre-event")
+    elif d <= 30:
+        parts.append(f"Earnings within {d}d; manage hold horizon")
+    elif d >= 0:
+        parts.append(f"Earnings runway: {d}d")
+
+    if fallback_reason:
+        parts.append(f"AI mode: fallback ({fallback_reason})")
+
+    if support_price > 0 and stop_price > 0:
+        basis_txt = str(stop_basis or "").replace("_", " ").strip()
+        if basis_txt:
+            parts.append(f"Support {support_price:.2f}; stop {stop_price:.2f} ({basis_txt})")
+        else:
+            parts.append(f"Support {support_price:.2f}; stop {stop_price:.2f}")
+
+    note = ". ".join([p for p in parts if p]).strip()
+    if note and not note.endswith("."):
+        note += "."
+    return note[:320]
+
+
+# _infer_sector_from_text — extracted to earnings_sector_logic.py (imported at top)
+# _infer_sector_phase_from_text — extracted to earnings_sector_logic.py (imported at top)
+# _sector_phase_display — extracted to earnings_sector_logic.py (imported at top)
+def _resolve_ticker_sector_for_detail(
+    ticker: str,
+    text_hint: str = "",
+    allow_fetch: bool = True,
+) -> Dict[str, str]:
+    """Resolve sector/phase for detail panels with cache + optional provider fallback."""
+    t = str(ticker or "").upper().strip()
+    rotation_ctx = st.session_state.get('sector_rotation', {}) or {}
+    ticker_sector_ctx = st.session_state.get('ticker_sectors', {}) or {}
+    scan_sector_map = st.session_state.get('_scan_sector_map', {}) or {}
+
+    sector_name = _canonicalize_sector_name(str(ticker_sector_ctx.get(t, '') or ''), rotation_ctx)
+    if not sector_name and t:
+        sector_name = _canonicalize_sector_name(str(scan_sector_map.get(t, '') or ''), rotation_ctx)
+    if not sector_name and text_hint:
+        sector_name = _canonicalize_sector_name(_infer_sector_from_text(text_hint), rotation_ctx)
+
+    if allow_fetch and t and not sector_name:
+        cache = st.session_state.get('_detail_sector_lookup_cache')
+        if not isinstance(cache, dict):
+            cache = {}
+        cached = str(cache.get(t, '') or '')
+        if not cached:
+            fetched = ""
+            try:
+                from data_fetcher import get_ticker_sector, fetch_fundamental_profile
+                fetched = str(get_ticker_sector(t) or '').strip()
+                if not fetched:
+                    profile = fetch_fundamental_profile(t) or {}
+                    fetched = str(profile.get('sector', '') or '').strip()
+            except Exception:
+                fetched = ""
+            cache[t] = fetched if fetched else "__MISS__"
+            st.session_state['_detail_sector_lookup_cache'] = cache
+            cached = fetched
+        if cached and cached != "__MISS__":
+            sector_name = _canonicalize_sector_name(cached, rotation_ctx)
+            if sector_name:
+                ticker_sector_ctx[t] = sector_name
+                st.session_state['ticker_sectors'] = ticker_sector_ctx
+
+    sector_phase = ""
+    if sector_name:
+        sector_phase = str((rotation_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+    if not sector_phase and text_hint:
+        sector_phase = _infer_sector_phase_from_text(text_hint)
+
+    return {
+        'sector': str(sector_name or '').strip(),
+        'sector_phase': str(sector_phase or '').upper().strip(),
+    }
+
+
+def _resolve_trade_finder_sector_fields(
+    row: Dict[str, Any],
+    rotation_ctx: Optional[Dict[str, Any]] = None,
+    ticker_sector_ctx: Optional[Dict[str, str]] = None,
+    scan_sector_map: Optional[Dict[str, str]] = None,
+    allow_fetch: bool = False,
+) -> Dict[str, str]:
+    """Resolve sector + rotation phase for a Trade Finder row with multi-source fallbacks."""
+    ticker = str(row.get('ticker', '')).upper().strip()
+    rotation_ctx = rotation_ctx or {}
+    ticker_sector_ctx = ticker_sector_ctx or {}
+    scan_sector_map = scan_sector_map or {}
+
+    sector_name = _canonicalize_sector_name(str(row.get('sector', '') or '').strip(), rotation_ctx)
+    sector_phase = str(row.get('sector_phase', '') or '').upper().strip()
+
+    if not sector_name and ticker:
+        sector_name = _canonicalize_sector_name(str(ticker_sector_ctx.get(ticker, '') or '').strip(), rotation_ctx)
+    if not sector_name and ticker:
+        sector_name = _canonicalize_sector_name(str(scan_sector_map.get(ticker, '') or '').strip(), rotation_ctx)
+
+    text_blob = " ".join([
+        str(row.get('scanner_summary', '') or ''),
+        str(row.get('reason', '') or ''),
+        str(row.get('analysis_note', '') or ''),
+        str(row.get('ai_rationale', '') or ''),
+    ]).strip()
+    if not sector_name:
+        sector_name = _canonicalize_sector_name(_infer_sector_from_text(text_blob), rotation_ctx)
+
+    # Last-resort lookup: try profile/sector endpoint once per ticker and cache it.
+    if allow_fetch and ticker and not sector_name:
+        cache = st.session_state.get('_tf_sector_lookup_cache')
+        if not isinstance(cache, dict):
+            cache = {}
+        cached = str(cache.get(ticker, '') or '')
+        if not cached:
+            fetched = ""
+            try:
+                from data_fetcher import get_ticker_sector, fetch_fundamental_profile
+                fetched = str(get_ticker_sector(ticker) or '').strip()
+                if not fetched:
+                    profile = fetch_fundamental_profile(ticker) or {}
+                    fetched = str(profile.get('sector', '') or '').strip()
+            except Exception:
+                fetched = ""
+            cache[ticker] = fetched if fetched else "__MISS__"
+            st.session_state['_tf_sector_lookup_cache'] = cache
+            cached = fetched
+        if cached and cached != "__MISS__":
+            sector_name = _canonicalize_sector_name(cached, rotation_ctx)
+            if sector_name:
+                ticker_sector_ctx[ticker] = sector_name
+                st.session_state['ticker_sectors'] = ticker_sector_ctx
+
+    if not sector_phase and sector_name:
+        sector_phase = str((rotation_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+    if not sector_phase:
+        sector_phase = _infer_sector_phase_from_text(text_blob)
+
+    return {
+        'sector': str(sector_name or "").strip(),
+        'sector_phase': str(sector_phase or "").upper().strip(),
+    }
+
+
+# _earnings_badge — extracted to earnings_sector_logic.py (imported at top)
+
+def _backfill_trade_finder_earnings(rows: List[Dict[str, Any]], verify_limit: int = 20) -> int:
+    """Fill missing Trade Finder earnings fields using canonical resolver with capped verified fetches."""
+    touched = 0
+    verify_used = 0
+    for row in rows:
+        ticker = str(row.get('ticker', '')).upper().strip()
+        if not ticker:
+            continue
+
+        persisted_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+        persisted_days = row.get('earn_days', row.get('days_until_earnings'))
+        earn = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=persisted_date,
+            persisted_days=persisted_days,
+            persisted_source=str(row.get('earn_source', '') or ''),
+            persisted_confidence=str(row.get('earn_confidence', '') or ''),
+            verify_with_fetch=False,
+        )
+        earn_date = str(earn.get('next_earnings', '') or '').strip()
+        try:
+            earn_days = int(earn.get('days_until', 999) or 999)
+        except Exception:
+            earn_days = 999
+        earn_source = str(earn.get('source', '') or '').strip()
+        earn_confidence = str(earn.get('confidence', '') or '').strip().upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+
+        if (earn_days == 999 or not earn_trusted) and verify_used < max(0, int(verify_limit)):
+            verify_used += 1
+            earn_v = resolve_earnings_for_ticker(
+                ticker,
+                persisted_date=persisted_date,
+                persisted_days=persisted_days,
+                persisted_source=str(row.get('earn_source', '') or ''),
+                persisted_confidence=str(row.get('earn_confidence', '') or ''),
+                verify_with_fetch=True,
+            )
+            _date_v = str(earn_v.get('next_earnings', '') or '').strip()
+            if _date_v:
+                earn_date = _date_v
+                try:
+                    earn_days = int(earn_v.get('days_until', 999) or 999)
+                except Exception:
+                    earn_days = 999
+                earn_source = str(earn_v.get('source', '') or '').strip()
+                earn_confidence = str(earn_v.get('confidence', '') or '').strip().upper()
+                earn_trusted = _is_earnings_data_trusted(
+                    earn_days,
+                    source=earn_source,
+                    confidence=earn_confidence,
+                    next_earnings=earn_date,
+                )
+
+        if earn_date and str(row.get('earn_date', '') or '').strip() != earn_date:
+            row['earn_date'] = earn_date
+            touched += 1
+        try:
+            _row_days = int(row.get('earn_days', 999) or 999)
+        except Exception:
+            _row_days = 999
+        if _row_days != int(earn_days):
+            row['earn_days'] = int(earn_days)
+            touched += 1
+        if earn_source and str(row.get('earn_source', '') or '').strip() != earn_source:
+            row['earn_source'] = earn_source
+            touched += 1
+        if earn_confidence != str(row.get('earn_confidence', '') or '').strip().upper():
+            row['earn_confidence'] = earn_confidence
+            touched += 1
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+        if bool(row.get('earn_trusted', False)) != bool(earn_trusted):
+            row['earn_trusted'] = bool(earn_trusted)
+            touched += 1
+    return touched
+
+
+def _trade_quality_settings() -> Dict[str, Any]:
+    """Global quality gates used by Trade Finder, Exec candidates, and New Trade entry checks."""
+    def _resolved_profile() -> str:
+        _raw = st.session_state.get('trade_macd_profile', None)
+        p = str(_raw or get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
+        if p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+            p = MACD_PROFILE_LEGACY
+        try:
+            set_active_macd_profile(p)
+        except Exception:
+            pass
+        return p
+
+    ensure_trade_quality_defaults(st.session_state)
+    return {
+        'macd_profile': _resolved_profile(),
+        'min_rr': float(st.session_state.get('trade_min_rr_threshold', 1.2) or 1.2),
+        'earn_block_days': int(st.session_state.get('trade_earnings_block_days', 7) or 7),
+        'require_ready': bool(st.session_state.get('trade_require_ready', False)),
+        'require_fresh_data': bool(st.session_state.get('trade_require_fresh_data', True)),
+        'include_watch_only': bool(st.session_state.get('trade_include_watch_only', True)),
+        'breakout_min_dist_pct': float(st.session_state.get('trade_breakout_min_dist_pct', 0.2) or 0.2),
+        'breakout_max_dist_pct': float(st.session_state.get('trade_breakout_max_dist_pct', 4.0) or 4.0),
+        'monthly_near_macd_pct': float(st.session_state.get('trade_monthly_near_macd_pct', 0.08) or 0.08),
+        'monthly_near_ao_floor': float(st.session_state.get('trade_monthly_near_ao_floor', -0.25) or -0.25),
+        'apex_primary': bool(st.session_state.get('trade_apex_primary', True)),
+        'apex_bear_vix_threshold': float(st.session_state.get('trade_apex_bear_vix_threshold', 20.0) or 20.0),
+    }
+
+
+def _trade_scan_profile_presets() -> Dict[str, Dict[str, Any]]:
+    """Named scan/filter bundles for simple Strict/Balanced/Loose operation."""
+    return {
+        "Strict": {
+            "find_new_max_tickers": 150,
+            "find_new_in_rotation_only": True,
+            "find_new_include_unknown_sector": False,
+            "find_new_max_minutes": 5.0,
+            "find_new_fetch_batch_size": 30,
+            "trade_min_rr_threshold": 2.0,
+            "trade_earnings_block_days": 7,
+            "trade_require_ready": True,
+            "trade_include_watch_only": False,
+            "trade_require_fresh_data": True,
+            "trade_breakout_min_dist_pct": 0.2,
+            "trade_breakout_max_dist_pct": 2.5,
+            "trade_monthly_near_macd_pct": 0.08,
+            "trade_monthly_near_ao_floor": -0.25,
+        },
+        "Balanced": {
+            "find_new_max_tickers": 350,
+            "find_new_in_rotation_only": True,
+            "find_new_include_unknown_sector": True,
+            "find_new_max_minutes": 5.0,
+            "find_new_fetch_batch_size": 40,
+            "trade_min_rr_threshold": 1.0,
+            "trade_earnings_block_days": 1,
+            "trade_require_ready": False,
+            "trade_include_watch_only": True,
+            "trade_require_fresh_data": False,
+            "trade_breakout_min_dist_pct": 0.1,
+            "trade_breakout_max_dist_pct": 5.0,
+            "trade_monthly_near_macd_pct": 0.10,
+            "trade_monthly_near_ao_floor": -0.50,
+        },
+        "Loose": {
+            "find_new_max_tickers": 500,
+            "find_new_in_rotation_only": False,
+            "find_new_include_unknown_sector": True,
+            "find_new_max_minutes": 10.0,
+            "find_new_fetch_batch_size": 50,
+            "trade_min_rr_threshold": 1.0,
+            "trade_earnings_block_days": 0,
+            "trade_require_ready": False,
+            "trade_include_watch_only": True,
+            "trade_require_fresh_data": False,
+            "trade_breakout_min_dist_pct": 0.0,
+            "trade_breakout_max_dist_pct": 8.0,
+            "trade_monthly_near_macd_pct": 0.18,
+            "trade_monthly_near_ao_floor": -1.50,
+        },
+    }
+
+
+def _apply_trade_scan_profile(profile_name: str) -> str:
+    """Apply profile settings into session state and return applied profile name."""
+    presets = _trade_scan_profile_presets()
+    chosen = str(profile_name or "Balanced").strip().title()
+    if chosen not in presets:
+        chosen = "Balanced"
+    for k, v in (presets.get(chosen, {}) or {}).items():
+        st.session_state[k] = v
+    st.session_state["_trade_scan_profile_applied"] = chosen
+    return chosen
+
+
+def _trade_finder_data_gate_state(*, rerank_only: bool = False) -> Dict[str, Any]:
+    """
+    Pre-run health gate for Trade Finder.
+
+    Full scans are blocked when provider cooldown is active or when both market
+    and sector context are stale. Re-rank mode remains available so users can
+    still work with existing snapshots.
+    """
+    fetch_health = get_fetch_health_status() or {}
+    rate_limited = bool(fetch_health.get('rate_limited', False))
+    cooldown_sec = int(fetch_health.get('cooldown_remaining_sec', 0) or 0)
+    hits = int(fetch_health.get('hits', 0) or 0)
+    governor_interval_sec = float(fetch_health.get('governor_interval_sec', 0.08) or 0.08)
+    requests_last_1s = int(fetch_health.get('requests_last_1s', 0) or 0)
+
+    stale = {
+        'scan': False,
+        'market': False,
+        'sector': False,
+        'positions': False,
+        'alerts': False,
+        'tags': [],
+        'count': 0,
+    }
+    try:
+        snap = _build_dashboard_snapshot()
+        stale = _stale_stream_status(snap)
+    except Exception:
+        # Keep gate permissive if snapshot cannot be built in this call path.
+        pass
+
+    stale_market = bool(stale.get('market', False))
+    stale_sector = bool(stale.get('sector', False))
+
+    warnings: List[str] = []
+    blockers: List[str] = []
+
+    if rate_limited and cooldown_sec > 0 and not rerank_only:
+        blockers.append(f"Provider cooldown active ({cooldown_sec}s)")
+    elif rate_limited and cooldown_sec > 0:
+        warnings.append(f"Provider cooldown active ({cooldown_sec}s) — rerank only")
+
+    if stale_market and stale_sector and not rerank_only:
+        blockers.append("Market + sector context are stale")
+    else:
+        if stale_market:
+            warnings.append("Market context is stale")
+        if stale_sector:
+            warnings.append("Sector rotation context is stale")
+
+    hard_block = len(blockers) > 0
+    reason = "; ".join(blockers) if blockers else ""
+    if not reason and warnings:
+        reason = "; ".join(warnings)
+    if not reason:
+        reason = "Data ready"
+
+    return {
+        'hard_block': hard_block,
+        'reason': reason,
+        'blockers': blockers,
+        'warnings': warnings,
+        'rate_limited': rate_limited,
+        'cooldown_sec': cooldown_sec,
+        'hits': hits,
+        'governor_interval_sec': governor_interval_sec,
+        'requests_last_1s': requests_last_1s,
+        'stale': stale,
+    }
+
+
+def _trade_data_freshness_badge(row: Dict[str, Any]) -> Dict[str, str]:
+    """Compact freshness badge for Trade Finder rows."""
+    state = str(row.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+    age_sec = float(row.get('data_age_sec', 0.0) or 0.0)
+    source = str(row.get('data_source', '') or '').strip()
+    age_txt = _format_eta(age_sec) if age_sec > 0 else "0s"
+
+    if state == "fresh":
+        return {'icon': "🟢", 'text': f"fresh ({age_txt})", 'color': "#22c55e", 'source': source}
+    if state == "cached":
+        return {'icon': "🟡", 'text': f"cached ({age_txt})", 'color': "#f59e0b", 'source': source}
+    if state == "stale":
+        return {'icon': "🔴", 'text': f"stale ({age_txt})", 'color': "#ef4444", 'source': source}
+    return {'icon': "⚪", 'text': "unknown", 'color': "#9ca3af", 'source': source}
+
+
+def _monthly_is_green_or_near(row: Dict[str, Any], settings: Dict[str, Any]) -> Tuple[bool, str]:
+    """Monthly timing gate: green OR close enough to green for early breakout setups."""
+    mm_bull = bool(row.get('monthly_macd_bullish', row.get('monthly_bullish', False)))
+    ma_pos = bool(row.get('monthly_ao_positive', row.get('monthly_bullish', False)))
+    if mm_bull and ma_pos:
+        return True, "monthly_green"
+
+    macd_v = float(row.get('monthly_macd_value', 0.0) or 0.0)
+    sig_v = float(row.get('monthly_signal_value', 0.0) or 0.0)
+    ao_v = float(row.get('monthly_ao_value', 0.0) or 0.0)
+    macd_cross_up = bool(row.get('monthly_cross_up', False))
+    ao_cross_up = bool(row.get('monthly_ao_cross_up', False))
+    near_pct = float(settings.get('monthly_near_macd_pct', 0.08) or 0.08)
+    ao_floor = float(settings.get('monthly_near_ao_floor', -0.25) or -0.25)
+
+    denom = max(abs(sig_v), 1e-6)
+    macd_gap_pct = (macd_v - sig_v) / denom
+    near_macd = macd_gap_pct >= (-1.0 * near_pct)
+    near_ao = ao_v >= ao_floor
+
+    # Early-turn allowance: monthly MACD is crossing/near-cross while AO is already positive.
+    if ma_pos and (macd_cross_up or near_macd):
+        return True, "monthly_crossing_up"
+    # Early-turn allowance: AO just crossed green while MACD is already bullish or very close.
+    if ao_cross_up and (mm_bull or near_macd):
+        return True, "monthly_ao_just_green"
+    # Monthly MACD is bullish and AO is only slightly negative (near zero line).
+    if mm_bull and near_ao:
+        return True, "monthly_ao_near_green"
+    if near_macd and near_ao:
+        return True, "monthly_near_green"
+    return False, "monthly_not_green"
+
+
+def _evaluate_trade_finder_hard_gate(row: Dict[str, Any], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministic pre-AI gate for breakout candidates.
+    AI ranking must only run on rows that pass this gate.
+    """
+    fail_codes: List[str] = []
+    fail_reasons: List[str] = []
+    macd_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY).strip().lower()
+    if macd_profile not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
+        macd_profile = MACD_PROFILE_LEGACY
+
+    def _zone_name(value: Any) -> str:
+        if isinstance(value, dict):
+            value = value.get('zone', '')
+        return str(value or '').strip().lower()
+
+    phase = str(row.get('sector_phase', '') or '').upper().strip()
+    if phase not in {"LEADING", "EMERGING"}:
+        fail_codes.append("sector_not_in_rotation")
+        fail_reasons.append(f"Sector phase not in rotation ({phase or 'unknown'})")
+
+    monthly_tag = "monthly_not_evaluated"
+    apex_primary = bool(settings.get('apex_primary', True))
+    apex_buy = bool(row.get('apex_buy', False))
+    apex_days = int(row.get('apex_signal_days_ago', 999) or 999)
+    daily_cross_recent = bool(row.get('daily_macd_cross_recent', False))
+    daily_ao_positive = bool(row.get('daily_ao_positive', False))
+    daily_ao_zero_cross = bool(row.get('daily_ao_zero_cross_found', False))
+    weekly_bullish = bool(row.get('weekly_bullish', False))
+
+    if macd_profile == MACD_PROFILE_HPOTTER_ZONE:
+        d_zone = _zone_name(row.get('daily_macd_zone', ''))
+        w_zone = _zone_name(row.get('weekly_macd_zone', ''))
+        m_zone = _zone_name(row.get('monthly_macd_zone', ''))
+        zone_ok = bool(row.get('mtf_zone_buy_approved', False))
+        zone_reason = str(row.get('mtf_zone_reject_reason', '') or '').strip()
+        monthly_tag = f"zones:{d_zone or 'n/a'}/{w_zone or 'n/a'}/{m_zone or 'n/a'}"
+        if zone_ok:
+            monthly_tag += " (approved)"
+        elif zone_reason:
+            monthly_tag += f" (rejected: {zone_reason[:64]})"
+
+        # Daily momentum confirmation remains mandatory for breakout timing.
+        if not daily_ao_positive:
+            fail_codes.append("daily_ao_not_positive")
+            fail_reasons.append("Daily AO is not positive")
+        # Use signal-engine zone approval as single source of truth.
+        # Weekly/monthly extended momentum is allowed when daily timing is valid.
+        if not zone_ok:
+            fail_codes.append("mtf_zone_not_approved")
+            fail_reasons.append(
+                zone_reason or
+                f"MACD zone timing not approved (D:{d_zone or 'n/a'} W:{w_zone or 'n/a'} M:{m_zone or 'n/a'})"
+            )
+    else:
+        monthly_ok, monthly_tag = _monthly_is_green_or_near(row, settings)
+        if apex_primary:
+            # APEX backtest parity: recent APEX buy qualifies directly; otherwise enforce
+            # full Daily + Weekly + Monthly alignment.
+            if apex_buy and apex_days <= 20:
+                monthly_tag = "apex_recent_buy"
+            else:
+                if not daily_cross_recent:
+                    fail_codes.append("daily_macd_cross_missing")
+                    fail_reasons.append("Daily MACD cross is not recent")
+                if not daily_ao_positive:
+                    fail_codes.append("daily_ao_not_positive")
+                    fail_reasons.append("Daily AO is not positive")
+                if not daily_ao_zero_cross:
+                    fail_codes.append("daily_ao_zero_cross_missing")
+                    fail_reasons.append("Daily AO has no recent zero-cross")
+                if not weekly_bullish:
+                    fail_codes.append("weekly_not_green")
+                    fail_reasons.append("Weekly MACD is not bullish")
+                if not monthly_ok:
+                    fail_codes.append("monthly_not_green")
+                    fail_reasons.append("Monthly momentum is not green/near-green")
+        else:
+            if not daily_cross_recent:
+                fail_codes.append("daily_macd_cross_missing")
+                fail_reasons.append("Daily MACD cross is not recent")
+            if not daily_ao_positive:
+                fail_codes.append("daily_ao_not_positive")
+                fail_reasons.append("Daily AO is not positive")
+            if not weekly_bullish:
+                fail_codes.append("weekly_not_green")
+                fail_reasons.append("Weekly MACD is not bullish")
+            if not monthly_ok:
+                fail_codes.append("monthly_not_green")
+                fail_reasons.append("Monthly momentum is not green/near-green")
+
+    # APEX bear-market filter: block only when SPY is below 200 and VIX is elevated.
+    spy_above_200 = bool(row.get('market_spy_above_200', True))
+    _vix_raw = row.get('market_vix_close', None)
+    vix_close: Optional[float] = None
+    try:
+        if _vix_raw is not None and str(_vix_raw) != '':
+            vix_close = float(_vix_raw)
+    except Exception:
+        vix_close = None
+    vix_bear_threshold = float(settings.get('apex_bear_vix_threshold', 20.0) or 20.0)
+    if (not spy_above_200) and vix_close is not None and vix_close >= vix_bear_threshold:
+        fail_codes.append("apex_bear_filter")
+        fail_reasons.append(
+            f"Bear filter active (SPY<200 & VIX {vix_close:.1f} >= {vix_bear_threshold:.1f})"
+        )
+
+    dist = float(row.get('resistance_distance_pct', -1.0) or -1.0)
+    min_dist = float(settings.get('breakout_min_dist_pct', 0.2) or 0.2)
+    max_dist = float(settings.get('breakout_max_dist_pct', 4.0) or 4.0)
+    if dist <= 0:
+        fail_codes.append("resistance_missing")
+        fail_reasons.append("No critical overhead resistance level available")
+    elif dist < min_dist or dist > max_dist:
+        fail_codes.append("resistance_distance_outside_window")
+        fail_reasons.append(f"Resistance distance {dist:.2f}% outside {min_dist:.2f}-{max_dist:.2f}% breakout window")
+
+    earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+    earn_trusted = _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    )
+    earn_block_days = int(settings.get('earn_block_days', 7) or 7)
+    if not earn_trusted:
+        fail_codes.append("earnings_untrusted")
+        fail_reasons.append("Earnings data is unverified")
+    elif 0 <= earn_days <= earn_block_days:
+        fail_codes.append("earnings_too_near")
+        fail_reasons.append(f"Earnings in {earn_days}d (block <= {earn_block_days}d)")
+
+    return {
+        'pass': len(fail_codes) == 0,
+        'fail_codes': fail_codes,
+        'fail_reasons': fail_reasons,
+        'monthly_tag': monthly_tag,
+        'metrics': {
+            'sector_phase': phase,
+            'macd_profile': macd_profile,
+            'apex_primary': apex_primary,
+            'apex_buy': apex_buy,
+            'apex_signal_days_ago': apex_days,
+            'spy_above_200': spy_above_200,
+            'vix_close': vix_close,
+            'resistance_distance_pct': dist,
+            'breakout_window': [min_dist, max_dist],
+            'earn_days': earn_days,
+        },
+    }
+
+
+def _hard_gate_pass_count(rows: List[Dict[str, Any]], settings: Dict[str, Any]) -> int:
+    """Count hard-gate passers for a given threshold set."""
+    c = 0
+    for r in (rows or []):
+        if bool(_evaluate_trade_finder_hard_gate(r, settings).get('pass', False)):
+            c += 1
+    return c
+
+
+def _suggest_trade_gate_settings(rows: List[Dict[str, Any]], settings: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Deterministically tune strict hard-gate thresholds so Trade Finder remains selective
+    without starving opportunities.
+    """
+    total = int(len(rows or []))
+    if total <= 0:
+        return {
+            'updated': False,
+            'reason': 'No rows to tune.',
+            'current_pass': 0,
+            'target_pass': 0,
+            'suggested': dict(settings),
+        }
+
+    current_settings = dict(settings)
+    current_pass = _hard_gate_pass_count(rows, current_settings)
+    target_pass = max(5, min(40, int(round(total * 0.04))))
+    target_lo = max(2, int(round(target_pass * 0.6)))
+    target_hi = max(target_lo + 1, int(round(target_pass * 1.6)))
+
+    base_max = float(current_settings.get('breakout_max_dist_pct', 4.0) or 4.0)
+    base_macd = float(current_settings.get('monthly_near_macd_pct', 0.08) or 0.08)
+    base_ao = float(current_settings.get('monthly_near_ao_floor', -0.25) or -0.25)
+
+    max_opts = sorted(set([
+        round(max(1.0, min(12.0, base_max + d)), 2)
+        for d in (-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0)
+    ]))
+    macd_opts = sorted(set([
+        round(max(0.02, min(0.25, base_macd + d)), 3)
+        for d in (-0.02, 0.0, 0.02, 0.04, 0.06)
+    ]))
+    ao_opts = sorted(set([
+        round(max(-1.5, min(0.2, base_ao + d)), 3)
+        for d in (0.2, 0.1, 0.0, -0.1, -0.2, -0.3)
+    ]))
+
+    # Preserve user's minimum breakout proximity floor.
+    min_dist = float(current_settings.get('breakout_min_dist_pct', 0.2) or 0.2)
+    max_opts = [x for x in max_opts if x > min_dist]
+    if not max_opts:
+        max_opts = [max(min_dist + 0.1, 1.0)]
+
+    best = {
+        'score': float('inf'),
+        'pass_count': current_pass,
+        'settings': dict(current_settings),
+    }
+
+    for mx in max_opts:
+        for mp in macd_opts:
+            for ao in ao_opts:
+                trial = dict(current_settings)
+                trial['breakout_max_dist_pct'] = float(mx)
+                trial['monthly_near_macd_pct'] = float(mp)
+                trial['monthly_near_ao_floor'] = float(ao)
+                pcount = _hard_gate_pass_count(rows, trial)
+
+                # Primary objective: stay inside a practical pass band.
+                if target_lo <= pcount <= target_hi:
+                    band_penalty = 0.0
+                else:
+                    band_penalty = min(abs(pcount - target_lo), abs(pcount - target_hi))
+
+                # Secondary objective: avoid unnecessary drift from current settings.
+                drift = (
+                    abs(float(mx) - base_max) * 0.35
+                    + abs(float(mp) - base_macd) * 18.0
+                    + abs(float(ao) - base_ao) * 3.0
+                )
+                score = band_penalty + drift
+                if score < best['score']:
+                    best = {
+                        'score': score,
+                        'pass_count': pcount,
+                        'settings': trial,
+                    }
+
+    suggested = dict(best['settings'])
+    updated = (
+        round(float(suggested.get('breakout_max_dist_pct', base_max)), 4) != round(base_max, 4)
+        or round(float(suggested.get('monthly_near_macd_pct', base_macd)), 4) != round(base_macd, 4)
+        or round(float(suggested.get('monthly_near_ao_floor', base_ao)), 4) != round(base_ao, 4)
+    )
+    if current_pass >= target_lo and current_pass <= target_hi:
+        # Already in healthy band; do not auto-change.
+        updated = False
+        suggested = dict(current_settings)
+
+    return {
+        'updated': bool(updated),
+        'reason': (
+            f"Current pass {current_pass}/{total}; target band {target_lo}-{target_hi}."
+            if not updated
+            else f"Adjusted hard gate from {current_pass}/{total} to {int(best['pass_count'])}/{total} passers."
+        ),
+        'current_pass': int(current_pass),
+        'target_pass': int(target_pass),
+        'target_band': [int(target_lo), int(target_hi)],
+        'suggested_pass': int(best['pass_count']),
+        'suggested': suggested,
+    }
+
+
+def _ai_tuning_note(
+    total_rows: int,
+    tuning: Dict[str, Any],
+    current_settings: Dict[str, Any],
+) -> str:
+    """Optional short AI note explaining threshold tuning changes."""
+    try:
+        ai_clients = _get_ai_clients()
+        openai_client = ai_clients.get('openai_client')
+        if openai_client is None:
+            return ""
+        ai_cfg = ai_clients.get('ai_config', {}) or {}
+        model = str(ai_cfg.get('model', 'grok-3-fast') or 'grok-3-fast')
+        payload = {
+            'rows': int(total_rows or 0),
+            'current_pass': int(tuning.get('current_pass', 0) or 0),
+            'suggested_pass': int(tuning.get('suggested_pass', 0) or 0),
+            'target_band': tuning.get('target_band', []),
+            'current': {
+                'breakout_max_dist_pct': float(current_settings.get('breakout_max_dist_pct', 0) or 0),
+                'monthly_near_macd_pct': float(current_settings.get('monthly_near_macd_pct', 0) or 0),
+                'monthly_near_ao_floor': float(current_settings.get('monthly_near_ao_floor', 0) or 0),
+            },
+            'suggested': {
+                'breakout_max_dist_pct': float((tuning.get('suggested', {}) or {}).get('breakout_max_dist_pct', 0) or 0),
+                'monthly_near_macd_pct': float((tuning.get('suggested', {}) or {}).get('monthly_near_macd_pct', 0) or 0),
+                'monthly_near_ao_floor': float((tuning.get('suggested', {}) or {}).get('monthly_near_ao_floor', 0) or 0),
+            },
+        }
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "Return one concise sentence (<=180 chars), no markdown."},
+                {"role": "user", "content": f"Explain this trade-gate tuning change for a trader: {payload}"},
+            ],
+            max_tokens=80,
+            temperature=0.2,
+            timeout=12,
+        )
+        msg = str(resp.choices[0].message.content or '').strip()
+        return msg[:180]
+    except Exception:
+        return ""
+
+
+def _trade_candidate_is_qualified(row: Dict[str, Any], settings: Dict[str, Any]) -> bool:
+    """Shared candidate quality filter."""
+    min_rr = float(settings.get('min_rr', 2.0) or 2.0)
+    earn_block_days = int(settings.get('earn_block_days', 7) or 7)
+    require_ready = bool(settings.get('require_ready', True))
+    include_watch_only = bool(settings.get('include_watch_only', False))
+
+    if bool(row.get('hard_gate_pass', True)) is False:
+        return False
+
+    if bool(settings.get('require_fresh_data', True)):
+        _fresh_state = str(row.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+        if _fresh_state == "stale":
+            return False
+
+    entry = float(row.get('suggested_entry', row.get('price', 0)) or 0)
+    stop = float(row.get('suggested_stop_loss', 0) or 0)
+    target = float(row.get('suggested_target', 0) or 0)
+    rr = float(row.get('risk_reward', 0) or 0)
+    if rr <= 0:
+        rr = _calc_rr(entry, stop, target)
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return False
+    if not (stop < entry < target):
+        return False
+    if rr < min_rr:
+        return False
+    ai_buy = str(row.get('ai_buy_recommendation', '') or '').strip()
+    allowed_ai = {"Strong Buy", "Buy"} | ({"Watch Only"} if include_watch_only else set())
+    if ai_buy not in allowed_ai:
+        return False
+
+    earn_days = int(row.get('earn_days', 999) or 999)
+    earn_source = str(row.get('earn_source', '') or '').strip()
+    earn_confidence = str(row.get('earn_confidence', '') or '').strip().upper()
+    earn_date = str(row.get('earn_date', row.get('earnings_date', '')) or '').strip()
+    if not _is_earnings_data_trusted(
+        earn_days,
+        source=earn_source,
+        confidence=earn_confidence,
+        next_earnings=earn_date,
+    ):
+        return False
+    if 0 <= earn_days <= earn_block_days:
+        return False
+
+    if require_ready:
+        card = row.get('decision_card', {}) or {}
+        if str(card.get('execution_readiness', '')).upper() != "READY":
+            return False
+    return True
+
+
+def _heuristic_trade_finder_ai(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Fallback AI recommendation when Grok is unavailable."""
+    price = float(candidate.get('price', 0) or 0)
+    conv = int(candidate.get('conviction', 0) or 0)
+    rec = str(candidate.get('recommendation', '')).upper()
+    summary = str(candidate.get('summary', '') or '')
+    quality = str(candidate.get('quality_grade', '?') or '?')
+
+    entry = price
+    if conv >= 8:
+        stop = round(entry * 0.95, 2) if entry > 0 else 0.0
+        target = round(entry * 1.12, 2) if entry > 0 else 0.0
+        ai_buy = "Strong Buy"
+    elif "BUY" in rec or "ENTRY" in rec:
+        stop = round(entry * 0.94, 2) if entry > 0 else 0.0
+        target = round(entry * 1.10, 2) if entry > 0 else 0.0
+        ai_buy = "Buy"
+    else:
+        stop = round(entry * 0.93, 2) if entry > 0 else 0.0
+        target = round(entry * 1.08, 2) if entry > 0 else 0.0
+        ai_buy = "Watch Only"
+    rr = _calc_rr(entry, stop, target)
+    rank_score = round(conv * 1.5 + rr * 3 + (2 if quality.startswith('A') else 0), 2)
+    return {
+        'ai_buy_recommendation': ai_buy if entry > 0 else "Skip",
+        'suggested_entry': entry,
+        'suggested_stop_loss': stop,
+        'suggested_target': target,
+        'risk_reward': rr,
+        'rank_score': rank_score,
+        'rationale': summary or "Heuristic fallback used (AI unavailable).",
+        'provider': 'system',
+    }
+
+
+def _trade_finder_candidate_signature(candidate: Dict[str, Any]) -> str:
+    """Stable hash for AI-eval cache reuse across reruns."""
+    payload = {
+        "ticker": str(candidate.get('ticker', '') or '').upper().strip(),
+        "recommendation": str(candidate.get('recommendation', '') or ''),
+        "conviction": int(candidate.get('conviction', 0) or 0),
+        "quality_grade": str(candidate.get('quality_grade', '?') or '?'),
+        "price": round(float(candidate.get('price', 0) or 0), 4),
+        "summary": str(candidate.get('summary', '') or ''),
+        "sector": str(candidate.get('sector', '') or ''),
+        "sector_phase": str(candidate.get('sector_phase', '') or ''),
+        "daily_macd_cross_recent": bool(candidate.get('daily_macd_cross_recent', False)),
+        "daily_ao_positive": bool(candidate.get('daily_ao_positive', False)),
+        "daily_ao_zero_cross_found": bool(candidate.get('daily_ao_zero_cross_found', False)),
+        "macd_profile": str(candidate.get('macd_profile', '') or ''),
+        "daily_macd_zone": str(candidate.get('daily_macd_zone', '') or ''),
+        "weekly_macd_zone": str(candidate.get('weekly_macd_zone', '') or ''),
+        "monthly_macd_zone": str(candidate.get('monthly_macd_zone', '') or ''),
+        "daily_macd_hist_pct": round(float(candidate.get('daily_macd_hist_pct', 0.0) or 0.0), 4),
+        "weekly_macd_hist_pct": round(float(candidate.get('weekly_macd_hist_pct', 0.0) or 0.0), 4),
+        "monthly_macd_hist_pct": round(float(candidate.get('monthly_macd_hist_pct', 0.0) or 0.0), 4),
+        "mtf_zone_buy_approved": bool(candidate.get('mtf_zone_buy_approved', False)),
+        "mtf_zone_reject_reason": str(candidate.get('mtf_zone_reject_reason', '') or ''),
+        "weekly_bullish": bool(candidate.get('weekly_bullish', False)),
+        "monthly_macd_bullish": bool(candidate.get('monthly_macd_bullish', False)),
+        "monthly_ao_positive": bool(candidate.get('monthly_ao_positive', False)),
+        "monthly_ao_cross_up": bool(candidate.get('monthly_ao_cross_up', False)),
+        "market_spy_above_200": bool(candidate.get('market_spy_above_200', True)),
+        "market_vix_below_30": bool(candidate.get('market_vix_below_30', True)),
+        "market_vix_close": candidate.get('market_vix_close'),
+        "apex_buy": bool(candidate.get('apex_buy', False)),
+        "apex_signal_days_ago": int(candidate.get('apex_signal_days_ago', 999) or 999),
+        "apex_signal_tier": str(candidate.get('apex_signal_tier', '') or ''),
+        "apex_signal_regime": str(candidate.get('apex_signal_regime', '') or ''),
+        "resistance_distance_pct": candidate.get('resistance_distance_pct'),
+        "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "earn_source": str(candidate.get('earn_source', '') or ''),
+        "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
+        "watchlists": str(candidate.get('watchlists', '') or ''),
+    }
+    try:
+        import hashlib
+        blob = _json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    except Exception:
+        return str(payload)
+
+
+def _grok_trade_finder_assessment(candidate: Dict[str, Any], ai_clients: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ask Grok/OpenAI-compatible provider for trade-finder scoring and risk levels.
+    Returns normalized fields used by the Trade Finder table.
+    """
+    openai_client = ai_clients.get('openai_client')
+    ai_cfg = ai_clients.get('ai_config', {}) or {}
+    model = ai_cfg.get('model', 'grok-3-fast')
+    fallback_model = ai_cfg.get('fallback_model', '')
+
+    if openai_client is None:
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = 'system'
+        out['fallback_reason'] = 'openai_client_unavailable'
+        return out
+
+    payload = {
+        "ticker": candidate.get('ticker', ''),
+        "recommendation": candidate.get('recommendation', ''),
+        "conviction": int(candidate.get('conviction', 0) or 0),
+        "quality_grade": candidate.get('quality_grade', '?'),
+        "price": float(candidate.get('price', 0) or 0),
+        "summary": candidate.get('summary', ''),
+        "sector": candidate.get('sector', ''),
+        "sector_phase": candidate.get('sector_phase', ''),
+        "apex_buy": bool(candidate.get('apex_buy', False)),
+        "apex_signal_days_ago": int(candidate.get('apex_signal_days_ago', 999) or 999),
+        "apex_signal_tier": str(candidate.get('apex_signal_tier', '') or ''),
+        "apex_signal_regime": str(candidate.get('apex_signal_regime', '') or ''),
+        "market_spy_above_200": bool(candidate.get('market_spy_above_200', True)),
+        "market_vix_close": candidate.get('market_vix_close'),
+        "earn_days": int(candidate.get('earn_days', 999) or 999),
+        "earn_source": str(candidate.get('earn_source', '') or ''),
+        "earn_confidence": str(candidate.get('earn_confidence', '') or ''),
+        "watchlists": candidate.get('watchlists', ''),
+    }
+    prompt = (
+        "You are scoring swing-trade candidates for execution TODAY. Return ONLY valid JSON with keys: "
+        "ai_buy_recommendation, suggested_entry, suggested_stop_loss, suggested_target, "
+        "risk_reward, rank_score, rationale. "
+        "ai_buy_recommendation must be one of: Strong Buy, Buy, Watch Only, Skip. "
+        "Do not change ticker identity. Do not infer or mention company names. "
+        "Do not invent earnings timing; use earn_days exactly as provided. "
+        "Treat unknown/low-confidence earnings data as a risk and reduce aggressiveness. "
+        "If earn_days <= 7, default to Skip unless recommendation is explicitly post-earnings. "
+        "Treat LAGGING/FADING sector_phase as a headwind and reduce conviction. "
+        "Set stop below entry, target above entry. "
+        "Rationale must be execution-focused, not generic, and <= 220 chars.\n\n"
+        f"Candidate:\n{_json.dumps(payload)}"
+    )
+
+    models = [m for m in [model, fallback_model] if m]
+    raw_text = None
+    provider = None
+    errors = []
+    for m in models:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=m,
+                messages=[
+                    {"role": "system", "content": "Return strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=190,
+                temperature=0.2,
+                timeout=20,
+            )
+            raw_text = resp.choices[0].message.content
+            provider = m
+            if raw_text:
+                break
+        except Exception as e:
+            errors.append(f"{m}:{str(e)[:120]}")
+            continue
+
+    if not raw_text:
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = 'system'
+        out['fallback_reason'] = 'ai_call_failed'
+        if errors:
+            out['fallback_error'] = " | ".join(errors[:2])
+        return out
+
+    parsed = _extract_first_json_object(raw_text)
+    if not parsed:
+        out = _heuristic_trade_finder_ai(candidate)
+        out['provider'] = provider or 'system'
+        out['fallback_reason'] = 'json_parse_failed'
+        out['fallback_error'] = str(raw_text)[:160]
+        return out
+
+    entry = float(parsed.get('suggested_entry', payload['price']) or payload['price'] or 0)
+    stop = float(parsed.get('suggested_stop_loss', 0) or 0)
+    target = float(parsed.get('suggested_target', 0) or 0)
+    if entry > 0 and (stop <= 0 or stop >= entry):
+        stop = round(entry * 0.94, 2)
+    if entry > 0 and (target <= entry):
+        target = round(entry * 1.10, 2)
+
+    rr = float(parsed.get('risk_reward', 0) or 0)
+    if rr <= 0:
+        rr = _calc_rr(entry, stop, target)
+    rank_score = float(parsed.get('rank_score', 0) or 0)
+    if rank_score <= 0:
+        rank_score = round(payload['conviction'] * 1.5 + rr * 3, 2)
+
+    ai_buy = str(parsed.get('ai_buy_recommendation', '') or '').strip() or "Watch Only"
+    if ai_buy not in {"Strong Buy", "Buy", "Watch Only", "Skip"}:
+        ai_buy = "Watch Only"
+    rationale = str(parsed.get('rationale', '') or '').strip()[:220]
+    if not rationale:
+        rationale = payload.get('summary') or "AI-ranked candidate."
+    earn_days = int(payload.get('earn_days', 999) or 999)
+    if 0 <= earn_days <= 7 and ai_buy in {"Strong Buy", "Buy"}:
+        ai_buy = "Skip"
+        rationale = f"PASS due to earnings in {earn_days}d; avoid pre-event gap risk."
+
+    return {
+        'ai_buy_recommendation': ai_buy,
+        'suggested_entry': round(entry, 2),
+        'suggested_stop_loss': round(stop, 2),
+        'suggested_target': round(target, 2),
+        'risk_reward': round(rr, 2),
+        'rank_score': round(rank_score, 2),
+        'rationale': rationale,
+        'provider': provider or 'system',
+        'fallback_reason': '',
+        'fallback_error': '',
+    }
+
+
+def _run_trade_finder_workflow(
+    find_progress_cb: Optional[Callable[[int, str], None]] = None,
+    ai_progress_cb: Optional[Callable[[int, str], None]] = None,
+    stream_rows_cb: Optional[Callable[[List[Dict[str, Any]], Dict[str, Any]], None]] = None,
+    rerank_only: bool = False,
+    *,
+    ui_mode: bool = True,
+    cancel_checker: Optional[Callable[[], bool]] = None,
+) -> None:
+    """
+    Executes scanner candidate discovery + Grok scoring.
+    Reuses existing find-new logic, then enriches/ranks candidates.
+    """
+    st.session_state['trade_finder_running'] = True
+    _data_gate = _trade_finder_data_gate_state(rerank_only=rerank_only)
+    if (not rerank_only) and bool(_data_gate.get('hard_block', False)):
+        _msg = (
+            "Trade Finder blocked until data is ready: "
+            f"{str(_data_gate.get('reason', '') or 'provider/market context not ready')}. "
+            "Run Fast Refresh / Refresh Mkt and retry."
+        )
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': _msg,
+            'ts': time.time(),
+        }
+        if callable(find_progress_cb):
+            try:
+                find_progress_cb(100, _msg)
+            except Exception:
+                pass
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(100, _msg)
+            except Exception:
+                pass
+        st.session_state['trade_finder_running'] = False
+        return
+    _cancelled = False
+    _report_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
+    _report_age_sec = max(0.0, time.time() - _report_ts) if _report_ts else 0.0
+    _report = st.session_state.get('find_new_trades_report', {}) or {}
+    if rerank_only:
+        if not _report:
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': "No cached Find New snapshot available. Run 'Find New Trades' first.",
+                'ts': time.time(),
+            }
+            if callable(find_progress_cb):
+                try:
+                    find_progress_cb(100, "Find New: no cached snapshot available.")
+                except Exception:
+                    pass
+            st.session_state['trade_finder_running'] = False
+            return
+        _ttl_min = float(st.session_state.get('find_new_cache_ttl_min', 20.0) or 20.0)
+        _fresh = bool(_report_ts and _report_age_sec <= (_ttl_min * 60.0))
+        _age_txt = _format_eta(_report_age_sec)
+        _mode_txt = "fresh" if _fresh else "stale"
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': (
+                f"Re-ranking cached Find New snapshot ({_mode_txt}, age {_age_txt}) "
+                f"without data fetch."
+            ),
+            'ts': time.time(),
+        }
+        if callable(find_progress_cb):
+            try:
+                find_progress_cb(100, f"Find New: cached snapshot reused ({_mode_txt}, age {_age_txt}).")
+            except Exception:
+                pass
+    else:
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': 'Running Find New Trades and AI ranking...',
+            'ts': time.time(),
+        }
+        _run_find_new_trades(
+            progress_cb=find_progress_cb,
+            stream_rows_cb=stream_rows_cb,
+            ui_mode=ui_mode,
+            cancel_checker=cancel_checker,
+        )
+        _report = st.session_state.get('find_new_trades_report', {}) or {}
+
+    report = _report
+    base_candidates = report.get('candidates', []) or []
+    _phase_rank = {"LEADING": 0, "EMERGING": 1}
+    ranked_candidates = sorted(
+        base_candidates,
+        key=lambda _c: (
+            _phase_rank.get(str(_c.get('sector_phase', '') or '').upper().strip(), 2),
+            -float(_c.get('score', 0) or 0),
+            str(_c.get('ticker', '') or ''),
+        ),
+    )
+    quality_settings = _trade_quality_settings()
+    macd_profile = str(quality_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+    run_id = datetime.now().strftime("TF_%Y%m%d_%H%M%S")
+    if not ranked_candidates:
+        st.session_state['trade_finder_results'] = {
+            'run_id': run_id,
+            'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'rows': [],
+            'provider': 'system',
+            'macd_profile': macd_profile,
+            'run_mode': 'rerank_only' if rerank_only else 'full_scan',
+            'elapsed_sec': 0.0,
+            'input_candidates': 0,
+            'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
+        }
+        _scan_universe = int(report.get('scan_universe', 0) or 0) if isinstance(report, dict) else 0
+        _results_count = int(report.get('results_count', 0) or 0) if isinstance(report, dict) else 0
+        if _scan_universe > 0:
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': (
+                    (
+                        f"Re-rank complete: reused cached scan "
+                        f"(analyzed {_results_count} result(s)), but no entry candidates passed current gates."
+                        if rerank_only else
+                        f"Run complete: scanned {_scan_universe} ticker(s), analyzed {_results_count} result(s), "
+                        "but no entry candidates passed current gates."
+                    )
+                ),
+                'ts': time.time(),
+            }
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(100, "AI ranking complete: no candidates passed scanner gates.")
+            except Exception:
+                pass
+        st.session_state['trade_finder_running'] = False
+        return
+
+    if callable(stream_rows_cb):
+        try:
+            _seed_preview = []
+            for _bc in ranked_candidates[:10]:
+                _seed_preview.append(
+                    {
+                        'ticker': str(_bc.get('ticker', '')).upper().strip(),
+                        'company_name': str(_bc.get('company_name', '') or '').strip() or "Unknown company",
+                        'price': float(_bc.get('price', 0) or 0),
+                        'ai_buy_recommendation': str(_bc.get('recommendation', 'Watch Only') or 'Watch Only'),
+                        'risk_reward': 0.0,
+                        'trade_score': float(_bc.get('score', 0.0) or 0.0),
+                        'rank_score': float(_bc.get('score', 0.0) or 0.0),
+                        'earn_days': int(_bc.get('earn_days', 999) or 999),
+                        'sector': str(_bc.get('sector', '') or '-'),
+                        'source': 'find_new_seed',
+                    }
+                )
+            stream_rows_cb(
+                _seed_preview,
+                {
+                    'phase': 'ai_seed',
+                    'processed': 0,
+                    'total': int(len(ranked_candidates)),
+                    'hard_gate_pass': 0,
+                    'ai_ranked': 0,
+                    'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                    'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                    'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                    'eta_sec': 0.0,
+                    'run_elapsed_sec': 0.0,
+                },
+            )
+        except Exception:
+            pass
+
+    ai_clients = _get_ai_clients()
+    snap = _build_dashboard_snapshot()
+    gate = _evaluate_trade_gate(snap)
+    ai_top_n_cfg = int(st.session_state.get('trade_finder_ai_top_n', 0) or 0)
+    # AI ranks only deterministic hard-gate passers.
+    ai_top_n = len(ranked_candidates) if ai_top_n_cfg <= 0 else max(0, ai_top_n_cfg)
+    ai_budget_sec = float(st.session_state.get('trade_finder_ai_budget_sec', 30.0) or 0.0)
+    ai_deadline_ts = (time.time() + ai_budget_sec) if ai_budget_sec > 0 else 0.0
+    ai_cache_ttl_sec = 6 * 60 * 60
+    rows = []
+    ai_eval_cache = st.session_state.get('_tf_ai_eval_cache', {}) or {}
+    provider_counts: Dict[str, int] = {}
+    fallback_counts: Dict[str, int] = {}
+    hard_gate_fail_counts: Dict[str, int] = {}
+    hard_gate_pass_count = 0
+    hard_gate_relaxed_pass_count = 0
+    ai_ranked_count = 0
+    relaxed_settings = dict(quality_settings)
+    relaxed_settings['breakout_max_dist_pct'] = float(quality_settings.get('breakout_max_dist_pct', 4.0) or 4.0) + 1.5
+    relaxed_settings['monthly_near_macd_pct'] = float(quality_settings.get('monthly_near_macd_pct', 0.08) or 0.08) + 0.03
+    relaxed_settings['monthly_near_ao_floor'] = float(quality_settings.get('monthly_near_ao_floor', -0.25) or -0.25) - 0.20
+    _t0 = time.time()
+    _tf_progress = None
+    if ui_mode and not callable(ai_progress_cb):
+        _tf_progress = st.progress(0, text=f"Scoring candidates with AI: 0/{len(ranked_candidates)}")
+    elif callable(ai_progress_cb):
+        try:
+            ai_progress_cb(0, f"Scoring candidates with AI: 0/{len(ranked_candidates)}")
+        except Exception:
+            pass
+
+    def _set_tf_progress(i: int, total: int, ticker: str):
+        pct = int((max(0, i) / max(1, total)) * 100)
+        _elapsed = max(0.001, time.time() - _t0)
+        _rate = float(i) / _elapsed if i > 0 else 0.0
+        _remain = max(0, total - i)
+        _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+        _txt = f"Scoring candidates with AI: {i}/{total} ({pct}%) — {ticker} | ETA {_format_eta(_eta_sec)}"
+        if callable(ai_progress_cb):
+            try:
+                ai_progress_cb(pct, _txt)
+            except Exception:
+                pass
+        if _tf_progress is not None:
+            try:
+                _tf_progress.progress(pct, text=_txt)
+            except TypeError:
+                _tf_progress.progress(pct)
+
+    for i, c in enumerate(ranked_candidates):
+        _cancel_req = bool(st.session_state.get('trade_finder_cancel_requested', False))
+        if callable(cancel_checker):
+            try:
+                _cancel_req = _cancel_req or bool(cancel_checker())
+            except Exception:
+                pass
+        if _cancel_req:
+            _cancelled = True
+            break
+        ticker = str(c.get('ticker', '')).upper().strip()
+        _set_tf_progress(i + 1, len(ranked_candidates), ticker)
+        company_name = str(c.get('company_name', '') or '').strip()
+        if not company_name:
+            company_name = _lookup_company_name_for_trade_finder(ticker)
+        earn_resolved = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=str(c.get('earn_date', '') or ''),
+            persisted_days=c.get('earn_days', 999),
+            persisted_source=str(c.get('earn_source', '') or ''),
+            persisted_confidence=str(c.get('earn_confidence', '') or ''),
+            verify_with_fetch=False,
+        )
+        earn_date = str(earn_resolved.get('next_earnings', c.get('earn_date', '')) or c.get('earn_date', '') or '').strip()
+        try:
+            earn_days = int(earn_resolved.get('days_until', c.get('earn_days', 999)) or c.get('earn_days', 999) or 999)
+        except Exception:
+            earn_days = int(c.get('earn_days', 999) or 999)
+        earn_source = str(earn_resolved.get('source', c.get('earn_source', '')) or c.get('earn_source', '') or '').strip()
+        earn_confidence = str(earn_resolved.get('confidence', c.get('earn_confidence', '')) or c.get('earn_confidence', '') or '').strip().upper()
+        _needs_verify = not _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+        if _needs_verify and i < 20:
+            # Bounded verified fetch for top candidates to reduce false n/a badges.
+            earn_verified = resolve_earnings_for_ticker(
+                ticker,
+                persisted_date=earn_date,
+                persisted_days=earn_days,
+                persisted_source=earn_source,
+                persisted_confidence=earn_confidence,
+                verify_with_fetch=True,
+            )
+            _ev_date = str(earn_verified.get('next_earnings', '') or '').strip()
+            if _ev_date:
+                earn_date = _ev_date
+                try:
+                    earn_days = int(earn_verified.get('days_until', earn_days) or earn_days)
+                except Exception:
+                    pass
+                earn_source = str(earn_verified.get('source', earn_source) or earn_source)
+                earn_confidence = str(earn_verified.get('confidence', earn_confidence) or earn_confidence).strip().upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date,
+        )
+        gate_seed = dict(c)
+        gate_seed.update({
+            'earn_date': earn_date,
+            'earn_days': earn_days,
+            'earn_source': earn_source,
+            'earn_confidence': earn_confidence,
+            'earn_trusted': bool(earn_trusted),
+        })
+        gate_eval = _evaluate_trade_finder_hard_gate(gate_seed, quality_settings)
+        gate_pass = bool(gate_eval.get('pass', False))
+        if gate_pass:
+            hard_gate_pass_count += 1
+        else:
+            for _code in (gate_eval.get('fail_codes', []) or []):
+                hard_gate_fail_counts[_code] = int(hard_gate_fail_counts.get(_code, 0) + 1)
+            gate_eval_relaxed = _evaluate_trade_finder_hard_gate(gate_seed, relaxed_settings)
+            if bool(gate_eval_relaxed.get('pass', False)):
+                hard_gate_relaxed_pass_count += 1
+
+        cand_sig = _trade_finder_candidate_signature(c)
+        cache_entry = ai_eval_cache.get(ticker, {}) if isinstance(ai_eval_cache, dict) else {}
+        cached_sig = str(cache_entry.get('signature', '') or '')
+        cached_ts = float(cache_entry.get('ts', 0) or 0.0)
+        cached_ai = cache_entry.get('ai_rec', {}) if isinstance(cache_entry, dict) else {}
+        cached_valid = bool(
+            isinstance(cached_ai, dict)
+            and cached_ai
+            and cached_sig == cand_sig
+            and (time.time() - cached_ts) <= ai_cache_ttl_sec
+        )
+
+        if not gate_pass:
+            ai_rec = _heuristic_trade_finder_ai(c)
+            ai_rec['provider'] = 'system'
+            ai_rec['ai_buy_recommendation'] = 'Skip'
+            ai_rec['fallback_reason'] = 'hard_gate_failed'
+            ai_rec['rationale'] = "Hard gate failed: " + "; ".join((gate_eval.get('fail_reasons', []) or [])[:3])
+        else:
+            if ai_ranked_count < ai_top_n:
+                ai_ranked_count += 1
+                if cached_valid:
+                    ai_rec = dict(cached_ai)
+                    ai_rec['fallback_reason'] = 'cached_ai_eval'
+                else:
+                    earn_days_now = int(earn_days or 999)
+                    if 0 <= earn_days_now <= 7:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['ai_buy_recommendation'] = 'Skip'
+                        ai_rec['fallback_reason'] = 'earnings_hard_block'
+                        ai_rec['rationale'] = f"PASS due to earnings in {earn_days_now}d; avoid pre-event gap risk."
+                    elif not earn_trusted:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['ai_buy_recommendation'] = 'Watch Only'
+                        ai_rec['fallback_reason'] = 'earnings_unverified'
+                        ai_rec['rationale'] = "Earnings date unverified; refresh earnings sources before considering entry."
+                    elif ai_deadline_ts and time.time() > ai_deadline_ts:
+                        ai_rec = _heuristic_trade_finder_ai(c)
+                        ai_rec['provider'] = 'system'
+                        ai_rec['fallback_reason'] = 'ai_time_budget'
+                    else:
+                        ai_rec = _grok_trade_finder_assessment(c, ai_clients)
+                        # Cache successful model-backed evaluations for fast reruns.
+                        if str(ai_rec.get('provider', '') or '') != 'system' and not str(ai_rec.get('fallback_reason', '') or ''):
+                            ai_eval_cache[ticker] = {
+                                'signature': cand_sig,
+                                'ts': time.time(),
+                                'ai_rec': dict(ai_rec),
+                            }
+                        elif cached_valid:
+                            ai_rec = dict(cached_ai)
+                            ai_rec['fallback_reason'] = 'cached_ai_eval'
+            else:
+                # Cap mode: still show best cached AI evaluation when available.
+                if cached_valid:
+                    ai_rec = dict(cached_ai)
+                    ai_rec['fallback_reason'] = 'cached_ai_eval'
+                else:
+                    ai_rec = _heuristic_trade_finder_ai(c)
+                    ai_rec['provider'] = 'system'
+                    ai_rec['fallback_reason'] = 'ai_top_n_limit'
+        entry = float(ai_rec.get('suggested_entry', c.get('price', 0)) or c.get('price', 0) or 0)
+        stop = float(ai_rec.get('suggested_stop_loss', 0) or 0)
+        target = float(ai_rec.get('suggested_target', 0) or 0)
+        support_ctx = derive_support_stop_levels(
+            entry=entry,
+            current_stop=stop,
+            support_price=float(c.get('support_price', 0) or 0),
+        )
+        support_price = float(support_ctx.get('support_price', 0) or 0)
+        support_distance_pct = float(support_ctx.get('support_distance_pct', 0) or 0)
+        support_stop_price = float(support_ctx.get('support_stop_price', 0) or 0)
+        support_stop = float(support_ctx.get('recommended_stop', 0) or 0)
+        stop_basis = str(support_ctx.get('stop_basis', '') or '')
+        if support_stop > 0 and entry > 0 and support_stop < entry:
+            stop = round(support_stop, 2)
+        if target > 0 and entry > 0 and stop > 0 and target <= entry:
+            # Keep a minimum 2R geometry when stop adjustment moves risk profile.
+            target = round(entry + ((entry - stop) * 2.0), 2)
+        ai_rr = float(ai_rec.get('risk_reward', 0) or 0)
+        # Canonical R:R is always derived from entry/stop/target levels.
+        rr = _calc_rr(entry, stop, target)
+        rationale = str(ai_rec.get('rationale', '') or '')
+        warnings = []
+        fallback_reason = str(ai_rec.get('fallback_reason', '') or '')
+        fallback_error = str(ai_rec.get('fallback_error', '') or '')
+        _data_state = str(c.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+        _data_source = str(c.get('data_source', 'unknown') or 'unknown').strip()
+        _data_age_sec = float(c.get('data_age_sec', 0.0) or 0.0)
+        _data_ts = float(c.get('data_ts', 0.0) or 0.0)
+        _data_fresh = bool(c.get('data_fresh', _data_state != "stale"))
+        if _data_state == "stale":
+            warnings.append(f"Source data is stale ({_format_eta(_data_age_sec)} old, {_data_source})")
+        if ai_rr > 0 and abs(ai_rr - rr) > 0.15:
+            warnings.append(f"AI R:R {ai_rr:.2f} differs from level-based R:R {rr:.2f}")
+        hinted_earn_days = _extract_earn_days_hint(rationale)
+        if hinted_earn_days is not None and abs(hinted_earn_days - earn_days) > 1:
+            warnings.append(f"Model note earnings hint ({hinted_earn_days}d) conflicts with signal ({earn_days}d)")
+        gold = _normalize_gold_ai_contract(
+            ticker,
+            {
+                'entry': entry,
+                'stop': stop,
+                'target': target,
+                'price': float(c.get('price', 0) or 0),
+            },
+            fallback_ai_buy=str(ai_rec.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only'),
+            fallback_confidence=int(c.get('conviction', 0) or 0),
+            fallback_rank_score=float(ai_rec.get('rank_score', 0) or 0),
+            sector_phase=str(c.get('sector_phase', '') or ''),
+        )
+        _rot_ctx = st.session_state.get('sector_rotation', {}) or {}
+        sector_name = _canonicalize_sector_name(str(c.get('sector', '') or '').strip(), _rot_ctx)
+        sector_phase = str(c.get('sector_phase', '') or '').strip()
+        if not sector_name or not sector_phase:
+            _ctx_text = " ".join([
+                str(c.get('summary', '') or ''),
+                rationale,
+                str(gold.get('note', '') or ''),
+            ]).strip()
+            if not sector_name:
+                sector_name = _canonicalize_sector_name(_infer_sector_from_text(_ctx_text), _rot_ctx)
+            if not sector_phase:
+                sector_phase = _infer_sector_phase_from_text(_ctx_text)
+        if sector_name and not sector_phase:
+            _phase = str((_rot_ctx.get(sector_name, {}) or {}).get('phase', '') or '').upper().strip()
+            if _phase:
+                sector_phase = _phase
+
+        analysis_note = _build_trade_finder_analysis_note(
+            scanner_summary=str(c.get('summary', '') or ''),
+            ai_note=str(gold.get('note', '') or rationale or ''),
+            ai_verdict=str(gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')) or 'Watch Only'),
+            ai_confidence=int(gold.get('confidence', 0) or 0),
+            sector=sector_name,
+            sector_phase=sector_phase,
+            earn_days=earn_days,
+            earn_trusted=bool(earn_trusted),
+            fallback_reason=fallback_reason,
+            is_gold_source=bool(gold.get('is_gold_source', False)),
+            support_price=support_price,
+            stop_price=stop,
+            stop_basis=stop_basis,
+            apex_buy=bool(c.get('apex_buy', False)),
+            apex_days_ago=int(c.get('apex_signal_days_ago', 999) or 999),
+            apex_tier=str(c.get('apex_signal_tier', '') or ''),
+            apex_regime=str(c.get('apex_signal_regime', '') or ''),
+        )
+        _decision_gate_status = gate.status if gate_pass else "NO_TRADE"
+        rows.append({
+            'ticker': ticker,
+            'trade_finder_run_id': run_id,
+            'company_name': company_name,
+            'price': float(c.get('price', 0) or 0),
+            'earn_date': earn_date,
+            'earn_days': earn_days,
+            'earn_source': earn_source,
+            'earn_confidence': earn_confidence,
+            'earn_trusted': bool(earn_trusted),
+            'reason': str(c.get('recommendation', '')) + f" | Conviction {int(c.get('conviction', 0) or 0)}/10",
+            'scanner_summary': str(c.get('summary', '') or ''),
+            'watchlists': str(c.get('watchlists', '') or ''),
+            'data_source': _data_source,
+            'data_ts': _data_ts,
+            'data_age_sec': round(_data_age_sec, 1),
+            'data_freshness_state': _data_state or 'fresh',
+            'data_fresh': bool(_data_fresh),
+            'ai_buy_recommendation': gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')),
+            'suggested_entry': round(entry, 2),
+            'suggested_stop_loss': round(stop, 2),
+            'suggested_target': round(target, 2),
+            'support_price': round(support_price, 2) if support_price > 0 else None,
+            'support_distance_pct': round(support_distance_pct, 2) if support_distance_pct > 0 else None,
+            'support_stop_price': round(support_stop_price, 2) if support_stop_price > 0 else None,
+            'stop_basis': stop_basis,
+            'risk_reward': round(float(gold.get('risk_reward', rr) or rr), 2),
+            'ai_reported_rr': round(ai_rr, 2),
+            'rank_score': float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
+            'ai_rationale': str(gold.get('note', '') or rationale or ''),
+            'analysis_note': analysis_note,
+            'ai_confidence': int(gold.get('confidence', 0) or 0),
+            'ai_position_sizing': str(gold.get('position_sizing', '') or ''),
+            'gold_source': bool(gold.get('is_gold_source', False)),
+            'consistency_warnings': warnings,
+            'provider': gold.get('provider', ai_rec.get('provider', 'system')),
+            'fallback_reason': fallback_reason,
+            'fallback_error': fallback_error,
+            'hard_gate_pass': bool(gate_pass),
+            'hard_gate_monthly_tag': str(gate_eval.get('monthly_tag', '') or ''),
+            'hard_gate_fail_codes': list(gate_eval.get('fail_codes', []) or []),
+            'hard_gate_fail_reasons': list(gate_eval.get('fail_reasons', []) or []),
+            'sector': sector_name,
+            'sector_phase': sector_phase,
+            'daily_macd_cross_recent': bool(c.get('daily_macd_cross_recent', False)),
+            'daily_ao_positive': bool(c.get('daily_ao_positive', False)),
+            'daily_ao_zero_cross_found': bool(c.get('daily_ao_zero_cross_found', False)),
+            'macd_profile': str(c.get('macd_profile', '') or ''),
+            'daily_macd_zone': str(c.get('daily_macd_zone', '') or ''),
+            'weekly_macd_zone': str(c.get('weekly_macd_zone', '') or ''),
+            'monthly_macd_zone': str(c.get('monthly_macd_zone', '') or ''),
+            'daily_macd_hist_pct': float(c.get('daily_macd_hist_pct', 0.0) or 0.0),
+            'weekly_macd_hist_pct': float(c.get('weekly_macd_hist_pct', 0.0) or 0.0),
+            'monthly_macd_hist_pct': float(c.get('monthly_macd_hist_pct', 0.0) or 0.0),
+            'mtf_zone_buy_approved': bool(c.get('mtf_zone_buy_approved', False)),
+            'mtf_zone_reject_reason': str(c.get('mtf_zone_reject_reason', '') or ''),
+            'mtf_zone_shadow_diff': bool(c.get('mtf_zone_shadow_diff', False)),
+            'weekly_bullish': bool(c.get('weekly_bullish', False)),
+            'monthly_bullish': bool(c.get('monthly_bullish', False)),
+            'monthly_macd_bullish': bool(c.get('monthly_macd_bullish', False)),
+            'monthly_ao_positive': bool(c.get('monthly_ao_positive', False)),
+            'market_spy_above_200': bool(c.get('market_spy_above_200', True)),
+            'market_vix_below_30': bool(c.get('market_vix_below_30', True)),
+            'market_vix_close': c.get('market_vix_close'),
+            'apex_buy': bool(c.get('apex_buy', False)),
+            'apex_signal_days_ago': int(c.get('apex_signal_days_ago', 999) or 999),
+            'apex_signal_tier': str(c.get('apex_signal_tier', '') or ''),
+            'apex_signal_regime': str(c.get('apex_signal_regime', '') or ''),
+            'resistance_price': c.get('resistance_price'),
+            'resistance_distance_pct': c.get('resistance_distance_pct'),
+            'decision_card': build_trade_decision_card(
+                ticker=ticker,
+                source="trade_finder",
+                recommendation=str(c.get('recommendation', '') or ''),
+                ai_buy_recommendation=str(gold.get('verdict', ai_rec.get('ai_buy_recommendation', 'Watch Only')) or 'Watch Only'),
+                conviction=max(int(c.get('conviction', 0) or 0), int(gold.get('confidence', 0) or 0)),
+                quality_grade=str(c.get('quality_grade', '?') or '?'),
+                entry=entry,
+                stop=stop,
+                target=target,
+                rank_score=float(gold.get('unified_rank_score', ai_rec.get('rank_score', 0) or 0) or 0),
+                regime=snap.regime,
+                gate_status=_decision_gate_status,
+                reason=str(c.get('summary', '') or str(c.get('recommendation', '') or '')),
+                ai_rationale=str(gold.get('note', '') or ai_rec.get('rationale', '') or ''),
+                sector_phase=sector_phase,
+                earn_days=earn_days,
+                explainability_bits=[
+                    f"rec={str(c.get('recommendation', '') or '')}",
+                    f"conv={int(c.get('conviction', 0) or 0)}",
+                    f"phase={sector_phase}",
+                    f"rr={float(gold.get('risk_reward', rr) or rr):.2f}",
+                    f"hard_gate={'PASS' if gate_pass else 'FAIL'}",
+                ],
+            ).to_dict(),
+        })
+        rows[-1]['trade_score'] = compute_trade_score(rows[-1])
+        _p = str(rows[-1].get('provider', 'system') or 'system')
+        provider_counts[_p] = int(provider_counts.get(_p, 0) + 1)
+        if fallback_reason:
+            fallback_counts[fallback_reason] = int(fallback_counts.get(fallback_reason, 0) + 1)
+        if callable(stream_rows_cb) and ((i + 1) % 5 == 0 or (i + 1) == len(ranked_candidates)):
+            try:
+                _elapsed = max(0.001, time.time() - _t0)
+                _rate = float(i + 1) / _elapsed if (i + 1) > 0 else 0.0
+                _remain = max(0, len(ranked_candidates) - (i + 1))
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                _preview = sorted(
+                    rows,
+                    key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+                    reverse=True,
+                )[:8]
+                stream_rows_cb(
+                    _preview,
+                    {
+                        'phase': 'ai_rank',
+                        'processed': int(i + 1),
+                        'total': int(len(ranked_candidates)),
+                        'hard_gate_pass': int(hard_gate_pass_count),
+                        'ai_ranked': int(ai_ranked_count),
+                        'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                        'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                        'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                        'eta_sec': float(_eta_sec or 0.0),
+                        'run_elapsed_sec': float(_elapsed or 0.0),
+                        'cancelled': bool(_cancelled),
+                    },
+                )
+            except Exception:
+                pass
+        elif callable(stream_rows_cb) and i == 0:
+            try:
+                _elapsed = max(0.001, time.time() - _t0)
+                _rate = 1.0 / _elapsed if _elapsed > 0 else 0.0
+                _remain = max(0, len(ranked_candidates) - 1)
+                _eta_sec = (_remain / _rate) if _rate > 0 else 0.0
+                _preview = sorted(
+                    rows,
+                    key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+                    reverse=True,
+                )[:8]
+                stream_rows_cb(
+                    _preview,
+                    {
+                        'phase': 'ai_rank',
+                        'processed': 1,
+                        'total': int(len(ranked_candidates)),
+                        'hard_gate_pass': int(hard_gate_pass_count),
+                        'ai_ranked': int(ai_ranked_count),
+                        'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                        'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                        'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                        'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                        'eta_sec': float(_eta_sec or 0.0),
+                        'run_elapsed_sec': float(_elapsed or 0.0),
+                        'cancelled': bool(_cancelled),
+                    },
+                )
+            except Exception:
+                pass
+    if _tf_progress is not None:
+        try:
+            _tf_progress.empty()
+        except Exception:
+            pass
+
+    rows = sorted(
+        rows,
+        key=lambda x: (float(x.get('trade_score', 0) or 0), float(x.get('rank_score', 0) or 0)),
+        reverse=True,
+    )
+    qualified_count = sum(1 for _r in rows if _trade_candidate_is_qualified(_r, quality_settings))
+    elapsed = max(0.0, time.time() - _t0)
+    if callable(stream_rows_cb):
+        try:
+            stream_rows_cb(
+                rows[:8],
+                {
+                    'phase': 'done' if not _cancelled else 'canceled',
+                    'processed': int(len(ranked_candidates)),
+                    'total': int(len(ranked_candidates)),
+                    'hard_gate_pass': int(hard_gate_pass_count),
+                    'ai_ranked': int(ai_ranked_count),
+                    'scoped_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'fetched_done': int((report or {}).get('results_count', 0) or 0),
+                    'fetched_total': int((report or {}).get('scan_universe', 0) or 0),
+                    'analysis_done': int((report or {}).get('results_count', 0) or 0),
+                    'analysis_total': int((report or {}).get('results_count', 0) or 0),
+                    'eta_sec': 0.0,
+                    'run_elapsed_sec': float(elapsed),
+                    'cancelled': bool(_cancelled),
+                },
+            )
+        except Exception:
+            pass
+    st.session_state['trade_finder_results'] = {
+        'run_id': run_id,
+        'generated_at_iso': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'rows': rows,
+        'provider': rows[0].get('provider', 'system') if rows else 'system',
+        'macd_profile': macd_profile,
+        'run_mode': 'rerank_only' if rerank_only else 'full_scan',
+        'elapsed_sec': elapsed,
+        'input_candidates': len(ranked_candidates),
+        'hard_gate_pass_count': int(hard_gate_pass_count),
+        'hard_gate_fail_count': int(max(0, len(ranked_candidates) - hard_gate_pass_count)),
+        'hard_gate_fail_counts': hard_gate_fail_counts,
+        'hard_gate_relaxed_pass_count': int(hard_gate_relaxed_pass_count),
+        'qualified_count': int(qualified_count),
+        'ai_ranked_count': int(ai_ranked_count),
+        'provider_counts': provider_counts,
+        'fallback_counts': fallback_counts,
+        'ai_top_n': ai_top_n,
+        'scan_scope': report.get('scan_scope', {}) if isinstance(report, dict) else {},
+    }
+    st.session_state['_tf_ai_eval_cache'] = ai_eval_cache
+    try:
+        get_journal().save_trade_finder_snapshot({
+            'generated_at_iso': st.session_state['trade_finder_results'].get('generated_at_iso', ''),
+            'run_id': run_id,
+            'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
+            'elapsed_sec': float(elapsed),
+            'input_candidates': int(len(ranked_candidates)),
+            'rows': rows,
+            'find_new_report': report,
+        })
+    except Exception:
+        pass
+    _append_perf_metric({
+        'kind': 'trade_finder',
+        'candidates_in': len(ranked_candidates),
+        'candidates_out': len(rows),
+        'hard_gate_pass': int(hard_gate_pass_count),
+        'ai_ranked': int(ai_ranked_count),
+        'sec': round(elapsed, 3),
+        'provider': st.session_state['trade_finder_results'].get('provider', 'system'),
+    })
+    st.session_state['trade_finder_last_status'] = {
+        'level': 'warning' if _cancelled else ('success' if len(rows) > 0 else 'info'),
+        'message': (
+            (
+                f"{'Re-rank' if rerank_only else 'Trade Finder'} canceled: processed {len(rows)}/{len(ranked_candidates)}; "
+                f"hard-gate pass {hard_gate_pass_count}; qualified {qualified_count}; AI ranked {ai_ranked_count}."
+            )
+            if _cancelled else
+            (
+                f"{'Re-rank' if rerank_only else 'Trade Finder'} complete: "
+                f"{hard_gate_pass_count}/{len(ranked_candidates)} passed hard gate; "
+                f"qualified/ready={qualified_count}; AI ranked {ai_ranked_count}; analyzed={len(rows)}. "
+                f"Relaxed-profile passers (strict-fail recovery): {hard_gate_relaxed_pass_count}."
+            )
+        ),
+        'ts': time.time(),
+    }
+    if callable(ai_progress_cb):
+        try:
+            ai_progress_cb(
+                100,
+                (
+                    f"Trade Finder canceled: processed {len(rows)}/{len(ranked_candidates)}, "
+                    f"hard-gate pass {hard_gate_pass_count}, qualified {qualified_count}, AI ranked {ai_ranked_count}."
+                    if _cancelled else
+                    f"Trade Finder complete: hard-gate pass {hard_gate_pass_count}/{len(ranked_candidates)}, "
+                    f"qualified {qualified_count}, AI ranked {ai_ranked_count}, "
+                    f"relaxed-profile passers {hard_gate_relaxed_pass_count}."
+                ),
+            )
+        except Exception:
+            pass
+    st.session_state['trade_finder_running'] = False
+
+
+def _persist_trade_finder_bg_state(state: Optional[Dict[str, Any]]) -> None:
+    """Persist compact Trade Finder background status for restart visibility."""
+    _state = dict(state or {})
+    if not _state:
+        return
+    _safe = {
+        'job_id': str(_state.get('id', '') or _state.get('job_id', '') or ''),
+        'name': str(_state.get('name', '') or ''),
+        'status': str(_state.get('status', '') or ''),
+        'status_text': str(_state.get('status_text', '') or ''),
+        'phase': str(_state.get('phase', '') or ''),
+        'find_pct': int(_state.get('find_pct', 0) or 0),
+        'ai_pct': int(_state.get('ai_pct', 0) or 0),
+        'processed': int(_state.get('processed', 0) or 0),
+        'total': int(_state.get('total', 0) or 0),
+        'hard_gate_pass': int(_state.get('hard_gate_pass', 0) or 0),
+        'ai_ranked': int(_state.get('ai_ranked', 0) or 0),
+        'scoped_total': int(_state.get('scoped_total', 0) or 0),
+        'fetched_done': int(_state.get('fetched_done', 0) or 0),
+        'fetched_total': int(_state.get('fetched_total', 0) or 0),
+        'analysis_done': int(_state.get('analysis_done', 0) or 0),
+        'analysis_total': int(_state.get('analysis_total', 0) or 0),
+        'eta_sec': float(_state.get('eta_sec', 0.0) or 0.0),
+        'run_elapsed_sec': float(_state.get('run_elapsed_sec', 0.0) or 0.0),
+        'fetch_rate_limited': bool(_state.get('fetch_rate_limited', False)),
+        'fetch_cooldown_sec': int(_state.get('fetch_cooldown_sec', 0) or 0),
+        'fetch_governor_interval_sec': float(_state.get('fetch_governor_interval_sec', 0.08) or 0.08),
+        'fetch_requests_last_1s': int(_state.get('fetch_requests_last_1s', 0) or 0),
+        'created_ts': float(_state.get('created_ts', time.time()) or time.time()),
+        'updated_ts': float(_state.get('updated_ts', time.time()) or time.time()),
+        'done_ts': float(_state.get('done_ts', 0.0) or 0.0),
+    }
+    st.session_state['_trade_finder_bg_persisted'] = _safe
+    try:
+        get_journal().save_trade_finder_bg_state(_safe)
+    except Exception:
+        pass
+
+
+def _start_trade_finder_background_run(*, rerank_only: bool = False, queue_if_running: bool = True) -> str:
+    """Start non-blocking Trade Finder run in a background thread.
+
+    Dedupes duplicate starts while a job is active and can queue one rerank to
+    launch after a full background scan finishes.
+    """
+    cleanup_background_jobs()
+    _requested_mode = "rerank" if rerank_only else "full"
+
+    _active_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    _active_job = get_background_job(_active_id) if _active_id else {}
+    _active_policy = evaluate_active_background_start(
+        _active_job,
+        requested_mode=_requested_mode,
+        queue_if_running=queue_if_running,
+    )
+    if _active_id and _active_job and bool(_active_policy.get('reuse_active', False)):
+        st.session_state['trade_finder_running'] = True
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_bg_job_id'] = _active_id
+        _persist_trade_finder_bg_state(_active_job)
+        if bool(_active_policy.get('queue_rerank', False)):
+            st.session_state['trade_finder_bg_rerank_queued'] = True
+        _msg = str(_active_policy.get('message', '') or '').strip() or "Background Trade Finder already running; using the current job."
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': _msg,
+            'ts': time.time(),
+        }
+        return _active_id
+
+    if not rerank_only:
+        _gate = _trade_finder_data_gate_state(rerank_only=False)
+        if bool(_gate.get('hard_block', False)):
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'warning',
+                'message': (
+                    "Background Trade Finder blocked: "
+                    f"{str(_gate.get('reason', '') or 'data not ready')}. "
+                    "Run Fast Refresh / Refresh Mkt and retry."
+                ),
+                'ts': time.time(),
+            }
+            return ""
+
+    _ctx = get_script_run_ctx()
+
+    def _worker(find_cb, ai_cb, stream_cb, cancel_cb):
+        _run_trade_finder_workflow(
+            find_progress_cb=find_cb,
+            ai_progress_cb=ai_cb,
+            stream_rows_cb=stream_cb,
+            rerank_only=rerank_only,
+            ui_mode=False,
+            cancel_checker=cancel_cb,
+        )
+
+    _name = "tf_rerank_bg" if rerank_only else "tf_full_bg"
+    _job_id = start_background_trade_finder_job(_worker, script_ctx=_ctx, name=_name)
+    if _job_id:
+        st.session_state['trade_finder_bg_job_id'] = _job_id
+        st.session_state['trade_finder_running'] = True
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state['trade_finder_bg_last_started_mode'] = _requested_mode
+        if not rerank_only:
+            # Queue flag is only for manual queueing behind a running full scan.
+            st.session_state['trade_finder_bg_rerank_queued'] = False
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': (
+                "Background re-rank started."
+                if rerank_only else
+                "Background Trade Finder scan started."
+            ),
+            'ts': time.time(),
+        }
+        _persist_trade_finder_bg_state({
+            'id': _job_id,
+            'name': _name,
+            'status': 'running',
+            'status_text': (
+                "Background re-rank started."
+                if rerank_only else
+                "Background Trade Finder scan started."
+            ),
+            'phase': 'queued',
+            'find_pct': 0,
+            'ai_pct': 0,
+            'processed': 0,
+            'total': 0,
+            'hard_gate_pass': 0,
+            'ai_ranked': 0,
+            'created_ts': time.time(),
+            'updated_ts': time.time(),
+        })
+    return str(_job_id or "")
+
+
+def _get_trade_finder_background_status() -> Dict[str, Any]:
+    _job_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    if not _job_id:
+        _persisted = st.session_state.get('_trade_finder_bg_persisted', {}) or {}
+        return dict(_persisted) if isinstance(_persisted, dict) else {}
+    _job = get_background_job(_job_id) or {}
+    if not _job:
+        _persisted = {
+            'id': _job_id,
+            'name': str(st.session_state.get('trade_finder_bg_last_started_mode', '') or ''),
+            'status': 'interrupted',
+            'status_text': 'Background worker not found (likely interrupted by app reload/reboot).',
+            'updated_ts': time.time(),
+            'done_ts': time.time(),
+        }
+        _persist_trade_finder_bg_state(_persisted)
+        st.session_state['trade_finder_running'] = False
+        st.session_state['trade_finder_cancel_requested'] = False
+        st.session_state.pop('trade_finder_bg_job_id', None)
+        return _persisted
+    _status = str(_job.get('status', '') or '').lower()
+    if _status in {"done", "failed", "canceled"}:
+        st.session_state['trade_finder_running'] = False
+        st.session_state['trade_finder_cancel_requested'] = False
+        _mode = bg_mode_from_job(_job)
+        _last_terminal = str(st.session_state.get('_trade_finder_bg_last_terminal_job_id', '') or '')
+        if _last_terminal != _job_id:
+            if _status == "done":
+                _msg = "Background Trade Finder run complete."
+                _lvl = "success"
+            elif _status == "canceled":
+                _msg = "Background Trade Finder run canceled."
+                _lvl = "warning"
+            else:
+                _err = str(_job.get('error', '') or '').strip()
+                _msg = f"Background Trade Finder run failed: {_err}" if _err else "Background Trade Finder run failed."
+                _lvl = "error"
+            st.session_state['trade_finder_last_status'] = {
+                'level': _lvl,
+                'message': _msg,
+                'ts': time.time(),
+            }
+            st.session_state['_trade_finder_bg_last_terminal_job_id'] = _job_id
+            st.session_state.pop('trade_finder_bg_job_id', None)
+
+            _manual_queue = bool(st.session_state.get('trade_finder_bg_rerank_queued', False))
+            _auto_enabled = bool(st.session_state.get('trade_finder_bg_auto_rerank', True))
+            _should_auto_rerank = should_auto_rerank_after_terminal(
+                status=_status,
+                mode=_mode,
+                manual_queue=_manual_queue,
+                auto_enabled=_auto_enabled,
+            )
+            if _status != "done" and _mode == "full":
+                st.session_state['trade_finder_bg_rerank_queued'] = False
+            if _should_auto_rerank:
+                _next_job = _start_trade_finder_background_run(rerank_only=True, queue_if_running=False)
+                if _next_job:
+                    st.session_state['trade_finder_bg_rerank_queued'] = False
+                    _job = get_background_job(_next_job) or {}
+    else:
+        st.session_state['trade_finder_running'] = True
+    _persist_trade_finder_bg_state(_job)
+    return _job
+
+
+def _request_trade_finder_background_cancel() -> bool:
+    _job_id = str(st.session_state.get('trade_finder_bg_job_id', '') or '').strip()
+    if not _job_id:
+        return False
+    _ok = bool(cancel_background_job(_job_id))
+    if _ok:
+        st.session_state['trade_finder_cancel_requested'] = True
+        st.session_state['trade_finder_bg_rerank_queued'] = False
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'warning',
+            'message': "Cancel requested. Background job will stop at the next checkpoint.",
+            'ts': time.time(),
+        }
+        _persist_trade_finder_bg_state({
+            'id': _job_id,
+            'status': 'cancel_requested',
+            'status_text': "Cancel requested. Waiting for checkpoint.",
+            'updated_ts': time.time(),
+        })
+    return _ok
+
+
+def _render_green_on_red_sector_finder(
+    source_rows: List[Dict[str, Any]],
+    *,
+    key_prefix: str = "exec",
+    include_ai_button: bool = True,
+) -> None:
+    """Render green-on-red sector strength scan and watchlist add suggestions."""
+    st.markdown("**🧠 Green-on-Red Sector Finder**")
+    st.caption(
+        "Find sectors/tickers holding green on down SPY days, and suggest additions to broaden your scan basket."
+    )
+    try:
+        _spy_key = "_green_red_spy_day_change"
+        _spy_ts_key = "_green_red_spy_day_change_ts"
+        _spy_day_change = None
+        _spy_cached_ts = float(st.session_state.get(_spy_ts_key, 0.0) or 0.0)
+        if (time.time() - _spy_cached_ts) < 300:
+            _spy_day_change = st.session_state.get(_spy_key)
+        else:
+            _spy_df = get_shared_spy_daily()
+            if _spy_df is not None and len(_spy_df) >= 2:
+                _prev = float(_spy_df["Close"].iloc[-2] or 0)
+                _last = float(_spy_df["Close"].iloc[-1] or 0)
+                if _prev > 0:
+                    _spy_day_change = ((_last - _prev) / _prev) * 100.0
+            st.session_state[_spy_key] = _spy_day_change
+            st.session_state[_spy_ts_key] = time.time()
+
+        if _spy_day_change is None:
+            st.info("SPY day-change unavailable right now. Try again after a refresh.")
+            return
+
+        _is_down = float(_spy_day_change) < 0
+        _dir = "DOWN" if _is_down else "UP"
+        _color = "🔴" if _is_down else "🟢"
+        st.caption(f"{_color} SPY day change: {float(_spy_day_change):+.2f}% ({_dir} day)")
+
+        _ticker_cache = st.session_state.get('ticker_data_cache', {}) or {}
+        _sector_bucket: Dict[str, Dict[str, Any]] = {}
+        _leaders: List[Dict[str, Any]] = []
+        _analysis_rows = source_rows if isinstance(source_rows, list) else []
+
+        for _r in _analysis_rows:
+            _t = str(_r.get('ticker', '') or '').upper().strip()
+            if not _t:
+                continue
+            _sec = str(_r.get('sector', '') or '').strip() or "Unknown"
+            _phase = str(_r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
+            _sector_key = f"{_sec} ({_phase})"
+
+            _day_chg = None
+            _td = (_ticker_cache.get(_t, {}) or {}).get('daily')
+            try:
+                if _td is not None and len(_td) >= 2:
+                    _p0 = float(_td['Close'].iloc[-2] or 0)
+                    _p1 = float(_td['Close'].iloc[-1] or 0)
+                    if _p0 > 0:
+                        _day_chg = ((_p1 - _p0) / _p0) * 100.0
+            except Exception:
+                _day_chg = None
+            if _day_chg is None:
+                continue
+
+            _bucket = _sector_bucket.setdefault(_sector_key, {
+                'sector': _sec,
+                'phase': _phase,
+                'total': 0,
+                'green': 0,
+                'sum_chg': 0.0,
+            })
+            _bucket['total'] += 1
+            if _day_chg > 0:
+                _bucket['green'] += 1
+            _bucket['sum_chg'] += float(_day_chg)
+            _leaders.append({
+                'ticker': _t,
+                'sector': _sec,
+                'phase': _phase,
+                'day_chg': float(_day_chg),
+                'conviction': int(_r.get('conviction', _r.get('ai_confidence', 0)) or 0),
+                'recommendation': str(_r.get('recommendation', _r.get('ai_buy_recommendation', '')) or ''),
+            })
+
+        if not _sector_bucket:
+            st.info("No per-ticker day-change data available in cache yet. Run Scan All / Find New first.")
+            return
+
+        _sector_rows = []
+        for _k, _v in _sector_bucket.items():
+            _tot = int(_v.get('total', 0) or 0)
+            _green = int(_v.get('green', 0) or 0)
+            _avg = (float(_v.get('sum_chg', 0.0) or 0.0) / _tot) if _tot > 0 else 0.0
+            _green_rate = (_green / _tot * 100.0) if _tot > 0 else 0.0
+            _sector_rows.append({
+                'sector_bucket': _k,
+                'sector': _v.get('sector', ''),
+                'phase': _v.get('phase', ''),
+                'green_count': _green,
+                'total_count': _tot,
+                'green_rate_pct': round(_green_rate, 1),
+                'avg_day_change_pct': round(_avg, 2),
+            })
+        _sector_rows = sorted(
+            _sector_rows,
+            key=lambda x: (float(x.get('green_rate_pct', 0) or 0), float(x.get('avg_day_change_pct', 0) or 0)),
+            reverse=True,
+        )
+        st.dataframe(pd.DataFrame(_sector_rows[:12]), hide_index=True, width="stretch")
+
+        _target_sectors = []
+        if _is_down:
+            for _s in _sector_rows:
+                if (
+                    float(_s.get('avg_day_change_pct', 0) or 0) > 0
+                    and float(_s.get('green_rate_pct', 0) or 0) >= 40.0
+                    and int(_s.get('total_count', 0) or 0) >= 2
+                ):
+                    _target_sectors.append(_s)
+        else:
+            _target_sectors = _sector_rows[:3]
+
+        if _target_sectors:
+            _target_labels = ", ".join([str(_s.get('sector_bucket', '')) for _s in _target_sectors[:4]])
+            if _is_down:
+                st.success(f"Suggested sector expansion today: {_target_labels}")
+            else:
+                st.info(f"Momentum sectors to monitor/add today: {_target_labels}")
+        else:
+            st.info("No strong green-on-red sector cluster detected yet.")
+
+        _bridge = st.session_state.get('watchlist_bridge')
+        _active_set = set()
+        try:
+            if _bridge:
+                _active_set = set(_bridge.get_watchlist_tickers() or [])
+        except Exception:
+            _active_set = set()
+
+        _leaders = sorted(_leaders, key=lambda x: (float(x.get('day_chg', 0) or 0), int(x.get('conviction', 0) or 0)), reverse=True)
+        _add_candidates = []
+        _target_sector_names = {str(_s.get('sector', '')) for _s in _target_sectors}
+        for _l in _leaders:
+            if _target_sector_names and str(_l.get('sector', '')) not in _target_sector_names:
+                continue
+            _t = str(_l.get('ticker', '')).upper().strip()
+            if not _t or _t in _active_set:
+                continue
+            _add_candidates.append(_l)
+        _add_candidates = _add_candidates[:12]
+
+        if _add_candidates:
+            st.caption("Suggested tickers to add to active watchlist:")
+            st.dataframe(pd.DataFrame(_add_candidates), hide_index=True, width="stretch")
+            if _bridge and st.button("➕ Add Top 5 Suggestions To Active Watchlist", key=f"{key_prefix}_green_red_add_top5", width="stretch"):
+                _added = 0
+                for _c in _add_candidates[:5]:
+                    _tk = str(_c.get('ticker', '')).upper().strip()
+                    if not _tk:
+                        continue
+                    try:
+                        _bridge.add_to_watchlist(WatchlistItem(ticker=_tk))
+                        _added += 1
+                    except Exception:
+                        pass
+                st.success(f"Added {_added} ticker(s) to active watchlist.")
+                st.rerun()
+        else:
+            st.caption("No additional ticker suggestions right now (or all are already in active watchlist).")
+
+        if include_ai_button and st.button("🤖 AI Sector Add Suggestion", key=f"{key_prefix}_green_red_ai_suggest", width="stretch"):
+            try:
+                _ai = _get_ai_clients()
+                _oc = _ai.get('openai_client')
+                _cfg = _ai.get('ai_config', {}) or {}
+                _model = _cfg.get('model', 'grok-3-fast')
+                if _oc is None:
+                    st.info("AI client unavailable. Using rule-based recommendation only.")
+                else:
+                    _payload = {
+                        'spy_day_change_pct': round(float(_spy_day_change), 2),
+                        'down_day': bool(_is_down),
+                        'top_sectors': _sector_rows[:6],
+                        'add_candidates': _add_candidates[:8],
+                    }
+                    _resp = _oc.chat.completions.create(
+                        model=_model,
+                        messages=[
+                            {"role": "system", "content": "Return 3 short bullet lines, execution-focused, no markdown tables."},
+                            {"role": "user", "content": f"Given this market-strength scan data, recommend sector adds and top ticker adds for a scanner watchlist: {_json.dumps(_payload)}"},
+                        ],
+                        max_tokens=220,
+                        temperature=0.2,
+                        timeout=18,
+                    )
+                    _txt = str((_resp.choices[0].message.content or '')).strip()
+                    if _txt:
+                        st.info(_txt)
+                    else:
+                        st.info("AI returned no text. Use rule-based suggestions above.")
+            except Exception as _e:
+                st.info(f"AI suggestion unavailable right now ({str(_e)[:140]}). Use rule-based suggestions above.")
+    except Exception as _e:
+        st.warning(f"Green-on-red analyzer unavailable in this session ({str(_e)[:140]}).")
+
+
+def render_trade_finder_tab():
+    """Top-level Trade Finder workflow with Grok ranking and click-through to Trade tab."""
+    # Apply queued scan profile before top-panel widgets are instantiated.
+    _profile_presets = _trade_scan_profile_presets()
+    _pending_profile = str(st.session_state.pop("_trade_scan_profile_pending", "") or "").strip().title()
+    if _pending_profile in _profile_presets:
+        _applied_profile = _apply_trade_scan_profile(_pending_profile)
+        st.session_state['trade_finder_last_status'] = {
+            'level': 'info',
+            'message': f"Scan profile applied: {_applied_profile}.",
+            'ts': time.time(),
+        }
+
+    _top_state = render_trade_finder_top_panel(
+        can_auto_rerank_cached_fn=can_auto_rerank_cached,
+        today_utc_str_fn=lambda: datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S UTC'),
+        get_fetch_health_status_fn=get_fetch_health_status,
+        trade_finder_data_gate_state_fn=_trade_finder_data_gate_state,
+        get_journal_fn=get_journal,
+        cleanup_background_jobs_fn=cleanup_background_jobs,
+        get_trade_finder_background_status_fn=_get_trade_finder_background_status,
+        bg_mode_from_job_fn=bg_mode_from_job,
+        start_trade_finder_background_run_fn=_start_trade_finder_background_run,
+        request_trade_finder_background_cancel_fn=_request_trade_finder_background_cancel,
+        format_eta_fn=_format_eta,
+        fmt_last_update_fn=_fmt_last_update,
+        render_green_on_red_sector_finder_fn=_render_green_on_red_sector_finder,
+    )
+    if isinstance(_top_state, dict):
+        alert_tickers: Set[str] = set(_top_state.get('alert_tickers', set()) or set())
+    else:
+        alert_tickers = set(getattr(_top_state, 'alert_tickers', set()) or set())
+    jm = get_journal()
+
+    # Simple scan profile presets for fast user control.
+    _profiles = list(_profile_presets.keys())
+    _profile_default = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+    if _profile_default not in _profiles:
+        _profile_default = "Balanced"
+    def _on_profile_change():
+        _sel = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+        st.session_state["_trade_scan_profile_pending"] = _sel
+
+    st.radio(
+        "Scan Profile",
+        options=_profiles,
+        horizontal=True,
+        key="trade_scan_profile",
+        on_change=_on_profile_change,
+        help=(
+            "Strict = highest quality/lowest count. "
+            "Balanced = default. "
+            "Loose = broader search to avoid empty candidate lists."
+        ),
+    )
+    _profile_selected = str(st.session_state.get("trade_scan_profile", _profile_default) or _profile_default).strip().title()
+    _profile_applied = str(st.session_state.get("_trade_scan_profile_applied", "") or "").strip().title()
+    if _profile_selected not in _profiles:
+        _profile_selected = "Balanced"
+    if _profile_applied not in _profiles:
+        _profile_applied = ""
+
+    results = st.session_state.get('trade_finder_results', {}) or {}
+    rows = results.get('rows', []) or []
+    # Backfill sector/phase on loaded snapshots so cards don't show unknown labels.
+    _rot_ctx = st.session_state.get('sector_rotation', {}) or {}
+    _ticker_sector_ctx = st.session_state.get('ticker_sectors', {}) or {}
+    _scan_sector_map: Dict[str, str] = {}
+    for _s in (st.session_state.get('scan_results_summary', []) or []):
+        _t = str(_s.get('ticker', '') or '').upper().strip()
+        _sec = str(_s.get('sector', '') or '').strip()
+        if _t and _sec:
+            _scan_sector_map[_t] = _sec
+    _rows_touched = False
+    for _r in rows:
+        _resolved = _resolve_trade_finder_sector_fields(
+            _r,
+            rotation_ctx=_rot_ctx,
+            ticker_sector_ctx=_ticker_sector_ctx,
+            scan_sector_map=_scan_sector_map,
+            allow_fetch=True,
+        )
+        _sec_new = str(_resolved.get('sector', '') or '').strip()
+        _phase_new = str(_resolved.get('sector_phase', '') or '').strip()
+        if _sec_new and _sec_new != str(_r.get('sector', '') or '').strip():
+            _r['sector'] = _sec_new
+            _rows_touched = True
+        if _phase_new and _phase_new != str(_r.get('sector_phase', '') or '').strip():
+            _r['sector_phase'] = _phase_new
+            _rows_touched = True
+    _earn_touched = _backfill_trade_finder_earnings(rows, verify_limit=15)
+    if _earn_touched > 0:
+        _rows_touched = True
+    _hg_settings = _trade_quality_settings()
+    _hg_sig = {
+        'macd_profile': str(_hg_settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY),
+        'breakout_min_dist_pct': float(_hg_settings.get('breakout_min_dist_pct', 0.0) or 0.0),
+        'breakout_max_dist_pct': float(_hg_settings.get('breakout_max_dist_pct', 0.0) or 0.0),
+        'monthly_near_macd_pct': float(_hg_settings.get('monthly_near_macd_pct', 0.0) or 0.0),
+        'monthly_near_ao_floor': float(_hg_settings.get('monthly_near_ao_floor', 0.0) or 0.0),
+        'apex_primary': bool(_hg_settings.get('apex_primary', True)),
+        'apex_bear_vix_threshold': float(_hg_settings.get('apex_bear_vix_threshold', 20.0) or 20.0),
+    }
+    _force_hg_refresh = dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
+    _hg_pass_count = 0
+    _hg_fail_counts: Dict[str, int] = {}
+    _relaxed_settings = dict(_hg_settings)
+    _relaxed_settings['breakout_max_dist_pct'] = float(_hg_settings.get('breakout_max_dist_pct', 4.0) or 4.0) + 1.5
+    _relaxed_settings['monthly_near_macd_pct'] = float(_hg_settings.get('monthly_near_macd_pct', 0.08) or 0.08) + 0.03
+    _relaxed_settings['monthly_near_ao_floor'] = float(_hg_settings.get('monthly_near_ao_floor', -0.25) or -0.25) - 0.20
+    _hg_relaxed_pass_count = 0
+    for _r in rows:
+        _gate_eval = _evaluate_trade_finder_hard_gate(_r, _hg_settings)
+        _new_pass = bool(_gate_eval.get('pass', False))
+        _new_monthly = str(_gate_eval.get('monthly_tag', '') or '')
+        _new_codes = list(_gate_eval.get('fail_codes', []) or [])
+        _new_reasons = list(_gate_eval.get('fail_reasons', []) or [])
+        if _new_pass:
+            _hg_pass_count += 1
+        else:
+            for _code in _new_codes:
+                _hg_fail_counts[_code] = int(_hg_fail_counts.get(_code, 0) + 1)
+        if bool(_evaluate_trade_finder_hard_gate(_r, _relaxed_settings).get('pass', False)):
+            _hg_relaxed_pass_count += 1
+
+        if (
+            _force_hg_refresh
+            or bool(_r.get('hard_gate_pass', True)) != _new_pass
+            or str(_r.get('hard_gate_monthly_tag', '') or '') != _new_monthly
+            or list(_r.get('hard_gate_fail_codes', []) or []) != _new_codes
+            or list(_r.get('hard_gate_fail_reasons', []) or []) != _new_reasons
+        ):
+            _r['hard_gate_pass'] = _new_pass
+            _r['hard_gate_monthly_tag'] = _new_monthly
+            _r['hard_gate_fail_codes'] = _new_codes
+            _r['hard_gate_fail_reasons'] = _new_reasons
+            _rows_touched = True
+
+    if (
+        int(results.get('hard_gate_pass_count', -1) or -1) != int(_hg_pass_count)
+        or int(results.get('hard_gate_fail_count', -1) or -1) != int(max(0, len(rows) - _hg_pass_count))
+        or dict(results.get('hard_gate_fail_counts', {}) or {}) != _hg_fail_counts
+        or int(results.get('hard_gate_relaxed_pass_count', -1) or -1) != int(_hg_relaxed_pass_count)
+        or dict(results.get('_hard_gate_signature', {}) or {}) != _hg_sig
+    ):
+        results['hard_gate_pass_count'] = int(_hg_pass_count)
+        results['hard_gate_fail_count'] = int(max(0, len(rows) - _hg_pass_count))
+        results['hard_gate_fail_counts'] = dict(_hg_fail_counts)
+        results['hard_gate_relaxed_pass_count'] = int(_hg_relaxed_pass_count)
+        results['_hard_gate_signature'] = dict(_hg_sig)
+        _rows_touched = True
+    if _rows_touched:
+        st.session_state['trade_finder_results'] = results
+
+    if not rows:
+        _find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        if _find_new:
+            _flt = ((_find_new.get('scan_scope', {}) or {}).get('filtered_counts', {}) or {})
+            st.caption(
+                f"Last run: {_find_new.get('generated_at_iso', '')} | "
+                f"Requested: {int((_find_new.get('scan_scope', {}) or {}).get('requested_universe', 0) or 0)} | "
+                f"Effective: {int((_find_new.get('scan_scope', {}) or {}).get('effective_universe', 0) or 0)} | "
+                f"Analyzed: {int(_find_new.get('results_count', 0) or 0)} | "
+                f"Candidates: {int(_find_new.get('candidate_count', 0) or 0)}"
+            )
+            if _flt:
+                st.caption(
+                    "Scope diagnostics: "
+                    f"sector_filtered={int(_flt.get('sector_filter', 0) or 0)}, "
+                    f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
+                    f"unknown_sector_seen={int(_flt.get('unknown_sector', 0) or 0)}, "
+                    f"rotation_unknown_kept={int(_flt.get('rotation_unknown_kept', 0) or 0)}, "
+                    f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}, "
+                    f"priority(L/E/O)={int(_flt.get('priority_leading', 0) or 0)}/"
+                    f"{int(_flt.get('priority_emerging', 0) or 0)}/"
+                    f"{int(_flt.get('priority_other', 0) or 0)}, "
+                    f"governor_hits={int(_flt.get('governor_hits', 0) or 0)}, "
+                    f"batch={int(_flt.get('effective_batch_size', 0) or 0)}"
+                )
+        st.info("Click Find New Trades to generate ranked candidates.")
+        return
+
+    settings = _trade_quality_settings()
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        st.number_input(
+            "Min R:R",
+            min_value=0.5,
+            max_value=5.0,
+            step=0.1,
+            format="%.1f",
+            key="trade_min_rr_threshold",
+            help="Candidates below this risk/reward are excluded from Ready-to-Enter list.",
+        )
+    with fc2:
+        st.number_input(
+            "Block if earnings <= days",
+            min_value=0,
+            max_value=30,
+            step=1,
+            key="trade_earnings_block_days",
+            help="Candidates with earnings inside this window are excluded by default.",
+        )
+    with fc3:
+        st.checkbox(
+            "Require READY",
+            key="trade_require_ready",
+            help="Only include decision-card READY candidates.",
+        )
+    fcx1, fcx2 = st.columns(2)
+    with fcx1:
+        st.checkbox(
+            "Include Watch Only ideas",
+            key="trade_include_watch_only",
+            help="When enabled, Watch Only AI ratings are included if other gates pass.",
+        )
+    with fcx2:
+        st.checkbox(
+            "Require fresh data",
+            key="trade_require_fresh_data",
+            help="Filters out stale candidates so Ready list uses current/fresh inputs only.",
+        )
+    with st.expander("🎯 Breakout Hard Gate Rules", expanded=False):
+        _gate_profile = str(settings.get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+        if _gate_profile == MACD_PROFILE_HPOTTER_ZONE:
+            st.caption("HPotter zone mode active: hard gate follows signal-engine MTF zone approval (daily timing + weekly/monthly momentum).")
+        elif _gate_profile == MACD_PROFILE_SHADOW:
+            st.caption("Shadow mode active: live gates remain legacy while HPotter zone diagnostics are still computed.")
+        hg1, hg2 = st.columns(2)
+        with hg1:
+            st.number_input(
+                "Breakout min distance to resistance (%)",
+                min_value=0.0,
+                max_value=10.0,
+                step=0.1,
+                format="%.1f",
+                key="trade_breakout_min_dist_pct",
+                help="Ticker must be close enough to key resistance to support breakout-alert workflow.",
+            )
+            st.number_input(
+                "Monthly near-green MACD tolerance",
+                min_value=0.0,
+                max_value=0.5,
+                step=0.01,
+                format="%.2f",
+                key="trade_monthly_near_macd_pct",
+                help="Allows monthly MACD to be slightly below signal while still qualifying as near-green.",
+            )
+        with hg2:
+            st.number_input(
+                "Breakout max distance to resistance (%)",
+                min_value=0.1,
+                max_value=20.0,
+                step=0.1,
+                format="%.1f",
+                key="trade_breakout_max_dist_pct",
+                help="Ticker too far below resistance is filtered out for breakout focus.",
+            )
+            st.number_input(
+                "Monthly AO near-green floor",
+                min_value=-5.0,
+                max_value=1.0,
+                step=0.05,
+                format="%.2f",
+                key="trade_monthly_near_ao_floor",
+                help="Minimum monthly AO value allowed for near-green monthly setup.",
+            )
+        hg3, hg4 = st.columns(2)
+        with hg3:
+            st.checkbox(
+                "Use APEX backtested gate (recommended)",
+                key="trade_apex_primary",
+                help="When enabled, hard gate prioritizes the backtested APEX rule stack for Trade Finder qualification.",
+            )
+        with hg4:
+            st.number_input(
+                "APEX bear filter VIX threshold",
+                min_value=15.0,
+                max_value=40.0,
+                step=0.5,
+                format="%.1f",
+                key="trade_apex_bear_vix_threshold",
+                help="APEX bear filter blocks entries only when SPY is below 200-day and VIX is above this level.",
+            )
+        _rows_for_tune = list(results.get('rows', []) or [])
+        _tune_col1, _tune_col2 = st.columns([1, 2])
+        with _tune_col1:
+            if st.button("🧠 Auto-Calibrate Gate", key="tf_auto_calibrate_gate", width="stretch", help="Tune hard-gate thresholds from latest run."):
+                _curr = _trade_quality_settings()
+                _tuning = _suggest_trade_gate_settings(_rows_for_tune, _curr)
+                st.session_state['trade_gate_tuning_last'] = _tuning
+                if bool(_tuning.get('updated', False)):
+                    _s = _tuning.get('suggested', {}) or {}
+                    st.session_state['trade_gate_pending_apply'] = {
+                        'trade_breakout_max_dist_pct': float(_s.get('breakout_max_dist_pct', _curr.get('breakout_max_dist_pct', 4.0)) or _curr.get('breakout_max_dist_pct', 4.0)),
+                        'trade_monthly_near_macd_pct': float(_s.get('monthly_near_macd_pct', _curr.get('monthly_near_macd_pct', 0.08)) or _curr.get('monthly_near_macd_pct', 0.08)),
+                        'trade_monthly_near_ao_floor': float(_s.get('monthly_near_ao_floor', _curr.get('monthly_near_ao_floor', -0.25)) or _curr.get('monthly_near_ao_floor', -0.25)),
+                        '_reason': str(_tuning.get('reason', 'Hard gate auto-calibrated.')),
+                    }
+                    _ai_note = _ai_tuning_note(len(_rows_for_tune), _tuning, _curr)
+                    if _ai_note:
+                        st.session_state['trade_gate_tuning_ai_note'] = _ai_note
+                    else:
+                        st.session_state.pop('trade_gate_tuning_ai_note', None)
+                    st.rerun()
+                else:
+                    st.info(str(_tuning.get('reason', 'Gate already within target selectivity band.')))
+        with _tune_col2:
+            _last_tune = st.session_state.get('trade_gate_tuning_last', {}) or {}
+            if _last_tune:
+                st.caption(
+                    f"Calibration: current={int(_last_tune.get('current_pass', 0) or 0)} | "
+                    f"suggested={int(_last_tune.get('suggested_pass', 0) or 0)} | "
+                    f"target band={(_last_tune.get('target_band', [0, 0]) or [0, 0])[0]}-"
+                    f"{(_last_tune.get('target_band', [0, 0]) or [0, 0])[1]}"
+                )
+                _ai_note = str(st.session_state.get('trade_gate_tuning_ai_note', '') or '').strip()
+                if _ai_note:
+                    st.caption(f"AI note: {_ai_note}")
+            _applied = st.session_state.get('trade_gate_last_applied', {}) or {}
+            if _applied:
+                st.caption(
+                    "Applied filters: "
+                    f"max dist {float(_applied.get('trade_breakout_max_dist_pct', settings.get('breakout_max_dist_pct', 4.0))):.1f}% | "
+                    f"monthly MACD tol {float(_applied.get('trade_monthly_near_macd_pct', settings.get('monthly_near_macd_pct', 0.08))):.2f} | "
+                    f"monthly AO floor {float(_applied.get('trade_monthly_near_ao_floor', settings.get('monthly_near_ao_floor', -0.25))):.2f}"
+                )
+    st.number_input(
+        "AI Rank Top N",
+        min_value=0,
+        max_value=100,
+        step=1,
+        key="trade_finder_ai_top_n",
+        help="0 = all candidates use live AI scoring. Set >0 to cap API usage and speed up runs.",
+    )
+    st.number_input(
+        "AI max seconds",
+        min_value=0.0,
+        max_value=120.0,
+        step=5.0,
+        key="trade_finder_ai_budget_sec",
+        help="Runtime cap for live AI ranking. Remaining candidates fall back to fast model/system scoring.",
+    )
+    settings = _trade_quality_settings()
+    _tf_gate = _evaluate_trade_gate(_build_dashboard_snapshot())
+    _tf_gate_status = _normalize_gate_status(_tf_gate.status)
+    if _tf_gate.severity == "danger":
+        st.error(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    elif _tf_gate.severity == "warning":
+        st.warning(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    else:
+        st.success(f"Execution Authority: {_tf_gate.label} — {_tf_gate.reason}")
+    st.caption("Ticker colors are now unified with this gate: NO_TRADE forces red; TRADE_LIGHT downgrades green to yellow.")
+
+    for _r in rows:
+        _cls = _classify_trade_candidate_color(_r, _tf_gate_status, settings=settings)
+        _r['market_class'] = str(_cls.get('level', 'YELLOW'))
+        _r['market_class_label'] = str(_cls.get('label', 'WATCH'))
+        _r['market_class_icon'] = str(_cls.get('icon', '🟡'))
+        _r['market_class_color'] = str(_cls.get('color', '#f59e0b'))
+        _r['market_class_reason'] = str(_cls.get('reason', ''))
+
+    qualified_rows = [r for r in rows if _trade_candidate_is_qualified(r, settings)]
+    hard_failed_rows = [r for r in rows if bool(r.get('hard_gate_pass', True)) is False]
+
+    st.caption(
+        f"Generated: {results.get('generated_at_iso', '')} | "
+        f"Run: {results.get('run_id', 'n/a') or 'n/a'} | "
+        f"MACD profile: {str(settings.get('macd_profile', MACD_PROFILE_LEGACY)).upper()} | "
+        f"Candidates: {len(rows)} | Hard-gate pass: {int(results.get('hard_gate_pass_count', 0) or 0)} | "
+        f"Relaxed-profile pass: {int(results.get('hard_gate_relaxed_pass_count', 0) or 0)} | "
+        f"Ready: {len(qualified_rows)} | Runtime: {float(results.get('elapsed_sec', 0) or 0):.1f}s | "
+        f"Provider: {results.get('provider', 'system')}"
+    )
+    st.caption("Snapshot is saved daily and restored after app restart.")
+    _pc = results.get('provider_counts', {}) or {}
+    _fc = results.get('fallback_counts', {}) or {}
+    _hfc = results.get('hard_gate_fail_counts', {}) or {}
+    _pn = int(results.get('ai_top_n', st.session_state.get('trade_finder_ai_top_n', 12)) or 12)
+    if _pc:
+        st.caption("Provider mix: " + ", ".join([f"{k}={v}" for k, v in sorted(_pc.items())]))
+    if _fc:
+        st.caption("AI fallback reasons: " + ", ".join([f"{k}={v}" for k, v in sorted(_fc.items())]) + f" | AI Top N={_pn}")
+    if _hfc:
+        st.caption("Hard-gate fails: " + ", ".join([f"{k}={v}" for k, v in sorted(_hfc.items())]))
+    if int(results.get('hard_gate_pass_count', 0) or 0) == 0 and int(results.get('hard_gate_relaxed_pass_count', 0) or 0) > 0:
+        st.warning(
+            "Strict hard gate returned zero passers. "
+            f"A slightly relaxed profile would pass {int(results.get('hard_gate_relaxed_pass_count', 0) or 0)} ticker(s). "
+            "Consider widening breakout distance and monthly near-green tolerance."
+        )
+    if hard_failed_rows:
+        with st.expander(f"🚫 Hard-Gate Failures ({len(hard_failed_rows)})", expanded=False):
+            st.caption("These tickers were scanned but blocked before AI ranking due to deterministic setup rules.")
+            for _rf in hard_failed_rows[:80]:
+                _t = str(_rf.get('ticker', '')).upper().strip()
+                _codes = ", ".join([str(x) for x in (_rf.get('hard_gate_fail_codes', []) or [])[:4]])
+                _reasons = "; ".join([str(x) for x in (_rf.get('hard_gate_fail_reasons', []) or [])[:2]])
+                st.caption(f"{_t}: {_codes} | {_reasons}")
+    _scope = results.get('scan_scope', {}) or {}
+    if _scope:
+        _flt = _scope.get('filtered_counts', {}) or {}
+        st.caption(
+            "Scan scope: "
+            f"requested={int(_scope.get('requested_universe', 0) or 0)}, "
+            f"effective={int(_scope.get('effective_universe', 0) or 0)}, "
+            f"sector_filtered={int(_flt.get('sector_filter', 0) or 0)}, "
+            f"rotation_filtered={int(_flt.get('rotation_filter', 0) or 0)}, "
+            f"unknown_sector_filtered={int(_flt.get('unknown_sector', 0) or 0)}, "
+            f"rotation_unknown_kept={int(_flt.get('rotation_unknown_kept', 0) or 0)}, "
+            f"max_filtered={int(_flt.get('max_tickers', 0) or 0)}"
+        )
+    _tf_chart_err = str(st.session_state.get('trade_finder_chart_error', '') or '').strip()
+    if _tf_chart_err:
+        st.warning(f"Chart load blocked: {_tf_chart_err[:220]}")
+    _inline_chart_ticker = str(st.session_state.get('trade_finder_inline_chart_ticker', '') or '').upper().strip()
+    _chart_focus = bool(st.session_state.get('trade_finder_chart_focus', False))
+
+    def _render_trade_finder_inline_chart_panel():
+        if not _inline_chart_ticker:
+            return
+        st.divider()
+        st.markdown("### 📈 Chart Focus")
+        ctrl1, ctrl2 = st.columns([1, 5])
+        with ctrl1:
+            if st.button("⬅ Back", key="tf_chart_back_top", width="stretch", help="Return to Trade Finder list"):
+                st.session_state.pop('trade_finder_inline_chart_ticker', None)
+                st.session_state['trade_finder_chart_focus'] = False
+                st.session_state.pop('trade_finder_scroll_to_chart', None)
+                st.rerun()
+        with ctrl2:
+            st.caption(f"Focused chart: {_inline_chart_ticker} | Use Back to return to the candidate list.")
+
+        st.markdown('<div id="tf_chart_focus_anchor"></div>', unsafe_allow_html=True)
+        if st.session_state.pop('trade_finder_scroll_to_chart', False):
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <script>
+                setTimeout(function() {
+                  var doc = window.parent.document;
+                  var el = doc.getElementById('tf_chart_focus_anchor');
+                  if (el) { el.scrollIntoView({behavior:'smooth', block:'start'}); }
+                }, 60);
+                </script>
+                """,
+                height=0,
+            )
+
+        _sel = st.session_state.get('selected_analysis')
+        _sel_ticker = str(getattr(_sel, 'ticker', '') or '').upper().strip() if _sel is not None else ''
+        try:
+            _have_daily = _ensure_ticker_chart_cache(
+                _inline_chart_ticker,
+                include_weekly=False,
+                include_monthly=False,
+                include_market_context=True,
+            )
+            if _sel is not None and _sel_ticker == _inline_chart_ticker:
+                _render_chart_tab(_inline_chart_ticker, _sel.signal, key_ns="tf_inline")
+            else:
+                _tf_cache = st.session_state.get('_tf_inline_analysis_cache', {}) or {}
+                _tf_analysis = _tf_cache.get(_inline_chart_ticker)
+                if _tf_analysis is None:
+                    _data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+                    _tf_data = dict((_data_cache.get(_inline_chart_ticker, {}) if isinstance(_data_cache, dict) else {}) or {})
+                    if _tf_data.get('daily') is None:
+                        _have_daily = _ensure_ticker_chart_cache(_inline_chart_ticker, include_market_context=True)
+                        _data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+                        _tf_data = dict((_data_cache.get(_inline_chart_ticker, {}) if isinstance(_data_cache, dict) else {}) or {})
+                    if not _have_daily or _tf_data.get('daily') is None:
+                        raise ValueError("No daily chart data available")
+                    _tf_data['ticker'] = _inline_chart_ticker
+                    _tf_data.setdefault('market_filter', get_shared_market_filter())
+                    _macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+                    _tf_analysis = analyze_ticker(_tf_data, macd_profile=_macd_profile)
+                    _tf_cache[_inline_chart_ticker] = _tf_analysis
+                    st.session_state['_tf_inline_analysis_cache'] = _tf_cache
+                    _analysis_cache = st.session_state.get('_ticker_analysis_cache', {}) or {}
+                    _analysis_cache[_inline_chart_ticker] = _tf_analysis
+                    st.session_state['_ticker_analysis_cache'] = _analysis_cache
+                st.session_state['selected_ticker'] = _inline_chart_ticker
+                st.session_state['selected_analysis'] = _tf_analysis
+                _render_chart_tab(_inline_chart_ticker, _tf_analysis.signal, key_ns="tf_inline")
+        except Exception as _e:
+            st.warning(f"Unable to load chart for {_inline_chart_ticker}: {str(_e)[:120]}")
+
+    if _inline_chart_ticker:
+        _render_trade_finder_inline_chart_panel()
+        if _chart_focus:
+            st.divider()
+            st.info("Chart focus mode is active. Click Back to return to Trade Finder candidates.")
+            return
+
+    _profile_mode = str(st.session_state.get("trade_scan_profile", "Balanced") or "Balanced").strip().title()
+    _auto_fallback_rows = [r for r in rows if bool(r.get('hard_gate_pass', False))]
+
+    if not qualified_rows and not (_profile_mode in {"Balanced", "Loose"} and _auto_fallback_rows):
+        st.warning("No candidates meet current quality gates. Relax filters or run Find New Trades again.")
+        _hard_pass_rows = [r for r in rows if bool(r.get('hard_gate_pass', False))]
+        _not_ready_rows = []
+        if bool(settings.get('require_ready', True)):
+            for _r in _hard_pass_rows:
+                _card = _r.get('decision_card', {}) or {}
+                if str(_card.get('execution_readiness', '')).upper() != "READY":
+                    _not_ready_rows.append(_r)
+        if _hard_pass_rows:
+            st.info(
+                f"{len(_hard_pass_rows)} ticker(s) passed hard gate but failed final filters. "
+                "You can expose them immediately without rescanning."
+            )
+            _quick_cols = st.columns(3)
+            with _quick_cols[0]:
+                if (
+                    not bool(settings.get('include_watch_only', True))
+                    and st.button("👁 Include Watch Only (no rescan)", key="tf_relax_watch_only", width="stretch")
+                ):
+                    st.session_state['trade_include_watch_only'] = True
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Watch Only ideas enabled for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with _quick_cols[1]:
+                if (
+                    float(settings.get('min_rr', 1.2) or 1.2) > 1.0
+                    and st.button("📉 Set Min R:R = 1.0 (no rescan)", key="tf_relax_rr", width="stretch")
+                ):
+                    st.session_state['trade_min_rr_threshold'] = 1.0
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Min R:R lowered to 1.0 for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with _quick_cols[2]:
+                if (
+                    int(settings.get('earn_block_days', 7) or 7) > 0
+                    and st.button("📅 Set earnings block = 0d (no rescan)", key="tf_relax_earn_block", width="stretch")
+                ):
+                    st.session_state['trade_earnings_block_days'] = 0
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': "Earnings block window set to 0d for current snapshot (no rescan).",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            if bool(settings.get('require_ready', True)) and _not_ready_rows:
+                if st.button("👁 Show Hard-Gate Passers (disable READY, no rescan)", key="tf_show_hard_passers", width="stretch"):
+                    st.session_state['trade_require_ready'] = False
+                    st.session_state['trade_finder_last_status'] = {
+                        'level': 'info',
+                        'message': f"READY filter disabled. Showing {len(_hard_pass_rows)} hard-gate passer(s) from current scan.",
+                        'ts': time.time(),
+                    }
+                    st.rerun()
+            with st.expander(f"🔎 Hard-Gate Passers ({len(_hard_pass_rows)})", expanded=True):
+                for _i, _r in enumerate(_hard_pass_rows[:20]):
+                    _t = str(_r.get('ticker', '')).upper().strip()
+                    _ai = str(_r.get('ai_buy_recommendation', '') or 'n/a')
+                    _rr = float(_r.get('risk_reward', 0) or 0)
+                    if _rr <= 0:
+                        _rr = _calc_rr(
+                            float(_r.get('suggested_entry', _r.get('price', 0)) or 0),
+                            float(_r.get('suggested_stop_loss', 0) or 0),
+                            float(_r.get('suggested_target', 0) or 0),
+                        )
+                    _ed = _earnings_badge(
+                        int(_r.get('earn_days', 999) or 999),
+                        source=str(_r.get('earn_source', '') or ''),
+                        confidence=str(_r.get('earn_confidence', '') or ''),
+                        earn_date=str(_r.get('earn_date', '') or ''),
+                    )
+                    _card = _r.get('decision_card', {}) or {}
+                    _ready = str(_card.get('execution_readiness', '') or 'N/A')
+                    _why = str(_r.get('reason', '') or '')
+                    _c1, _c2 = st.columns([4, 1])
+                    with _c1:
+                        st.caption(
+                            f"{_t} | AI: {_ai} | R:R {_rr:.2f}:1 | Ready: {_ready} | "
+                            f"Earnings: {_ed['icon']} {_ed['text']} | {_why[:120]}"
+                        )
+                    with _c2:
+                        if st.button("📈 Chart", key=f"tf_hardpass_chart_{_i}_{_t}", width="stretch"):
+                            if _open_chart_anywhere(_t, warn=True):
+                                st.rerun()
+
+        hard_gate_fail = {
+            'hard_gate_failed': 0,
+        }
+        post_gate_fail = {
+            'ai_rating_filtered': 0,
+            'missing_levels': 0,
+            'invalid_level_order': 0,
+            'rr_below_threshold': 0,
+            'earnings_untrusted': 0,
+            'earnings_blocked': 0,
+            'not_ready': 0,
+            'stale_data': 0,
+        }
+        hard_gate_reason_counts: Dict[str, int] = {}
+        for r in rows:
+            if bool(r.get('hard_gate_pass', True)) is False:
+                hard_gate_fail['hard_gate_failed'] += 1
+                for _code in (r.get('hard_gate_fail_codes', []) or []):
+                    hard_gate_reason_counts[_code] = int(hard_gate_reason_counts.get(_code, 0) + 1)
+                continue
+            entry = float(r.get('suggested_entry', r.get('price', 0)) or 0)
+            stop = float(r.get('suggested_stop_loss', 0) or 0)
+            target = float(r.get('suggested_target', 0) or 0)
+            rr = float(r.get('risk_reward', 0) or 0)
+            if rr <= 0:
+                rr = _calc_rr(entry, stop, target)
+            ai_buy = str(r.get('ai_buy_recommendation', '') or '').strip()
+            allowed_ai = {"Strong Buy", "Buy"} | ({"Watch Only"} if settings.get('include_watch_only') else set())
+            if ai_buy not in allowed_ai:
+                post_gate_fail['ai_rating_filtered'] += 1
+            if not (entry > 0 and stop > 0 and target > 0):
+                post_gate_fail['missing_levels'] += 1
+            if not (stop < entry < target):
+                post_gate_fail['invalid_level_order'] += 1
+            if rr < float(settings.get('min_rr', 2.0)):
+                post_gate_fail['rr_below_threshold'] += 1
+            if bool(settings.get('require_fresh_data', True)):
+                _fresh_state = str(r.get('data_freshness_state', 'fresh') or 'fresh').strip().lower()
+                if _fresh_state == "stale":
+                    post_gate_fail['stale_data'] += 1
+            earn_days = int(r.get('earn_days', 999) or 999)
+            earn_source = str(r.get('earn_source', '') or '').strip()
+            earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
+            earn_date = str(r.get('earn_date', r.get('earnings_date', '')) or '').strip()
+            if not _is_earnings_data_trusted(
+                earn_days,
+                source=earn_source,
+                confidence=earn_confidence,
+                next_earnings=earn_date,
+            ):
+                post_gate_fail['earnings_untrusted'] += 1
+            if 0 <= earn_days <= int(settings.get('earn_block_days', 7)):
+                post_gate_fail['earnings_blocked'] += 1
+            if settings.get('require_ready'):
+                card = r.get('decision_card', {}) or {}
+                if str(card.get('execution_readiness', '')).upper() != "READY":
+                    post_gate_fail['not_ready'] += 1
+        _hard_diag = ", ".join([f"{k}={v}" for k, v in hard_gate_fail.items() if v > 0])
+        if _hard_diag:
+            st.caption(f"Hard-gate diagnostics: {_hard_diag}")
+        if hard_gate_reason_counts:
+            st.caption("Hard-gate reason detail: " + ", ".join([f"{k}={v}" for k, v in sorted(hard_gate_reason_counts.items())]))
+        _post_diag = ", ".join([f"{k}={v}" for k, v in post_gate_fail.items() if v > 0])
+        if _post_diag:
+            st.caption(
+                f"Post hard-gate diagnostics (on {len(_hard_pass_rows)} passers): {_post_diag}"
+            )
+        if not _hard_diag and not _post_diag and not hard_gate_reason_counts:
+            st.caption("Filter diagnostics: no blocking failures detected (check data freshness).")
+    else:
+        if not qualified_rows and _auto_fallback_rows:
+            qualified_rows = list(_auto_fallback_rows)
+            st.warning(
+                f"No rows passed final filters. Showing {len(qualified_rows)} hard-gate passers "
+                f"as fallback candidates ({_profile_mode} profile)."
+            )
+        st.markdown("### Qualified Signals")
+        st.caption("Signal Verdict uses model/system scoring. Use actions to review chart or place trade.")
+
+        def _open_candidate_for_action(_r: Dict[str, Any], detail_tab: int):
+            _ticker = str(_r.get('ticker', '')).upper().strip()
+            _selection = build_trade_finder_selection(
+                _r,
+                generated_at_iso=str(results.get('generated_at_iso', '') or ''),
+                run_id=str(results.get('run_id', '') or ''),
+            )
+            _selection['prefill_token'] = f"{_ticker}:{int(time.time() * 1000)}"
+            st.session_state['trade_finder_selected_trade'] = _selection
+            st.session_state['trade_finder_last_action'] = 'chart' if int(detail_tab) == 1 else 'trade'
+            st.session_state['trade_finder_last_ticker'] = _ticker
+            _target = "chart" if int(detail_tab) == 1 else ("trade" if int(detail_tab) == 4 else "signal")
+            _opened = _navigate_to_scanner_ticker(_ticker, target=_target)
+            if not _opened:
+                st.session_state['trade_finder_chart_error'] = str(
+                    st.session_state.get('_scanner_nav_error', f"Unable to load data for {_ticker}.")
+                )
+                st.rerun()
+                return
+            st.session_state.pop('trade_finder_chart_error', None)
+            st.rerun()
+
+        green_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "GREEN"]
+        yellow_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "YELLOW"]
+        red_rows = [r for r in qualified_rows if str(r.get('market_class', 'YELLOW')).upper() == "RED"]
+        view_mode = st.radio(
+            "View Mode",
+            ["Cards", "Table"],
+            horizontal=True,
+            key="tf_view_mode",
+        )
+
+        def _stage_candidate(_r: Dict[str, Any], _price: float, _rr: float, _rank: float, _reason: str, _notes: str):
+            # Canonical builder keeps staging payload consistent with New Trade prefill.
+            _tmp = dict(_r)
+            _tmp['price'] = _price
+            _tmp['risk_reward'] = _rr
+            _tmp['rank_score'] = _rank
+            _tmp['reason'] = _reason
+            _tmp['ai_rationale'] = _notes
+            plan = build_planned_trade(_tmp, run_id=str(results.get('run_id', '') or ''))
+            st.success(jm.add_planned_trade(plan))
+            st.rerun()
+
+        def _set_alert_for_candidate(_r: Dict[str, Any], _price: float, _rr: float, _reason: str):
+            _ticker = str(_r.get('ticker', '')).upper().strip()
+            _msg = create_alert_from_candidate(
+                jm, _r, price=_price, risk_reward=_rr, reason=_reason,
+            )
+            if _msg.startswith("Cannot"):
+                st.warning(_msg)
+                return
+            st.session_state['trade_finder_last_status'] = {
+                'level': 'success',
+                'message': _msg,
+                'ts': time.time(),
+            }
+            st.rerun()
+
+        for group_label, group_rows, expanded in [
+            ("🟢 Trade-Ready", green_rows, True),
+            ("🟡 Watch / Conditional", yellow_rows, True),
+            ("🔴 Blocked By Gate/Rules", red_rows, False),
+        ]:
+            with st.expander(f"{group_label} ({len(group_rows)})", expanded=expanded):
+                if not group_rows:
+                    st.caption("None in this group.")
+                if view_mode == "Table":
+                    h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12 = st.columns([0.7, 0.9, 1.8, 1.2, 1.2, 1.0, 0.9, 1.2, 0.8, 0.8, 0.8, 2.0])
+                    h1.caption("Alert")
+                    h2.caption("Ticker")
+                    h3.caption("Company")
+                    h4.caption("Sector")
+                    h5.caption("Rotation")
+                    h6.caption("Class")
+                    h7.caption("Price")
+                    h8.caption("Verdict")
+                    h9.caption("R:R")
+                    h10.caption("Score")
+                    h11.caption("Earn")
+                    h12.caption("Actions")
+                for i, r in enumerate(group_rows[:40]):
+                    ticker = str(r.get('ticker', '')).upper().strip()
+                    _resolved_sector = _resolve_trade_finder_sector_fields(
+                        r,
+                        rotation_ctx=st.session_state.get('sector_rotation', {}) or {},
+                        ticker_sector_ctx=st.session_state.get('ticker_sectors', {}) or {},
+                        scan_sector_map={},
+                        allow_fetch=False,
+                    )
+                    _sec_new = str(_resolved_sector.get('sector', '') or '').strip()
+                    _phase_new = str(_resolved_sector.get('sector_phase', '') or '').strip()
+                    if _sec_new and _sec_new != str(r.get('sector', '') or '').strip():
+                        r['sector'] = _sec_new
+                    if _phase_new and _phase_new != str(r.get('sector_phase', '') or '').strip():
+                        r['sector_phase'] = _phase_new
+                    company = str(r.get('company_name', '') or '').strip() or "Unknown company"
+                    has_alert = ticker in alert_tickers
+                    ai_buy = str(r.get('ai_buy_recommendation', '') or '')
+                    rr = float(r.get('risk_reward', 0) or 0)
+                    rank = float(r.get('rank_score', 0) or 0)
+                    trade_score = float(r.get('trade_score', rank) or rank)
+                    price = float(r.get('price', 0) or 0)
+                    earn_days = int(r.get('earn_days', 999) or 999)
+                    earn_source = str(r.get('earn_source', '') or '').strip()
+                    earn_confidence = str(r.get('earn_confidence', '') or '').strip().upper()
+                    sector_name = str(r.get('sector', '') or '').strip() or "Unknown sector"
+                    sector_phase = str(r.get('sector_phase', '') or '').strip()
+                    sector_disp = _sector_phase_display(sector_phase)
+                    class_icon = str(r.get('market_class_icon', '🟡') or '🟡')
+                    class_label = str(r.get('market_class_label', 'WATCH') or 'WATCH')
+                    class_color = str(r.get('market_class_color', '#f59e0b') or '#f59e0b')
+                    class_reason = str(r.get('market_class_reason', '') or '')
+                    earn_disp = _earnings_badge(
+                        earn_days,
+                        source=earn_source,
+                        confidence=earn_confidence,
+                        earn_date=str(r.get('earn_date', '') or ''),
+                    )
+                    fresh_disp = _trade_data_freshness_badge(r)
+                    signal_reason = str(r.get('reason', '') or '')
+                    rationale = str(
+                        r.get('analysis_note', '')
+                        or r.get('ai_rationale', '')
+                        or str(r.get('scanner_summary', '') or '')
+                    ).strip()
+                    warnings = list(r.get('consistency_warnings', []) or [])
+                    fallback_reason = str(r.get('fallback_reason', '') or '')
+                    fallback_error = str(r.get('fallback_error', '') or '')
+
+                    if view_mode == "Table":
+                        c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12 = st.columns([0.7, 0.9, 1.8, 1.2, 1.2, 1.0, 0.9, 1.2, 0.8, 0.8, 0.8, 2.0])
+                        c1.write("🎯 Set" if has_alert else "—")
+                        c2.write(ticker)
+                        c3.write(company)
+                        c4.write(sector_name)
+                        c5.markdown(
+                            f"<span style='color:{sector_disp['color']};font-weight:700'>{sector_disp['icon']} {sector_disp['label']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        c6.markdown(
+                            f"<span style='color:{class_color};font-weight:700'>{class_icon} {class_label}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        c7.write(f"${price:.2f}")
+                        c8.write(ai_buy or "N/A")
+                        c9.write(f"{rr:.2f}:1")
+                        c10.write(f"{float(r.get('trade_score', rank) or rank):.2f}")
+                        c11.markdown(
+                            f"<span style='color:{earn_disp['color']};font-weight:700'>{earn_disp['icon']} {earn_disp['text']}</span>",
+                            unsafe_allow_html=True,
+                        )
+                        a1, a2, a3, a4 = c12.columns(4)
+                        with a1:
+                            if st.button("📈", key=f"tf_tbl_chart_{group_label}_{i}_{ticker}", help="View Chart", width="stretch"):
+                                _open_candidate_for_action(r, detail_tab=1)
+                        with a2:
+                            if st.button("✅", key=f"tf_tbl_trade_{group_label}_{i}_{ticker}", help="Place Trade", width="stretch"):
+                                _open_candidate_for_action(r, detail_tab=4)
+                        with a3:
+                            _alert_help = "Update Alert" if has_alert else "Set Alert"
+                            if st.button("🎯", key=f"tf_tbl_alert_{group_label}_{i}_{ticker}", help=_alert_help, width="stretch"):
+                                _set_alert_for_candidate(r, price, rr, signal_reason)
+                        with a4:
+                            if st.button("🗂️", key=f"tf_tbl_stage_{group_label}_{i}_{ticker}", help="Stage Ticket", width="stretch"):
+                                _stage_candidate(r, price, rr, rank, signal_reason, rationale)
+                        st.caption(
+                            f"{ticker} Levels: E ${float(r.get('suggested_entry', price) or price):.2f} | "
+                            f"S ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
+                            f"T ${float(r.get('suggested_target', 0) or 0):.2f}"
+                        )
+                        _fresh_src = f" | source {fresh_disp['source']}" if fresh_disp.get('source') else ""
+                        st.caption(f"{ticker} Data: {fresh_disp['icon']} {fresh_disp['text']}{_fresh_src}")
+                        if class_reason:
+                            st.caption(f"{ticker} Class reason: {class_reason}")
+                        _sup = float(r.get('support_price', 0) or 0)
+                        _sup_stop = float(r.get('support_stop_price', 0) or 0)
+                        _sup_dist = r.get('support_distance_pct', None)
+                        _stop_basis = str(r.get('stop_basis', '') or '')
+                        if _sup > 0:
+                            _dist_txt = f" ({float(_sup_dist):.2f}% below entry)" if _sup_dist is not None else ""
+                            st.caption(
+                                f"{ticker} Support ${_sup:.2f}{_dist_txt} | Stop plan ${(_sup_stop if _sup_stop > 0 else float(r.get('suggested_stop_loss', 0) or 0)):.2f} [{_stop_basis or 'support plan'}]"
+                            )
+                        if signal_reason:
+                            st.caption(f"{ticker} Scanner Context: {signal_reason}")
+                        _hg_monthly = str(r.get('hard_gate_monthly_tag', '') or '')
+                        _hg_dist = r.get('resistance_distance_pct', None)
+                        if _hg_dist is not None:
+                            st.caption(f"{ticker} Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'} | resistance distance={float(_hg_dist):.2f}%")
+                        else:
+                            st.caption(f"{ticker} Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'}")
+                        if earn_source:
+                            _ec = f" [{earn_confidence}]" if earn_confidence else ""
+                            st.caption(f"{ticker} Earnings source: {earn_source}{_ec}")
+                        if fallback_reason:
+                            st.caption(f"{ticker} AI fallback: {fallback_reason}")
+                            if fallback_error:
+                                st.caption(f"↳ {fallback_error[:140]}")
+                        for w in warnings[:2]:
+                            st.caption(f"⚠ {w}")
+                    else:
+                        with st.container(border=True):
+                            alert_badge = " | 🎯 Alert Set" if has_alert else ""
+                            st.markdown(f"**{ticker}{alert_badge} — {company}**")
+                            st.markdown(
+                                f"<span style='color:{class_color};font-weight:700'>{class_icon} {class_label}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.markdown(
+                                f"<span style='color:{sector_disp['color']};font-weight:700'>"
+                                f"{sector_disp['icon']} {sector_disp['label']}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption(
+                                f"Price ${price:.2f} | Signal Verdict: {ai_buy} | "
+                                f"Trade Score: {trade_score:.2f} (Model {rank:.2f}) | "
+                                f"Earnings: {earn_disp['icon']} {earn_disp['text']} | "
+                                f"Signal source: {'Ask AI Gold' if bool(r.get('gold_source', False)) else 'Model'}"
+                            )
+                            _fresh_src = f" | source {fresh_disp['source']}" if fresh_disp.get('source') else ""
+                            st.caption(f"Data freshness: {fresh_disp['icon']} {fresh_disp['text']}{_fresh_src}")
+                            st.caption(f"Sector: {sector_name} ({sector_phase or 'n/a'})")
+                            if earn_source:
+                                _ec = f" [{earn_confidence}]" if earn_confidence else ""
+                                st.caption(f"Earnings source: {earn_source}{_ec}")
+                            st.caption(
+                                f"Entry ${float(r.get('suggested_entry', price) or price):.2f} | "
+                                f"Stop ${float(r.get('suggested_stop_loss', 0) or 0):.2f} | "
+                                f"Target ${float(r.get('suggested_target', 0) or 0):.2f} | "
+                                f"R:R {rr:.2f}:1"
+                            )
+                            _sup = float(r.get('support_price', 0) or 0)
+                            _sup_stop = float(r.get('support_stop_price', 0) or 0)
+                            _sup_dist = r.get('support_distance_pct', None)
+                            _stop_basis = str(r.get('stop_basis', '') or '')
+                            if _sup > 0:
+                                _dist_txt = f" ({float(_sup_dist):.2f}% below entry)" if _sup_dist is not None else ""
+                                st.caption(
+                                    f"Support ${_sup:.2f}{_dist_txt} | Stop plan ${(_sup_stop if _sup_stop > 0 else float(r.get('suggested_stop_loss', 0) or 0)):.2f} [{_stop_basis or 'support plan'}]"
+                                )
+                            st.caption(f"Scanner Context: {signal_reason}")
+                            _hg_monthly = str(r.get('hard_gate_monthly_tag', '') or '')
+                            _hg_dist = r.get('resistance_distance_pct', None)
+                            if _hg_dist is not None:
+                                st.caption(f"Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'} | resistance distance={float(_hg_dist):.2f}%")
+                            else:
+                                st.caption(f"Hard gate: PASS | monthly={_hg_monthly or 'monthly_green'}")
+                            if fallback_reason:
+                                st.caption(f"AI fallback: {fallback_reason}")
+                                if fallback_error:
+                                    st.caption(f"↳ {fallback_error[:140]}")
+                            if rationale:
+                                st.caption(f"Analysis Note: {rationale}")
+                            if class_reason:
+                                st.caption(f"Class reason: {class_reason}")
+                            for w in warnings[:3]:
+                                st.warning(f"Consistency warning: {w}")
+                            a1, a2, a3, a4 = st.columns(4)
+                            with a1:
+                                if st.button("📈 View Chart", key=f"tf_chart_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _open_candidate_for_action(r, detail_tab=1)
+                            with a2:
+                                if st.button("✅ Place Trade", key=f"tf_trade_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _open_candidate_for_action(r, detail_tab=4)
+                            with a3:
+                                _alert_label = "🎯 Update Alert" if has_alert else "🎯 Set Alert"
+                                if st.button(_alert_label, key=f"tf_alert_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _set_alert_for_candidate(r, price, rr, signal_reason)
+                            with a4:
+                                if st.button("🗂️ Stage Ticket", key=f"tf_stage_{group_label}_{i}_{ticker}", width="stretch"):
+                                    _stage_candidate(r, price, rr, rank, signal_reason, rationale)
+
+    st.markdown("### Open In New Trade")
+    sb1, sb2 = st.columns([1, 1])
+    with sb1:
+        stage_n = st.number_input("Stage Best N", min_value=1, max_value=20, value=5, step=1, key="tf_stage_best_n")
+    with sb2:
+        if st.button("🗂️ Stage Top Qualified", key="tf_stage_top_qualified", width="stretch"):
+            staged = 0
+            for r in qualified_rows[:int(stage_n)]:
+                plan = build_planned_trade(r, run_id=str(results.get('run_id', '') or ''))
+                jm.add_planned_trade(plan)
+                staged += 1
+            st.success(f"Staged {staged} qualified trade(s).")
+            st.rerun()
+
+    # Hot-reload safety: ensure journal handle exists even if a partial rerun
+    # skips earlier initialization in this render cycle.
+    try:
+        _jm = jm
+    except NameError:
+        _jm = get_journal()
+        jm = _jm
+
+    planned = _jm.get_planned_trades()
+    if planned:
+        st.divider()
+        st.markdown(f"### 🗂️ Planned Trade Tickets ({len(planned)})")
+        for p in planned[:30]:
+            pid = str(p.get('plan_id', ''))
+            pt = str(p.get('ticker', ''))
+            pstatus = str(p.get('status', 'PLANNED'))
+            plabel = (
+                f"{pt} | {pstatus} | Entry ${float(p.get('entry', 0) or 0):.2f} "
+                f"| Stop ${float(p.get('stop', 0) or 0):.2f} | Target ${float(p.get('target', 0) or 0):.2f}"
+            )
+            st.caption(plabel)
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                if st.button("▶ Open", key=f"plan_open_{pid}", width="stretch"):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'plan_id': pid,
+                        'ticker': pt,
+                        'entry': float(p.get('entry', 0) or 0),
+                        'stop': float(p.get('stop', 0) or 0),
+                        'target': float(p.get('target', 0) or 0),
+                        'ai_buy_recommendation': str(p.get('ai_recommendation', '') or ''),
+                        'risk_reward': float(p.get('risk_reward', 0) or 0),
+                        'trade_finder_run_id': str(p.get('trade_finder_run_id', '') or ''),
+                        'reason': str(p.get('reason', '') or ''),
+                        'ai_rationale': str(p.get('notes', '') or ''),
+                        'provider': str(p.get('source', 'planned') or 'planned'),
+                        'prefill_token': f"{pt}:{int(time.time() * 1000)}",
+                    }
+                    if _navigate_to_scanner_ticker(pt, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {pt}.")))
+            with a2:
+                if st.button("⚡ Trigger", key=f"plan_trigger_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
+                    st.rerun()
+            with a3:
+                if st.button("✖ Cancel", key=f"plan_cancel_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "CANCELLED"))
+                    st.rerun()
+            with a4:
+                if st.button("🗑️ Remove", key=f"plan_remove_{pid}", width="stretch"):
+                    st.info(jm.remove_planned_trade(pid))
+                    st.rerun()
+
+
+# =============================================================================
+# MAIN CONTENT — Scanner Results Table
+# =============================================================================
+
+def render_scanner_table():
+    """Render scan results with watchlist management, filters, and click-to-view."""
+    results = st.session_state.get('scan_results', [])
+    summary = st.session_state.get('scan_results_summary', [])
+    timestamp = st.session_state.get('scan_timestamp', '')
+    jm = get_journal()
+    bridge = get_bridge()
+    _fh = get_fetch_health_status() or {}
+    if bool(_fh.get('rate_limited', False)):
+        st.warning(
+            f"Data provider is rate-limited ({int(_fh.get('cooldown_remaining_sec', 0) or 0)}s cooldown). "
+            "Scanner is using cached/partial data where live fetch is unavailable."
+        )
+    _scan_nav_err = str(st.session_state.pop('_scanner_nav_error', '') or '').strip()
+    if _scan_nav_err:
+        st.warning(_scan_nav_err)
+
+    # ══════════════════════════════════════════════════════════════════
+    # TRIGGERED ALERTS BANNER
+    # ══════════════════════════════════════════════════════════════════
+    triggered = st.session_state.get('triggered_alerts', [])
+    if triggered:
+        for t in triggered:
+            st.success(
+                f"🎯 **BREAKOUT TRIGGERED: {t['ticker']}** — "
+                f"Price ${t.get('triggered_price', 0):.2f} broke above "
+                f"${t.get('trigger_price', 0):.2f} "
+                f"(Volume: {t.get('triggered_volume_ratio', 0):.1f}x avg)"
+            )
+        st.session_state['triggered_alerts'] = []
+
+    # ══════════════════════════════════════════════════════════════════
+    # CROSS-WATCHLIST "FIND NEW TRADES" REPORT
+    # ══════════════════════════════════════════════════════════════════
+    find_new = st.session_state.get('find_new_trades_report', {}) or {}
+    if find_new:
+        cands = find_new.get('candidates', []) or []
+        generated = find_new.get('generated_at_iso', '')
+        wl_count = int(find_new.get('watchlists_count', 0) or 0)
+        universe = int(find_new.get('scan_universe', 0) or 0)
+        elapsed = float(find_new.get('elapsed_sec', 0) or 0)
+        with st.expander(
+            f"🧭 Find New Trades Report — {len(cands)} candidate(s) from {universe} tickers ({wl_count} watchlists)",
+            expanded=True,
+        ):
+            st.caption(f"Generated: {generated} | Runtime: {elapsed:.1f}s")
+            if not cands:
+                st.info("No new buy candidates found in this run.")
+            else:
+                view_rows = []
+                for c in cands[:50]:
+                    view_rows.append({
+                        'Ticker': c.get('ticker', ''),
+                        'Rec': c.get('recommendation', ''),
+                        'Conv': c.get('conviction', 0),
+                        'Grade': c.get('quality_grade', ''),
+                        'Score': c.get('score', 0),
+                        'Price': f"${float(c.get('price', 0) or 0):.2f}",
+                        'Sector': c.get('sector', ''),
+                        'Phase': c.get('sector_phase', ''),
+                        'Earnings': c.get('earn_date', ''),
+                        'Watchlists': c.get('watchlists', ''),
+                    })
+                st.dataframe(pd.DataFrame(view_rows), hide_index=True, width='stretch')
+
+    # ══════════════════════════════════════════════════════════════════
+    # WATCHLIST EDITOR (collapsible)
+    # ══════════════════════════════════════════════════════════════════
+    watchlist_tickers = bridge.get_watchlist_tickers()
+    favorite_tickers = set(bridge.get_favorite_tickers())
+
+    # Get active watchlist name for display
+    _active_wl_name = bridge.manager.get_active_watchlist().get("name", "Watchlist")
+
+    # Watchlist version counter defaults are centrally managed.
+    ensure_scanner_defaults(st.session_state)
+
+    with st.expander(f"📋 {_active_wl_name} ({len(watchlist_tickers)} tickers) — click to edit",
+                     expanded=(len(watchlist_tickers) == 0)):
+
+        # ── Quick Add (single ticker) ─────────────────────────────────
+        qa1, qa2 = st.columns([3, 1])
+        with qa1:
+            new_ticker = st.text_input("Add ticker", placeholder="e.g. AAPL",
+                                       key="wl_add_input", label_visibility="collapsed")
+        with qa2:
+            if st.button("➕ Add", key="wl_add_btn", width="stretch"):
+                if new_ticker:
+                    import re as _re
+                    ticker_clean = new_ticker.strip().upper()
+                    # Validate: base symbols (AAPL), class shares (BRK.B), or indices (^VIX).
+                    is_base = bool(_re.match(r'^[A-Z]{1,5}$', ticker_clean))
+                    class_match = _re.match(r'^[A-Z]{1,5}\.([A-Z])$', ticker_clean)
+                    is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+                    is_index = ticker_clean.startswith('^')
+                    if ticker_clean and (is_base or is_class or is_index):
+                        if ticker_clean not in watchlist_tickers:
+                            bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                            _append_audit_event("ADD_TICKER", ticker_clean, source="quick_add")
+                            st.session_state['wl_version'] += 1
+                            st.rerun()
+                        else:
+                            st.toast(f"⚠️ {ticker_clean} already in watchlist")
+                    else:
+                        st.toast(f"⚠️ Invalid ticker: {ticker_clean[:20]}")
+
+        # ── Sort Controls ─────────────────────────────────────────────
+        if watchlist_tickers:
+            sort_col1, sort_col2 = st.columns([1, 1])
+            with sort_col1:
+                wl_sort = st.selectbox(
+                    "Sort", ["⭐ Favorites first", "A-Z", "Z-A", "Date added"],
+                    key="wl_sort", label_visibility="collapsed",
+                )
+            with sort_col2:
+                st.caption(f"{len(watchlist_tickers)} tickers"
+                           + (f" | ⭐{len(favorite_tickers)}" if favorite_tickers else ""))
+
+        # ── Interactive List with Favorite/Delete ─────────────────────
+        if watchlist_tickers:
+            # Apply sort
+            if wl_sort == "A-Z":
+                sorted_tickers = sorted(watchlist_tickers)
+            elif wl_sort == "Z-A":
+                sorted_tickers = sorted(watchlist_tickers, reverse=True)
+            elif wl_sort == "Date added":
+                sorted_tickers = list(watchlist_tickers)  # Original order = date added
+            else:  # Favorites first (default)
+                sorted_tickers = sorted(
+                    watchlist_tickers,
+                    key=lambda t: (0 if t in favorite_tickers else 1, t)
+                )
+
+            # Show in compact rows
+            for t in sorted_tickers:
+                is_fav = t in favorite_tickers
+                fav_icon = "⭐" if is_fav else "☆"
+
+                tc1, tc2, tc3, tc4 = st.columns([0.5, 2.5, 0.5, 0.5])
+                with tc1:
+                    if st.button(fav_icon, key=f"fav_{t}",
+                                 help="Toggle favorite"):
+                        bridge.toggle_favorite(t)
+                        st.rerun()
+                with tc2:
+                    st.caption(f"{'⭐ ' if is_fav else ''}{t}")
+                with tc3:
+                    if st.button("📈", key=f"chart_{t}",
+                                 help="Open chart"):
+                        if _open_chart_anywhere(t, warn=True, switch_to_scanner_tab=False):
+                            st.rerun()
+                with tc4:
+                    if st.button("🗑️", key=f"del_{t}",
+                                 help="Remove from watchlist"):
+                        bridge.remove_from_watchlist(t)
+                        # Also remove from JM for metadata sync
+                        try:
+                            jm.delete_single_ticker(t)
+                        except Exception:
+                            pass
+                        st.session_state['wl_version'] += 1  # Force text_area refresh
+                        # Also remove from scan results
+                        if 'scan_results' in st.session_state:
+                            st.session_state['scan_results'] = [
+                                r for r in st.session_state['scan_results']
+                                if r.ticker != t
+                            ]
+                        if 'scan_results_summary' in st.session_state:
+                            st.session_state['scan_results_summary'] = [
+                                s for s in st.session_state['scan_results_summary']
+                                if s.get('ticker') != t
+                            ]
+                        _append_audit_event("REMOVE_TICKER", t, source="row_delete")
+                        st.rerun()
+
+        # ── Bulk Editor (for pasting 200 tickers) ─────────────────────
+        with st.expander("📝 Bulk Edit (paste tickers)"):
+            st.caption("Paste tickers separated by commas, spaces, or new lines.")
+            append_only = st.checkbox(
+                "Add/Merge only (recommended)",
+                value=True,
+                key="wl_bulk_append_only",
+                help="On: adds new tickers and keeps existing ones. Off: replaces watchlist with pasted list.",
+            )
+
+            # PERSISTENCE FIX: Use dynamic key that resets when watchlist changes
+            # This prevents stale text_area values from overwriting new additions
+            wl_ver = st.session_state.get('wl_version', 0)
+            default_text = ", ".join(sorted(watchlist_tickers)) if watchlist_tickers else ""
+            new_text = st.text_area(
+                "Tickers",
+                value=default_text,
+                height=100 if len(watchlist_tickers) > 20 else 68,
+                label_visibility="collapsed",
+                key=f"watchlist_editor_v{wl_ver}",  # Dynamic key forces fresh value
+            )
+
+            wl_col1, wl_col2, wl_col3 = st.columns([1, 1, 2])
+            with wl_col1:
+                if st.button("💾 Save", width="stretch", type="primary",
+                             key="wl_save"):
+                    import re
+                    raw = re.split(r'[,\s\n\t]+', new_text)
+                    tickers = [t.strip().upper() for t in raw if t.strip()]
+                    
+                    # Validate: real tickers are 1-5 uppercase alpha chars
+                    # Reject comma-strings, numbers-only, special chars
+                    seen = set()
+                    unique = []
+                    rejected = []
+                    for t in tickers:
+                        if t in seen:
+                            continue
+                        is_base = bool(re.match(r'^[A-Z]{1,5}$', t))
+                        class_match = re.match(r'^[A-Z]{1,5}\.([A-Z])$', t)
+                        is_class = bool(class_match and class_match.group(1) in {'A', 'B', 'C', 'D'})
+                        is_index = t.startswith('^')
+                        if not (is_base or is_class or is_index):
+                            rejected.append(t)
+                            continue
+                        seen.add(t)
+                        unique.append(t)
+
+                    existing_set = set(watchlist_tickers)
+                    if append_only:
+                        # Merge mode (default): incremental adds via the same path
+                        # as quick-add, so auto/manual watchlist rules stay consistent.
+                        added_count = 0
+                        for t in unique:
+                            if t not in existing_set:
+                                bridge.add_to_watchlist(WatchlistItem(ticker=t))
+                                existing_set.add(t)
+                                added_count += 1
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event(
+                            "BULK_ADD",
+                            f"added={added_count} total={len(existing_set)} rejected={len(rejected)}",
+                            source="bulk_merge",
+                        )
+                        st.session_state['wl_version'] += 1
+                        msg = f"✅ Added {added_count} ticker(s) | Total: {len(existing_set)}"
+                        if rejected:
+                            msg += f" | ⚠️ Rejected {len(rejected)}: {', '.join(rejected[:5])}"
+                        st.success(msg)
+                        st.rerun()
+
+                    new_set = set(unique)
+                    removed = sorted(existing_set - new_set)
+
+                    # Guardrail: require explicit confirmation before removing existing tickers.
+                    if removed:
+                        st.session_state['wl_bulk_pending_unique'] = unique
+                        st.session_state['wl_bulk_pending_rejected'] = rejected
+                        st.session_state['wl_bulk_pending_removed'] = removed
+                        st.rerun()
+
+                    # Preserve favorites across bulk save (non-destructive path).
+                    old_favorites = set(bridge.get_favorite_tickers())
+                    bridge.set_watchlist_tickers(unique)
+                    for fav in old_favorites:
+                        if fav in unique and not bridge.is_favorite(fav):
+                            bridge.toggle_favorite(fav)
+
+                    _append_audit_event(
+                        "BULK_REPLACE",
+                        f"saved={len(unique)} removed={len(removed)} rejected={len(rejected)}",
+                        source="bulk_replace",
+                    )
+                    st.session_state['wl_version'] += 1
+                    msg = f"✅ Saved {len(unique)} tickers"
+                    if rejected:
+                        msg += f" | ⚠️ Rejected {len(rejected)}: {', '.join(rejected[:5])}"
+                    st.success(msg)
+                    st.rerun()
+            with wl_col2:
+                if st.button("🗑️ Clear All", width="stretch", key="wl_clear"):
+                    bridge.clear_watchlist()
+                    st.session_state.pop('wl_bulk_pending_unique', None)
+                    st.session_state.pop('wl_bulk_pending_rejected', None)
+                    st.session_state.pop('wl_bulk_pending_removed', None)
+                    st.session_state['wl_version'] += 1
+                    st.session_state['scan_results'] = []
+                    st.session_state['scan_results_summary'] = []
+                    st.session_state['scan_timestamp'] = ''
+                    st.session_state['ticker_data_cache'] = {}
+                    # Clear per-watchlist scan cache
+                    _clear_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+                    if _clear_wl_id:
+                        save_scan_for_watchlist(_clear_wl_id)
+                    _append_audit_event("CLEAR_WATCHLIST", "all tickers removed", source="bulk_clear")
+                    st.rerun()
+            with wl_col3:
+                st.caption(f"{len(watchlist_tickers)} saved"
+                           + (f" | ⭐ {len(favorite_tickers)}" if favorite_tickers else ""))
+
+            pending_unique = st.session_state.get('wl_bulk_pending_unique')
+            pending_rejected = st.session_state.get('wl_bulk_pending_rejected', [])
+            pending_removed = st.session_state.get('wl_bulk_pending_removed', [])
+            if pending_unique is not None:
+                st.warning(
+                    f"This save will remove {len(pending_removed)} ticker(s): "
+                    f"{', '.join(pending_removed[:10])}"
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Confirm Save", key="wl_bulk_confirm_save", type="primary", width="stretch"):
+                        old_favorites = set(bridge.get_favorite_tickers())
+                        bridge.set_watchlist_tickers(pending_unique)
+                        for fav in old_favorites:
+                            if fav in pending_unique and not bridge.is_favorite(fav):
+                                bridge.toggle_favorite(fav)
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event(
+                            "BULK_REPLACE_CONFIRM",
+                            f"saved={len(pending_unique)} removed={len(pending_removed)} rejected={len(pending_rejected)}",
+                            source="bulk_replace_confirm",
+                        )
+                        st.session_state['wl_version'] += 1
+                        msg = f"✅ Saved {len(pending_unique)} tickers"
+                        if pending_rejected:
+                            msg += f" | ⚠️ Rejected {len(pending_rejected)}: {', '.join(pending_rejected[:5])}"
+                        st.success(msg)
+                        st.rerun()
+                with c2:
+                    if st.button("Cancel", key="wl_bulk_confirm_cancel", width="stretch"):
+                        st.session_state.pop('wl_bulk_pending_unique', None)
+                        st.session_state.pop('wl_bulk_pending_rejected', None)
+                        st.session_state.pop('wl_bulk_pending_removed', None)
+                        _append_audit_event("BULK_REPLACE_CANCEL", "user canceled replacement", source="bulk_replace_confirm")
+                        st.info("Bulk save canceled.")
+
+            with st.expander("🧾 Activity Log", expanded=False):
+                current_wl_id = bridge.manager.get_active_watchlist().get("id", "")
+                show_all = st.checkbox("Show all watchlists", value=False, key="wl_audit_show_all")
+                events = _get_audit_events()
+                if not show_all:
+                    events = [e for e in events if e.get('wl_id') == current_wl_id]
+
+                if not events:
+                    st.caption("No activity logged yet.")
+                else:
+                    for e in events[:30]:
+                        ts = e.get('ts', '')
+                        action = e.get('action', '')
+                        src = e.get('source', '')
+                        details = e.get('details', '')
+                        st.caption(f"{ts} | {action} | {src} | {details}")
+
+                a1, a2 = st.columns(2)
+                with a1:
+                    if st.button("Clear Log", key="wl_audit_clear", width="stretch"):
+                        _clear_audit_events()
+                        st.rerun()
+                with a2:
+                    st.caption(f"{len(events)} shown")
+
+    # ══════════════════════════════════════════════════════════════════
+    # WATCHLIST NOTES (collapsible accordion)
+    # ══════════════════════════════════════════════════════════════════
+    _active_wl = bridge.manager.get_active_watchlist()
+    _active_wl_id = _active_wl.get("id", "")
+    _existing_notes = _active_wl.get("notes", "")
+    _notes_edit_key = f"_notes_editing_{_active_wl_id}"
+    _is_editing = st.session_state.get(_notes_edit_key, False)
+
+    # Only show if notes exist OR user is editing
+    _has_notes = bool(_existing_notes and _existing_notes.strip())
+
+    # Build label
+    if _has_notes:
+        # Show preview of first line (truncated)
+        _first_line = _existing_notes.strip().split('\n')[0][:60]
+        _notes_label = f"📝 Notes — {_first_line}{'…' if len(_first_line) >= 60 else ''}"
+    else:
+        _notes_label = "📝 Notes — click to add"
+
+    with st.expander(_notes_label, expanded=_is_editing):
+        if _is_editing:
+            # ── Edit mode ──
+            _edited = st.text_area(
+                "Watchlist notes (Markdown supported)",
+                value=_existing_notes,
+                height=250,
+                key=f"notes_textarea_{_active_wl_id}",
+                placeholder="Add notes, rationales, strategy context...\n\n"
+                            "Supports **bold**, *italic*, - bullet lists, 1. numbered lists",
+                label_visibility="collapsed",
+            )
+            _nc1, _nc2, _nc3 = st.columns([1, 1, 3])
+            with _nc1:
+                if st.button("💾 Save", key="notes_save", type="primary", width="stretch"):
+                    bridge.manager.update_watchlist_metadata(_active_wl_id, notes=_edited)
+                    st.session_state[_notes_edit_key] = False
+                    st.toast("Notes saved ✓")
+                    st.rerun()
+            with _nc2:
+                if st.button("Cancel", key="notes_cancel", width="stretch"):
+                    st.session_state[_notes_edit_key] = False
+                    st.rerun()
+        else:
+            # ── View mode ──
+            if _has_notes:
+                st.markdown(_existing_notes)
+            else:
+                st.caption("No notes yet.")
+            if st.button("✏️ Edit Notes", key="notes_edit_btn"):
+                st.session_state[_notes_edit_key] = True
+                st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════
+    # SCAN RESULTS
+    # ══════════════════════════════════════════════════════════════════
+
+    # No results at all
+    if not results and not summary:
+        st.info(f"👆 Add tickers to **{_active_wl_name}** (above) and click **Scan All** in the sidebar.")
+        return
+
+    # Build table from live scan results if available, else from persisted summary
+    if results:
+        rows = _build_rows_from_analysis(results, jm)
+        source = "live"
+    else:
+        rows = _build_rows_from_summary(summary, jm)
+        source = "restored"
+        if timestamp:
+            try:
+                ts = datetime.fromisoformat(timestamp)
+                age = datetime.now() - ts
+                age_str = f"{age.days}d {age.seconds // 3600}h ago" if age.days > 0 else f"{age.seconds // 3600}h ago"
+                st.caption(f"📌 Last scan: {ts.strftime('%Y-%m-%d %H:%M')} ({age_str}) — Scan All for fresh data")
+            except Exception:
+                st.caption("📌 Showing last saved scan results — Scan All for fresh data")
+
+    if not rows:
+        return
+
+    # ── Sector Rotation Strip ─────────────────────────────────────────
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    if sector_rotation:
+        # Build compact sector strip using phase classification
+        leading = []
+        emerging = []
+        fading = []
+        lagging = []
+        for sector, info in sector_rotation.items():
+            short = info.get('short_name', sector[:4])
+            vs = info.get('vs_spy_20d', 0)
+            phase = info.get('phase', '')
+            label = f"{short} ({vs:+.1f}%)"
+            if phase == 'LEADING':
+                leading.append(label)
+            elif phase == 'EMERGING':
+                emerging.append(label)
+            elif phase == 'FADING':
+                fading.append(label)
+            elif phase == 'LAGGING':
+                lagging.append(label)
+
+        parts = []
+        if leading:
+            parts.append(f"🟢 **Leading:** {', '.join(leading)}")
+        if emerging:
+            parts.append(f"🔵 **Emerging:** {', '.join(emerging)}")
+        if lagging:
+            parts.append(f"🔴 **Lagging:** {', '.join(lagging)}")
+        if parts:
+            st.caption(" | ".join(parts))
+
+    # ── Filter Bar ────────────────────────────────────────────────────
+    filt_col1, filt_col2, filt_col3, filt_col4, filt_col5 = st.columns([2, 1.5, 1.5, 2, 1])
+
+    with filt_col1:
+        rec_filter = st.selectbox("Filter", [
+            "All", "Signals Only", "BUY+", "STRONG BUY", "Quality A-B",
+            "🟢 Focus", "🟡 Focus", "🔴 Focus", "🔵 Focus", "Any Focus",
+            "Open Positions", "⚡ Earnings Soon"
+        ], key="scan_filter", label_visibility="collapsed")
+
+    with filt_col2:
+        sector_filter = st.selectbox("Sector", [
+            "All Sectors", "🟢 Leading", "🔵 Emerging", "🟡 Fading", "🔴 Lagging"
+        ], key="sector_filter", label_visibility="collapsed")
+
+    with filt_col3:
+        sort_by = st.selectbox("Sort", [
+            "Signal Strength ↓", "Conviction ↓", "Name A-Z", "Name Z-A",
+            "Quality ↓", "Price ↓", "Price ↑", "Default"
+        ], key="scan_sort", label_visibility="collapsed")
+
+    with filt_col4:
+        search = st.text_input("Search", placeholder="Filter by ticker...",
+                                key="scan_search", label_visibility="collapsed")
+
+    with filt_col5:
+        st.caption(f"**{len(rows)}** total")
+
+    # Reset pagination when filter/sort/search changes
+    _filter_sig = f"{rec_filter}|{sector_filter}|{sort_by}|{search}"
+    if st.session_state.get('_last_filter_sig') != _filter_sig:
+        st.session_state['scanner_page'] = 0
+        st.session_state['_last_filter_sig'] = _filter_sig
+
+    # ── Build focus label lookup ──────────────────────────────────────
+    focus_labels = jm.get_focus_labels()
+
+    # Apply filters
+    filtered = rows.copy()
+
+    if search:
+        search_upper = search.upper()
+        filtered = [r for r in filtered if search_upper in r['Ticker'].upper()]
+
+    if rec_filter == "Signals Only":
+        filtered = [r for r in filtered if r['Rec'] != 'SKIP']
+    elif rec_filter == "BUY+":
+        # Match ALL buy-type recommendations (both old and new names)
+        filtered = [r for r in filtered
+                    if any(kw in r['Rec'].upper() for kw in
+                           ['STRONG BUY', 'BUY', 'RE-ENTRY', 'LATE ENTRY', 'FRESH', 'AO'])
+                    and 'SKIP' not in r['Rec'] and 'WATCH' not in r['Rec']
+                    and 'WAIT' not in r['Rec']]
+    elif rec_filter == "STRONG BUY":
+        filtered = [r for r in filtered if r['Rec'] == 'STRONG BUY']
+    elif rec_filter == "Quality A-B":
+        filtered = [r for r in filtered if r['Quality'] in ('A', 'B')]
+    elif rec_filter == "Open Positions":
+        filtered = [r for r in filtered if 'Open' in r.get('Status', '')]
+    elif rec_filter == "⚡ Earnings Soon":
+        filtered = [r for r in filtered if r.get('Earn', '')]
+    elif rec_filter == "🟢 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'green']
+    elif rec_filter == "🟡 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'yellow']
+    elif rec_filter == "🔴 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'red']
+    elif rec_filter == "🔵 Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker']) == 'blue']
+    elif rec_filter == "Any Focus":
+        filtered = [r for r in filtered if focus_labels.get(r['Ticker'], '') != '']
+
+    # Apply sector phase filter
+    _sector_phase_map = {
+        "🟢 Leading": "LEADING", "🔵 Emerging": "EMERGING",
+        "🟡 Fading": "FADING", "🔴 Lagging": "LAGGING",
+    }
+    if sector_filter != "All Sectors":
+        target_phase = _sector_phase_map.get(sector_filter, '')
+        if target_phase:
+            filtered = [r for r in filtered if r.get('SectorPhase', '') == target_phase]
+
+    # Always sort favorites to top first
+    fav_tickers = set(bridge.get_favorite_tickers())
+
+    # Signal strength hierarchy for sorting (handles both old and new names)
+    _rec_rank = {
+        'STRONG BUY': 10,
+        'BUY': 8,
+        'BUY (AO)': 7, 'BUY (AO CONFIRM)': 7, 'BUY (CAUTION)': 7,
+        'RE-ENTRY': 6, 'RE-ENTRY (CAUTIOUS)': 5,
+        'WATCH (AO)': 4, 'WATCH (AO CONFIRM)': 4,
+        'WATCH': 3, 'WATCH (RE-ENTRY)': 3, 'WATCH (LATE)': 3,
+        'WAIT': 2, 'WAIT (D)': 2,
+        'SKIP': 0,
+    }
+
+    # Apply sort
+    if sort_by == "Signal Strength ↓":
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -_rec_rank.get(r['Rec'].split(' (+')[0], 5 if 'LATE ENTRY' in r['Rec'] else 0),
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
+    elif sort_by == "Conviction ↓":
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
+    elif sort_by == "Name A-Z":
+        filtered.sort(key=lambda r: (0 if r['Ticker'] in fav_tickers else 1, r['Ticker']))
+    elif sort_by == "Name Z-A":
+        # Use negative ord values to reverse alpha while keeping favorites first
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            [-ord(c) for c in r['Ticker']],
+        ))
+    elif sort_by == "Quality ↓":
+        q_order = {'A': 5, 'B': 4, 'C': 3, 'D': 2, 'F': 1, '?': 0}
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -q_order.get(r.get('Quality', '?'), 0),
+        ))
+    elif sort_by == "Price ↓":
+        filtered.sort(key=lambda r: -float(r['Price'].replace('$', '').replace(',', '') or '0'))
+    elif sort_by == "Price ↑":
+        filtered.sort(key=lambda r: float(r['Price'].replace('$', '').replace(',', '') or '0'))
+    else:
+        # Default: favorites first, then by conviction
+        filtered.sort(key=lambda r: (
+            0 if r['Ticker'] in fav_tickers else 1,
+            -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
+        ))
+
+    showing = len(filtered)
+    if showing != len(rows):
+        st.caption(f"Showing {showing} of {len(rows)}")
+
+    # ── Results as clickable ticker buttons ────────────────────────────
+    if not filtered:
+        st.info("No tickers match the current filter.")
+        return
+
+    # ── Pagination — render 25 rows at a time to keep UI fast ─────────
+    PAGE_SIZE = 25
+    total_pages = max(1, (len(filtered) + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    # Scanner pagination defaults are centrally managed.
+    ensure_scanner_defaults(st.session_state)
+    current_page = st.session_state['scanner_page']
+    # Clamp to valid range
+    if current_page >= total_pages:
+        current_page = total_pages - 1
+        st.session_state['scanner_page'] = current_page
+
+    start_idx = current_page * PAGE_SIZE
+    end_idx = min(start_idx + PAGE_SIZE, len(filtered))
+    page_rows = filtered[start_idx:end_idx]
+
+    # Pagination controls (top)
+    if total_pages > 1:
+        pg_col1, pg_col2, pg_col3, pg_col4, pg_col5 = st.columns([1, 1, 3, 1, 1])
+        with pg_col1:
+            if st.button("⏮", key="page_first", disabled=current_page == 0):
+                st.session_state['scanner_page'] = 0
+                st.rerun()
+        with pg_col2:
+            if st.button("◀", key="page_prev", disabled=current_page == 0):
+                st.session_state['scanner_page'] = current_page - 1
+                st.rerun()
+        with pg_col3:
+            st.caption(f"Page {current_page + 1} of {total_pages}  ·  Rows {start_idx + 1}–{end_idx} of {len(filtered)}")
+        with pg_col4:
+            if st.button("▶", key="page_next", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = current_page + 1
+                st.rerun()
+        with pg_col5:
+            if st.button("⏭", key="page_last", disabled=current_page >= total_pages - 1):
+                st.session_state['scanner_page'] = total_pages - 1
+                st.rerun()
+
+    # Table header — added Focus, Earnings Date, Volume, Apex columns
+    hdr_cols = st.columns([0.9, 0.3, 0.42, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 0.8, 1.35])
+    headers = ['Ticker', '📈', '🔔', '🏷️', 'Rec', 'Conv', 'Sector', '🎯', 'MACD', 'AO', 'VCP', 'Wkly', 'Mthly', 'Qlty', 'Price', 'Vol', 'Earn', 'Alert@', 'Summary']
+    for col, h in zip(hdr_cols, headers):
+        col.markdown(f"**{h}**")
+
+    # Focus label icons
+    _focus_icons = {
+        'green': '🟢', 'yellow': '🟡', 'red': '🔴', 'blue': '🔵', '': '⚪'
+    }
+    _focus_cycle = ['', 'green', 'yellow', 'red', 'blue']  # Click to cycle
+    _now_ts = time.time()
+    _flash_ticker = str(st.session_state.get('_scanner_alert_flash_ticker', '') or '').upper().strip()
+    _flash_until = float(st.session_state.get('_scanner_alert_flash_until', 0.0) or 0.0)
+    if _flash_until and _now_ts > _flash_until:
+        st.session_state.pop('_scanner_alert_flash_ticker', None)
+        st.session_state.pop('_scanner_alert_flash_until', None)
+        _flash_ticker = ''
+        _flash_until = 0.0
+    _pending_alerts = jm.get_pending_conditionals() or []
+    _pending_alert_map = {
+        str(c.get('ticker', '') or '').upper().strip(): c
+        for c in _pending_alerts
+        if str(c.get('status', 'PENDING') or 'PENDING').upper() == 'PENDING'
+    }
+
+    # Table rows — ONLY render current page (25 rows max = fast)
+    for idx, row in enumerate(page_rows):
+        # Use global index for unique keys
+        global_idx = start_idx + idx
+        cols = st.columns([0.9, 0.3, 0.42, 0.4, 0.9, 0.4, 0.7, 0.4, 0.4, 0.4, 0.55, 0.4, 0.4, 0.4, 0.6, 0.7, 0.5, 0.8, 1.35])
+        _ticker = str(row.get('Ticker', '') or '').upper().strip()
+        try:
+            _alert_trigger = float(row.get('AlertTrigger', 0) or 0)
+        except Exception:
+            _alert_trigger = 0.0
+        try:
+            _alert_dist = float(row.get('AlertTriggerDistPct', 0) or 0)
+        except Exception:
+            _alert_dist = 0.0
+        try:
+            _alert_vol_need = float(row.get('BreakoutVolumeNeeded', 0) or 0)
+        except Exception:
+            _alert_vol_need = 0.0
+        _alert_desc = str(row.get('AlertTriggerDesc', '') or '').strip()
+        _conv_raw = str(row.get('Conv', '0/10') or '0/10')
+        try:
+            _conv_int = int(_conv_raw.split('/')[0])
+        except Exception:
+            _conv_int = 0
+        _quality = str(row.get('Quality', '?') or '?')
+        _has_pending_alert = _ticker in _pending_alert_map
+
+        # Ticker as clickable button with earnings flag
+        with cols[0]:
+            ticker_label = row['Ticker']
+            status = row.get('Status', '')
+            earn = row.get('Earn', '')
+            is_fav = row['Ticker'] in fav_tickers
+            if is_fav:
+                ticker_label = f"⭐ {ticker_label}"
+            elif 'Open' in status:
+                ticker_label = f"📈 {ticker_label}"
+            elif 'Alert' in status:
+                ticker_label = f"🎯 {ticker_label}"
+            if earn:
+                ticker_label = f"{ticker_label} ⚡"
+
+            if st.button(ticker_label, key=f"row_{row['Ticker']}_{global_idx}",
+                        width="stretch"):
+                st.session_state['default_detail_tab'] = 0  # Signal tab
+                st.session_state['scroll_to_detail'] = True
+                _loaded = _load_ticker_for_view(row['Ticker'])
+                if not _loaded:
+                    st.session_state['_scanner_nav_error'] = str(
+                        st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
+                    )
+                st.rerun()
+
+        # Chart button — opens directly to chart tab
+        with cols[1]:
+            if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
+                if _open_chart_anywhere(row['Ticker'], warn=True, switch_to_scanner_tab=False):
+                    st.rerun()
+
+        # One-click alert button @ major overhead resistance
+        with cols[2]:
+            if _alert_trigger > 0:
+                _alert_help = (
+                    f"{'Update' if _has_pending_alert else 'Set'} alert for {_ticker} "
+                    f"at ${_alert_trigger:.2f}"
+                )
+                if _alert_desc:
+                    _alert_help += f" — {_alert_desc[:100]}"
+                _is_flash = _has_pending_alert and (_flash_ticker == _ticker) and (_flash_until > _now_ts)
+                _alert_btn = "✨🎯" if _is_flash else ("🎯" if _has_pending_alert else "🔔")
+                if st.button(_alert_btn, key=f"scanner_alert_{_ticker}_{global_idx}", help=_alert_help, width="stretch"):
+                    _notes = (
+                        f"[Scanner] major resistance trigger=${_alert_trigger:.2f}"
+                        + (f" dist={_alert_dist:+.1f}%" if _alert_dist else "")
+                        + (f" | {_alert_desc}" if _alert_desc else "")
+                    )
+                    _msg = _set_breakout_alert_from_resistance(
+                        jm,
+                        ticker=_ticker,
+                        trigger_price=_alert_trigger,
+                        conviction=_conv_int,
+                        quality_grade=_quality,
+                        notes=_notes,
+                    )
+                    st.session_state['_scanner_alert_flash_ticker'] = _ticker
+                    st.session_state['_scanner_alert_flash_until'] = time.time() + 1.8
+                    st.session_state['_scanner_alert_last_msg'] = _msg
+                    st.rerun()
+            else:
+                _is_flash = _has_pending_alert and (_flash_ticker == _ticker) and (_flash_until > _now_ts)
+                _manual_btn = "✨🎯" if _is_flash else ("🎯" if _has_pending_alert else "➕")
+                _manual_help = (
+                    "Alert active. Click to edit manually."
+                    if _has_pending_alert else
+                    "No auto resistance trigger available. Set manual alert."
+                )
+                if st.button(
+                    _manual_btn,
+                    key=f"scanner_alert_manual_{_ticker}_{global_idx}",
+                    help=_manual_help,
+                    width="stretch",
+                ):
+                    st.session_state['show_alert_form'] = _ticker
+                    if _has_pending_alert:
+                        st.session_state['_scanner_alert_flash_ticker'] = _ticker
+                        st.session_state['_scanner_alert_flash_until'] = time.time() + 1.8
+                    st.rerun()
+
+        # Focus label — click to cycle through colors
+        with cols[3]:
+            curr_label = focus_labels.get(row['Ticker'], '')
+            curr_icon = _focus_icons.get(curr_label, '⚪')
+            if st.button(curr_icon, key=f"focus_{row['Ticker']}_{global_idx}",
+                        help="Click to cycle: ⚪→🟢→🟡→🔴→🔵"):
+                curr_idx = _focus_cycle.index(curr_label) if curr_label in _focus_cycle else 0
+                next_label = _focus_cycle[(curr_idx + 1) % len(_focus_cycle)]
+                jm.set_focus_label(row['Ticker'], next_label)
+                st.rerun()
+
+        # Recommendation with color + divergence flag + re-entry recency
+        rec_val = row.get('Rec', 'SKIP')
+        div_flag = row.get('DivFlag', '')
+        rec_colors = {
+            'STRONG BUY': '🟢', 'BUY': '🟢', 'BUY (CAUTION)': '🟢',
+            'BUY (AO)': '🔵', 'BUY (AO CONFIRM)': '🔵',
+            'RE-ENTRY': '🔵', 'RE-ENTRY (CAUTIOUS)': '🔵',
+            'WATCH (AO)': '🟡', 'WATCH (AO CONFIRM)': '🟡',
+            'WATCH': '🟡', 'WATCH (RE-ENTRY)': '🟡', 'WATCH (LATE)': '🟡',
+            'WAIT': '🟡', 'WAIT (D)': '🟠', 'SKIP': '⚪',
+        }
+        rec_icon = rec_colors.get(rec_val.split(' (+')[0], '⚪')
+        if 'LATE ENTRY' in rec_val:
+            rec_icon = '🕐'
+
+        # RE-ENTRY / LATE ENTRY recency color coding
+        reentry_age = row.get('ReentryAge', 0)
+        age_tag = ""
+        if ('RE-ENTRY' in rec_val or 'LATE ENTRY' in rec_val):
+            if reentry_age <= 3:
+                age_tag = f" 🟢{reentry_age}d"      # Fresh — ideal entry
+                rec_icon = '🟢'
+            elif reentry_age <= 7:
+                age_tag = f" 🟡{reentry_age}d"      # Acceptable — move quickly
+                rec_icon = '🟡'
+            elif reentry_age > 7:
+                age_tag = f" 🔴{reentry_age}d"      # Stale — higher risk
+                rec_icon = '🔴'
+
+        cols[4].caption(f"{rec_icon}{rec_val}{div_flag}{age_tag}")
+        cols[5].caption(row.get('Conv', '0/10'))
+        cols[6].caption(row.get('Sector', ''))
+
+        # Apex buy indicator
+        cols[7].caption(row.get('ApexFlag', ''))
+
+        cols[8].caption(row.get('MACD', '❌'))
+        cols[9].caption(row.get('AO', '❌'))
+        cols[10].caption(row.get('VCP', '❌'))
+        cols[11].caption(row.get('Wkly', '❌'))
+        cols[12].caption(row.get('Mthly', '❌'))
+
+        # Quality with color
+        q = row.get('Quality', '?')
+        q_colors = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴', 'F': '🔴'}
+        cols[13].caption(f"{q_colors.get(q, '⚪')}{q}")
+
+        cols[14].caption(row.get('Price', '?'))
+        cols[15].caption(row.get('Volume', ''))
+
+        # Earnings date with highlight
+        cols[16].caption(row.get('EarnDate', ''))
+        if _alert_trigger > 0:
+            _alert_txt = f"${_alert_trigger:.2f}"
+            if _alert_dist:
+                _alert_txt += f" ({_alert_dist:+.1f}%)"
+            if _alert_vol_need > 0:
+                _alert_txt += f" · {_alert_vol_need:.1f}x"
+        else:
+            _alert_txt = "n/a"
+        cols[17].caption(_alert_txt)
+        cols[18].caption(row.get('Summary', '')[:42])
+
+    # ── Bottom pagination ─────────────────────────────────────────────
+    if total_pages > 1:
+        def _set_page(page: int):
+            st.session_state['scanner_page'] = page
+
+        bpg1, bpg2, bpg3, bpg4, bpg5 = st.columns([1, 1, 3, 1, 1])
+        with bpg1:
+            st.button("⏮", key="bpage_first", disabled=current_page == 0,
+                      on_click=_set_page, args=(0,))
+        with bpg2:
+            st.button("◀", key="bpage_prev", disabled=current_page == 0,
+                      on_click=_set_page, args=(max(0, current_page - 1),))
+        with bpg3:
+            st.caption(f"Page {current_page + 1}/{total_pages}")
+        with bpg4:
+            st.button("▶", key="bpage_next", disabled=current_page >= total_pages - 1,
+                      on_click=_set_page, args=(min(total_pages - 1, current_page + 1),))
+        with bpg5:
+            st.button("⏭", key="bpage_last", disabled=current_page >= total_pages - 1,
+                      on_click=_set_page, args=(total_pages - 1,))
+
+    # ── Quick Actions for selected ticker ─────────────────────────────
+    st.divider()
+
+    # Inline quick-add ticker
+    qa_col1, qa_col2 = st.columns([3, 1])
+    with qa_col1:
+        quick_ticker = st.text_input("Quick add ticker", placeholder="Type ticker and press Enter",
+                                      key="quick_add_main", label_visibility="collapsed")
+    with qa_col2:
+        if st.button("➕ Add & Scan", width="stretch"):
+            if quick_ticker:
+                ticker_clean = quick_ticker.strip().upper()
+                wl = bridge.get_watchlist_tickers()
+                if ticker_clean not in wl:
+                    bridge.add_to_watchlist(WatchlistItem(ticker=ticker_clean))
+                _loaded = _load_ticker_for_view(ticker_clean)
+                if not _loaded:
+                    st.session_state['_scanner_nav_error'] = str(
+                        st.session_state.get('_ticker_load_error', f"Unable to load {ticker_clean}.")
+                    )
+                st.rerun()
+
+    # Alert form (if requested from detail view)
+    alert_ticker = st.session_state.get('show_alert_form')
+    if alert_ticker:
+        _render_quick_alert_form(alert_ticker, jm)
+
+
+def _build_rows_from_analysis(results, jm) -> list:
+    """Build table rows from live TickerAnalysis objects."""
+    open_tickers = jm.get_open_tickers()
+    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    ticker_sectors = st.session_state.get('ticker_sectors', {})
+
+    def _resolve_sector(_ticker: str) -> str:
+        t = str(_ticker or '').upper().strip()
+        if not t:
+            return ''
+        sec = str(ticker_sectors.get(t, '') or '').strip()
+        if sec:
+            return sec
+        # Lazy backfill when scan-time sector assignment missed this ticker.
+        try:
+            from data_fetcher import get_ticker_sector
+            sec = str(get_ticker_sector(t) or '').strip()
+            if sec:
+                ticker_sectors[t] = sec
+                st.session_state['ticker_sectors'] = ticker_sectors
+                return sec
+        except Exception:
+            pass
+        return ''
+
+    rows = []
+    for r in results:
+        rec = r.recommendation or {}
+        q = r.quality or {}
+        sig = r.signal
+        if sig:
+            if isinstance(sig, dict):
+                vcp = (sig.get('vcp', {}) or {})
+            else:
+                vcp = (getattr(sig, 'vcp', {}) or {})
+        else:
+            vcp = {}
+        _ores = (sig.overhead_resistance if (sig and not isinstance(sig, dict)) else ((sig or {}).get('overhead_resistance', {}) if isinstance(sig, dict) else {})) or {}
+        _crit = (_ores.get('critical_level') or {}) if isinstance(_ores, dict) else {}
+        try:
+            _crit_px = float(_crit.get('price', 0) or 0)
+        except Exception:
+            _crit_px = 0.0
+        try:
+            _crit_dist = float(_ores.get('distance_to_critical_pct', 0) or 0)
+        except Exception:
+            _crit_dist = 0.0
+        try:
+            _breakout_vol_need = float(_ores.get('breakout_volume_needed', 0) or 0)
+        except Exception:
+            _breakout_vol_need = 0.0
+
+        # Status column
+        if r.ticker in open_tickers:
+            status = "📈 Open"
+        elif r.ticker in conditional_tickers:
+            status = "🎯 Alert"
+        else:
+            status = "👀"
+
+        # Sector rotation — use phase for color (LEADING/EMERGING/FADING/LAGGING)
+        sector = _resolve_sector(r.ticker)
+        sector_info = sector_rotation.get(sector, {})
+        sector_phase = sector_info.get('phase', '')
+        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        if sector_phase == 'LEADING':
+            sector_dot = f"🟢 {sector_short}"
+        elif sector_phase == 'EMERGING':
+            sector_dot = f"🔵 {sector_short}"
+        elif sector_phase == 'FADING':
+            sector_dot = f"🟡 {sector_short}"
+        elif sector_phase == 'LAGGING':
+            sector_dot = f"🔴 {sector_short}"
+        elif sector_short:
+            sector_dot = f"⚪ {sector_short}"
+        else:
+            sector_dot = ""
+
+        # Earnings flag (canonical resolver to stay aligned with AI context).
+        earn_info = resolve_earnings_for_ticker(r.ticker)
+        _ed = earn_info.get('days_until')
+        _earn_src = str(earn_info.get('source', '') or '').strip()
+        _earn_conf = str(earn_info.get('confidence', '') or '').strip().upper()
+        _earn_dt = str(earn_info.get('next_earnings', '') or '').strip()
+        _earn_trusted = _is_earnings_data_trusted(
+            _ed if _ed is not None else 999,
+            source=_earn_src,
+            confidence=_earn_conf,
+            next_earnings=_earn_dt,
+        )
+        if _ed is not None:
+            if not _earn_trusted:
+                earn_flag = "🔴?"
+            elif _ed <= 7:
+                earn_flag = f"⚡{_ed}d"
+            elif _ed <= 14:
+                earn_flag = f"⏰{_ed}d"
+            elif _ed <= 30:
+                earn_flag = f"📅{_ed}d"
+            else:
+                earn_flag = f"{_ed}d"
+        else:
+            earn_flag = ""
+
+        # Volume
+        vol = r.volume or 0
+        avg_vol = r.avg_volume_50d or 0
+        vol_ratio = r.volume_ratio or 0
+        if vol >= 1_000_000:
+            vol_str = f"{vol/1_000_000:.1f}M"
+        elif vol >= 1_000:
+            vol_str = f"{vol/1_000:.0f}K"
+        else:
+            vol_str = str(int(vol)) if vol else ""
+
+        # Volume ratio indicator
+        if vol_ratio >= 2.0:
+            vol_str = f"🔥{vol_str}"  # 2x+ above average
+        elif vol_ratio >= 1.5:
+            vol_str = f"📈{vol_str}"  # 1.5x+ above average
+
+        # Earnings date
+        earn_date_str = str(earn_info.get('next_earnings', '') or '')
+        if earn_date_str and _ed is not None:
+            if not _earn_trusted:
+                earn_date_str = f"🔴{earn_date_str}"
+            elif _ed <= 7:
+                earn_date_str = f"⚡{earn_date_str}"
+            elif _ed <= 14:
+                earn_date_str = f"⏰{earn_date_str}"
+
+        # AO divergence + Apex indicators
+        div_flag = " (D)" if r.ao_divergence_active else ""
+        apex_flag = "🎯" if r.apex_buy else ""
+        rec_adj = _adjust_recommendation_for_sector(
+            str(rec.get('recommendation', 'SKIP') or 'SKIP'),
+            int(rec.get('conviction', 0) or 0),
+            sector_phase,
+        )
+
+        # Re-entry recency (for color coding)
+        reentry_bars_ago = 0
+        if r.reentry and r.reentry.get('is_valid'):
+            reentry_bars_ago = r.reentry.get('macd_cross_bars_ago', 0)
+        elif r.late_entry and r.late_entry.get('is_valid'):
+            reentry_bars_ago = r.late_entry.get('days_since_cross', 0)
+
+        rows.append({
+            'Ticker': r.ticker,
+            'Status': status,
+            'Sector': sector_dot,
+            'SectorPhase': sector_phase,  # For filtering
+            'Earn': earn_flag,
+            'EarnDate': earn_date_str,
+            'Rec': rec_adj.get('recommendation', rec.get('recommendation', 'SKIP')),
+            'Conv': f"{rec_adj.get('conviction', rec.get('conviction', 0))}/10",
+            'MACD': "✅" if sig and sig.macd.get('bullish') else "❌",
+            'AO': "✅" if sig and sig.ao.get('positive') else "❌",
+            'VCP': (
+                f"✅ {float(vcp.get('vcp_score', 0.0) or 0.0):.0f}"
+                if bool(vcp.get('vcp_detected', False))
+                else "❌"
+            ),
+            'Wkly': (
+                "✅" if sig and bool(sig.weekly_macd) and sig.weekly_macd.get('bullish') else
+                ("❌" if sig and bool(sig.weekly_macd) else "➖")
+            ),
+            'Mthly': (
+                "✅" if sig and bool(sig.monthly_macd) and bool(sig.monthly_ao)
+                and sig.monthly_macd.get('bullish') and sig.monthly_ao.get('positive') else
+                ("❌" if sig and bool(sig.monthly_macd) and bool(sig.monthly_ao) else "➖")
+            ),
+            'Quality': q.get('quality_grade', '?'),
+            'Price': f"${r.current_price:.2f}" if r.current_price else "?",
+            'Volume': vol_str,
+            'DivFlag': div_flag,
+            'ApexFlag': apex_flag,
+            'ReentryAge': reentry_bars_ago,
+            'VCPDetected': bool(vcp.get('vcp_detected', False)),
+            'VCPScore': float(vcp.get('vcp_score', 0.0) or 0.0),
+            'VCPPivot': float(vcp.get('pivot_price', 0.0) or 0.0),
+            'VCPPriceContracting': bool(vcp.get('price_contracting', False)),
+            'VCPVolumeContracting': bool(vcp.get('volume_contracting', False)),
+            'AlertTrigger': _crit_px,
+            'AlertTriggerDistPct': _crit_dist,
+            'AlertTriggerDesc': str(_crit.get('description', '') or ''),
+            'BreakoutVolumeNeeded': _breakout_vol_need,
+            'Summary': rec.get('summary', ''),
+        })
+    return rows
+
+
+def _build_rows_from_summary(summary, jm) -> list:
+    """Build table rows from persisted scan summary (cross-session)."""
+    open_tickers = jm.get_open_tickers()
+    conditional_tickers = [c['ticker'] for c in jm.get_pending_conditionals()]
+    sector_rotation = st.session_state.get('sector_rotation', {})
+    ticker_sectors = st.session_state.get('ticker_sectors', {})
+
+    def _resolve_sector(_ticker: str, _persisted_sector: str) -> str:
+        sec = str(_persisted_sector or '').strip()
+        if sec:
+            return sec
+        t = str(_ticker or '').upper().strip()
+        if not t:
+            return ''
+        sec = str(ticker_sectors.get(t, '') or '').strip()
+        if sec:
+            return sec
+        try:
+            from data_fetcher import get_ticker_sector
+            sec = str(get_ticker_sector(t) or '').strip()
+            if sec:
+                ticker_sectors[t] = sec
+                st.session_state['ticker_sectors'] = ticker_sectors
+                return sec
+        except Exception:
+            pass
+        return ''
+
+    rows = []
+    for s in summary:
+        ticker = s.get('ticker', '?')
+        if ticker in open_tickers:
+            status = "📈 Open"
+        elif ticker in conditional_tickers:
+            status = "🎯 Alert"
+        else:
+            status = "👀"
+
+        # Sector rotation — prefer persisted phase, fallback to runtime lookup
+        sector = _resolve_sector(ticker, s.get('sector', ''))
+        sector_phase = s.get('sector_phase', '')  # Persisted from scan
+        if not sector_phase:
+            # Fallback to runtime sector_rotation (may be empty after page refresh)
+            sector_info = sector_rotation.get(sector, {})
+            sector_phase = sector_info.get('phase', '')
+        sector_info = sector_rotation.get(sector, {})
+        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        if sector_phase == 'LEADING':
+            sector_dot = f"🟢 {sector_short}"
+        elif sector_phase == 'EMERGING':
+            sector_dot = f"🔵 {sector_short}"
+        elif sector_phase == 'FADING':
+            sector_dot = f"🟡 {sector_short}"
+        elif sector_phase == 'LAGGING':
+            sector_dot = f"🔴 {sector_short}"
+        elif sector_short:
+            sector_dot = f"⚪ {sector_short}"
+        else:
+            sector_dot = ""
+
+        # Earnings (canonical resolver). Prefer session values over stale persisted snapshots.
+        earn_info = resolve_earnings_for_ticker(
+            ticker,
+            persisted_date=s.get('earn_date', ''),
+            persisted_days=s.get('earn_days'),
+            persisted_source=s.get('earn_source', ''),
+            persisted_confidence=s.get('earn_confidence', ''),
+        )
+        earn_days = earn_info.get('days_until')
+        earn_date_str = str(earn_info.get('next_earnings', '') or '')
+        earn_source = str(earn_info.get('source', s.get('earn_source', '')) or s.get('earn_source', '') or '')
+        earn_confidence = str(earn_info.get('confidence', s.get('earn_confidence', '')) or s.get('earn_confidence', '') or '').upper()
+        earn_trusted = _is_earnings_data_trusted(
+            earn_days if earn_days is not None else 999,
+            source=earn_source,
+            confidence=earn_confidence,
+            next_earnings=earn_date_str,
+        )
+        if not earn_trusted:
+            earn_flag = "🔴?"
+            if earn_date_str:
+                earn_date_str = f"🔴{earn_date_str}"
+        elif earn_days is None:
+            earn_flag = ""
+        elif earn_days <= 7:
+            earn_flag = f"⚡{earn_days}d"
+            if earn_date_str:
+                earn_date_str = f"⚡{earn_date_str}"
+        elif earn_days <= 14:
+            earn_flag = f"⏰{earn_days}d"
+            if earn_date_str:
+                earn_date_str = f"⏰{earn_date_str}"
+        elif earn_days <= 30:
+            earn_flag = f"📅{earn_days}d"
+        else:
+            earn_flag = f"{earn_days}d"
+
+        # Volume from persisted data
+        vol_str = s.get('volume_str', '')
+        div_flag = " (D)" if s.get('ao_divergence_active') else ""
+        apex_flag = "🎯" if s.get('apex_buy') else ""
+        reentry_bars_ago = s.get('reentry_bars_ago', 0)
+        rec_adj = _adjust_recommendation_for_sector(
+            str(s.get('recommendation', 'SKIP') or 'SKIP'),
+            int(s.get('conviction', 0) or 0),
+            sector_phase,
+        )
+
+        rows.append({
+            'Ticker': ticker,
+            'Status': status,
+            'Sector': sector_dot,
+            'SectorPhase': sector_phase,
+            'Earn': earn_flag,
+            'EarnDate': earn_date_str,
+            'Rec': rec_adj.get('recommendation', s.get('recommendation', 'SKIP')),
+            'Conv': f"{rec_adj.get('conviction', s.get('conviction', 0))}/10",
+            'MACD': "✅" if s.get('macd_bullish') else "❌",
+            'AO': "✅" if s.get('ao_positive') else "❌",
+            'VCP': (
+                f"✅ {float(s.get('vcp_score', 0.0) or 0.0):.0f}"
+                if bool(s.get('vcp_detected', False))
+                else "❌"
+            ),
+            'Wkly': (
+                "✅" if bool(s.get('weekly_bullish', False)) else
+                ("❌" if bool(s.get('weekly_available', True)) else "➖")
+            ),
+            'Mthly': (
+                "✅" if bool(s.get('monthly_bullish', False)) else
+                ("❌" if bool(s.get('monthly_available', True)) and bool(s.get('monthly_ao_available', True)) else "➖")
+            ),
+            'Quality': s.get('quality_grade', '?'),
+            'Price': f"${s.get('price', 0):.2f}" if s.get('price') else "?",
+            'Volume': vol_str,
+            'DivFlag': div_flag,
+            'ApexFlag': apex_flag,
+            'ReentryAge': reentry_bars_ago,
+            'VCPDetected': bool(s.get('vcp_detected', False)),
+            'VCPScore': float(s.get('vcp_score', 0.0) or 0.0),
+            'VCPPivot': float(s.get('vcp_pivot_price', 0.0) or 0.0),
+            'VCPPriceContracting': bool(s.get('vcp_price_contracting', False)),
+            'VCPVolumeContracting': bool(s.get('vcp_volume_contracting', False)),
+            'AlertTrigger': float(s.get('critical_resistance_price', 0.0) or 0.0),
+            'AlertTriggerDistPct': float(s.get('critical_resistance_dist_pct', 0.0) or 0.0),
+            'AlertTriggerDesc': str(s.get('critical_resistance_desc', '') or ''),
+            'BreakoutVolumeNeeded': float(s.get('critical_breakout_volume_needed', 0.0) or 0.0),
+            'Summary': s.get('summary', ''),
+        })
+    return rows
+
+
+def _extract_overhead_alert_metrics(signal: Optional[EntrySignal]) -> Dict[str, Any]:
+    """Extract major overhead resistance metrics for alert actions."""
+    ores = {}
+    if signal:
+        if isinstance(signal, dict):
+            ores = signal.get('overhead_resistance', {}) or {}
+        else:
+            ores = getattr(signal, 'overhead_resistance', {}) or {}
+    critical = (ores.get('critical_level') or {}) if isinstance(ores, dict) else {}
+    try:
+        trigger = float(critical.get('price', 0) or 0)
+    except Exception:
+        trigger = 0.0
+    try:
+        dist_pct = float(ores.get('distance_to_critical_pct', 0) or 0)
+    except Exception:
+        dist_pct = 0.0
+    try:
+        vol_need = float(ores.get('breakout_volume_needed', 0) or 0)
+    except Exception:
+        vol_need = 0.0
+    return {
+        'trigger': trigger,
+        'distance_pct': dist_pct,
+        'volume_needed': vol_need,
+        'description': str(critical.get('description', '') or ''),
+        'assessment': str(ores.get('assessment', '') or ''),
+    }
+
+
+def _set_breakout_alert_from_resistance(
+    jm: JournalManager,
+    *,
+    ticker: str,
+    trigger_price: float,
+    stop_price: float = 0.0,
+    target_price: float = 0.0,
+    conviction: int = 0,
+    quality_grade: str = "?",
+    notes: str = "",
+) -> str:
+    """Create/update a breakout-volume alert at major overhead resistance.
+    Delegates to alert_manager.create_breakout_alert().
+    """
+    return create_breakout_alert(
+        jm,
+        ticker=ticker,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        conviction=conviction,
+        quality_grade=quality_grade,
+        notes=notes,
+    )
+
+
+def _render_quick_alert_form(ticker: str, jm: JournalManager):
+    """Inline form to set a breakout/pullback alert.
+    Uses alert_manager.create_alert_from_form() for creation logic.
+    """
+    st.markdown(f"### 🎯 Set Alert for {ticker}")
+
+    current = fetch_current_price(ticker) or 0
+
+    ca1, ca2, ca3, ca4 = st.columns(4)
+    with ca1:
+        cond_type = st.selectbox("Type", ['breakout_above', 'pullback_to', 'breakout_volume'],
+                                  key=f"alert_type_{ticker}")
+    with ca2:
+        # Default trigger: overhead resistance if available, else current + 3%
+        default_trigger = float(current * 1.03) if current > 0 else 0.0
+        # Try to get resistance from analysis
+        analysis = st.session_state.get('selected_analysis')
+        if analysis and analysis.signal and analysis.signal.overhead_resistance:
+            ores_info = extract_resistance_info(analysis.signal.overhead_resistance)
+            if ores_info['trigger'] > 0:
+                default_trigger = ores_info['trigger']
+
+        trigger = st.number_input("Trigger Price", value=default_trigger,
+                                   step=0.01, format="%.2f", key=f"alert_trigger_{ticker}")
+    with ca3:
+        vol_mult = st.number_input("Volume (x avg)", value=1.5,
+                                    min_value=1.0, max_value=5.0, step=0.1,
+                                    key=f"alert_vol_{ticker}")
+    with ca4:
+        expires = st.date_input("Expires",
+                                 value=datetime.now() + timedelta(days=30),
+                                 key=f"alert_exp_{ticker}")
+
+    ac1, ac2 = st.columns(2)
+    with ac1:
+        if st.button("✅ Set Alert", type="primary", key=f"set_alert_{ticker}"):
+            result = create_alert_from_form(
+                jm,
+                ticker=ticker,
+                condition_type=cond_type,
+                trigger_price=trigger,
+                volume_multiplier=vol_mult,
+                expires_date=expires.strftime('%Y-%m-%d'),
+                notes=f"Current: ${current:.2f}",
+            )
+            st.success(result)
+            st.session_state.pop('show_alert_form', None)
+            st.rerun()
+    with ac2:
+        if st.button("Cancel", key=f"cancel_alert_{ticker}"):
+            st.session_state.pop('show_alert_form', None)
+            st.rerun()
+
+
+# =============================================================================
+# DETAIL VIEW — Tabbed analysis for selected ticker
+# =============================================================================
+
+@st.fragment
+def render_detail_view():
+    """Render detailed analysis for selected ticker via delegated UI shell."""
+    analysis: TickerAnalysis = st.session_state.get("selected_analysis")
+    render_detail_view_shell(
+        analysis=analysis,
+        render_signal_tab=_render_signal_tab,
+        render_chart_tab=_render_chart_tab,
+        render_ai_tab=_render_ai_tab,
+        render_chat_tab=_render_chat_tab,
+        render_trade_tab=_render_trade_tab,
+    )
+
+def _summary_snippet(value: Any, max_chars: int = 240) -> str:
+    txt = clean_ai_formatting(str(value or "").strip())
+    if len(txt) <= max_chars:
+        return txt
+    return txt[: max_chars - 1].rstrip() + "..."
+
+
+def _render_signal_tab(ticker: str, signal: EntrySignal, rec: Dict[str, Any], analysis: TickerAnalysis):
+    """Master analysis panel: signal engine + Grok AI + Perplexity in one streamlined view."""
+    if not signal:
+        st.warning("No signal data")
+        return
+
+    quality = analysis.quality or {}
+    jm = get_journal()
+    ai_result = st.session_state.get(f'ai_result_{ticker}') or {}
+    pplx_results = st.session_state.get(f"pplx_research_results_{ticker}", {}) or {}
+
+    _price = float(getattr(analysis, "current_price", 0.0) or 0.0)
+    _stops = signal.stops if signal else {}
+    _entry = float(_stops.get('entry', 0) or 0)
+    _stop = float(_stops.get('stop', 0) or 0)
+    _target = float(_stops.get('target', 0) or 0)
+    _rr = 0.0
+    if _entry > 0 and _stop > 0 and _target > 0 and _entry > _stop:
+        _risk = (_entry - _stop)
+        _reward = (_target - _entry)
+        _rr = (_reward / _risk) if _risk > 0 else 0.0
+
+    _rotation = st.session_state.get('sector_rotation', {}) or {}
+    _sector_ctx_text = " ".join([
+        str(getattr(analysis, 'summary', '') or ''),
+        str(rec.get('summary', '') or ''),
+        str(getattr(analysis, 'reasoning', '') or ''),
+        str(getattr(analysis, 'market_intel', '') or ''),
+    ]).strip()
+    _sector_info = _resolve_ticker_sector_for_detail(
+        ticker,
+        text_hint=_sector_ctx_text,
+        allow_fetch=True,
+    )
+    _sector = str(_sector_info.get('sector', '') or '').strip()
+    _phase = str(_sector_info.get('sector_phase', '') or '').upper().strip()
+    _phase_badge = _sector_phase_display(_phase)
+
+    _earn = resolve_earnings_for_ticker(ticker, verify_with_fetch=False)
+    _earn_days = int(_earn.get('days_until') or 999) if _earn.get('days_until') is not None else 999
+    _earn_badge = _earnings_badge(
+        _earn_days,
+        source=str(_earn.get('source', '') or ''),
+        confidence=str(_earn.get('confidence', '') or ''),
+        earn_date=str(_earn.get('next_earnings', '') or ''),
+    )
+    _earn_txt = str(_earn.get('next_earnings', '') or _earn_badge.get('text', 'n/a'))
+
+    st.markdown("### 🧭 Master Analysis")
+    st.caption("Unified view of scanner signal, Grok AI intelligence, and Perplexity research for faster decisions.")
+
+    mt1, mt2, mt3, mt4, mt5, mt6 = st.columns(6)
+    with mt1:
+        st.metric("Ticker", ticker)
+    with mt2:
+        st.metric("Price", f"${_price:.2f}" if _price > 0 else "n/a")
+    with mt3:
+        st.metric("Scanner Rec", str(rec.get('recommendation', 'SKIP') or 'SKIP'))
+    with mt4:
+        st.metric("Conviction", f"{int(rec.get('conviction', 0) or 0)}/10")
+    with mt5:
+        st.metric("Quality", str(quality.get('quality_grade', '?') or '?'))
+    with mt6:
+        st.metric("R:R", f"{_rr:.2f}:1" if _rr > 0 else "n/a")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        with st.container(border=True):
+            st.markdown("#### 📊 Signal Panel")
+            _daily_icon = "✅" if bool(signal.macd.get('bullish', False)) else "❌"
+            _ao_icon = "✅" if bool(signal.ao.get('positive', False)) else "❌"
+            _w = (signal.weekly_macd or {})
+            _m = (signal.monthly_macd or {})
+            _weekly_icon = "➖" if not _w else ("✅" if bool(_w.get('bullish', False)) else "❌")
+            _monthly_icon = "➖" if not _m else ("✅" if bool(_m.get('bullish', False)) else "❌")
+            st.caption(
+                f"Daily MACD: {_daily_icon} | Weekly: {_weekly_icon} | "
+                f"Monthly: {_monthly_icon} | AO: {_ao_icon}"
+            )
+            _vcp = {}
+            if signal:
+                if isinstance(signal, dict):
+                    _vcp = (signal.get('vcp', {}) or {})
+                else:
+                    _vcp = (getattr(signal, 'vcp', {}) or {})
+            _vcp_det = bool(_vcp.get('vcp_detected', False))
+            _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+            _vcp_pivot = _vcp.get('pivot_price', None)
+            _vcp_txt = (
+                f"VCP: ✅ detected ({_vcp_score:.0f}/100)"
+                if _vcp_det else
+                f"VCP: ❌ not detected ({_vcp_score:.0f}/100)"
+            )
+            if _vcp_pivot:
+                _pivot_label = "Pivot" if _vcp_det else "Candidate pivot"
+                _vcp_txt += f" | {_pivot_label} ${float(_vcp_pivot):.2f}"
+            st.caption(_vcp_txt)
+            if not _vcp_det and _vcp:
+                _pc = bool(_vcp.get('price_contracting', False))
+                _vc = bool(_vcp.get('volume_contracting', False))
+                _ut = bool(_vcp.get('in_uptrend', False))
+                st.caption(
+                    "VCP checks: "
+                    + f"price {'✅' if _pc else '❌'} | "
+                    + f"volume {'✅' if _vc else '❌'} | "
+                    + f"uptrend {'✅' if _ut else '❌'}"
+                )
+            st.caption(
+                f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
+                + (f" ({_sector})" if _sector else " (n/a)")
+            )
+            st.caption(f"Earnings: {_earn_badge['icon']} {_earn_txt}")
+            if _entry > 0 and _stop > 0 and _target > 0:
+                st.caption(f"Entry ${_entry:.2f} | Stop ${_stop:.2f} | Target ${_target:.2f}")
+            _ores = _extract_overhead_alert_metrics(signal)
+            _trigger = float(_ores.get('trigger', 0) or 0)
+            _dist = float(_ores.get('distance_pct', 0) or 0)
+            _vol_need = float(_ores.get('volume_needed', 0) or 0)
+            _desc = str(_ores.get('description', '') or '')
+            if _trigger > 0:
+                _line = f"Major overhead resistance trigger: ${_trigger:.2f}"
+                if _dist:
+                    _line += f" ({_dist:+.1f}% from price)"
+                if _vol_need > 0:
+                    _line += f" | breakout vol ~{_vol_need:.1f}x"
+                st.caption(_line)
+                if _desc:
+                    st.caption(_desc[:180])
+                if st.button("🔔 Set Alert @ Resistance", key=f"master_set_alert_{ticker}", width="stretch"):
+                    _msg = _set_breakout_alert_from_resistance(
+                        jm,
+                        ticker=ticker,
+                        trigger_price=_trigger,
+                        stop_price=_stop,
+                        target_price=_target,
+                        conviction=int(rec.get('conviction', 0) or 0),
+                        quality_grade=str(quality.get('quality_grade', '?') or '?'),
+                        notes=f"[Master] resistance trigger ${_trigger:.2f} | {_desc[:140]}",
+                    )
+                    st.success(_msg)
+                    st.rerun()
+            else:
+                st.caption("Major overhead resistance trigger: n/a")
+
+    with c2:
+        with st.container(border=True):
+            st.markdown("#### 🤖 Grok Panel")
+            if ai_result:
+                _action = str(ai_result.get('action', ai_result.get('timing', 'n/a')) or 'n/a')
+                _a_conv = int(ai_result.get('conviction', 0) or 0)
+                st.caption(f"Action: {_action}")
+                st.caption(f"AI Conviction: {_a_conv}/10")
+                st.caption(f"Sizing: {str(ai_result.get('position_sizing', 'n/a') or 'n/a')}")
+                st.caption(f"Quality: {str(ai_result.get('fundamental_quality', 'n/a') or 'n/a')[:90]}")
+                _why = _summary_snippet(ai_result.get('why_moving') or ai_result.get('analysis') or '', max_chars=220)
+                if _why:
+                    st.caption(f"Why now: {_why}")
+                _risk = _summary_snippet(ai_result.get('bear_case') or ai_result.get('red_flags') or '', max_chars=200)
+                if _risk:
+                    st.caption(f"Risk: {_risk}")
+            else:
+                st.info("No Grok analysis cached for this ticker yet.")
+                if st.button("Open AI Intel", key=f"master_open_aiintel_{ticker}", width="stretch"):
+                    st.session_state['default_detail_tab'] = 2
+                    st.rerun()
+
+    with c3:
+        with st.container(border=True):
+            st.markdown("#### 🔎 Perplexity Panel")
+            _labels = {
+                "fundamental_research": "Fundamental Research",
+                "fundamental_narrative": "Narrative",
+                "news_thesis": "News Thesis",
+            }
+            if not pplx_results:
+                st.info("No Perplexity outputs cached for this ticker yet.")
+            else:
+                for _k in ("fundamental_research", "fundamental_narrative", "news_thesis"):
+                    _r = pplx_results.get(_k) or {}
+                    _ok = bool(_r.get("ok"))
+                    _ts = str(_r.get("timestamp_utc", "") or "").strip()
+                    _prefix = "✅" if _ok else "⚠️"
+                    st.caption(f"{_prefix} {_labels.get(_k, _k)}" + (f" ({_ts})" if _ts else ""))
+                    if _ok:
+                        st.caption(_summary_snippet(_r.get("text", ""), max_chars=170))
+                    else:
+                        st.caption(_summary_snippet(_r.get("error", "not available"), max_chars=150))
+
+    st.markdown("#### 🔎 Research Actions")
+    _render_perplexity_research_controls(
+        ticker,
+        key_ns="master",
+        show_results=False,
+        heading="",
+    )
+
+    if pplx_results:
+        with st.expander("📚 Perplexity Output Details", expanded=False):
+            for _mode, _title in (
+                ("fundamental_research", "Fundamental Research"),
+                ("fundamental_narrative", "Fundamental Research — Narrative"),
+                ("news_thesis", "News Thesis"),
+            ):
+                _res = pplx_results.get(_mode)
+                if not _res:
+                    continue
+                st.markdown(f"**{_title}**")
+                if bool(_res.get("ok")):
+                    st.markdown(clean_ai_formatting(str(_res.get("text", "") or "")))
+                else:
+                    st.caption(str(_res.get("error", "failed"))[:220])
+                st.markdown("---")
+
+    with st.expander("🧪 Detailed Signal Diagnostics", expanded=False):
+        _render_signal_breakdown(signal, analysis)
+
+
+def _render_signal_breakdown(signal: EntrySignal, analysis: TickerAnalysis):
+    """Detailed signal diagnostics and multi-timeframe breakdown."""
+    if not signal:
+        st.warning("No signal data")
+        return
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("Daily")
+        m = signal.macd
+        st.metric("MACD", "Bullish ✅" if m.get('bullish') else "Bearish ❌",
+                  f"Hist: {m.get('histogram', 0):+.4f}")
+        if m.get('weakening'):
+            st.warning("⚠ MACD histogram weakening")
+        if m.get('near_cross'):
+            st.warning("⚠ Near crossover")
+
+        a = signal.ao
+        st.metric("AO", "Positive ✅" if a.get('positive') else "Negative ❌",
+                  f"Value: {a.get('value', 0):+.4f}")
+        st.caption(f"Trend: {a.get('trend', '?')}")
+
+    with col2:
+        st.subheader("Weekly")
+        w = signal.weekly_macd
+        if w:
+            st.metric("MACD", "Bullish ✅" if w.get('bullish') else "Bearish ❌",
+                      f"Hist: {w.get('histogram', 0):+.4f}")
+        else:
+            st.info("No weekly data")
+
+        st.subheader("Monthly")
+        mo = signal.monthly_macd
+        if mo:
+            st.metric("MACD", "Bullish ✅" if mo.get('bullish') else "Bearish ❌",
+                      f"Hist: {mo.get('histogram', 0):+.4f}")
+        else:
+            st.info("No monthly data")
+
+    with col3:
+        st.subheader("Context")
+        ws = signal.weinstein
+        st.metric("Weinstein", ws.get('label', '?'), ws.get('trend_maturity', ''))
+
+        q = analysis.quality or {}
+        st.metric("Quality", q.get('quality_grade', '?'),
+                  f"Score: {q.get('quality_score', 0)}/100")
+        st.caption(f"Win rate: {q.get('win_rate', 0):.0f}% | "
+                   f"Signals: {q.get('signals_found', 0)}")
+        _vcp = {}
+        if signal:
+            if isinstance(signal, dict):
+                _vcp = (signal.get('vcp', {}) or {})
+            else:
+                _vcp = (getattr(signal, 'vcp', {}) or {})
+        _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+        _vcp_state = "Detected ✅" if bool(_vcp.get('vcp_detected', False)) else "No ❌"
+        _vcp_delta = f"Score {_vcp_score:.0f}/100"
+        st.metric("VCP", _vcp_state, _vcp_delta)
+        if _vcp.get('pivot_price'):
+            st.caption(f"Pivot: ${float(_vcp.get('pivot_price')):.2f}")
+
+    # Overhead Resistance
+    ores = signal.overhead_resistance
+    if ores and ores.get('levels'):
+        st.divider()
+        st.subheader("Overhead Resistance")
+        st.caption(ores.get('assessment', ''))
+        for lev in ores['levels']:
+            st.text(f"  {lev['description']}")
+
+    # Key Levels
+    kl = signal.key_levels
+    if kl and kl.get('price'):
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("50 SMA", f"${kl.get('sma50', '?')}", kl.get('price_vs_sma50', ''))
+        c2.metric("200 SMA", f"${kl.get('sma200', '?')}", kl.get('price_vs_sma200', ''))
+        c3.metric("Golden Cross", "Yes ✅" if kl.get('golden_cross') else "No ❌")
+
+
+def _render_chart_tab(ticker: str, signal: EntrySignal, key_ns: str = "detail"):
+    """Interactive TradingView-style chart with APEX MTF signal overlay."""
+    data_cache = st.session_state.get('ticker_data_cache', {})
+    ticker_data = data_cache.get(ticker, {})
+    daily = ticker_data.get('daily')
+
+    if daily is None:
+        if _ensure_ticker_chart_cache(ticker, include_weekly=False, include_monthly=False):
+            data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+            ticker_data = data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}
+            daily = ticker_data.get('daily')
+        if daily is None:
+            st.warning("No chart data available")
+            return
+
+    weekly = ticker_data.get('weekly')
+    monthly = ticker_data.get('monthly')
+    macd_profile = str((_trade_quality_settings() or {}).get('macd_profile', MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY)
+    macd_label = get_macd_indicator_label(macd_profile)
+    jm = get_journal()
+    _sector_hint = " ".join([
+        str((signal.weinstein or {}).get('label', '') if signal else ''),
+        str((signal.overhead_resistance or {}).get('assessment', '') if signal else ''),
+    ]).strip()
+    _sector_info = _resolve_ticker_sector_for_detail(
+        ticker,
+        text_hint=_sector_hint,
+        allow_fetch=True,
+    )
+    _sector = str(_sector_info.get('sector', '') or '').strip()
+    _phase = str(_sector_info.get('sector_phase', '') or '').upper().strip()
+    _phase_badge = _sector_phase_display(_phase)
+
+    # Quick research actions placed in chart section for fast workflow.
+    _render_perplexity_research_controls(
+        ticker,
+        key_ns=f"chart_{key_ns}",
+        show_results=False,
+        heading="#### 🔎 Fundamental / News Research",
+    )
+
+    _ores = _extract_overhead_alert_metrics(signal)
+    _trigger = float(_ores.get('trigger', 0) or 0)
+    _dist = float(_ores.get('distance_pct', 0) or 0)
+    _vol_need = float(_ores.get('volume_needed', 0) or 0)
+    _desc = str(_ores.get('description', '') or '')
+    with st.container(border=True):
+        st.caption(
+            f"Sector: {_phase_badge['icon']} {_phase_badge['label']}"
+            + (f" ({_sector})" if _sector else " (n/a)")
+        )
+        _vcp = getattr(signal, 'vcp', {}) or {}
+        _vcp_det = bool(_vcp.get('vcp_detected', False))
+        _vcp_score = float(_vcp.get('vcp_score', 0.0) or 0.0)
+        _vcp_pivot = _vcp.get('pivot_price')
+        _vcp_line = (
+            f"VCP: {'✅ detected' if _vcp_det else '❌ not detected'} ({_vcp_score:.0f}/100)"
+        )
+        if _vcp_pivot:
+            _vcp_line += f" | {'Pivot' if _vcp_det else 'Candidate pivot'} ${float(_vcp_pivot):.2f}"
+        st.caption(_vcp_line)
+        if not _vcp_det and _vcp:
+            st.caption(
+                "VCP checks: "
+                + f"price {'✅' if bool(_vcp.get('price_contracting', False)) else '❌'} | "
+                + f"volume {'✅' if bool(_vcp.get('volume_contracting', False)) else '❌'} | "
+                + f"uptrend {'✅' if bool(_vcp.get('in_uptrend', False)) else '❌'}"
+            )
+        if _trigger > 0:
+            _line = f"🔔 Breakout alert trigger (major resistance): **${_trigger:.2f}**"
+            if _dist:
+                _line += f" ({_dist:+.1f}% from price)"
+            if _vol_need > 0:
+                _line += f" | needs ~{_vol_need:.1f}x volume"
+            st.markdown(_line)
+            if _desc:
+                st.caption(_desc[:180])
+            if st.button("🔔 Set Alert @ Resistance", key=f"chart_set_alert_{key_ns}_{ticker}", width="stretch"):
+                _stops = (signal.stops if signal else {}) or {}
+                _msg = _set_breakout_alert_from_resistance(
+                    jm,
+                    ticker=ticker,
+                    trigger_price=_trigger,
+                    stop_price=float(_stops.get('stop', 0) or 0),
+                    target_price=float(_stops.get('target', 0) or 0),
+                    conviction=0,
+                    quality_grade='?',
+                    notes=f"[Chart] resistance trigger ${_trigger:.2f} | {_desc[:140]}",
+                )
+                st.success(_msg)
+                st.rerun()
+        else:
+            st.caption("🔔 Breakout alert trigger (major resistance): n/a")
+
+    # ── APEX Signal Detection (cached per ticker) ──────────────────
+    _apex_toggle_key = f"apex_{key_ns}_{ticker}"
+    if _apex_toggle_key not in st.session_state:
+        # Default OFF for responsiveness; load on demand.
+        st.session_state[_apex_toggle_key] = False
+    show_apex = st.checkbox("🎯 Show APEX Signals", key=_apex_toggle_key)
+
+    apex_markers = []
+    apex_signals_list = []
+    apex_summary = {}
+
+    _apex_cache_key = f'_apex_cache_{ticker}'
+
+    if show_apex and (weekly is None or monthly is None):
+        _ensure_ticker_chart_cache(ticker, include_weekly=True, include_monthly=True)
+        data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+        ticker_data = data_cache.get(ticker, {}) if isinstance(data_cache, dict) else {}
+        weekly = ticker_data.get('weekly')
+        monthly = ticker_data.get('monthly')
+
+    if show_apex and weekly is not None and monthly is not None:
+        # Use cached APEX results if available
+        _cached_apex = st.session_state.get(_apex_cache_key)
+        if _cached_apex:
+            apex_signals_list = _cached_apex['signals']
+            apex_markers = _cached_apex['markers']
+            apex_summary = _cached_apex['summary']
+        else:
+            try:
+                spy_df = st.session_state.get('apex_spy_data')
+                vix_df = st.session_state.get('apex_vix_data')
+
+                apex_signals_list = detect_apex_signals(
+                    ticker=ticker,
+                    daily_data=daily,
+                    weekly_data=weekly,
+                    monthly_data=monthly,
+                    spy_data=spy_df,
+                    vix_data=vix_df,
+                )
+
+                apex_markers = get_apex_markers(apex_signals_list)
+                apex_summary = get_apex_summary(apex_signals_list)
+
+                # Cache for subsequent reruns (avoids re-detection on tab switches)
+                st.session_state[_apex_cache_key] = {
+                    'signals': apex_signals_list,
+                    'markers': apex_markers,
+                    'summary': apex_summary,
+                }
+
+            except Exception as e:
+                st.warning(f"APEX detection error: {e}")
+
+    # ── Render Chart ──────────────────────────────────────────────
+    render_tv_chart(daily, ticker, signal=signal, height=750,
+                    zoom_level=200, extra_markers=apex_markers,
+                    key=f"tv_{key_ns}_{ticker}",
+                    macd_profile=macd_profile)
+
+    # ── APEX Signal Panel ─────────────────────────────────────────
+    if apex_signals_list:
+        st.markdown("---")
+        st.markdown("### 🎯 APEX MTF Signals")
+
+        cols = st.columns(5)
+        with cols[0]:
+            st.metric("Signals", apex_summary.get('total', 0))
+        with cols[1]:
+            wr = apex_summary.get('win_rate', 0)
+            st.metric("Win Rate", f"{wr:.0f}%")
+        with cols[2]:
+            avg_r = apex_summary.get('avg_return', 0)
+            st.metric("Avg Return", f"{avg_r:+.1f}%")
+        with cols[3]:
+            st.metric("Best", f"{apex_summary.get('best_trade', 0):+.1f}%")
+        with cols[4]:
+            st.metric("Active", apex_summary.get('active', 0))
+
+        # Active trade banner
+        if 'active_trade' in apex_summary:
+            at = apex_summary['active_trade']
+            trail_status = '🟢 ATR Trail ON' if at['atr_trail_active'] else '⏳ Pre-trail'
+            st.success(
+                f"**ACTIVE** | Entry: {at['entry_date']} @ ${at['entry_price']:.2f} | "
+                f"Return: {at['current_return']:+.1f}% | "
+                f"{at['tier'].replace('_', ' ')} | {at['regime'].replace('Monthly_', '')} | "
+                f"Stop: {at['stop']}% | {trail_status}"
+            )
+
+        # Signal history table
+        with st.expander("📋 Signal History", expanded=False):
+            history_data = []
+            for sig in reversed(apex_signals_list):
+                history_data.append({
+                    'Entry': sig.entry_date.strftime('%Y-%m-%d'),
+                    'Exit': sig.exit_date.strftime('%Y-%m-%d') if sig.exit_date else '🔵 ACTIVE',
+                    'Tier': sig.signal_tier.replace('Tier_', 'T'),
+                    'Regime': sig.monthly_regime.replace('Monthly_', ''),
+                    'Return': f"{sig.return_pct:+.1f}%" if sig.return_pct is not None else '-',
+                    'Exit Type': (sig.exit_reason or 'Active').replace('_', ' '),
+                    'Weeks': f"{sig.hold_weeks:.1f}" if sig.hold_weeks else '-',
+                })
+            st.dataframe(
+                pd.DataFrame(history_data),
+                width="stretch",
+                hide_index=True,
+            )
+
+    # ── Chart Legend ──────────────────────────────────────────────
+    with st.expander("📊 Chart Legend", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("""
+**Price Panel:**
+- 🟢🔴 **Candles** — Green = bullish close, Red = bearish close
+- 🟠 **150d SMA** (dotted) — 30-week trend proxy. Price above = uptrend
+- 🔵 **50 SMA** (dashed) — Medium-term trend direction
+- 🟣 **200 SMA** (dashed) — Long-term trend. Price above = bull market
+- 🔴 **R $xxx** — Overhead resistance levels (★ = critical resistance)
+
+**TTA Signals (MACD zero-cross):**
+- 🟢 **BUY** — MACD crossed above zero + AO confirmed positive
+- 🔴 **SELL** — MACD crossed below zero + AO confirmed negative
+- 🔶 **W5(div)** — Bearish divergence (AO wave method)
+- 🟢 **W3** — Wave 3 momentum peak
+""")
+        with c2:
+            st.markdown(f"""
+**APEX MTF Signals (multi-timeframe system):**
+- 🟢 **APEX T1** — Daily + Weekly confirmed + Monthly bullish
+- 🟢 **APEX T2** — Daily + Weekly confirmed + Monthly curling
+- 🟢 **APEX T3** — Daily + Weekly early + Monthly bullish
+- 🔴 **EXIT** (red) — Stop loss hit
+- 🟡 **EXIT** (yellow) — Weekly MACD crossed down
+- 🟠 **EXIT** (orange) — ATR trailing stop (profit protection)
+- 🔵 **ACTIVE** — Trade still open with current return %
+
+**Indicator Panels:**
+- **Volume** — Green/red bars
+- **AO** — Momentum histogram (green = bullish)
+- **{macd_label}** — Blue = MACD, Orange = Signal, Histogram = diff
+""")
+
+    # ── MTF chart ─────────────────────────────────────────────────
+    with st.expander("Multi-Timeframe View"):
+        if weekly is None or monthly is None:
+            st.caption("Weekly/monthly data not loaded yet.")
+            if st.button("Load weekly/monthly view", key=f"load_mtf_{key_ns}_{ticker}", width="stretch"):
+                _ok = _ensure_ticker_chart_cache(ticker, include_weekly=True, include_monthly=True)
+                if _ok:
+                    st.rerun()
+                else:
+                    st.warning("Unable to load multi-timeframe data right now.")
+        else:
+            try:
+                render_mtf_chart(daily, weekly, monthly, ticker, height=400, key_prefix=f"{key_ns}_", macd_profile=macd_profile)
+            except TypeError:
+                # Backward compatibility when Streamlit Cloud hot-reload has an older
+                # chart_engine module version in memory without key_prefix support.
+                render_mtf_chart(daily, weekly, monthly, ticker, height=400)
+
+
+def _render_ai_tab(ticker: str, signal: EntrySignal,
+                   rec: Dict, analysis: TickerAnalysis):
+    """AI-enhanced analysis with fundamental profile, TV-TA, news, and breakout guidance."""
+    quality = analysis.quality or {}
+    jm = get_journal()
+
+    # ── Get cached AI clients (no re-import/re-create on every rerun) ──
+    ai_clients = _get_ai_clients()
+    openai_client = ai_clients['openai_client']
+    gemini = ai_clients['gemini']
+    ai_config = ai_clients['ai_config']
+    primary_error = ai_clients['primary_error']
+    gemini_error = ai_clients['gemini_error']
+
+    # Show provider info
+    if openai_client:
+        st.caption(f"Provider: {ai_config['display']} | Model: {ai_config['model']}")
+
+    if not openai_client and not gemini:
+        errors = []
+        if primary_error:
+            errors.append(primary_error)
+        if gemini_error:
+            errors.append(f"Gemini: {gemini_error}")
+        st.warning(f"⚠️ AI providers unavailable: {' | '.join(errors)}")
+        st.caption("💡 After updating API keys, click 🔑 **Reset API** in ⚙️ Settings sidebar.")
+
+    # ── Perplexity quick research (fundamentals/news narrative) ──────────────
+    _render_perplexity_research_controls(ticker, key_ns="aiintel", show_results=True)
+
+    # Auto-run on first view for this ticker, or manual re-run
+    has_cached = st.session_state.get(f'ai_result_{ticker}') is not None
+    should_run = False
+    keys_available = bool(openai_client or gemini)
+
+    if has_cached:
+        # Show refresh button only if already have results
+        if st.button("🔄 Re-run AI Analysis", type="secondary"):
+            should_run = True
+    elif keys_available:
+        # Show prominent run button — don't auto-fire (saves ~10 API calls per ticker switch)
+        st.info("🤖 **AI analysis ready.** Click below to fetch fundamentals, market intel & AI recommendation.")
+        if st.button("▶️ Run AI Analysis", type="primary", width="stretch"):
+            should_run = True
+    else:
+        # No providers + no cached results — show manual button (to fetch data at least)
+        st.caption("AI providers unavailable. Data-only analysis available.")
+        if st.button("📊 Fetch Fundamentals (data only)", type="secondary"):
+            should_run = True
+
+    if should_run:
+        with st.spinner("Fetching fundamentals, market intel & analyzing..."):
+            fundamentals = {}
+            fundamental_profile = {}
+            tradingview_data = {}
+            news_data = {}
+
+            try:
+                from data_fetcher import (
+                    fetch_ticker_info, fetch_options_data,
+                    fetch_insider_transactions, fetch_institutional_holders,
+                    fetch_earnings_date, fetch_fundamental_profile,
+                    fetch_earnings_history,
+                    fetch_tradingview_mtf, fetch_finnhub_news,
+                )
+                fundamentals = {
+                    'info': fetch_ticker_info(ticker),
+                    'options': fetch_options_data(ticker),
+                    'insider': fetch_insider_transactions(ticker),
+                    'institutional': fetch_institutional_holders(ticker),
+                    'earnings': fetch_earnings_date(ticker),
+                }
+                fundamental_profile = fetch_fundamental_profile(ticker)
+            except Exception as e:
+                st.caption(f"Fundamentals error: {e}")
+
+            # Earnings history
+            earnings_history = {}
+            try:
+                earnings_history = fetch_earnings_history(ticker)
+            except Exception:
+                pass
+
+            # TradingView-TA (optional — no API key needed)
+            try:
+                tradingview_data = fetch_tradingview_mtf(ticker)
+            except Exception:
+                pass
+
+            # Finnhub news (optional — needs API key)
+            try:
+                finnhub_key = ""
+                try:
+                    finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                except Exception:
+                    pass
+                if finnhub_key:
+                    news_data = fetch_finnhub_news(ticker, api_key=finnhub_key)
+            except Exception:
+                pass
+
+            # Market intelligence — ALWAYS fetch (analysts, insiders, social proxy)
+            market_intel = {}
+            try:
+                from data_fetcher import fetch_market_intelligence
+                # Safe secrets access — st.secrets.get() throws if no secrets.toml
+                finnhub_key = ""
+                try:
+                    finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+                except Exception:
+                    pass
+                market_intel = fetch_market_intelligence(ticker, finnhub_key=finnhub_key)
+            except Exception as e:
+                st.caption(f"Market intel error: {e}")
+
+            # AI analysis — only if provider available
+            if openai_client or gemini:
+                result = run_ai_analysis(
+                    ticker=ticker,
+                    signal=signal,
+                    recommendation=rec,
+                    quality=quality,
+                    fundamentals=fundamentals,
+                    fundamental_profile=fundamental_profile,
+                    tradingview_data=tradingview_data,
+                    news_data=news_data,
+                    market_intel=market_intel,
+                    gemini_model=gemini,
+                    openai_client=openai_client,
+                    ai_model=ai_config.get('model', 'llama-3.3-70b-versatile'),
+                )
+            else:
+                # No AI provider — build result from data only
+                result = {
+                    'provider': 'none',
+                    'note': 'No AI provider configured. Showing data only.',
+                    'conviction': 0,
+                    'action': rec.get('recommendation', 'N/A'),
+                    'position_sizing': 'N/A',
+                    'fundamental_quality': 'N/A',
+                    'analysis': 'Configure GROQ_API_KEY or GEMINI_API_KEY for AI analysis.',
+                }
+
+            # Attach extra data for UI display
+            result['earnings_history'] = earnings_history
+            result['market_intel'] = market_intel
+            result['fundamentals'] = fundamentals  # For earnings fallback in risk assessment
+            result['fundamental_profile'] = fundamental_profile
+
+            st.session_state[f'ai_result_{ticker}'] = result
+
+    # Display result
+    ai_result = st.session_state.get(f'ai_result_{ticker}')
+    if not ai_result:
+        return
+
+    provider = ai_result.get('provider', 'unknown')
+    st.caption(f"Provider: {provider} | {ai_result.get('note', '')}")
+
+    # Show AI errors if present
+    groq_err = ai_result.get('groq_error', '')
+    gemini_err = ai_result.get('gemini_error', '')
+    _cfg = st.session_state.get('_ai_config', {})
+    _provider_name = _cfg.get('display', 'AI provider')
+
+    if groq_err:
+        if 'Invalid API Key' in groq_err or '401' in groq_err or 'Unauthorized' in groq_err:
+            st.error(f"🔑 **{_provider_name}: API key invalid (401).** Click 🔑 Reset API in ⚙️ Settings sidebar after fixing.")
+        else:
+            st.warning(f"⚠️ {_provider_name} error: {groq_err}")
+    if gemini_err:
+        if '429' in gemini_err or 'quota' in gemini_err.lower():
+            st.warning("⚠️ Gemini fallback: quota exceeded. Fix your primary API key to avoid this.")
+        else:
+            st.warning(f"⚠️ Gemini error: {gemini_err}")
+    if ai_result.get('openai_error'):
+        st.warning(f"⚠️ API error: {ai_result['openai_error']}")
+    if ai_result.get('error'):
+        if 'All AI providers failed' in str(ai_result.get('error', '')):
+            st.error(f"❌ All AI providers failed. Check your API key in secrets, then click 🔑 Reset API.")
+        else:
+            st.warning(f"⚠️ Error: {ai_result['error']}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TOP ROW: Action + Conviction + Sizing
+    # ═══════════════════════════════════════════════════════════════
+    conv = ai_result.get('conviction', 0)
+    action = ai_result.get('action', ai_result.get('timing', '?'))
+
+    # Action banner
+    action_upper = action.upper() if action else ''
+    if 'BUY NOW' in action_upper:
+        st.success(f"🟢 **{action}**")
+    elif 'WAIT' in action_upper:
+        st.warning(f"🟡 **{action}**")
+    elif 'SKIP' in action_upper:
+        st.error(f"🔴 **{action}**")
+    else:
+        st.info(f"📊 **{action}**")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        conv_icon = "🟢" if conv >= 7 else ("🟡" if conv >= 4 else "🔴")
+        st.metric("Conviction", f"{conv_icon} {conv}/10")
+    with c2:
+        sizing = ai_result.get('position_sizing', '?')
+        st.metric("Position Size", sizing.split('—')[0].strip() if '—' in sizing else sizing)
+    with c3:
+        fq = ai_result.get('fundamental_quality', '?')
+        grade = fq[0] if fq and fq[0] in 'ABCD' else '?'
+        grade_icon = {'A': '🟢', 'B': '🟢', 'C': '🟡', 'D': '🔴'}.get(grade, '⚪')
+        st.metric("Business Quality", f"{grade_icon} {grade}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # EARNINGS DATE BANNER (always visible — multiple source fallback)
+    # ═══════════════════════════════════════════════════════════════
+    _earn_hist = ai_result.get('earnings_history', {})
+    _earn_cal = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+
+    # Try earnings_history first (has quarters + streak), then calendar fallback
+    _e_date = _earn_hist.get('next_earnings') or _earn_cal.get('next_earnings')
+    _e_days = _earn_hist.get('days_until_earnings') or _earn_cal.get('days_until_earnings')
+    _e_eps = _earn_hist.get('next_eps_estimate') or _earn_cal.get('next_eps_estimate')
+    _e_conf = _earn_hist.get('confidence') or _earn_cal.get('confidence', '')
+    _e_src = _earn_hist.get('source') or _earn_cal.get('source', '')
+    _e_streak = _earn_hist.get('streak', 0)
+    _e_last = _earn_hist.get('last_earnings') or _earn_cal.get('last_earnings', '')
+
+    if _e_date:
+        _eps_str = f" | EPS Est: ${_e_eps:.2f}" if _e_eps else ""
+        _streak_str = f" | {'🔥' if _e_streak > 0 else '📉'} {abs(_e_streak)} {'beat' if _e_streak > 0 else 'miss'}{'s' if abs(_e_streak) > 1 else ''}" if _e_streak != 0 else ""
+        _conf_str = f" ({_e_conf})" if _e_conf else ""
+
+        if _e_days is not None and _e_days <= 7:
+            st.error(f"⚡ **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str} — Binary event imminent{_conf_str}")
+        elif _e_days is not None and _e_days <= 14:
+            st.warning(f"⏰ **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str} — Plan exit strategy{_conf_str}")
+        elif _e_days is not None and _e_days <= 30:
+            st.info(f"📅 **Earnings: {_e_date} ({_e_days}d)**{_eps_str}{_streak_str}{_conf_str}")
+        else:
+            _days_str = f" ({_e_days}d)" if _e_days else ""
+            st.caption(f"📅 Next Earnings: {_e_date}{_days_str}{_eps_str}{_streak_str}{_conf_str}")
+    elif _e_last:
+        st.caption(f"📅 Earnings: Not yet announced (Last: {_e_last})")
+    # If no earnings data at all, don't clutter the header
+
+    # ═══════════════════════════════════════════════════════════════
+    # TRADE LEVELS (Entry / Target / Stop / R:R)
+    # ═══════════════════════════════════════════════════════════════
+    stops = signal.stops if signal else {}
+    _entry = stops.get('entry', 0)
+    _stop = stops.get('stop', 0)
+    _target = stops.get('target', 0)
+    _price = analysis.current_price if analysis else 0
+
+    if _entry and _stop and _target and _entry > _stop:
+        risk = _entry - _stop
+        reward = _target - _entry
+        rr_ratio = reward / risk if risk > 0 else 0
+
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            st.metric("Entry", f"${_entry:.2f}")
+        with t2:
+            pct_target = ((_target - _entry) / _entry * 100) if _entry else 0
+            st.metric("Target", f"${_target:.2f}", delta=f"+{pct_target:.1f}%")
+        with t3:
+            pct_stop = ((_stop - _entry) / _entry * 100) if _entry else 0
+            st.metric("Stop Loss", f"${_stop:.2f}", delta=f"{pct_stop:.1f}%")
+        with t4:
+            rr_icon = "🟢" if rr_ratio >= 2.5 else ("🟡" if rr_ratio >= 2.0 else "🔴")
+            st.metric("R:R Ratio", f"{rr_icon} {rr_ratio:.1f}:1")
+
+    # ═══════════════════════════════════════════════════════════════
+    # SECTOR ROTATION POSITION
+    # ═══════════════════════════════════════════════════════════════
+    _rotation = st.session_state.get('sector_rotation', {})
+    _fp = ai_result.get('fundamental_profile', {})
+    _stock_sector = _fp.get('sector', '') if _fp else ''
+    _phase = ''  # Initialize — may be set below
+    _vs_spy = 0
+
+    if _rotation and _stock_sector:
+        _sector_info = _rotation.get(_stock_sector, {})
+        _phase = _sector_info.get('phase', '')
+        _vs_spy = _sector_info.get('vs_spy_20d', 0)
+        _etf = _sector_info.get('etf', '')
+        _perf_20d = _sector_info.get('perf_20d', 0)
+
+        if _phase == 'LEADING':
+            st.success(f"🚀 **MOMENTUM TAILWIND** — {_stock_sector} ({_etf}) is **LEADING** the market ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** 2 of 3 timeframes aligned = valid setup. Sector momentum supports the trade.")
+        elif _phase == 'EMERGING':
+            st.info(f"📈 **REQUIRES STRONGER CONFLUENCE** — {_stock_sector} ({_etf}) is **EMERGING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** All 3 timeframes must align. Sector is building momentum but not yet confirmed.")
+        elif _phase == 'FADING':
+            st.warning(f"⚠️ **TIGHTEN STOPS** — {_stock_sector} ({_etf}) is **FADING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** Consider taking profits, reduce position size. Watch for sector breakdown.")
+        elif _phase == 'LAGGING':
+            st.error(f"🔴 **SECTOR HEADWIND** — {_stock_sector} ({_etf}) is **LAGGING** ({_vs_spy:+.1f}% vs SPY, {_perf_20d:+.1f}% 20d)")
+            st.caption("**Trading Guidance:** Perfect confluence + volume surge required. Sector is working against you.")
+
+    # ═══════════════════════════════════════════════════════════════
+    # MULTI-TIMEFRAME CONFLUENCE
+    # ═══════════════════════════════════════════════════════════════
+    _macd = signal.macd if signal else {}
+    _ao = signal.ao if signal else {}
+    _weinstein = signal.weinstein if signal else {}
+    _ws_stage = _weinstein.get('stage', 0) if _weinstein else 0
+
+    # Daily: MACD above signal line = bullish
+    _daily_bullish = _macd.get('bullish', False) if _macd else False
+    _daily_weakening = _macd.get('weakening', False) if _macd else False
+    _daily_cross_recent = _macd.get('cross_recent', False) if _macd else False
+    _daily_hist = _macd.get('histogram', 0) if _macd else 0
+
+    # Weekly: Weinstein Stage 2 (advancing) = bullish structure
+    _weekly_bullish = _ws_stage == 2
+
+    # Momentum: AO positive = bullish momentum (trend adds nuance)
+    _ao_positive = _ao.get('positive', False) if _ao else False
+    _ao_trend = _ao.get('trend', 'flat') if _ao else 'flat'
+    _ao_value = _ao.get('value', 0) if _ao else 0
+    _momentum_bullish = _ao_positive
+
+    _aligned_count = sum([_daily_bullish, _weekly_bullish, _momentum_bullish])
+    _confluence_score = _aligned_count / 3.0
+
+    st.markdown("---")
+    tf1, tf2, tf3 = st.columns(3)
+    with tf1:
+        if _daily_bullish:
+            _d_icon = "✅ Bullish"
+            if _daily_weakening:
+                _d_icon = "⚠️ Weakening"
+        else:
+            _d_icon = "❌ Bearish"
+        _d_detail = f"Hist: {_daily_hist:+.2f}" + (" | Recent cross" if _daily_cross_recent else "")
+        st.metric("Daily (MACD)", _d_icon)
+        st.caption(_d_detail)
+    with tf2:
+        _w_icon = "✅ Stage 2" if _weekly_bullish else ("⚠️ Stage " + str(_ws_stage) if _ws_stage else "❌ N/A")
+        _w_label = _weinstein.get('label', '')[:25] if _weinstein else ''
+        st.metric("Weekly (Weinstein)", _w_icon)
+        st.caption(_w_label if _w_label else "Structure")
+    with tf3:
+        if _ao_positive:
+            _m_icon = "✅ Positive" if _ao_trend != 'falling' else "⚠️ Fading"
+        else:
+            _m_icon = "❌ Negative"
+        st.metric("Momentum (AO)", _m_icon)
+        st.caption(f"AO: {_ao_value:+.1f} ({_ao_trend})")
+
+    # Confluence bar + sector-adjusted guidance
+    _required = 3 if _phase == 'LAGGING' else (3 if _phase == 'EMERGING' else 2)
+    _meets_req = _aligned_count >= _required
+    _bar_text = f"Confluence: {_aligned_count}/3 aligned"
+    if _phase:
+        _bar_text += f" ({'✅ meets' if _meets_req else '❌ below'} {_phase.lower()} sector requirement of {_required}/3)"
+    st.progress(_confluence_score, text=_bar_text)
+
+    # ═══════════════════════════════════════════════════════════════
+    # RISK ASSESSMENT (earnings proximity + volatility)
+    # ═══════════════════════════════════════════════════════════════
+    resistance = ai_result.get('resistance_verdict', '')  # Used here and in resistance section below
+
+    # Earnings date — try earnings_history first, then fundamentals.earnings as fallback
+    _earnings_data = ai_result.get('earnings_history', {})
+    _next_earnings = _earnings_data.get('next_earnings') if _earnings_data else None
+    _days_to_earn = _earnings_data.get('days_until_earnings') if _earnings_data else None
+    _earn_confidence = _earnings_data.get('confidence', '') if _earnings_data else ''
+
+    # Fallback: fetch_earnings_date result (stored in fundamentals dict during AI Intel)
+    if not _next_earnings:
+        _fund_earnings = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+        if _fund_earnings:
+            _next_earnings = _fund_earnings.get('next_earnings')
+            _days_to_earn = _fund_earnings.get('days_until_earnings')
+            _earn_confidence = _fund_earnings.get('confidence', '')
+
+    # Parse days if we have a date string but no days count
+    if _next_earnings and _days_to_earn is None:
+        try:
+            _earn_dt = datetime.strptime(str(_next_earnings), '%Y-%m-%d')
+            _days_to_earn = (_earn_dt - datetime.now()).days
+        except Exception:
+            pass
+
+    _risk_factors = []
+    _risk_score = 0
+
+    # Earnings risk
+    if _days_to_earn is not None and _days_to_earn <= 30:
+        _risk_score += 40 if _days_to_earn <= 7 else (30 if _days_to_earn <= 14 else 20)
+        _risk_factors.append(f"Earnings in {_days_to_earn}d")
+
+    # Sector headwind
+    if _phase in ('LAGGING', 'FADING'):
+        _risk_score += 20
+        _risk_factors.append(f"Sector {_phase.lower()}")
+
+    # Low conviction
+    if conv <= 3:
+        _risk_score += 20
+        _risk_factors.append("Low conviction")
+
+    # Resistance overhead
+    if resistance and any(w in resistance.lower() for w in ['wait', 'stall', 'failed']):
+        _risk_score += 15
+        _risk_factors.append("Resistance overhead")
+
+    # Low confluence
+    if _aligned_count <= 1:
+        _risk_score += 15
+        _risk_factors.append(f"Low confluence ({_aligned_count}/3)")
+
+    _risk_score = min(_risk_score, 100)
+
+    if _risk_score > 0:
+        r1, r2 = st.columns([3, 1])
+        with r1:
+            _risk_label = "LOW" if _risk_score < 30 else ("MODERATE" if _risk_score < 50 else ("HIGH" if _risk_score < 75 else "EXTREME"))
+            _risk_color = "success" if _risk_score < 30 else ("info" if _risk_score < 50 else ("warning" if _risk_score < 75 else "error"))
+            getattr(st, _risk_color)(f"⚠️ **Risk: {_risk_label}** ({_risk_score}/100) — {', '.join(_risk_factors)}")
+        with r2:
+            st.progress(_risk_score / 100, text=f"{_risk_score}%")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TECHNICAL SNAPSHOT TABLE (reuses _macd, _ao, _weinstein from confluence)
+    # ═══════════════════════════════════════════════════════════════
+    if signal and _price:
+        _vol_ratio = analysis.volume_ratio if analysis else 0
+        _ores = signal.overhead_resistance if signal else {}
+
+        _tech_rows = []
+
+        # Price
+        _tech_rows.append(("Price", f"${_price:.2f}", "—"))
+
+        # Weinstein Stage
+        _ts_icon = "✅" if _ws_stage == 2 else ("⚠️" if _ws_stage in (1, 3) else "❌")
+        _ts_label = _weinstein.get('label', '')[:30] if _weinstein else ''
+        _tech_rows.append(("Weinstein Stage", f"Stage {_ws_stage}" + (f" — {_ts_label}" if _ts_label else ""), _ts_icon))
+
+        # MACD Signal
+        _macd_bullish = _macd.get('bullish', False) if _macd else False
+        _macd_weak = _macd.get('weakening', False) if _macd else False
+        _macd_hist = _macd.get('histogram', 0) if _macd else 0
+        if _macd_bullish:
+            _ms_label = "Bullish" + (" (weakening)" if _macd_weak else "")
+            _ms_icon = "⚠️" if _macd_weak else "✅"
+        else:
+            _ms_label = "Bearish"
+            _ms_icon = "❌"
+        _tech_rows.append(("MACD Signal", f"{_ms_label} (Hist: {_macd_hist:+.2f})", _ms_icon))
+
+        # AO Momentum
+        _ao_pos = _ao.get('positive', False) if _ao else False
+        _ao_trn = _ao.get('trend', 'flat') if _ao else 'flat'
+        _ao_val = _ao.get('value', 0) if _ao else 0
+        if _ao_pos:
+            _ao_label = f"Positive ({_ao_trn})"
+            _ao_icon = "✅" if _ao_trn != 'falling' else "⚠️"
+        else:
+            _ao_label = f"Negative ({_ao_trn})"
+            _ao_icon = "❌"
+        _tech_rows.append(("AO Momentum", f"{_ao_label} ({_ao_val:+.1f})", _ao_icon))
+
+        # Volume vs Average
+        if _vol_ratio:
+            _vol_status = "✅ High" if _vol_ratio >= 1.5 else ("⚠️ Normal" if _vol_ratio >= 0.8 else "❌ Low")
+            _tech_rows.append(("Volume vs Avg", f"{_vol_ratio:.1f}x", _vol_status))
+
+        # Risk per Share
+        if _entry and _stop:
+            _risk_pct = abs((_entry - _stop) / _entry * 100) if _entry else 0
+            _tech_rows.append(("Risk per Share", f"${abs(_entry - _stop):.2f}", f"{_risk_pct:.1f}%"))
+
+        # Overhead Resistance Density
+        if _ores:
+            _density = _ores.get('density_pct', 0) if isinstance(_ores, dict) else 0
+            _crit = _ores.get('critical_level', {}) if isinstance(_ores, dict) else {}
+            _crit_price = _crit.get('price', 0) if isinstance(_crit, dict) else 0
+            _ores_val = f"{_density:.0f}%" + (f" (critical: ${_crit_price:.2f})" if _crit_price else "")
+            _ores_icon = "✅ Clear" if _density < 15 else ("⚠️ Moderate" if _density < 40 else "❌ Heavy")
+            _tech_rows.append(("Overhead Resistance", _ores_val, _ores_icon))
+
+        # Distance to 200 SMA
+        _sma200 = _weinstein.get('sma_200', 0) if _weinstein else 0
+        if not _sma200:
+            _sma200 = _weinstein.get('ma_200', 0) if _weinstein else 0
+        if _sma200 and _price:
+            _dist_200 = ((_price / _sma200) - 1) * 100
+            _dist_icon = "✅ Above" if _dist_200 > 0 else "❌ Below"
+            _tech_rows.append(("Distance to 200 SMA", f"{_dist_200:+.1f}%" + (f" (${_sma200:.2f})" if _sma200 else ""), _dist_icon))
+
+        if _tech_rows:
+            with st.expander("📈 Technical Snapshot", expanded=False):
+                _df = pd.DataFrame(_tech_rows, columns=["Metric", "Value", "Status"])
+                st.dataframe(_df, hide_index=True, width='stretch')
+
+    # ═══════════════════════════════════════════════════════════════
+    # RESISTANCE VERDICT + BREAKOUT ALERT BUTTON
+    # ═══════════════════════════════════════════════════════════════
+    if resistance:
+        is_wait = any(w in resistance.lower() for w in ['wait', 'breakout', 'stall', 'failed'])
+        if is_wait:
+            st.warning(f"🚧 **Resistance:** {resistance}")
+
+            # Extract trigger price from resistance verdict or overhead data
+            _ores_info = extract_resistance_info(
+                signal.overhead_resistance if signal else {}
+            )
+            trigger_price = _ores_info['trigger'] if _ores_info['trigger'] > 0 else None
+
+            # Show "Set Breakout Alert" button
+            if trigger_price:
+                ba_col1, ba_col2 = st.columns([3, 1])
+                with ba_col1:
+                    st.markdown(f"**Set alert for breakout above ${trigger_price:.2f}?**")
+                with ba_col2:
+                    if st.button("🎯 Set Breakout Alert", key=f"ba_{ticker}",
+                                 type="primary"):
+                        msg = create_breakout_alert(
+                            jm,
+                            ticker=ticker,
+                            trigger_price=trigger_price,
+                            stop_price=float(signal.stops.get('stop', 0) if signal and signal.stops else 0),
+                            target_price=float(signal.stops.get('target', 0) if signal and signal.stops else 0),
+                            conviction=conv,
+                            quality_grade=fq[0] if fq and fq[0] in 'ABCD' else '?',
+                            notes=f"AI: {resistance[:100]}",
+                        )
+                        st.success(msg)
+                        st.rerun()
+        else:
+            st.success(f"✅ **Resistance:** {resistance}")
+
+    # ═══════════════════════════════════════════════════════════════
+    # TRADINGVIEW CONFIRMATION
+    # ═══════════════════════════════════════════════════════════════
+    tv_data = ai_result.get('tradingview_data', {})
+    if tv_data:
+        _render_tv_confirmation(tv_data)
+
+    # ═══════════════════════════════════════════════════════════════
+    # WHY IT'S MOVING + FUNDAMENTAL QUALITY
+    # ═══════════════════════════════════════════════════════════════
+    col_l, col_r = st.columns(2)
+
+    with col_l:
+        why = ai_result.get('why_moving', '')
+        if why:
+            st.markdown(f"**📰 Why it's moving:**")
+            st.info(clean_ai_formatting(why))
+
+        fq_detail = ai_result.get('fundamental_quality', '')
+        if fq_detail:
+            st.markdown(f"**💼 Fundamental quality:**")
+            st.info(clean_ai_formatting(fq_detail))
+
+    with col_r:
+        bull = ai_result.get('bull_case', '')
+        if bull:
+            st.markdown("**🐂 Bull case:**")
+            st.success(clean_ai_formatting(bull))
+
+        bear = ai_result.get('bear_case', '')
+        if bear:
+            st.markdown("**🐻 Bear case:**")
+            st.error(clean_ai_formatting(bear))
+
+    # ═══════════════════════════════════════════════════════════════
+    # SMART MONEY (AI-synthesized analyst + insider view)
+    # ═══════════════════════════════════════════════════════════════
+    smart = ai_result.get('smart_money', '')
+    if smart:
+        st.markdown("**🏦 Smart Money:**")
+        st.info(clean_ai_formatting(smart))
+
+    # ═══════════════════════════════════════════════════════════════
+    # RED FLAGS
+    # ═══════════════════════════════════════════════════════════════
+    flags = ai_result.get('red_flags', '')
+    if flags and flags.lower() != 'none':
+        st.warning(f"🚩 **Red flags:** {clean_ai_formatting(flags)}")
+    else:
+        st.success("🚩 **Red flags:** None — clean setup")
+
+    # ═══════════════════════════════════════════════════════════════
+    # MARKET INTELLIGENCE PANEL
+    # ═══════════════════════════════════════════════════════════════
+    mi = ai_result.get('market_intel', {})
+    if mi:
+        _render_market_intelligence(mi)
+    else:
+        st.caption("Market intelligence not available — re-run analysis to fetch")
+
+    # ═══════════════════════════════════════════════════════════════
+    # EARNINGS SECTION
+    # ═══════════════════════════════════════════════════════════════
+    earnings = ai_result.get('earnings_history', {}) or {}
+
+    # Merge in fallback date from fetch_earnings_date() if history didn't get it
+    if not earnings.get('next_earnings'):
+        _fallback_earn = ai_result.get('fundamentals', {}).get('earnings', {}) if ai_result.get('fundamentals') else {}
+        if _fallback_earn and _fallback_earn.get('next_earnings'):
+            earnings['next_earnings'] = _fallback_earn['next_earnings']
+            earnings['days_until_earnings'] = _fallback_earn.get('days_until_earnings')
+            if not earnings.get('next_eps_estimate'):
+                earnings['next_eps_estimate'] = _fallback_earn.get('next_eps_estimate')
+            earnings['confidence'] = _fallback_earn.get('confidence', '')
+            earnings['source'] = _fallback_earn.get('source', '')
+
+    if earnings and (earnings.get('next_earnings') or earnings.get('quarters')):
+        _render_earnings_section(earnings)
+
+    # ═══════════════════════════════════════════════════════════════
+    # NEWS HEADLINES
+    # ═══════════════════════════════════════════════════════════════
+    news = ai_result.get('news_data', {})
+    if news and news.get('headlines'):
+        with st.expander(f"📰 Recent News ({news.get('count', 0)} articles)", expanded=False):
+            for h in news['headlines'][:5]:
+                url = h.get('url', '')
+                headline = h.get('headline', '')
+                source = h.get('source', '')
+                dt = h.get('datetime', '')
+                if url:
+                    st.markdown(f"**{dt}** — [{headline}]({url}) *({source})*")
+                else:
+                    st.markdown(f"**{dt}** — {headline} *({source})*")
+
+    # ═══════════════════════════════════════════════════════════════
+    # FUNDAMENTAL SNAPSHOT TABLE
+    # ═══════════════════════════════════════════════════════════════
+    fp = ai_result.get('fundamental_profile', {})
+    if fp and not fp.get('error'):
+        with st.expander("📊 Fundamental Snapshot", expanded=False):
+            _render_fundamental_snapshot(fp)
+
+    # ═══════════════════════════════════════════════════════════════
+    # FULL AI RESPONSE
+    # ═══════════════════════════════════════════════════════════════
+    with st.expander("📝 Full AI Response"):
+        st.markdown(clean_ai_formatting(ai_result.get('raw_text', '')))
+
+
+def _render_market_intelligence(intel: Dict):
+    """Render market intelligence panel — analysts, insiders, social."""
+    st.markdown("### 🏦 Market Intelligence")
+
+    # ── Analyst Consensus + Price Targets ─────────────────────────
+    col_analyst, col_targets = st.columns(2)
+
+    with col_analyst:
+        consensus = intel.get('analyst_consensus')
+        total = intel.get('analyst_count', 0)
+
+        if consensus and total:
+            # Color-coded consensus
+            c_map = {
+                'Strong Buy': ('success', '🟢🟢'),
+                'Buy': ('success', '🟢'),
+                'Hold': ('warning', '🟡'),
+                'Sell': ('error', '🔴'),
+                'Strong Sell': ('error', '🔴🔴'),
+            }
+            method, icon = c_map.get(consensus, ('info', '⚪'))
+            getattr(st, method)(f"{icon} **Analyst Consensus: {consensus}** ({total} analysts)")
+
+            # Breakdown bar
+            sb = intel.get('analyst_strong_buy', 0)
+            b = intel.get('analyst_buy', 0)
+            h = intel.get('analyst_hold', 0)
+            s = intel.get('analyst_sell', 0)
+            ss = intel.get('analyst_strong_sell', 0)
+
+            st.caption(f"Strong Buy: {sb} | Buy: {b} | Hold: {h} | Sell: {s} | Strong Sell: {ss}")
+        else:
+            st.caption("No analyst data available")
+
+    with col_targets:
+        target = intel.get('target_mean')
+        if target:
+            high = intel.get('target_high')
+            low = intel.get('target_low')
+            upside = intel.get('target_upside_pct')
+
+            if upside is not None:
+                if upside > 15:
+                    st.success(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% upside)")
+                elif upside > 0:
+                    st.info(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% upside)")
+                else:
+                    st.error(f"🎯 **Target: ${target:.2f}** ({upside:+.1f}% — below current)")
+
+            if high and low:
+                st.caption(f"Range: ${low:.2f} (bear) → ${high:.2f} (bull)")
+        else:
+            st.caption("No price targets available")
+
+    # ── Recent Rating Changes ─────────────────────────────────────
+    changes = intel.get('recent_changes', [])
+    if changes:
+        with st.expander(f"📋 Recent Upgrades/Downgrades ({len(changes)})", expanded=False):
+            rows = []
+            for c in changes[:8]:
+                action = c.get('action', '?')
+                # Color code
+                if 'upgrade' in action.lower() or 'initiated' in action.lower():
+                    action_str = f"⬆️ {action}"
+                elif 'downgrade' in action.lower():
+                    action_str = f"⬇️ {action}"
+                else:
+                    action_str = f"➡️ {action}"
+
+                from_g = f" (from {c.get('from_grade', '')})" if c.get('from_grade') else ""
+                rows.append({
+                    'Date': c.get('date', '?'),
+                    'Firm': c.get('firm', '?'),
+                    'Action': action_str,
+                    'Rating': f"{c.get('to_grade', '?')}{from_g}",
+                })
+
+            import pandas as pd
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+
+    # ── Insider Activity + Social ─────────────────────────────────
+    col_insider, col_social = st.columns(2)
+
+    with col_insider:
+        st.markdown("**👔 Insider Transactions (90d)**")
+        buys = intel.get('insider_buys_90d', 0)
+        sells = intel.get('insider_sells_90d', 0)
+
+        if buys > 0 or sells > 0:
+            net = intel.get('insider_net_shares', 0)
+            if net > 0:
+                st.success(f"**{buys} buys, {sells} sells — NET BUYING**")
+            elif net < 0:
+                st.warning(f"**{buys} buys, {sells} sells — NET SELLING**")
+            else:
+                st.info(f"**{buys} buys, {sells} sells — Neutral**")
+
+            # Show top transactions
+            txns = intel.get('insider_transactions', [])
+            if txns:
+                with st.expander("Transaction Details", expanded=False):
+                    rows = []
+                    for t in txns[:8]:
+                        val = t.get('value', 0)
+                        val_str = f"${val:,.0f}" if val else "—"
+                        rows.append({
+                            'Date': t.get('date', '?'),
+                            'Name': t.get('name', '?'),
+                            'Type': t.get('type', '?'),
+                            'Shares': f"{t.get('shares', 0):,}",
+                            'Value': val_str,
+                        })
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        else:
+            st.caption("No insider transactions found in last 90 days")
+
+    with col_social:
+        st.markdown("**📊 Social / Volume Buzz**")
+        social = intel.get('social_score')
+        reddit = intel.get('social_reddit_mentions')
+        twitter = intel.get('social_twitter_mentions')
+        social_source = intel.get('social_source', '')
+        social_error = intel.get('social_error', '')
+        vol_surge = intel.get('volume_surge_ratio')
+
+        if social:
+            s_map = {
+                'High buzz': ('success', '🔥'), 'Moderate': ('info', '📊'), 'Low': ('warning', '😴'),
+                'High volume surge': ('success', '🔥'), 'Elevated volume': ('info', '📈'),
+                'Above avg volume': ('info', '📊'), 'Normal volume': ('warning', '😴'),
+                'No volume data': ('warning', '📊'), 'Volume check failed': ('warning', '⚠️'),
+            }
+            method, icon = s_map.get(social, ('info', '📊'))
+            getattr(st, method)(f"{icon} **{social}**")
+
+            parts = []
+            if reddit is not None and reddit > 0:
+                parts.append(f"Reddit: {reddit}")
+            if twitter is not None and twitter > 0:
+                parts.append(f"Twitter: {twitter}")
+            if vol_surge is not None and social_source == 'volume_proxy':
+                parts.append(f"Vol ratio: {vol_surge:.1f}x avg")
+            if parts:
+                source_label = "7-day mentions" if social_source != 'volume_proxy' else "5-day vs 50-day avg"
+                st.caption(f"{source_label} — {' | '.join(parts)}")
+
+            # Show source info
+            if social_source == 'volume_proxy':
+                if social_error == 'Finnhub premium required':
+                    st.caption("ℹ️ Finnhub social requires premium plan — using volume as proxy")
+                else:
+                    st.caption("ℹ️ Using volume surge as social proxy")
+            elif social_source == 'unavailable':
+                st.caption("Volume data unavailable for this ticker")
+        else:
+            if social_error:
+                st.caption(f"📊 {social_error}")
+            else:
+                st.caption("📊 Social data not available")
+
+
+def _render_tv_confirmation(tv_data: Dict):
+    """Render TradingView-TA conviction with overall verdict and timeframe breakdown."""
+    if not tv_data:
+        return
+
+    # Calculate overall conviction from all timeframes
+    rec_scores = {'STRONG_BUY': 2, 'BUY': 1, 'NEUTRAL': 0, 'SELL': -1, 'STRONG_SELL': -2}
+    rec_labels = {2: 'STRONG BUY', 1: 'BUY', 0: 'NEUTRAL', -1: 'SELL', -2: 'STRONG SELL'}
+    rec_icons = {
+        'STRONG_BUY': '🟢🟢', 'BUY': '🟢', 'NEUTRAL': '🟡',
+        'SELL': '🔴', 'STRONG_SELL': '🔴🔴',
+    }
+
+    scores = []
+    valid_data = {}
+    for interval in ['1h', '4h', '1d', '1W']:
+        data = tv_data.get(interval, {})
+        if data.get('error') or not data.get('recommendation'):
+            continue
+        valid_data[interval] = data
+        rec = data['recommendation']
+        if rec in rec_scores:
+            scores.append(rec_scores[rec])
+
+    if not scores:
+        # Check for specific errors
+        first_err = None
+        for data in tv_data.values():
+            err = data.get('error')
+            if err:
+                first_err = err
+                break
+        if first_err and 'not installed' in first_err:
+            st.caption("TradingView-TA: Not available (pip install tradingview_ta)")
+        elif first_err:
+            st.caption(f"TradingView-TA: {first_err}")
+        else:
+            st.caption("TradingView-TA: No data returned")
+        return
+
+    # Overall verdict
+    avg_score = sum(scores) / len(scores)
+    if avg_score >= 1.5:
+        overall = 'STRONG BUY'
+        overall_color = 'success'
+        icon = '🟢🟢'
+    elif avg_score >= 0.5:
+        overall = 'BUY'
+        overall_color = 'success'
+        icon = '🟢'
+    elif avg_score >= -0.5:
+        overall = 'NEUTRAL'
+        overall_color = 'warning'
+        icon = '🟡'
+    elif avg_score >= -1.5:
+        overall = 'SELL'
+        overall_color = 'error'
+        icon = '🔴'
+    else:
+        overall = 'STRONG SELL'
+        overall_color = 'error'
+        icon = '🔴🔴'
+
+    # Display overall verdict
+    getattr(st, overall_color)(f"{icon} **TradingView Conviction: {overall}** "
+                                f"(avg score: {avg_score:+.1f})")
+
+    # Timeframe breakdown
+    labels = {'1h': '1 Hour', '4h': '4 Hour', '1d': 'Daily', '1W': 'Weekly'}
+    cols = st.columns(len(valid_data))
+
+    for i, (interval, data) in enumerate(valid_data.items()):
+        rec = data.get('recommendation', '')
+        buy = data.get('buy', 0)
+        sell = data.get('sell', 0)
+        neutral = data.get('neutral', 0)
+        total = buy + sell + neutral
+        label = labels.get(interval, interval)
+        ri = rec_icons.get(rec, '⚪')
+
+        with cols[i]:
+            st.markdown(f"**{label}**")
+            st.markdown(f"{ri} **{rec.replace('_', ' ')}**")
+            if total > 0:
+                st.caption(f"Buy: {buy} | Neutral: {neutral} | Sell: {sell}")
+
+    # Key indicators from daily
+    daily = valid_data.get('1d', {})
+    indicator_parts = []
+    if daily.get('rsi') is not None:
+        rsi = daily['rsi']
+        rsi_label = "overbought" if rsi > 70 else ("oversold" if rsi < 30 else "neutral")
+        indicator_parts.append(f"RSI: {rsi:.1f} ({rsi_label})")
+    if daily.get('adx') is not None:
+        adx = daily['adx']
+        trend_str = "strong trend" if adx > 25 else "weak trend"
+        indicator_parts.append(f"ADX: {adx:.1f} ({trend_str})")
+    if daily.get('cci') is not None:
+        indicator_parts.append(f"CCI: {daily['cci']:.0f}")
+
+    if indicator_parts:
+        st.caption(" | ".join(indicator_parts))
+
+
+def _render_earnings_section(earnings: Dict):
+    """Render earnings history with next date, streak, and quarterly results."""
+    next_date = earnings.get('next_earnings')
+    days_until = earnings.get('days_until_earnings')
+    quarters = earnings.get('quarters', [])
+    streak = earnings.get('streak', 0)
+    confidence = earnings.get('confidence', '')
+    source = earnings.get('source', '')
+
+    if not next_date and not quarters:
+        return
+
+    st.markdown("### 📅 Earnings")
+
+    # ── Next Earnings Banner ──────────────────────────────────────
+    if next_date:
+        next_eps = earnings.get('next_eps_estimate')
+        conf_str = f" [{confidence}]" if confidence and confidence != 'HIGH' else ""
+
+        if days_until is not None and days_until <= 14:
+            # Imminent — warning
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.error(f"⚠️ **Next Earnings: {next_date} ({days_until} days)**{eps_str}{conf_str} — "
+                     f"Consider waiting or reducing size")
+        elif days_until is not None and days_until <= 30:
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.warning(f"📅 **Next Earnings: {next_date} ({days_until} days)**{eps_str}{conf_str}")
+        else:
+            eps_str = f" | Consensus EPS: ${next_eps:.2f}" if next_eps else ""
+            st.info(f"📅 **Next Earnings: {next_date}"
+                    f"{f' ({days_until} days)' if days_until else ''}**{eps_str}{conf_str}")
+
+    # ── Streak + Summary ──────────────────────────────────────────
+    if quarters:
+        col_streak, col_avg = st.columns(2)
+
+        with col_streak:
+            if streak > 0:
+                st.success(f"🔥 **{streak} consecutive beat{'s' if streak > 1 else ''}**")
+            elif streak < 0:
+                st.error(f"📉 **{abs(streak)} consecutive miss{'es' if abs(streak) > 1 else ''}**")
+            else:
+                st.info("➡️ **Mixed results**")
+
+        with col_avg:
+            avg = earnings.get('avg_surprise_pct')
+            if avg is not None:
+                if avg > 0:
+                    st.success(f"📊 **Avg surprise: +{avg:.1f}%**")
+                else:
+                    st.error(f"📊 **Avg surprise: {avg:.1f}%**")
+
+    # ── Quarterly Table ───────────────────────────────────────────
+    if quarters:
+        rows = []
+        for q in quarters:
+            date = q.get('date', '?')
+            eps_est = q.get('eps_estimate')
+            eps_act = q.get('eps_actual')
+            surprise = q.get('surprise_pct')
+            beat = q.get('beat')
+
+            est_str = f"${eps_est:.2f}" if eps_est is not None else "—"
+            act_str = f"${eps_act:.2f}" if eps_act is not None else "—"
+            surp_str = f"{surprise:+.1f}%" if surprise is not None else "—"
+
+            if beat is True:
+                verdict = "✅ Beat"
+            elif beat is False:
+                verdict = "❌ Miss"
+            else:
+                verdict = "—"
+
+            rows.append({
+                'Date': date,
+                'EPS Est': est_str,
+                'EPS Act': act_str,
+                'Surprise': surp_str,
+                'Result': verdict,
+            })
+
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        st.dataframe(df, width='stretch', hide_index=True,
+                      column_config={
+                          'Date': st.column_config.TextColumn(width="medium"),
+                          'EPS Est': st.column_config.TextColumn("Estimate", width="small"),
+                          'EPS Act': st.column_config.TextColumn("Actual", width="small"),
+                          'Surprise': st.column_config.TextColumn(width="small"),
+                          'Result': st.column_config.TextColumn(width="small"),
+                      })
+
+
+def _render_fundamental_snapshot(fp: Dict):
+    """Render compact fundamental data table from profile."""
+
+    def _fmt_money(val):
+        if val is None:
+            return "—"
+        if abs(val) >= 1e9:
+            return f"${val/1e9:.1f}B"
+        if abs(val) >= 1e6:
+            return f"${val/1e6:.0f}M"
+        return f"${val:,.0f}"
+
+    def _fmt_pct(val):
+        if val is None:
+            return "—"
+        return f"{val*100:.1f}%"
+
+    def _fmt_num(val, decimals=1):
+        if val is None:
+            return "—"
+        return f"{val:.{decimals}f}"
+
+    # Company header
+    name = fp.get('name', '?')
+    sector = fp.get('sector', '?')
+    industry = fp.get('industry', '?')
+    st.markdown(f"**{name}** — {sector} / {industry}")
+
+    if fp.get('business_summary'):
+        st.caption(fp['business_summary'][:300] + "..." if len(fp.get('business_summary', '')) > 300 else fp['business_summary'])
+
+    # Three column layout
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("**Growth & Scale**")
+        rows = [
+            ("Market Cap", _fmt_money(fp.get('market_cap'))),
+            ("Revenue", _fmt_money(fp.get('total_revenue'))),
+            ("Revenue Growth", _fmt_pct(fp.get('revenue_growth_yoy'))),
+            ("Earnings Growth", _fmt_pct(fp.get('earnings_growth_yoy'))),
+            ("EBITDA", _fmt_money(fp.get('ebitda'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    with c2:
+        st.markdown("**Profitability**")
+        rows = [
+            ("Gross Margin", _fmt_pct(fp.get('gross_margin'))),
+            ("Operating Margin", _fmt_pct(fp.get('operating_margin'))),
+            ("Net Margin", _fmt_pct(fp.get('profit_margin'))),
+            ("ROE", _fmt_pct(fp.get('return_on_equity'))),
+            ("FCF", _fmt_money(fp.get('free_cash_flow'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    with c3:
+        st.markdown("**Valuation & Health**")
+        rows = [
+            ("P/E (Fwd)", _fmt_num(fp.get('forward_pe'))),
+            ("EV/EBITDA", _fmt_num(fp.get('ev_to_ebitda'))),
+            ("P/Sales", _fmt_num(fp.get('price_to_sales'))),
+            ("Debt/Equity", _fmt_num(fp.get('debt_to_equity'), 0)),
+            ("Short % Float", _fmt_pct(fp.get('short_pct_float'))),
+        ]
+        for label, val in rows:
+            if val != "—":
+                st.caption(f"{label}: **{val}**")
+
+    # Ownership bar
+    insider = fp.get('insider_pct')
+    inst = fp.get('institution_pct')
+    if insider is not None or inst is not None:
+        parts = []
+        if insider is not None:
+            parts.append(f"Insider: {insider*100:.1f}%")
+        if inst is not None:
+            parts.append(f"Institutional: {inst*100:.1f}%")
+        if fp.get('next_earnings'):
+            parts.append(f"Next Earnings: {fp['next_earnings']}")
+        if fp.get('last_earnings_surprise_pct') is not None:
+            parts.append(f"Last Surprise: {fp['last_earnings_surprise_pct']:+.1f}%")
+        st.caption(" | ".join(parts))
+
+
+# =============================================================================
+# ASK AI — Research Analyst + Interactive Chat
+# =============================================================================
+
+def _build_sector_rotation_context() -> str:
+    """
+    Build dynamic sector rotation context from live cached data.
+    Pulls from session state (populated by fetch_sector_rotation at startup).
+    Returns formatted text for injection into the AI system prompt.
+    """
+    rotation = st.session_state.get('sector_rotation')
+    if not rotation:
+        return "SECTOR ROTATION: Data not yet loaded. Ask user to refresh market data."
+
+    # Group sectors by phase
+    phases = {'LEADING': [], 'EMERGING': [], 'FADING': [], 'LAGGING': []}
+    seen_etfs = set()
+    for sector, info in rotation.items():
+        etf = info.get('etf', '')
+        if etf in seen_etfs:
+            continue
+        seen_etfs.add(etf)
+        phase = info.get('phase', 'LAGGING')
+        vs_spy = info.get('vs_spy_20d', 0)
+        perf = info.get('perf_20d', 0)
+        short_name = info.get('short_name', sector[:4])
+        phases[phase].append({
+            'name': sector,
+            'short': short_name,
+            'etf': etf,
+            'perf_20d': perf,
+            'vs_spy_20d': vs_spy,
+        })
+
+    lines = [f"═══ CURRENT SECTOR ROTATION STATUS (Updated: {datetime.now().strftime('%Y-%m-%d')}) ═══\n"]
+
+    def _fmt_sector_list(sectors):
+        if not sectors:
+            return "  (none currently)"
+        return "\n".join(f"  - {s['name']} ({s['etf']}): {s['perf_20d']:+.1f}% (vs SPY: {s['vs_spy_20d']:+.1f}%)"
+                         for s in sorted(sectors, key=lambda x: x['vs_spy_20d'], reverse=True))
+
+    lines.append("LEADING Sectors (momentum tailwind — 2 of 3 timeframes aligned = valid setup):")
+    lines.append(_fmt_sector_list(phases['LEADING']))
+    lines.append("")
+    lines.append("EMERGING Sectors (building momentum — all 3 timeframes must align):")
+    lines.append(_fmt_sector_list(phases['EMERGING']))
+    lines.append("")
+    lines.append("FADING Sectors (losing momentum — tighten stops, reduce position size):")
+    lines.append(_fmt_sector_list(phases['FADING']))
+    lines.append("")
+    lines.append("LAGGING Sectors (headwind — perfect confluence + volume breakout required):")
+    lines.append(_fmt_sector_list(phases['LAGGING']))
+    lines.append("")
+    lines.append("""MOMENTUM TRADING GUIDANCE:
+- Stocks in LEADING sectors: 2 of 3 timeframes aligned = valid setup. Sector is a tailwind.
+- Stocks in EMERGING sectors: All 3 timeframes must align. Sector is neutral-to-positive.
+- Stocks in FADING sectors: Tighten stops, reduce sizing. Sector momentum is weakening.
+- Stocks in LAGGING sectors: Perfect confluence + volume breakout required. Sector is a headwind.
+- ALWAYS state which sector rotation category the ticker belongs to in your analysis.
+- Adjust conviction level up/down based on whether sector has momentum tailwinds or headwinds.
+- If the stock's actual business doesn't match its assigned sector, note which sector's data is more relevant.""")
+
+    return "\n".join(lines)
+
+
+def _build_internal_context(ticker: str, signal: EntrySignal, rec: Dict,
+                            analysis: TickerAnalysis) -> str:
+    """Build internal app data context — signals, quality, AI results.
+    This is what the AI can SEE from the app. It should interpret, not repeat."""
+    lines = [f"═══ IN-APP DATA FOR {ticker} (visible to user — DO NOT repeat, only interpret) ═══\n"]
+
+    # Price & recommendation
+    if analysis.current_price:
+        lines.append(f"PRICE: ${analysis.current_price:.2f}")
+    lines.append(f"APP RECOMMENDATION: {rec.get('recommendation', 'N/A')} | Conviction: {rec.get('conviction', 0)}/10")
+
+    # Quality
+    q = analysis.quality or {}
+    if q:
+        lines.append(f"QUALITY GRADE: {q.get('quality_grade', '?')}")
+
+    # Signals
+    if signal:
+        m = signal.macd
+        ao = signal.ao
+        wm = signal.weekly_macd
+        mm = signal.monthly_macd
+        lines.append(f"\nTECHNICAL SIGNALS (user can see these on Signal tab):")
+        lines.append(f"  Daily MACD: {'Bullish' if m.get('bullish') else 'Bearish'} | Hist: {m.get('histogram', 0):+.4f}"
+                     f"{' | NEAR CROSS' if m.get('near_cross') else ''}"
+                     f"{' | WEAKENING' if m.get('weakening') else ''}")
+        lines.append(f"  AO: {'Positive' if ao.get('positive') else 'Negative'} | {ao.get('value', 0):+.4f}"
+                     f"{' | SAUCER' if ao.get('saucer') else ''}")
+        lines.append(f"  Weekly MACD: {'Bullish' if wm.get('bullish') else 'Bearish'}")
+        lines.append(f"  Monthly MACD: {'Bullish' if mm.get('bullish') else 'Bearish'}")
+
+        if analysis.volume_ratio:
+            lines.append(f"  Volume: {analysis.volume_ratio:.1f}x average")
+
+    # Special signals
+    if analysis.reentry and analysis.reentry.get('is_valid'):
+        re = analysis.reentry
+        lines.append(f"  RE-ENTRY: MACD cross {re.get('macd_cross_bars_ago', '?')} bars ago, AO confirm: {re.get('ao_confirmed')}")
+    if analysis.apex_buy:
+        lines.append(f"  🎯 APEX BUY SIGNAL ACTIVE")
+    if analysis.ao_divergence_active:
+        lines.append(f"  ⚡ AO BULLISH DIVERGENCE DETECTED")
+
+    # Previous AI analysis
+    ai_result = st.session_state.get(f'ai_result_{ticker}')
+    if ai_result:
+        lines.append(f"\nPREVIOUS AI ANALYSIS (AI Intel tab):")
+        for key in ['action', 'conviction', 'resistance_verdict', 'why_moving',
+                     'fundamental_quality', 'smart_money', 'bull_case', 'bear_case',
+                     'red_flags', 'position_sizing']:
+            val = ai_result.get(key)
+            if val:
+                lines.append(f"  {key.replace('_', ' ').title()}: {val}")
+
+        # Market intel summary
+        mi = ai_result.get('market_intel', {})
+        if mi:
+            ac = mi.get('analyst_consensus')
+            if ac:
+                lines.append(f"  Analyst Consensus: {ac} ({mi.get('analyst_count', 0)} analysts)")
+            target = mi.get('target_mean')
+            if target:
+                lines.append(f"  Mean Price Target: ${target:.2f} ({mi.get('target_upside_pct', 0):+.1f}%)")
+            buys = mi.get('insider_buys_90d', 0)
+            sells = mi.get('insider_sells_90d', 0)
+            if buys > 0 or sells > 0:
+                lines.append(f"  Insider Transactions: {buys} buys, {sells} sells (90d)")
+            else:
+                lines.append(f"  Insider Transactions: None in 90 days")
+
+    # ═══ SECTOR (from app session — MANDATORY for AI to discuss) ═══
+    sector = st.session_state.get('ticker_sectors', {}).get(ticker)
+    if sector:
+        rotation = st.session_state.get('sector_rotation', {}).get(sector, {})
+        if rotation:
+            lines.append(f"\n═══ SECTOR CONTEXT (MANDATORY — you MUST discuss this) ═══")
+            lines.append(f"  Sector: {sector}")
+            lines.append(f"  Sector ETF: {rotation.get('etf', '?')}")
+            lines.append(f"  Phase: {rotation.get('phase', '?')}")
+            lines.append(f"  Sector vs SPY (20-day): {rotation.get('vs_spy_20d', 0):+.1f}%")
+            lines.append(f"  Sector vs SPY (5-day): {rotation.get('vs_spy_5d', 0):+.1f}%")
+            lines.append(f"  Sector 5d perf: {rotation.get('perf_5d', 0):+.1f}%")
+            lines.append(f"  Sector 20d perf: {rotation.get('perf_20d', 0):+.1f}%")
+        else:
+            lines.append(f"\n═══ SECTOR: {sector} (no rotation data — check external research) ═══")
+    else:
+        lines.append(f"\n═══ SECTOR: Unknown (check Yahoo data in external research for sector) ═══")
+
+    # ═══ EARNINGS (canonical resolver — keeps AI + scanner aligned) ═══
+    earn = resolve_earnings_for_ticker(ticker, verify_with_fetch=True)
+    if earn.get('next_earnings'):
+        days = earn.get('days_until')
+        lines.append(f"\n═══ EARNINGS (MANDATORY — you MUST address this in your analysis) ═══")
+        lines.append(f"  Next Earnings Date: {earn.get('next_earnings', '?')}")
+        lines.append(f"  Days Until: {days}")
+        if days is not None and days <= 7:
+            lines.append(f"  ⚠️ CRITICAL: EARNINGS IN {days} DAYS — EXTREME RISK")
+        elif days is not None and days <= 14:
+            lines.append(f"  ⚠️ WARNING: EARNINGS IN {days} DAYS — HIGH RISK, limited trading window")
+        elif days is not None and days <= 30:
+            lines.append(f"  ⚠️ CAUTION: EARNINGS WITHIN 30 DAYS — affects hold duration")
+        else:
+            lines.append(f"  ✅ Clear runway: {days if days is not None else '?'} days before earnings")
+    else:
+        lines.append(f"\n═══ EARNINGS: Date not available from app — CHECK Yahoo data in external research ═══")
+
+    return "\n".join(lines)
+
+
+def _fetch_external_research(ticker: str) -> str:
+    """Fetch comprehensive external data — this is the AI's UNIQUE VALUE.
+    Includes: market conditions, sector rotation, earnings, news, fundamentals, social."""
+    lines = [f"\n═══ EXTERNAL RESEARCH FOR {ticker} (freshly fetched) ═══\n"]
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTIONS 1 & 2: MARKET CONDITIONS + SECTOR ROTATION
+    # These are TICKER-INDEPENDENT — cache in session state (5-min TTL)
+    # ══════════════════════════════════════════════════════════════════
+    _mkt_cache = st.session_state.get('_research_market_cache', '')
+    _mkt_ts = st.session_state.get('_research_market_cache_ts', 0)
+    _now = datetime.now().timestamp()
+
+    if _mkt_cache and (_now - _mkt_ts) < 300:
+        # Use cached market context (same for all tickers)
+        lines.append(_mkt_cache)
+    else:
+        # Build fresh market context
+        _mkt_lines = []
+        _mkt_lines.append("🌍 OVERALL MARKET CONDITIONS:")
+        try:
+            market = get_shared_market_filter()
+
+            spy_close = market.get('spy_close')
+            spy_sma200 = market.get('spy_sma200')
+            spy_above = market.get('spy_above_200', True)
+            vix_close = market.get('vix_close')
+            vix_below = market.get('vix_below_30', True)
+
+            if spy_close:
+                _mkt_lines.append(f"  SPY: ${spy_close:.2f} | 200-day SMA: ${spy_sma200:.2f} | {'ABOVE ✅' if spy_above else 'BELOW ❌'}")
+            if vix_close:
+                _mkt_lines.append(f"  VIX: {vix_close:.1f} | {'LOW fear ✅' if vix_close < 20 else 'ELEVATED ⚠️' if vix_close < 30 else 'HIGH FEAR ❌'}")
+
+            # SPY recent performance (risk-on vs risk-off)
+            spy_df = get_shared_spy_daily()
+            if spy_df is not None and len(spy_df) >= 50:
+                spy_5d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-5] - 1) * 100
+                spy_20d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-20] - 1) * 100
+                spy_50d = (spy_df['Close'].iloc[-1] / spy_df['Close'].iloc[-50] - 1) * 100
+                spy_sma50 = float(spy_df['Close'].rolling(50).mean().iloc[-1])
+                spy_high52 = float(spy_df['Close'].tail(252).max()) if len(spy_df) >= 252 else float(spy_df['Close'].max())
+                pct_from_high = (spy_df['Close'].iloc[-1] / spy_high52 - 1) * 100
+
+                _mkt_lines.append(f"  SPY Returns: 5d {spy_5d:+.1f}% | 20d {spy_20d:+.1f}% | 50d {spy_50d:+.1f}%")
+                _mkt_lines.append(f"  SPY 50-day SMA: ${spy_sma50:.2f} | {'Above' if spy_df['Close'].iloc[-1] > spy_sma50 else 'Below'}")
+                _mkt_lines.append(f"  SPY vs 52-week high: {pct_from_high:+.1f}%")
+
+                # Overall market assessment
+                if spy_above and vix_close and vix_close < 20 and spy_5d > 0:
+                    _mkt_lines.append(f"  ASSESSMENT: RISK-ON environment — market bullish, low fear, new positions supported")
+                elif spy_above and vix_close and vix_close < 25:
+                    _mkt_lines.append(f"  ASSESSMENT: CAUTIOUSLY BULLISH — market above key support, moderate fear")
+                elif not spy_above:
+                    _mkt_lines.append(f"  ASSESSMENT: RISK-OFF — SPY below 200-day SMA, defensive posture recommended")
+                elif vix_close and vix_close >= 30:
+                    _mkt_lines.append(f"  ASSESSMENT: HIGH VOLATILITY — elevated VIX, reduce position sizes")
+                else:
+                    _mkt_lines.append(f"  ASSESSMENT: NEUTRAL — mixed signals, selective stock-picking environment")
+
+                # Breadth proxy: RSP (equal-weight SPY) vs SPY
+                try:
+                    rsp_df = fetch_daily("RSP")
+                    if rsp_df is not None and len(rsp_df) >= 20:
+                        rsp_20d = (rsp_df['Close'].iloc[-1] / rsp_df['Close'].iloc[-20] - 1) * 100
+                        spread = rsp_20d - spy_20d
+                        if spread > 1.0:
+                            breadth = "BROAD — equal-weight outperforming (healthy breadth)"
+                        elif spread < -1.0:
+                            breadth = "NARROW — cap-weighted leading (top-heavy, fragile)"
+                        else:
+                            breadth = "BALANCED — similar performance"
+                        _mkt_lines.append(f"  Market Breadth: RSP 20d {rsp_20d:+.1f}% vs SPY {spy_20d:+.1f}% → {breadth}")
+                except Exception:
+                    pass
+        except Exception as e:
+            _mkt_lines.append(f"  Error fetching market data: {str(e)[:100]}")
+
+        # Sector rotation (already cached in session state from startup)
+        _mkt_lines.append(f"\n📊 SECTOR ROTATION (all sectors vs SPY):")
+        try:
+            all_sectors = st.session_state.get('sector_rotation')
+            if not all_sectors:
+                from data_fetcher import fetch_sector_rotation
+                all_sectors = fetch_sector_rotation()
+            if all_sectors:
+                sorted_sectors = sorted(all_sectors.items(),
+                                        key=lambda x: x[1].get('vs_spy_20d', 0), reverse=True)
+                for sector_name, data in sorted_sectors:
+                    phase = data.get('phase', '?')
+                    vs_spy = data.get('vs_spy_20d', 0)
+                    perf_20d = data.get('perf_20d', 0)
+                    etf = data.get('etf', '?')
+                    icon = "🟢" if phase == 'LEADING' else "🟡" if phase == 'WEAKENING' else "🔴" if phase == 'LAGGING' else "⚪"
+                    _mkt_lines.append(f"  {icon} {sector_name} ({etf}): {phase} | 20d: {perf_20d:+.1f}% | vs SPY: {vs_spy:+.1f}%")
+            else:
+                _mkt_lines.append(f"  Sector data unavailable")
+        except Exception as e:
+            _mkt_lines.append(f"  Error: {str(e)[:100]}")
+
+        # Cache the combined market context
+        _mkt_text = "\n".join(_mkt_lines)
+        st.session_state['_research_market_cache'] = _mkt_text
+        st.session_state['_research_market_cache_ts'] = _now
+        lines.append(_mkt_text)
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 3: EARNINGS DATE (MANDATORY — 4-method cascade via fetch_earnings_date)
+    # ══════════════════════════════════════════════════════════════════
+    lines.append(f"\n📅 EARNINGS DATE (MANDATORY — you MUST state this):")
+    earnings_found = False
+    earnings_date_str = None
+    earnings_days = None
+    earn_result = {}
+
+    # Canonical resolution for this ticker; verify against live 4-method fetch on conflict.
+    try:
+        earn_result = resolve_earnings_for_ticker(ticker, verify_with_fetch=True)
+        if earn_result.get('next_earnings'):
+            earnings_date_str = earn_result.get('next_earnings')
+            earnings_days = earn_result.get('days_until')
+            earnings_found = True
+            _src = earn_result.get('source', 'TTA Scanner')
+            _conf = earn_result.get('confidence', '')
+            if _conf:
+                lines.append(f"  Source: {_src} (confidence: {_conf})")
+            else:
+                lines.append(f"  Source: {_src}")
+            lines.append(f"  Next Earnings: {earnings_date_str}")
+            lines.append(f"  Days Until: {earnings_days}")
+    except Exception as e:
+        lines.append(f"  Earnings fetch error: {str(e)[:100]}")
+
+    if not earnings_found:
+        lines.append(f"  ⚠️ EARNINGS DATE NOT FOUND after 4-method cascade")
+        lines.append(f"  → Tell user: 'Earnings date could not be determined from available sources'")
+        lines.append(f"  → Still provide risk framework based on typical quarterly patterns")
+
+    # Earnings risk assessment
+    if earnings_found and earnings_days is not None:
+        if earnings_days <= 7:
+            lines.append(f"  🚨 CRITICAL RISK: Earnings in {earnings_days} days — binary event imminent")
+            lines.append(f"  → Any position recommendation MUST account for earnings gap risk")
+            lines.append(f"  → Consider: wait until after earnings, or use options to define risk")
+        elif earnings_days <= 14:
+            lines.append(f"  ⚠️ HIGH RISK: Earnings in {earnings_days} days — limited trading window")
+            lines.append(f"  → A 3-6 month hold recommendation does NOT make sense here")
+            lines.append(f"  → Must be an earnings play or wait until after report")
+        elif earnings_days <= 30:
+            lines.append(f"  ⚠️ CAUTION: Earnings within 30 days — adjust hold duration")
+            lines.append(f"  → Any swing trade must have exit plan BEFORE earnings")
+        elif earnings_days <= 60:
+            lines.append(f"  ℹ️ Earnings approaching in {earnings_days} days — factor into hold duration")
+        else:
+            lines.append(f"  ✅ Clear runway: {earnings_days} days before next earnings report")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 4: NEWS
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        finnhub_key = ""
+        try:
+            finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+        except Exception:
+            pass
+
+        if finnhub_key:
+            from data_fetcher import fetch_finnhub_news
+            news = fetch_finnhub_news(ticker, api_key=finnhub_key)
+            if news and news.get('articles'):
+                lines.append(f"\n📰 RECENT NEWS (last 7 days):")
+                for article in news['articles'][:10]:
+                    headline = article.get('headline', article.get('title', '?'))
+                    source = article.get('source', '?')
+                    date = article.get('datetime', '')
+                    if isinstance(date, (int, float)) and date > 0:
+                        from datetime import datetime as dt
+                        try:
+                            date = dt.fromtimestamp(date).strftime('%Y-%m-%d')
+                        except Exception:
+                            date = ''
+                    summary = article.get('summary', '')[:300]
+                    lines.append(f"  [{date}] {headline} — {source}")
+                    if summary:
+                        lines.append(f"    Summary: {summary}")
+            else:
+                lines.append(f"\n📰 NEWS: No articles found on Finnhub for last 7 days")
+        else:
+            lines.append(f"\n📰 NEWS: No Finnhub API key — limited news data")
+    except Exception as e:
+        lines.append(f"\n📰 NEWS ERROR: {str(e)[:100]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 5: YAHOO FINANCE FUNDAMENTALS + ANALYST DATA
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+
+        if info:
+            lines.append(f"\n📊 YAHOO FINANCE DATA:")
+            # Company basics
+            for key, label in [
+                ('shortName', 'Company'), ('industry', 'Industry'), ('sector', 'Sector'),
+            ]:
+                val = info.get(key)
+                if val:
+                    lines.append(f"  {label}: {val}")
+
+            # Business description (critical for sector misclassification detection)
+            biz_summary = info.get('longBusinessSummary', '')
+            if biz_summary:
+                # First 400 chars is enough to identify actual business
+                lines.append(f"  Business: {biz_summary[:400]}")
+
+            # Valuation
+            lines.append(f"  --- Valuation ---")
+            mc = info.get('marketCap')
+            if mc:
+                if mc >= 1e12: mc_str = f"${mc/1e12:.1f}T"
+                elif mc >= 1e9: mc_str = f"${mc/1e9:.1f}B"
+                else: mc_str = f"${mc/1e6:.0f}M"
+                lines.append(f"  Market Cap: {mc_str}")
+            for key, label in [
+                ('trailingPE', 'Trailing P/E'), ('forwardPE', 'Forward P/E'),
+                ('priceToBook', 'P/B'), ('enterpriseToRevenue', 'EV/Revenue'),
+                ('trailingEps', 'EPS'), ('dividendYield', 'Dividend Yield'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    if 'Yield' in label:
+                        lines.append(f"  {label}: {val*100:.2f}%")
+                    else:
+                        lines.append(f"  {label}: {val:.2f}")
+
+            # Growth & profitability
+            lines.append(f"  --- Growth & Profitability ---")
+            for key, label in [
+                ('revenueGrowth', 'Revenue Growth'), ('earningsGrowth', 'Earnings Growth'),
+                ('profitMargins', 'Profit Margin'), ('grossMargins', 'Gross Margin'),
+                ('operatingMargins', 'Operating Margin'), ('returnOnEquity', 'ROE'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    lines.append(f"  {label}: {val*100:.1f}%")
+
+            # Analyst data
+            lines.append(f"  --- Analyst Consensus ---")
+            rec_key = info.get('recommendationKey', '')
+            rec_mean = info.get('recommendationMean')
+            target_mean = info.get('targetMeanPrice')
+            target_high = info.get('targetHighPrice')
+            target_low = info.get('targetLowPrice')
+            num_analysts = info.get('numberOfAnalystOpinions')
+            current = info.get('currentPrice') or info.get('regularMarketPrice')
+
+            if rec_key:
+                lines.append(f"  Yahoo Recommendation: {rec_key.upper()}")
+            if rec_mean:
+                lines.append(f"  Recommendation Score: {rec_mean:.1f} (1=Strong Buy, 5=Strong Sell)")
+            if target_mean and current:
+                upside = (target_mean - current) / current * 100
+                lines.append(f"  Target: ${target_low:.2f} — ${target_mean:.2f} — ${target_high:.2f} ({upside:+.1f}% to mean)")
+            if num_analysts:
+                lines.append(f"  Analysts Covering: {num_analysts}")
+
+            # Short interest
+            lines.append(f"  --- Short Interest & Risk ---")
+            for key, label in [
+                ('shortPercentOfFloat', 'Short % of Float'),
+                ('shortRatio', 'Short Ratio (days to cover)'),
+                ('beta', 'Beta'),
+            ]:
+                val = info.get(key)
+                if val is not None:
+                    if 'Percent' in label:
+                        lines.append(f"  {label}: {val*100:.1f}%")
+                    else:
+                        lines.append(f"  {label}: {val:.2f}")
+
+            # 52-week range
+            high52 = info.get('fiftyTwoWeekHigh')
+            low52 = info.get('fiftyTwoWeekLow')
+            if high52 and low52 and current:
+                range_pct = (current - low52) / (high52 - low52) * 100 if high52 != low52 else 50
+                lines.append(f"  52-Week: ${low52:.2f} — ${high52:.2f} (currently at {range_pct:.0f}% of range)")
+
+            # Ownership
+            insider_pct = info.get('heldPercentInsiders')
+            inst_pct = info.get('heldPercentInstitutions')
+            if insider_pct is not None:
+                lines.append(f"  Insider Ownership: {insider_pct*100:.1f}% (static stake, NOT selling)")
+            if inst_pct is not None:
+                lines.append(f"  Institutional Ownership: {inst_pct*100:.1f}%")
+
+        # Yahoo news
+        try:
+            news_items = stock.news
+            if news_items:
+                lines.append(f"\n📰 YAHOO NEWS:")
+                for item in news_items[:8]:
+                    title = item.get('title', '?')
+                    publisher = item.get('publisher', '?')
+                    lines.append(f"  • {title} ({publisher})")
+        except Exception:
+            pass
+
+    except Exception as e:
+        lines.append(f"\nYAHOO ERROR: {str(e)[:100]}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 6: SOCIAL / VOLUME SENTIMENT
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        from data_fetcher import fetch_daily
+        daily = fetch_daily(ticker, period='3mo')
+        if daily is not None and len(daily) >= 20 and 'Volume' in daily.columns:
+            recent_vol = float(daily['Volume'].iloc[-5:].mean())
+            avg_vol = float(daily['Volume'].tail(50).mean())
+            vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1.0
+
+            lines.append(f"\n📱 SOCIAL/VOLUME SENTIMENT PROXY:")
+            lines.append(f"  5-day avg volume vs 50-day avg: {vol_ratio:.1f}x")
+            if vol_ratio >= 3.0:
+                lines.append(f"  Signal: 🔥 EXTREME volume surge — major institutional activity or news-driven")
+            elif vol_ratio >= 2.0:
+                lines.append(f"  Signal: 📈 ELEVATED volume — increased interest, possible accumulation")
+            elif vol_ratio >= 1.5:
+                lines.append(f"  Signal: 📊 Above average — moderate interest")
+            elif vol_ratio <= 0.5:
+                lines.append(f"  Signal: 😴 Very LOW volume — lack of interest, thin liquidity risk")
+            else:
+                lines.append(f"  Signal: Normal trading volume")
+
+            # Recent price action context
+            if len(daily) >= 5:
+                last_5_return = (daily['Close'].iloc[-1] / daily['Close'].iloc[-5] - 1) * 100
+                last_20_return = (daily['Close'].iloc[-1] / daily['Close'].iloc[-20] - 1) * 100 if len(daily) >= 20 else None
+                lines.append(f"  5-day return: {last_5_return:+.1f}%")
+                if last_20_return is not None:
+                    lines.append(f"  20-day return: {last_20_return:+.1f}%")
+    except Exception:
+        pass
+
+    # Finnhub Social Sentiment (if premium key)
+    try:
+        finnhub_key = ""
+        try:
+            finnhub_key = st.secrets.get("FINNHUB_API_KEY", "")
+        except Exception:
+            pass
+
+        if finnhub_key:
+            import requests as req
+            import pandas as pd
+            from_date = (datetime.now() - pd.Timedelta(days=30)).strftime('%Y-%m-%d')
+            url = f"https://finnhub.io/api/v1/stock/social-sentiment?symbol={ticker}&from={from_date}&token={finnhub_key}"
+            resp = req.get(url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                reddit = data.get('reddit', [])
+                twitter = data.get('twitter', [])
+                if reddit or twitter:
+                    r_mentions = sum(r.get('mention', 0) for r in reddit[-7:]) if reddit else 0
+                    t_mentions = sum(t.get('mention', 0) for t in twitter[-7:]) if twitter else 0
+                    lines.append(f"\n📱 FINNHUB SOCIAL SENTIMENT (7 days):")
+                    lines.append(f"  Reddit mentions: {r_mentions}")
+                    lines.append(f"  Twitter mentions: {t_mentions}")
+                    total = r_mentions + t_mentions
+                    if total > 100:
+                        lines.append(f"  Assessment: HIGH social buzz — stock is being actively discussed")
+                    elif total > 20:
+                        lines.append(f"  Assessment: Moderate social interest")
+                    elif total > 0:
+                        lines.append(f"  Assessment: Low social mentions")
+                    else:
+                        lines.append(f"  Assessment: Minimal social presence")
+            elif resp.status_code in (401, 403):
+                lines.append(f"\n📱 FINNHUB SOCIAL: Premium subscription required for social sentiment data")
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 7: CORRELATED ASSET PRICE ACTION
+    # (Auto-detects crypto miners, oil/gas, gold miners, etc.)
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        # Re-use Yahoo info if available, otherwise fetch
+        try:
+            _yf_info = stock.info if 'stock' in dir() else yf.Ticker(ticker).info
+        except Exception:
+            import yfinance as yf
+            _yf_info = yf.Ticker(ticker).info or {}
+
+        biz = (_yf_info.get('longBusinessSummary', '') + ' ' +
+               _yf_info.get('industry', '') + ' ' +
+               _yf_info.get('sector', '')).lower()
+
+        # Map business keywords to correlated assets
+        CORRELATED_ASSETS = {
+            'BTC-USD': {
+                'name': 'Bitcoin',
+                'keywords': ['bitcoin', 'crypto', 'blockchain', 'mining', 'btc',
+                             'digital asset', 'digital currency', 'hash rate'],
+            },
+            'CL=F': {
+                'name': 'Crude Oil (WTI)',
+                'keywords': ['oil', 'petroleum', 'crude', 'drilling', 'upstream',
+                             'exploration and production', 'e&p'],
+            },
+            'GC=F': {
+                'name': 'Gold',
+                'keywords': ['gold mining', 'gold miner', 'precious metal',
+                             'gold exploration', 'gold production'],
+            },
+            'SI=F': {
+                'name': 'Silver',
+                'keywords': ['silver mining', 'silver miner'],
+            },
+            'NG=F': {
+                'name': 'Natural Gas',
+                'keywords': ['natural gas', 'lng', 'gas producer'],
+            },
+            'ETH-USD': {
+                'name': 'Ethereum',
+                'keywords': ['ethereum', 'defi', 'smart contract', 'eth'],
+            },
+        }
+
+        matched_assets = []
+        for asset_ticker, asset_info in CORRELATED_ASSETS.items():
+            if any(kw in biz for kw in asset_info['keywords']):
+                matched_assets.append((asset_ticker, asset_info['name']))
+
+        if matched_assets:
+            from data_fetcher import fetch_daily
+            lines.append(f"\n🔗 CORRELATED ASSET PRICE ACTION:")
+            for asset_ticker, asset_name in matched_assets:
+                try:
+                    asset_df = fetch_daily(asset_ticker, period='3mo')
+                    if asset_df is not None and len(asset_df) >= 20:
+                        current = float(asset_df['Close'].iloc[-1])
+                        ret_5d = (asset_df['Close'].iloc[-1] / asset_df['Close'].iloc[-5] - 1) * 100
+                        ret_20d = (asset_df['Close'].iloc[-1] / asset_df['Close'].iloc[-20] - 1) * 100
+                        high_3mo = float(asset_df['Close'].max())
+                        low_3mo = float(asset_df['Close'].min())
+                        pct_from_high = (current / high_3mo - 1) * 100
+
+                        # Format price based on asset
+                        if current >= 1000:
+                            price_str = f"${current:,.0f}"
+                        elif current >= 1:
+                            price_str = f"${current:,.2f}"
+                        else:
+                            price_str = f"${current:.4f}"
+
+                        lines.append(f"  {asset_name} ({asset_ticker}): {price_str}")
+                        lines.append(f"    5d: {ret_5d:+.1f}% | 20d: {ret_20d:+.1f}% | vs 3mo high: {pct_from_high:+.1f}%")
+                        lines.append(f"    3mo range: ${low_3mo:,.0f} — ${high_3mo:,.0f}")
+
+                        # Directional assessment
+                        if ret_5d > 3 and ret_20d > 5:
+                            lines.append(f"    → {asset_name} in STRONG UPTREND — supports bullish thesis")
+                        elif ret_5d > 0 and ret_20d > 0:
+                            lines.append(f"    → {asset_name} trending UP — mildly supportive")
+                        elif ret_5d < -3 and ret_20d < -5:
+                            lines.append(f"    → {asset_name} in DOWNTREND — HEADWIND for {ticker}")
+                        elif ret_5d < 0:
+                            lines.append(f"    → {asset_name} pulling back — near-term caution")
+                        else:
+                            lines.append(f"    → {asset_name} FLAT — neutral for {ticker}")
+                except Exception:
+                    lines.append(f"  {asset_name}: Data unavailable")
+    except Exception:
+        pass
+
+    # ══════════════════════════════════════════════════════════════════
+    # SECTION 8: EARNINGS VOLATILITY ESTIMATE
+    # (For stocks with imminent earnings + high short interest)
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        # Only generate if earnings within 30 days
+        if earnings_found and earnings_days is not None and earnings_days <= 30:
+            try:
+                _yf_info2 = stock.info if 'stock' in dir() else {}
+            except Exception:
+                _yf_info2 = {}
+
+            short_pct = _yf_info2.get('shortPercentOfFloat', 0) or 0
+            beta_val = _yf_info2.get('beta', 1.0) or 1.0
+
+            # Historical earnings moves (from earnings_dates if available)
+            hist_moves = []
+            try:
+                import yfinance as yf
+                _stock = yf.Ticker(ticker)
+                edates = _stock.earnings_dates
+                if edates is not None and len(edates) >= 2:
+                    from data_fetcher import fetch_daily
+                    hist_df = fetch_daily(ticker, period='2y')
+                    if hist_df is not None and len(hist_df) > 50:
+                        for dt_idx in edates.index:
+                            try:
+                                d = dt_idx.date() if hasattr(dt_idx, 'date') else dt_idx.to_pydatetime().date()
+                                # Find the trading day before and after earnings
+                                mask_before = hist_df.index.date <= d
+                                mask_after = hist_df.index.date >= d
+                                if mask_before.any() and mask_after.any():
+                                    close_before = float(hist_df.loc[mask_before, 'Close'].iloc[-1])
+                                    # Day after (or same day if reported pre-market)
+                                    after_df = hist_df.loc[mask_after]
+                                    if len(after_df) >= 2:
+                                        close_after = float(after_df['Close'].iloc[1])
+                                        move_pct = (close_after / close_before - 1) * 100
+                                        hist_moves.append(round(move_pct, 1))
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+
+            lines.append(f"\n📊 EARNINGS VOLATILITY ESTIMATE:")
+            lines.append(f"  Days to earnings: {earnings_days}")
+            lines.append(f"  Short % of float: {short_pct*100:.1f}%" if short_pct else "  Short %: N/A")
+            lines.append(f"  Beta: {beta_val:.2f}")
+
+            if hist_moves and len(hist_moves) >= 2:
+                avg_move = sum(abs(m) for m in hist_moves) / len(hist_moves)
+                max_move = max(abs(m) for m in hist_moves)
+                lines.append(f"  Historical earnings moves (last {len(hist_moves)}): {', '.join(f'{m:+.1f}%' for m in hist_moves[:6])}")
+                lines.append(f"  Average absolute move: ±{avg_move:.1f}%")
+                lines.append(f"  Largest move: ±{max_move:.1f}%")
+            else:
+                # Estimate from beta and short interest
+                base_move = 8.0  # Average S&P stock earnings move
+                beta_adj = base_move * beta_val
+                short_adj = beta_adj * (1 + short_pct * 2) if short_pct else beta_adj
+                lines.append(f"  No historical earnings data — estimating from beta + short interest:")
+                lines.append(f"  Estimated earnings move: ±{short_adj:.0f}–{short_adj*1.5:.0f}%")
+
+            # Short squeeze potential
+            if short_pct and short_pct > 0.15:
+                lines.append(f"  ⚠️ SHORT SQUEEZE RISK: {short_pct*100:.1f}% short interest")
+                lines.append(f"  → If earnings beat: potential for {short_pct*100:.0f}–{short_pct*200:.0f}%+ upside squeeze")
+                lines.append(f"  → If earnings miss: shorts will pile on, amplifying downside")
+                lines.append(f"  → Standard stop losses may be INEFFECTIVE on gap moves — stock could gap past your stop")
+            elif short_pct and short_pct > 0.10:
+                lines.append(f"  ℹ️ Elevated short interest ({short_pct*100:.1f}%) — earnings moves likely amplified")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def _render_chat_tab(ticker: str, signal: EntrySignal, rec: Dict,
+                     analysis: TickerAnalysis):
+    """AI Research Analyst — auto-runs external research + interactive follow-up chat."""
+
+    # ── Get cached AI client (no re-import/re-create on every rerun) ──
+    ai_clients = _get_ai_clients()
+    openai_client = ai_clients['openai_client']
+    ai_config = ai_clients['ai_config']
+
+    if not openai_client:
+        st.warning(f"🔑 **API key missing or invalid.** Current: {ai_config.get('display', 'none')}")
+        st.caption("Add your API key in Settings → Secrets as `GROQ_API_KEY`. "
+                   "Supports **Groq** (`gsk_...`) or **xAI/Grok** (`xai-...`) keys. "
+                   "After updating, click 🔑 **Reset API** in ⚙️ Settings sidebar.")
+        return
+
+    # ── Chat state management (per ticker) ────────────────────────────
+    chat_key = f'chat_history_{ticker}'
+    research_key = f'chat_research_{ticker}'
+    autorun_key = f'chat_autorun_{ticker}'
+
+    # Reset when switching tickers
+    if st.session_state.get('chat_active_ticker') != ticker:
+        st.session_state[chat_key] = []
+        st.session_state['chat_active_ticker'] = ticker
+        st.session_state.pop(research_key, None)
+        st.session_state.pop(autorun_key, None)
+
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = []
+
+    # ── Build context lazily (only when needed for API calls) ─────────
+    def _get_system_prompt():
+        """Build system prompt on demand — avoids fetching external research on every render."""
+        internal_context = _build_internal_context(ticker, signal, rec, analysis)
+
+        # Fetch external research (cached per ticker within session)
+        if research_key not in st.session_state:
+            with st.spinner(f"🔍 Researching {ticker} — fetching news, analyst data, sentiment..."):
+                external_research = _fetch_external_research(ticker)
+                st.session_state[research_key] = external_research
+        external_research = st.session_state.get(research_key, "External research not yet loaded.")
+
+        return f"""You are a senior equity research analyst integrated into a stock trading application called TTA (Technical Trading Assistant).
+CRITICAL FORMATTING RULE: NEVER use markdown formatting in your response — no *italic*, **bold**, or ***bold italic*** markers. Use PLAIN TEXT only with proper spacing between ALL words. Section headers should be plain numbered labels like "1. MARKET & SECTOR CONTEXT".
+
+═══ YOUR DATA SOURCES ═══
+
+1. IN-APP DATA (the user can already see this on their screen — DO NOT list it back):
+{internal_context}
+
+2. EXTERNAL RESEARCH (you just gathered this — this is YOUR unique value):
+{external_research}
+
+3. {_build_sector_rotation_context()}
+
+═══ MANDATORY ANALYSIS STRUCTURE ═══
+Your response MUST include ALL sections below in this order. Omitting any section is a FAILURE.
+
+**1. MARKET & SECTOR CONTEXT** (ALWAYS INCLUDE FIRST)
+- Current overall equity market conditions (use SPY, VIX, breadth data provided)
+- Identify the stock's SECTOR and INDUSTRY by name
+- SECTOR CLASSIFICATION CHECK: Read the company's Business description. Does the Yahoo-assigned sector accurately reflect what this company actually does? Many companies are misclassified (e.g., crypto miners in "Financial Services", SaaS companies in "Industrials", EV companies in "Consumer Cyclical"). If the actual business doesn't match the assigned sector, SAY SO and explain which sector's rotation data is more relevant. Example: "WULF is classified as Financial Services but is actually a Bitcoin mining company — crypto/tech sector rotation is more relevant than traditional financials."
+- Is the RELEVANT sector in rotation vs S&P 500? LEADING, LAGGING, or WEAKENING?
+- Cite current sector performance data (20d vs SPY)
+- CORRELATED ASSET: If your research data includes a "CORRELATED ASSET PRICE ACTION" section (e.g., Bitcoin for crypto miners, oil for E&P companies, gold for gold miners), you MUST mention it. State the correlated asset's current trend and whether it supports or contradicts the bullish thesis. This is critical context — a Bitcoin miner in a BTC downtrend faces a massive headwind regardless of its own technicals.
+- If sector rotation data unavailable, explicitly state this limitation
+
+**2. EARNINGS & TRADE TIMING** (CRITICAL — ALWAYS INCLUDE)
+- State the next earnings date and exact days remaining
+- If earnings <30 days away: flag as HIGH RISK and assess viability
+- VOLATILITY ESTIMATE: If your research data includes an "EARNINGS VOLATILITY ESTIMATE" section, you MUST reference it. State the estimated or historical earnings move range (e.g., "±15-25%"). If short interest is >15%, explicitly warn that a gap move could blow past any stop loss — the stock could open 20-30% lower/higher than the prior close. This affects whether a stop loss is even a viable risk management tool.
+- Is there a viable trade window before the next binary event?
+- Note any other upcoming catalysts from news data
+- If earnings date is missing, state: "Unable to fully assess trade timing — earnings date not found"
+
+**3. TECHNICAL INTERPRETATION** (from in-app data)
+- Reference but DO NOT LIST the technical indicators the user can already see on screen
+- INTERPRET what the signals mean collectively — what's the story?
+- Identify the most critical patterns, levels, and momentum state
+- Volume and momentum assessment in context
+
+**4. EXTERNAL INTELLIGENCE** (from your research data above)
+- Latest analyst ratings, price targets, and any recent changes
+- Social media / volume sentiment assessment
+- Recent news highlights (past 7 days) — only material items
+- Institutional/insider transaction activity (ownership % is NOT selling)
+- Only cite data actually present in your research — do NOT hallucinate
+
+**5. SYNTHESIZED RECOMMENDATION**
+- **BUY / HOLD / PASS** with confidence level (High/Medium/Low)
+- Entry price or zone (if BUY)
+- Stop loss level (MUST include)
+- Target price with upside %
+- **RISK/REWARD RATIO** (MUST calculate explicitly): Upside % to target ÷ Downside % to stop. State the ratio (e.g., "1.75:1"). Assess whether it's adequate given the setup: 2:1+ is standard for swing trades; earnings plays with high short interest need 2.5:1+ to justify the binary risk. If R:R is below 1.5:1, flag it as inadequate.
+- Hold duration — MUST be appropriate to earnings calendar
+- Position sizing: Full (100%) / Reduced (75%) / Small (50%) / Skip — with reason
+
+**6. POST-EARNINGS SCENARIOS** (REQUIRED if earnings are within 30 days)
+If the next earnings report falls within the recommended hold period OR within 30 days, you MUST provide:
+- **If earnings BEAT and stock gaps up:** Take profits at what level? Or reassess for a longer hold? What would confirm a continuation vs a "sell the news" fade?
+- **If earnings MISS and stock gaps down:** Exit immediately regardless of stop loss? Or is there a lower support level worth holding to?
+- **Recommended exit strategy:** Should this be a day-after-earnings exit regardless of direction? Or hold through? What's the plan for a flat/neutral reaction?
+- **Pre-earnings positioning:** Should the full position be entered now, or scale in? Should part be hedged with options?
+If earnings are 60+ days away, skip this section.
+
+═══ CRITICAL RULES ═══
+- Never recommend a multi-month hold if earnings are <30 days away without explicitly acknowledging the risk
+- Your value is SYNTHESIS + EXTERNAL CONTEXT, not repeating in-app data
+- When discussing insider activity, ONLY report actual BUY/SELL transactions — ownership % is NOT selling
+- Cite sources for external data (e.g. "Yahoo analysts", "Finnhub news", "volume data")
+- Do NOT say "Based on the app data..." or list signals back — INTERPRET them
+- ALWAYS calculate and state the risk/reward ratio — never present a trade plan without it
+- Keep under 600 words. Be decisive, not exhaustive. Every sentence must add value.
+- FORMATTING: Do NOT use markdown formatting in your response body — no *italic*, **bold**, or ***bold italic*** markers anywhere. Use PLAIN TEXT with proper spacing between all words. Section headers should be plain numbered labels (e.g., "1. MARKET & SECTOR CONTEXT") without markdown.
+
+═══ FOR FOLLOW-UP QUESTIONS (CONVERSATIONAL Q&A MODE) ═══
+
+When the user asks follow-up questions, switch to conversational mode:
+
+YOUR AVAILABLE DATA SOURCES:
+✅ In-app technical indicators (MACD, AO, RSI, volume, moving averages, Weinstein stages)
+✅ Yahoo Finance (fundamentals, analyst ratings, insider transactions, earnings dates, options)
+✅ Finnhub basic tier (news, company profile, social sentiment proxy)
+✅ Market conditions (SPY, VIX, sector rotation, breadth)
+✅ Correlated asset data (BTC, oil, gold for relevant stocks)
+✅ Your previous analysis in this conversation — reference it freely
+
+NOT AVAILABLE (be transparent):
+❌ Real-time social media (Twitter/X, Reddit, StockTwits) — requires premium subscription
+❌ Elliott Wave analysis — not in the system, suggest TradingView
+❌ Level 2 / order book data — not available
+❌ Advanced options flow (unusual activity) — only basic Yahoo options chain
+❌ Dark pool / institutional flow data — not available
+❌ Proprietary scoring models — only what's in the app
+
+RESPONSE GUIDELINES:
+- Be conversational, helpful, and direct — cite specific prices, percentages, dates
+- Reference your previous analysis sections when relevant ("As I noted in Section 2...")
+- When users ask about unavailable data:
+  * Explain what you DO have access to as an alternative
+  * Suggest external tools when appropriate (TradingView, Finviz, Unusual Whales, etc.)
+  * Offer to analyze available proxy data instead
+- When asked "why did you recommend X?": Give detailed reasoning referencing specific data points
+- When asked hypotheticals ("what if BTC drops?"): Use available data to model scenarios
+- If asked about something not in your data, say so honestly and suggest clicking "Refresh Research"
+- You can discuss entry strategy, position sizing, risk management, catalysts, sector trends
+
+EXAMPLE RESPONSES:
+Q: "What's the sentiment on Twitter?"
+→ "I don't have real-time Twitter/X access. However, I can see that [institutional ownership, insider activity, analyst consensus, social mention counts from Finnhub] — these 'smart money' signals often matter more than social buzz."
+
+Q: "Can you do Elliott Wave?"
+→ "Elliott Wave isn't part of my analysis tools. I work with MACD, AO, Weinstein stages, and support/resistance. For EW, try TradingView. I can help with trend structure using multi-timeframe momentum — want me to break that down?"
+
+Q: "Why PASS when analysts say $23?"
+→ [Reference specific sections from initial analysis with data points]"""
+
+    # ── Header with controls ──────────────────────────────────────────
+    hdr1, hdr2, hdr3 = st.columns([5, 2, 1])
+    with hdr1:
+        st.markdown(f"**🔬 AI Research Analyst — {ticker}**")
+    with hdr2:
+        if st.button("🔄 Refresh Research", key="chat_refresh_research",
+                     help="Re-fetch latest news, analyst data & sentiment"):
+            st.session_state.pop(research_key, None)
+            st.session_state.pop(autorun_key, None)
+            st.session_state[chat_key] = []
+            st.rerun()
+    with hdr3:
+        if st.button("🗑️", key="chat_clear", help="Clear conversation"):
+            st.session_state[chat_key] = []
+            st.session_state.pop(autorun_key, None)
+            st.rerun()
+
+    # ── Auto-run initial analysis ─────────────────────────────────────
+    history = st.session_state[chat_key]
+
+    if not st.session_state.get(autorun_key):
+        if not history:
+            # Show run button — don't auto-fire (saves ~15 API calls per ticker switch)
+            st.info("💬 **AI Research Analyst ready.** Click below to fetch research data & generate analysis.")
+            if st.button("▶️ Run Research Analysis", type="primary", width="stretch",
+                         key=f"chat_run_{ticker}"):
+                pass  # Fall through to run the analysis below
+            else:
+                # Show data sources info even before running
+                with st.expander("ℹ️ About Data Sources", expanded=False):
+                    st.markdown("""**Available in this analysis:**
+✅ Technical indicators (MACD, AO, Weinstein stages, volume, support/resistance)
+✅ Yahoo Finance (fundamentals, analyst ratings, insider transactions, earnings)
+✅ Finnhub (news, company profile, social sentiment proxy)
+✅ Market context (SPY, VIX, sector rotation, breadth)
+✅ Correlated assets (BTC for crypto miners, oil for E&P, gold for miners)
+
+**Not available (will suggest alternatives):**
+❌ Real-time social media (Twitter/X, Reddit) · ❌ Elliott Wave · ❌ Level 2 / dark pool · ❌ Advanced options flow""")
+                return  # Don't run yet
+
+        # Auto-populate and send the initial analysis request
+        initial_query = f"Analyze {ticker} and provide a BUY/HOLD/PASS recommendation."
+
+        history.append({'role': 'user', 'content': initial_query})
+
+        messages = [
+            {'role': 'system', 'content': _get_system_prompt()},
+            {'role': 'user', 'content': initial_query},
+        ]
+
+        try:
+            with st.spinner(f"🧠 Analyzing {ticker} — synthesizing signals + research..."):
+                response = openai_client.chat.completions.create(
+                    model=ai_config['model'],
+                    messages=messages,
+                    max_tokens=1800,
+                    temperature=0.3,
+                )
+                reply = response.choices[0].message.content
+                history.append({'role': 'assistant', 'content': reply})
+        except Exception as e:
+            err_str = str(e)
+            # Cache 401 invalid key so we don't keep retrying
+            if 'Invalid API Key' in err_str or '401' in err_str or 'Unauthorized' in err_str:
+                try:
+                    st.session_state['_groq_key_status'] = 'invalid'
+                    st.session_state['_groq_key_cached'] = ai_config.get('key', '')
+                except Exception:
+                    pass
+                history.append({'role': 'assistant',
+                                'content': f"🔑 **API key invalid ({ai_config.get('display', 'unknown')}).** Update GROQ_API_KEY in secrets, then click 🔑 Reset API in sidebar."})
+            else:
+                # Fallback model
+                try:
+                    response = openai_client.chat.completions.create(
+                        model=ai_config['fallback_model'],
+                        messages=messages,
+                        max_tokens=1400,
+                        temperature=0.3,
+                    )
+                    reply = response.choices[0].message.content
+                    history.append({'role': 'assistant', 'content': reply})
+                except Exception as e2:
+                    err2_str = str(e2)
+                    if 'Invalid API Key' in err2_str or '401' in err2_str or 'Unauthorized' in err2_str:
+                        try:
+                            st.session_state['_groq_key_status'] = 'invalid'
+                            st.session_state['_groq_key_cached'] = ai_config.get('key', '')
+                        except Exception:
+                            pass
+                        history.append({'role': 'assistant',
+                                        'content': f"🔑 **API key invalid.** Update GROQ_API_KEY in secrets, then click 🔑 Reset API."})
+                    else:
+                        history.append({'role': 'assistant',
+                                        'content': f"⚠️ Analysis failed: {err_str[:200]}\nFallback: {err2_str[:200]}"})
+
+        st.session_state[chat_key] = history
+        st.session_state[autorun_key] = True
+
+    # ── Display conversation ──────────────────────────────────────────
+    for msg in history:
+        with st.chat_message(msg['role'], avatar="🧑‍💼" if msg['role'] == 'user' else "🔬"):
+            st.markdown(clean_ai_formatting(msg['content']) if msg['role'] == 'assistant' else msg['content'])
+
+    # ── Suggested follow-ups (after initial analysis) ─────────────────
+    if len(history) == 2:  # Just the auto-run Q&A
+        st.caption("💡 **Ask follow-ups:** *\"What's the biggest risk here?\"* · "
+                   "*\"Where exactly should I enter?\"* · "
+                   "*\"What catalyst could move this 20%?\"* · "
+                   "*\"Is smart money buying or selling?\"* · "
+                   "*\"Compare bull and bear case\"* · "
+                   "*\"How does this sector look right now?\"*")
+
+    # ── Data sources transparency ─────────────────────────────────────
+    with st.expander("ℹ️ About Data Sources", expanded=False):
+        st.markdown("""
+**Available in this analysis:**
+- ✅ Technical indicators — MACD, AO, RSI, volume, moving averages, Weinstein stages
+- ✅ Yahoo Finance — fundamentals, analyst ratings, insider transactions, earnings dates
+- ✅ Finnhub (basic) — news, company profile, social mention counts
+- ✅ Market context — SPY/VIX, sector rotation (all 11 GICS sectors), breadth
+- ✅ Correlated assets — BTC, oil, gold (auto-detected for relevant stocks)
+- ✅ Earnings volatility — historical moves, short squeeze risk assessment
+
+**Not available (ask the AI for workarounds):**
+- ❌ Real-time social media (Twitter/X, Reddit) — premium subscription required
+- ❌ Elliott Wave analysis — use TradingView for this
+- ❌ Level 2 / order book / dark pool data
+- ❌ Advanced options flow (unusual activity beyond Yahoo chain)
+
+The AI is transparent about limitations and will suggest alternatives using available data.
+""")
+
+    # ── Chat input for follow-ups ─────────────────────────────────────
+    user_input = st.chat_input(f"Ask about {ticker}...", key=f"chat_input_{ticker}")
+
+    if user_input:
+        history.append({'role': 'user', 'content': user_input})
+
+        with st.chat_message('user', avatar="🧑‍💼"):
+            st.markdown(user_input)
+
+        # Build full message chain (system + last 20 messages)
+        messages = [{'role': 'system', 'content': _get_system_prompt()}]
+        for msg in history[-20:]:
+            messages.append({'role': msg['role'], 'content': msg['content']})
+
+        with st.chat_message('assistant', avatar="🔬"):
+            try:
+                with st.spinner("Thinking..."):
+                    response = openai_client.chat.completions.create(
+                        model=ai_config['model'],
+                        messages=messages,
+                        max_tokens=1000,
+                        temperature=0.4,
+                    )
+                    reply = response.choices[0].message.content
+
+                st.markdown(clean_ai_formatting(reply))
+                history.append({'role': 'assistant', 'content': reply})
+                st.session_state[chat_key] = history
+
+            except Exception as e:
+                error_msg = str(e)[:300]
+                st.error(f"AI Error: {error_msg}")
+                try:
+                    with st.spinner("Retrying..."):
+                        response = openai_client.chat.completions.create(
+                            model=ai_config['fallback_model'],
+                            messages=messages,
+                            max_tokens=800,
+                            temperature=0.4,
+                        )
+                        reply = response.choices[0].message.content
+                    st.markdown(clean_ai_formatting(reply))
+                    history.append({'role': 'assistant', 'content': reply})
+                    st.session_state[chat_key] = history
+                except Exception as e2:
+                    st.error(f"Fallback failed: {str(e2)[:200]}")
+
+
+def _render_trade_tab(ticker: str, signal: EntrySignal,
+                      analysis: TickerAnalysis):
+    """Enhanced trade management: position calculator, portfolio dashboard, health monitoring."""
+    jm = get_journal()
+    rec = analysis.recommendation or {}
+    stops = signal.stops if signal else {}
+
+    # ── Portfolio Capital Summary (always visible) ────────────────
+    _render_capital_overview(jm)
+
+    st.divider()
+
+    # Check if already in a position
+    open_tickers = jm.get_open_tickers()
+    if ticker in open_tickers:
+        _render_position_management(ticker, jm)
+        return
+
+    # ── Position Calculator & Entry ───────────────────────────────
+    _render_position_calculator(ticker, signal, analysis, jm, rec, stops)
+
+
+def _render_capital_overview(jm: JournalManager):
+    """
+    Always-visible capital bar: total account, deployed, available,
+    per-ticker breakdown with health status.
+    """
+    open_trades = jm.get_open_trades()
+
+    # Account-size default is centrally managed.
+    ensure_portfolio_defaults(st.session_state)
+
+    account_size = st.session_state['account_size']
+
+    if not open_trades:
+        col_a, col_b = st.columns([1, 3])
+        with col_a:
+            new_acct = st.number_input(
+                "💰 Account Size", value=account_size,
+                step=10000.0, format="%.0f", key="global_acct",
+                label_visibility="collapsed",
+            )
+            if new_acct != account_size:
+                st.session_state['account_size'] = new_acct
+        with col_b:
+            st.info(f"💰 **${account_size:,.0f}** available — no open positions")
+        return
+
+    # Fetch live prices
+    from data_fetcher import fetch_current_price
+
+    current_prices = {}
+    for trade in open_trades:
+        t = trade['ticker']
+        price = fetch_current_price(t)
+        if price:
+            current_prices[t] = price
+
+    # Calculate totals
+    total_deployed = 0
+    total_current_value = 0
+    total_pnl = 0
+    position_rows = []
+
+    for trade in open_trades:
+        t = trade['ticker']
+        entry = float(trade.get('entry_price', 0))
+        shares = float(trade.get('shares', 0))
+        pos_size = float(trade.get('position_size', 0))
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+        current = current_prices.get(t, entry)
+
+        total_deployed += pos_size
+        current_value = current * shares
+        total_current_value += current_value
+        pnl_dollars = (current - entry) * shares
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        total_pnl += pnl_dollars
+
+        # Distance to stop
+        stop_dist = ((current - stop) / current * 100) if current > 0 and stop > 0 else 999
+
+        # Health traffic light
+        if (stop > 0 and current <= stop) or pnl_pct < -10:
+            health = "🔴"
+            action = "CLOSE NOW"
+        elif stop_dist < 2 or pnl_pct < -5:
+            health = "🔴"
+            action = "EXIT SOON"
+        elif stop_dist < 5 or pnl_pct < -3:
+            health = "🟡"
+            action = "WATCH"
+        elif pnl_pct >= 15:
+            health = "🟢"
+            action = "TRAIL STOP"
+        else:
+            health = "🟢"
+            action = "HOLD"
+
+        # Days held
+        try:
+            days_held = (datetime.now() - datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')).days
+        except Exception:
+            days_held = 0
+
+        position_rows.append({
+            'health': health,
+            'action': action,
+            'ticker': t,
+            'shares': shares,
+            'entry': entry,
+            'current': current,
+            'cost': pos_size,
+            'value': current_value,
+            'pnl_dollars': pnl_dollars,
+            'pnl_pct': pnl_pct,
+            'stop': stop,
+            'stop_dist': stop_dist,
+            'days': days_held,
+        })
+
+    available = account_size - total_deployed
+    deployed_pct = (total_deployed / account_size * 100) if account_size > 0 else 0
+
+    # ── Capital Bar ───────────────────────────────────────────────
+    st.markdown("### 💼 Portfolio Capital")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        st.metric("Account", f"${account_size:,.0f}")
+    with c2:
+        st.metric("Deployed", f"${total_deployed:,.0f}",
+                  f"{deployed_pct:.0f}%")
+    with c3:
+        avail_color = "normal" if available > 0 else "inverse"
+        st.metric("Available", f"${available:,.0f}",
+                  f"{100 - deployed_pct:.0f}%")
+    with c4:
+        st.metric("Current Value", f"${total_current_value:,.0f}",
+                  f"{total_pnl:+,.0f}")
+    with c5:
+        total_pnl_pct = (total_pnl / total_deployed * 100) if total_deployed > 0 else 0
+        st.metric("Total P&L", f"{total_pnl_pct:+.1f}%",
+                  f"${total_pnl:+,.0f}")
+
+    # Deployment progress bar
+    bar_pct = min(deployed_pct / 100, 1.0)
+    if deployed_pct >= 90:
+        st.progress(bar_pct, text=f"⚠️ {deployed_pct:.0f}% deployed — near full allocation")
+    elif deployed_pct >= 70:
+        st.progress(bar_pct, text=f"🟡 {deployed_pct:.0f}% deployed")
+    else:
+        st.progress(bar_pct, text=f"🟢 {deployed_pct:.0f}% deployed")
+
+    # ── Positions Table with Health Lights ─────────────────────────
+    # Alert banner for red positions
+    reds = [r for r in position_rows if r['health'] == '🔴']
+    if reds:
+        tickers_at_risk = ", ".join(f"**{r['ticker']}** ({r['action']})" for r in reds)
+        st.error(f"🚨 ACTION REQUIRED: {tickers_at_risk}")
+
+    # Table
+    table_rows = []
+    for r in position_rows:
+        table_rows.append({
+            '': r['health'],
+            'Ticker': r['ticker'],
+            'Action': r['action'],
+            'Shares': f"{r['shares']:.0f}",
+            'Entry': f"${r['entry']:.2f}",
+            'Now': f"${r['current']:.2f}",
+            'P&L': f"{r['pnl_pct']:+.1f}%",
+            'P&L $': f"${r['pnl_dollars']:+,.0f}",
+            'Cost': f"${r['cost']:,.0f}",
+            'Value': f"${r['value']:,.0f}",
+            'Stop': f"${r['stop']:.2f}" if r['stop'] > 0 else "—",
+            'To Stop': f"{r['stop_dist']:.1f}%" if r['stop_dist'] < 999 else "—",
+            'Days': r['days'],
+        })
+
+    if table_rows:
+        st.dataframe(
+            pd.DataFrame(table_rows),
+            width="stretch",
+            hide_index=True,
+        )
+
+    # Account size editor (collapsed)
+    with st.expander("⚙️ Account Settings"):
+        new_acct = st.number_input(
+            "Account Size ($)", value=account_size,
+            step=10000.0, format="%.0f", key="global_acct_edit",
+        )
+        if new_acct != account_size:
+            st.session_state['account_size'] = new_acct
+            st.rerun()
+
+
+def _extract_ai_trade_levels(
+    ai_result: Dict,
+    technical_entry: float,
+    technical_stop: float,
+    technical_target: float,
+    current_price: float,
+) -> Dict[str, float]:
+    """Parse AI text for entry/stop/target levels with technical fallback."""
+    action = str(ai_result.get('action', '') or '')
+    fields = [
+        action,
+        str(ai_result.get('resistance_verdict', '') or ''),
+        str(ai_result.get('analysis', '') or ''),
+        str(ai_result.get('raw_text', '') or ''),
+        str(ai_result.get('bull_case', '') or ''),
+        str(ai_result.get('bear_case', '') or ''),
+    ]
+    blob = "\n".join(fields)
+
+    def _find_labeled_price(labels: List[str]) -> float:
+        for label in labels:
+            m = re.search(rf"{label}\s*[:=]?\s*\$?\s*(\d+(?:\.\d+)?)", blob, flags=re.IGNORECASE)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    pass
+        return 0.0
+
+    ai_entry = _find_labeled_price([r'entry', r'buy(?:\s+zone)?', r'breakout(?:\s+above)?', r'entry zone'])
+    ai_stop = _find_labeled_price([r'stop(?:\s+loss)?', r'invalidat(?:ion|e)\s+below'])
+    ai_target = _find_labeled_price([r'target', r'price target', r'upside target'])
+
+    if not ai_entry:
+        m_break = re.search(r'WAIT\s+FOR\s+BREAKOUT\s+above\s+\$?(\d+(?:\.\d+)?)', action, flags=re.IGNORECASE)
+        if m_break:
+            ai_entry = float(m_break.group(1))
+
+    if not ai_entry and "BUY NOW" in action.upper() and current_price > 0:
+        ai_entry = float(current_price)
+
+    entry = ai_entry if ai_entry > 0 else float(technical_entry or current_price or 0.0)
+    stop = ai_stop if (ai_stop > 0 and ai_stop < entry) else float(technical_stop or 0.0)
+    target = ai_target if (ai_target > entry) else float(technical_target or 0.0)
+
+    using_ai = bool(ai_entry or ai_stop or ai_target)
+    return {
+        'entry': float(entry),
+        'stop': float(stop),
+        'target': float(target),
+        'using_ai': using_ai,
+        'parsed_entry': float(ai_entry),
+        'parsed_stop': float(ai_stop),
+        'parsed_target': float(ai_target),
+    }
+
+
+def _build_trade_ticket_note(
+    ticker: str,
+    ai_result: Dict,
+    rec: Dict,
+    signal: EntrySignal,
+    source_mode: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+) -> str:
+    """Build timestamped trade-ticket note attached to the trade."""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    action = str(ai_result.get('action', ai_result.get('timing', '')) or '')
+    conviction = ai_result.get('conviction', rec.get('conviction', 0))
+    pos_size_txt = str(ai_result.get('position_sizing', '') or '')
+    resistance = str(ai_result.get('resistance_verdict', '') or '')
+    why = str(ai_result.get('why_moving', '') or '')
+    red_flags = str(ai_result.get('red_flags', '') or '')
+
+    lines = [
+        f"[TRADE TICKET | {ts}]",
+        f"Ticker: {ticker}",
+        f"Default Source: {source_mode}",
+        f"Action: {action or rec.get('recommendation', 'N/A')}",
+        f"Conviction: {conviction}/10",
+        f"Position Sizing Guidance: {pos_size_txt or 'N/A'}",
+        f"Planned Entry: ${entry_price:.2f} | Stop: ${stop_price:.2f} | Target: ${target_price:.2f}",
+    ]
+    if signal and signal.stops:
+        rr = signal.stops.get('reward_risk')
+        if rr:
+            lines.append(f"Technical Reward:Risk: {rr}")
+    if resistance:
+        lines.append(f"Resistance Verdict: {resistance[:220]}")
+    if why:
+        lines.append(f"Narrative: {why[:220]}")
+    if red_flags:
+        lines.append(f"Red Flags: {red_flags[:220]}")
+
+    return "\n".join(lines)
+
+
+def _render_position_calculator(ticker, signal, analysis, jm, rec, stops):
+    """
+    Institutional-grade position calculator using position_sizer.py.
+    Uses AI-recommended defaults when available, with technical fallback.
+    """
+    from position_sizer import calculate_position_size
+
+    current_price = float(analysis.current_price or 0.0)
+    tech_entry = float(stops.get('entry', current_price or 0.0))
+    tech_stop = float(stops.get('stop', 0.0))
+    tech_target = float(stops.get('target', 0.0))
+    ai_result = st.session_state.get(f'ai_result_{ticker}', {}) or {}
+    ai_levels = _extract_ai_trade_levels(ai_result, tech_entry, tech_stop, tech_target, current_price)
+    finder_trade = st.session_state.get('trade_finder_selected_trade', {}) or {}
+    finder_for_ticker = finder_trade if str(finder_trade.get('ticker', '')).upper() == str(ticker).upper() else {}
+    if finder_for_ticker:
+        ai_levels['entry'] = float(finder_for_ticker.get('entry', ai_levels.get('entry', current_price)) or ai_levels.get('entry', current_price) or current_price)
+        ai_levels['stop'] = float(finder_for_ticker.get('stop', ai_levels.get('stop', 0)) or ai_levels.get('stop', 0) or 0)
+        ai_levels['target'] = float(finder_for_ticker.get('target', ai_levels.get('target', 0)) or ai_levels.get('target', 0) or 0)
+        ai_levels['using_ai'] = True
+
+    account_size = float(st.session_state.get('account_size', 100000.0))
+    open_trades = jm.get_open_trades()
+    snap = _build_dashboard_snapshot()
+    policy = snap.risk_policy
+    gate = _evaluate_trade_gate(snap)
+    win_rate = jm.get_recent_win_rate(last_n=20)
+    losing_streak = jm.get_current_losing_streak()
+    stale = _stale_stream_status(snap)
+    stale_tags = list(stale["tags"])
+    stale_count = int(stale["count"])
+    hard_block_stale = stale_count >= 3
+
+    st.subheader(f"📐 Position Sizer — {ticker}")
+
+    def _safe_state_set(_key: str, _value: Any) -> bool:
+        """
+        Streamlit can invoke this renderer more than once in the same run path.
+        In that case, writing a widget-backed key after widget instantiation raises:
+        "cannot be modified after the widget with key ... is instantiated".
+        Guard writes so UI stays operational instead of crashing.
+        """
+        try:
+            st.session_state[_key] = _value
+            return True
+        except Exception as _e:
+            _msg = str(_e)
+            if "cannot be modified after the widget with key" in _msg:
+                return False
+            raise
+
+    if losing_streak >= 2:
+        st.warning(f"⚠️ On a {losing_streak}-trade losing streak — position sizes auto-reduced")
+    if win_rate < 0.4 and jm.get_trade_history(last_n=5):
+        st.warning(f"⚠️ Recent win rate: {win_rate:.0%} — consider reducing exposure")
+    st.caption(
+        f"Regime policy: {policy.regime} | "
+        f"Max new/day {policy.max_new_trades} | "
+        f"Size x{policy.position_size_multiplier:.2f} | "
+        f"Max open {policy.max_total_open_positions}"
+    )
+    if gate.severity == "danger":
+        st.error(f"{gate.label} — {gate.reason}")
+    elif gate.severity == "warning":
+        st.warning(f"{gate.label} — {gate.reason}")
+    else:
+        st.success(f"{gate.label} — {gate.reason}")
+    if hard_block_stale:
+        st.error(
+            "Entry hard-blocked: critical stale data streams detected "
+            f"({', '.join(stale_tags)}). Run Fast Refresh before entering new trades."
+        )
+    if len(open_trades) >= policy.max_total_open_positions:
+        st.error(
+            f"New entries blocked by policy: open positions {len(open_trades)} >= "
+            f"max {policy.max_total_open_positions} for regime {policy.regime}."
+        )
+
+    source_options = ["AI Recommended", "Technical"]
+    source_state_key = f"sizer_default_source_state_{ticker}"  # non-widget state (safe to mutate)
+    source_widget_key = f"sizer_default_source_ui_{ticker}"    # widget key (never mutate directly)
+    prev_source_key = f"sizer_default_source_prev_{ticker}"
+    pending_source_key = f"{source_state_key}_pending"
+    if pending_source_key in st.session_state:
+        _pending_source = str(st.session_state.pop(pending_source_key) or "").strip()
+        if _pending_source in source_options:
+            _safe_state_set(source_state_key, _pending_source)
+            # Force widget to rebind from updated state on next instantiation.
+            try:
+                st.session_state.pop(source_widget_key, None)
+            except Exception:
+                pass
+    if source_state_key not in st.session_state:
+        _safe_state_set(source_state_key, "AI Recommended" if ai_levels.get('using_ai') else "Technical")
+    elif st.session_state.get(source_state_key) not in source_options:
+        _safe_state_set(source_state_key, "Technical")
+    selected_source = st.selectbox(
+        "Default Price Source",
+        source_options,
+        index=source_options.index(st.session_state.get(source_state_key, "Technical")),
+        key=source_widget_key,
+    )
+    _safe_state_set(source_state_key, selected_source)
+
+    selected_entry = ai_levels['entry'] if selected_source == "AI Recommended" else tech_entry
+    selected_stop = ai_levels['stop'] if selected_source == "AI Recommended" else tech_stop
+    selected_target = ai_levels['target'] if selected_source == "AI Recommended" else tech_target
+    recommended_stop_ref = float(ai_levels.get('stop', 0) or 0)
+    recommended_stop_src = "Grok/AI" if ai_levels.get('using_ai') else "System"
+
+    if selected_source == "AI Recommended":
+        if ai_levels.get('using_ai'):
+            st.caption("AI defaults loaded (with technical fallback for missing fields).")
+        else:
+            st.caption("AI defaults not fully available for this ticker; using technical fallback.")
+    else:
+        st.caption("Technical defaults loaded from signal model.")
+
+    entry_key = f"sizer_entry_{ticker}"
+    stop_key = f"sizer_stop_{ticker}"
+    target_key = f"sizer_target_{ticker}"
+    stop_dist_key = f"sizer_stop_dist_pct_{ticker}"
+    pending_stop_key = f"{stop_key}_pending"
+    pending_stop_dist_key = f"{stop_dist_key}_pending"
+    stop_dist_prev_key = f"sizer_stop_dist_pct_prev_{ticker}"
+    stop_prev_key = f"sizer_stop_prev_{ticker}"
+    confirm_entry_key = f"confirm_entry_{ticker}"
+    confirm_stop_key = f"confirm_stop_{ticker}"
+    confirm_target_key = f"confirm_target_{ticker}"
+    tf_prefill_token = str(finder_for_ticker.get('prefill_token', '') or '').strip()
+    tf_prefill_applied_key = f"_tf_prefill_applied_{ticker}"
+
+    if finder_for_ticker and tf_prefill_token and st.session_state.get(tf_prefill_applied_key) != tf_prefill_token:
+        _pref_entry = float(finder_for_ticker.get('entry', selected_entry) or selected_entry or current_price or 0)
+        _pref_stop = float(finder_for_ticker.get('stop', selected_stop) or selected_stop or 0)
+        _pref_target = float(finder_for_ticker.get('target', selected_target) or selected_target or 0)
+        if _pref_entry > 0 and (_pref_stop <= 0 or _pref_stop >= _pref_entry):
+            _pref_stop = round(_pref_entry * 0.94, 2)
+        if _pref_entry > 0 and (_pref_target <= _pref_entry):
+            _pref_target = round(_pref_entry + ((_pref_entry - _pref_stop) * 2.0), 2)
+        _pref_dist = ((_pref_entry - _pref_stop) / _pref_entry * 100.0) if _pref_entry > 0 and _pref_stop > 0 else 0.0
+        _pref_dist = round(max(0.0, _pref_dist), 2)
+        _safe_state_set(pending_source_key, "AI Recommended")
+        _safe_state_set(entry_key, float(_pref_entry))
+        _safe_state_set(stop_key, float(_pref_stop))
+        _safe_state_set(target_key, float(_pref_target))
+        _safe_state_set(confirm_entry_key, float(_pref_entry))
+        _safe_state_set(confirm_stop_key, float(_pref_stop))
+        _safe_state_set(confirm_target_key, float(_pref_target))
+        _safe_state_set(pending_stop_dist_key, float(_pref_dist))
+        _safe_state_set(stop_dist_prev_key, float(_pref_dist))
+        _safe_state_set(stop_prev_key, float(_pref_stop))
+        _safe_state_set(prev_source_key, "AI Recommended")
+        _safe_state_set(tf_prefill_applied_key, tf_prefill_token)
+        st.rerun()
+
+    if entry_key not in st.session_state:
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
+    if stop_key not in st.session_state:
+        _safe_state_set(stop_key, float(selected_stop))
+    if target_key not in st.session_state:
+        _safe_state_set(target_key, float(selected_target))
+    if stop_dist_key not in st.session_state:
+        _entry0 = float(st.session_state.get(entry_key, selected_entry) or 0)
+        _stop0 = float(st.session_state.get(stop_key, selected_stop) or 0)
+        _dist0 = ((_entry0 - _stop0) / _entry0 * 100) if _entry0 > 0 and _stop0 > 0 and _entry0 > _stop0 else 0.0
+        _safe_state_set(stop_dist_key, round(max(0.0, _dist0), 2))
+    if stop_dist_prev_key not in st.session_state:
+        _safe_state_set(stop_dist_prev_key, float(st.session_state.get(stop_dist_key, 0.0) or 0.0))
+    if stop_prev_key not in st.session_state:
+        _safe_state_set(stop_prev_key, float(st.session_state.get(stop_key, selected_stop) or selected_stop or 0.0))
+
+    # Apply deferred widget-sync updates before number_input widgets are instantiated.
+    if pending_stop_key in st.session_state:
+        _pending_stop = float(st.session_state.pop(pending_stop_key) or 0.0)
+        _safe_state_set(stop_key, _pending_stop)
+        _safe_state_set(confirm_stop_key, _pending_stop)
+        _safe_state_set(stop_prev_key, _pending_stop)
+    if pending_stop_dist_key in st.session_state:
+        _pending_dist = float(st.session_state.pop(pending_stop_dist_key) or 0.0)
+        _safe_state_set(stop_dist_key, _pending_dist)
+        _safe_state_set(stop_dist_prev_key, _pending_dist)
+
+    prev_source = st.session_state.get(prev_source_key)
+    if prev_source != selected_source:
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(stop_key, float(selected_stop))
+        _safe_state_set(target_key, float(selected_target))
+        _safe_state_set(confirm_entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(confirm_stop_key, float(selected_stop))
+        _safe_state_set(confirm_target_key, float(selected_target))
+        _entry = float(st.session_state.get(entry_key, 0) or 0)
+        _stop = float(st.session_state.get(stop_key, 0) or 0)
+        _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
+        _dist_val = round(max(0.0, _dist), 2)
+        _safe_state_set(pending_stop_dist_key, _dist_val)
+        _safe_state_set(stop_dist_prev_key, float(_dist_val))
+        _safe_state_set(stop_prev_key, float(_stop))
+        _safe_state_set(prev_source_key, selected_source)
+        st.rerun()
+
+    if st.button("↺ Apply Selected Defaults", key=f"apply_defaults_{ticker}"):
+        _safe_state_set(entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(stop_key, float(selected_stop))
+        _safe_state_set(target_key, float(selected_target))
+        _safe_state_set(confirm_entry_key, float(selected_entry if selected_entry > 0 else current_price))
+        _safe_state_set(confirm_stop_key, float(selected_stop))
+        _safe_state_set(confirm_target_key, float(selected_target))
+        _entry = float(st.session_state.get(entry_key, 0) or 0)
+        _stop = float(st.session_state.get(stop_key, 0) or 0)
+        _dist = ((_entry - _stop) / _entry * 100) if _entry > 0 and _stop > 0 and _entry > _stop else 0.0
+        _dist_val = round(max(0.0, _dist), 2)
+        _safe_state_set(pending_stop_dist_key, _dist_val)
+        _safe_state_set(stop_dist_prev_key, float(_dist_val))
+        _safe_state_set(stop_prev_key, float(_stop))
+        st.rerun()
+
+    if recommended_stop_ref > 0:
+        st.caption(f"Recommended Stop Loss ({recommended_stop_src}): ${recommended_stop_ref:.2f}")
+    _tf_support = float(finder_for_ticker.get('support_price', 0) or 0)
+    _tf_support_stop = float(finder_for_ticker.get('support_stop_price', 0) or 0)
+    _tf_stop_basis = str(finder_for_ticker.get('stop_basis', '') or '').replace('_', ' ')
+    if _tf_support > 0:
+        _sp = _tf_support_stop if _tf_support_stop > 0 else float(ai_levels.get('stop', 0) or 0)
+        _sd = finder_for_ticker.get('support_distance_pct', None)
+        _sd_txt = f" ({float(_sd):.2f}% below entry)" if _sd is not None else ""
+        st.caption(
+            f"Support-based plan: support ${_tf_support:.2f}{_sd_txt} | stop ${_sp:.2f}"
+            + (f" [{_tf_stop_basis}]" if _tf_stop_basis else "")
+        )
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        entry_price = st.number_input("Entry Price", step=0.01, format="%.2f", key=entry_key)
+    with col2:
+        stop_price = st.number_input("Stop Loss", step=0.01, format="%.2f", key=stop_key)
+    with col3:
+        target_price = st.number_input("Target", step=0.01, format="%.2f", key=target_key)
+    with col4:
+        stop_dist_pct = st.number_input(
+            "Stop Distance %",
+            min_value=0.10,
+            max_value=50.00,
+            step=0.10,
+            format="%.2f",
+            key=stop_dist_key,
+            help="Percent distance from Entry. Changing this recalculates Stop Loss.",
+        )
+    with col5:
+        max_risk = st.number_input(
+            "Max Risk %",
+            value=max(0.5, min(5.0, round(1.5 * policy.position_size_multiplier, 2))),
+            min_value=0.5,
+            max_value=5.0,
+            step=0.25,
+            format="%.2f",
+            key=f"sizer_risk_{ticker}",
+        )
+
+    prev_stop_dist_pct = float(st.session_state.get(stop_dist_prev_key, stop_dist_pct) or 0.0)
+    if abs(stop_dist_pct - prev_stop_dist_pct) > 1e-9 and entry_price > 0:
+        new_stop_from_pct = max(0.01, entry_price * (1 - (stop_dist_pct / 100.0)))
+        new_stop_val = round(new_stop_from_pct, 2)
+        st.session_state[pending_stop_key] = new_stop_val
+        st.session_state[stop_dist_prev_key] = float(stop_dist_pct)
+        st.rerun()
+
+    prev_stop_price = float(st.session_state.get(stop_prev_key, stop_price) or 0.0)
+    if abs(stop_price - prev_stop_price) > 1e-9 and entry_price > 0:
+        derived_stop_dist_pct = ((entry_price - stop_price) / entry_price * 100.0) if stop_price > 0 else 0.0
+        derived_stop_dist_pct = round(max(0.0, derived_stop_dist_pct), 2)
+        st.session_state[pending_stop_dist_key] = derived_stop_dist_pct
+        st.session_state[stop_dist_prev_key] = float(derived_stop_dist_pct)
+        st.session_state[stop_prev_key] = float(stop_price)
+        st.rerun()
+
+    if entry_price > 0 and stop_price > 0 and entry_price > stop_price:
+        result = calculate_position_size(
+            ticker=ticker,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
+            account_size=account_size,
+            open_positions=open_trades,
+            recent_win_rate=win_rate,
+            current_losing_streak=losing_streak,
+            max_risk_pct=max_risk,
+        )
+
+        st.markdown("---")
+        if result.recommended_shares > 0:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("✅ Recommended", f"{result.recommended_shares:,} shares", f"${result.position_cost:,.0f}")
+            r2.metric("💸 Risk", f"${result.risk_dollars:,.0f}", f"{result.risk_pct_of_equity:.1f}% of equity")
+            r3.metric(
+                "🔥 Heat",
+                f"{result.portfolio_heat_before:.1f}% → {result.portfolio_heat_after:.1f}%",
+                f"{'✅' if result.portfolio_heat_after < 8 else '⚠️'}",
+            )
+            if result.reward_risk_ratio > 0:
+                r4.metric("🎯 R:R", f"{result.reward_risk_ratio:.1f}:1", "Good ✅" if result.reward_risk_ratio >= 2 else "Low ⚠️")
+            else:
+                r4.metric("📊 Concentration", f"{result.concentration_pct:.1f}%", f"{'✅' if result.concentration_pct < 20 else '⚠️'}")
+
+            with st.expander("📊 Sizing Breakdown"):
+                st.caption(f"**Risk limit (1.5%):** {result.shares_from_risk:,} shares")
+                st.caption(f"**Heat limit (8%):** {result.shares_from_heat:,} shares")
+                st.caption(f"**Concentration (20%):** {result.shares_from_concentration:,} shares")
+                st.caption(f"**Available capital:** {result.shares_from_capital:,} shares")
+                st.caption(f"**Binding constraint:** {result.limiting_factor.replace('_', ' ').title()}")
+                if result.scale_factor < 1.0:
+                    st.warning(
+                        f"⚠️ Base size: {result.base_shares:,} shares → "
+                        f"Reduced to {result.recommended_shares:,} — {result.scale_reason}"
+                    )
+                st.caption(f"Win rate (last 20): {win_rate:.0%} | Losing streak: {losing_streak}")
+
+            for w in result.warnings:
+                st.warning(w)
+            if not result.warnings:
+                st.success("✅ Position sizing within all risk parameters")
+            st.session_state[f'sizer_result_{ticker}'] = result.recommended_shares
+        else:
+            st.error(result.explanation)
+    elif entry_price > 0 and stop_price > 0 and stop_price >= entry_price:
+        st.error("Stop price must be below entry price")
+
+    st.divider()
+    st.markdown("### ✅ Enter Trade")
+
+    sizer_shares = st.session_state.get(f'sizer_result_{ticker}', 0)
+    final_shares = sizer_shares if sizer_shares > 0 else (int(account_size * 0.125 / entry_price) if entry_price > 0 else 0)
+
+    ec1, ec2, ec3, ec4 = st.columns(4)
+    with ec1:
+        confirm_shares = st.number_input("Shares", value=final_shares, min_value=0, step=1, key=f"confirm_shares_{ticker}")
+    with ec2:
+        if confirm_entry_key not in st.session_state:
+            st.session_state[confirm_entry_key] = float(entry_price if entry_price > 0 else selected_entry)
+        confirm_entry = st.number_input("Entry $", step=0.01, format="%.2f", key=confirm_entry_key)
+    with ec3:
+        if confirm_stop_key not in st.session_state:
+            st.session_state[confirm_stop_key] = float(stop_price if stop_price > 0 else selected_stop)
+        confirm_stop = st.number_input("Stop $", step=0.01, format="%.2f", key=confirm_stop_key)
+    with ec4:
+        if confirm_target_key not in st.session_state:
+            st.session_state[confirm_target_key] = float(target_price if target_price > 0 else selected_target)
+        confirm_target = st.number_input("Target $", step=0.01, format="%.2f", key=confirm_target_key)
+
+    if confirm_shares > 0 and confirm_entry > 0:
+        total_cost = confirm_shares * confirm_entry
+        st.caption(
+            f"**{confirm_shares} shares × ${confirm_entry:.2f} = ${total_cost:,.0f}** "
+            f"({total_cost / account_size * 100:.1f}% of account)"
+        )
+
+    notes_key = f"notes_{ticker}"
+    finder_note_applied_key = f"_tf_note_applied_{ticker}"
+    tf_run_id = str(finder_for_ticker.get('trade_finder_run_id', '') or '').strip()
+    if finder_for_ticker and not st.session_state.get(finder_note_applied_key):
+        tf_reason = str(finder_for_ticker.get('ai_rationale', '') or finder_for_ticker.get('reason', '') or '').strip()
+        tf_rr = float(finder_for_ticker.get('risk_reward', 0) or 0)
+        tf_rec = str(finder_for_ticker.get('ai_buy_recommendation', '') or '').strip()
+        seed = rec.get('summary', '') or ''
+        tf_line = f"[Trade Finder {tf_run_id or 'run:unknown'}] {tf_rec} | R:R {tf_rr:.2f}:1 | {tf_reason}".strip()
+        st.session_state[notes_key] = f"{seed}\n{tf_line}".strip() if seed else tf_line
+        st.session_state[finder_note_applied_key] = True
+    notes = st.text_area("Notes", value=rec.get('summary', ''), height=90, key=notes_key)
+    attach_ticket = st.checkbox("Attach AI trade ticket to notes", value=True, key=f"attach_trade_ticket_{ticker}")
+    quality_settings = _trade_quality_settings()
+    min_rr_required = float(quality_settings.get('min_rr', 2.0) or 2.0)
+    earnings_block_days = int(quality_settings.get('earn_block_days', 7) or 7)
+    confirm_rr = _calc_rr(float(confirm_entry or 0), float(confirm_stop or 0), float(confirm_target or 0))
+
+    finder_earn_date = str(finder_for_ticker.get('earn_date', '') or '').strip() if finder_for_ticker else ''
+    finder_earn_days = int(finder_for_ticker.get('earn_days', 999) or 999) if finder_for_ticker else 999
+    finder_earn_source = str(finder_for_ticker.get('earn_source', '') or '').strip() if finder_for_ticker else ''
+    finder_earn_conf = str(finder_for_ticker.get('earn_confidence', '') or '').strip() if finder_for_ticker else ''
+    entry_earn = resolve_earnings_for_ticker(
+        ticker,
+        persisted_date=finder_earn_date,
+        persisted_days=finder_earn_days,
+        persisted_source=finder_earn_source,
+        persisted_confidence=finder_earn_conf,
+        verify_with_fetch=False,
+    )
+    effective_earn_days = int(entry_earn.get('days_until', 999) or 999)
+    effective_earn_date = str(entry_earn.get('next_earnings', '') or '')
+    effective_earn_source = str(entry_earn.get('source', '') or '')
+    effective_earn_conf = str(entry_earn.get('confidence', '') or '').upper()
+    earnings_trusted = _is_earnings_data_trusted(
+        effective_earn_days,
+        source=effective_earn_source,
+        confidence=effective_earn_conf,
+        next_earnings=effective_earn_date,
+    )
+
+    st.caption(
+        f"Entry guards: min R:R {min_rr_required:.1f} | block earnings <= {earnings_block_days}d | "
+        f"current R:R {confirm_rr:.2f} | earnings {'trusted' if earnings_trusted else 'unverified'}"
+    )
+    earnings_override = st.checkbox(
+        f"Override earnings guard (window <= {earnings_block_days}d or unverified date)",
+        value=False,
+        key=f"earnings_override_{ticker}",
+        help="Allows entry despite imminent/unverified earnings data. Use only for intentional earnings plays.",
+    )
+
+    if st.button("✅ Enter Trade", type="primary", key=f"enter_{ticker}", disabled=hard_block_stale):
+        trades_today = _count_today_trade_entries()
+        if hard_block_stale:
+            st.error(
+                "Blocked: critical stale data streams. Run Fast Refresh and recheck before entering."
+            )
+        elif confirm_stop <= 0 or confirm_stop >= confirm_entry:
+            st.error("Blocked: stop must be below entry and greater than 0.")
+        elif confirm_target <= confirm_entry:
+            st.error("Blocked: target must be above entry.")
+        elif confirm_rr < min_rr_required:
+            st.error(f"Blocked: R:R {confirm_rr:.2f} is below minimum {min_rr_required:.1f}.")
+        elif (not earnings_trusted) and not earnings_override:
+            st.error(
+                "Blocked: earnings date is unverified. Refresh earnings data (Scan All / Find New) "
+                "or enable override only for intentional high-risk entries."
+            )
+        elif 0 <= effective_earn_days <= earnings_block_days and not earnings_override:
+            st.error(
+                f"Blocked: earnings in {effective_earn_days} day(s). "
+                "Enable override only if this is an intentional earnings trade."
+            )
+        elif not gate.allow_new_trades:
+            st.error(f"Blocked: {gate.label}. {gate.reason}")
+        elif len(open_trades) >= policy.max_total_open_positions:
+            st.error(f"Blocked by regime policy: max open positions reached ({policy.max_total_open_positions}).")
+        elif trades_today >= policy.max_new_trades:
+            st.error(f"Blocked by regime policy: max new trades today reached ({policy.max_new_trades}).")
+        elif confirm_entry <= 0 or confirm_shares <= 0:
+            st.error("Set entry price and shares first")
+        elif confirm_stop <= 0:
+            st.error("Set a stop loss — never trade without a stop")
+        elif confirm_stop >= confirm_entry:
+            st.error("Stop must be below entry price")
+        else:
+            pos_size = confirm_shares * confirm_entry
+            final_notes = notes.strip()
+            if attach_ticket:
+                ticket = _build_trade_ticket_note(
+                    ticker=ticker,
+                    ai_result=ai_result,
+                    rec=rec,
+                    signal=signal,
+                    source_mode=selected_source,
+                    entry_price=float(confirm_entry),
+                    stop_price=float(confirm_stop),
+                    target_price=float(confirm_target),
+                )
+                final_notes = f"{final_notes}\n\n{ticket}".strip() if final_notes else ticket
+
+                trade = Trade(
+                trade_id='',
+                ticker=ticker,
+                entry_price=confirm_entry,
+                initial_stop=confirm_stop,
+                target=confirm_target,
+                position_size=pos_size,
+                shares=confirm_shares,
+                signal_type=rec.get('signal_type', ''),
+                quality_grade=analysis.quality.get('quality_grade', '') if analysis.quality else '',
+                conviction_at_entry=rec.get('conviction', 0),
+                weekly_bullish_at_entry=signal.weekly_macd.get('bullish', False) if signal else False,
+                monthly_bullish_at_entry=signal.monthly_macd.get('bullish', False) if signal else False,
+                weinstein_stage_at_entry=signal.weinstein.get('stage', 0) if signal else 0,
+                    regime_at_entry=str(snap.regime or ''),
+                    gate_status_at_entry=str(gate.status or ''),
+                    vix_at_entry=float(snap.market_filter.get('vix_close', 0) or 0),
+                    entry_source='trade_finder' if finder_for_ticker else 'scanner',
+                    trade_finder_run_id=tf_run_id,
+                    risk_per_share=confirm_entry - confirm_stop,
+                    risk_pct=((confirm_entry - confirm_stop) / confirm_entry * 100) if confirm_entry > 0 else 0,
+                    notes=final_notes,
+                )
+            result = jm.enter_trade(trade)
+            st.success(result)
+            try:
+                plan_id = str((finder_for_ticker or {}).get('plan_id', '')).strip()
+                if plan_id:
+                    jm.update_planned_trade_status(plan_id, "ENTERED", notes=f"Entered {ticker} @ {confirm_entry:.2f}")
+            except Exception:
+                pass
+                _append_audit_event(
+                    "ENTER_TRADE",
+                    (
+                        f"{ticker} entry={confirm_entry:.2f} stop={confirm_stop:.2f} "
+                        f"target={confirm_target:.2f} shares={confirm_shares} "
+                        f"regime={policy.regime} source={'trade_finder' if finder_for_ticker else 'scanner'} "
+                        f"tf_run={tf_run_id or 'n/a'}"
+                    ),
+                    source="trade_entry",
+                )
+            st.rerun()
+
+
+def _render_portfolio_dashboard(jm: JournalManager):
+    """Compatibility wrapper — now redirects to capital overview."""
+    _render_capital_overview(jm)
+
+
+def _render_position_management(ticker: str, jm: JournalManager):
+    """Manage an existing open position with health monitoring and APEX context."""
+    trades = jm.get_open_trades()
+    trade = next((t for t in trades if t['ticker'] == ticker), None)
+    if not trade:
+        return
+
+    from data_fetcher import fetch_current_price
+    current = fetch_current_price(ticker) or 0
+
+    entry = float(trade.get('entry_price', 0))
+    shares = float(trade.get('shares', 0))
+    stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+    target = float(trade.get('target', 0))
+    pos_size = float(trade.get('position_size', 0))
+
+    pnl_pct = ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
+    pnl_dollars = (current - entry) * shares
+    current_value = current * shares if current > 0 else pos_size
+    stop_distance = ((current - stop) / current * 100) if current > 0 and stop > 0 else 999
+    target_distance = ((target - current) / current * 100) if current > 0 and target > 0 else 0
+
+    try:
+        days_held = (datetime.now() - datetime.strptime(trade.get('entry_date', ''), '%Y-%m-%d')).days
+    except Exception:
+        days_held = 0
+
+    # ── Health Assessment ─────────────────────────────────────────
+    if stop > 0 and current > 0 and current <= stop:
+        health_icon = "🔴"
+        health_msg = "STOP HIT — Close this position NOW"
+        health_level = "error"
+    elif stop_distance < 2:
+        health_icon = "🔴"
+        health_msg = f"Only {stop_distance:.1f}% above stop — prepare to exit"
+        health_level = "error"
+    elif pnl_pct < -10:
+        health_icon = "🔴"
+        health_msg = f"Down {pnl_pct:.1f}% — significant loss, review immediately"
+        health_level = "error"
+    elif pnl_pct < -5:
+        health_icon = "🔴"
+        health_msg = f"Down {pnl_pct:.1f}% — approaching max pain, decide: hold or cut"
+        health_level = "error"
+    elif stop_distance < 5:
+        health_icon = "🟡"
+        health_msg = f"{stop_distance:.1f}% buffer to stop — monitor closely"
+        health_level = "warning"
+    elif pnl_pct < -3:
+        health_icon = "🟡"
+        health_msg = f"Small drawdown {pnl_pct:.1f}% — within normal range but watchful"
+        health_level = "warning"
+    elif days_held > 60 and pnl_pct < 3:
+        health_icon = "🟡"
+        health_msg = f"Held {days_held}d with only {pnl_pct:+.1f}% gain — dead money?"
+        health_level = "warning"
+    elif pnl_pct >= 20:
+        health_icon = "🟢"
+        health_msg = f"Excellent +{pnl_pct:.1f}% — trail stop to protect profits!"
+        health_level = "success"
+    elif pnl_pct >= 15:
+        health_icon = "🟢"
+        health_msg = f"Strong +{pnl_pct:.1f}% — ATR trailing stop should be active"
+        health_level = "success"
+    elif pnl_pct >= 5:
+        health_icon = "🟢"
+        health_msg = f"Healthy +{pnl_pct:.1f}% — trend intact"
+        health_level = "success"
+    else:
+        health_icon = "🟢"
+        health_msg = "Within normal parameters"
+        health_level = "success"
+
+    # Header
+    st.subheader(f"{health_icon} {ticker} — Open Position")
+
+    if health_level == "error":
+        st.error(health_msg)
+    elif health_level == "warning":
+        st.warning(health_msg)
+    else:
+        st.success(health_msg)
+
+    # ── Key Metrics ───────────────────────────────────────────────
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("Entry", f"${entry:.2f}", f"{shares:.0f} shares")
+    with col2:
+        st.metric("Current", f"${current:.2f}" if current > 0 else "—",
+                  f"{pnl_pct:+.1f}%" if current > 0 else "")
+    with col3:
+        st.metric("P&L", f"${pnl_dollars:+,.0f}" if current > 0 else "—",
+                  f"${pos_size:,.0f} → ${current_value:,.0f}" if current > 0 else "")
+    with col4:
+        st.metric("Stop", f"${stop:.2f}",
+                  f"{stop_distance:.1f}% away" if stop_distance < 999 else "")
+    with col5:
+        st.metric("Target", f"${target:.2f}" if target > 0 else "—",
+                  f"{target_distance:.1f}% to go" if target > 0 and current > 0 else "")
+
+    st.caption(
+        f"Signal: {trade.get('signal_type', '?')} | "
+        f"Quality: {trade.get('quality_grade', '?')} | "
+        f"Conviction: {trade.get('conviction_at_entry', '?')}/10 | "
+        f"Opened: {trade.get('entry_date', '?')} ({days_held}d ago)"
+    )
+
+    # ── APEX Signal Context ───────────────────────────────────────
+    # Check if APEX signals are available in session state (from chart tab cache)
+    _apex_cache = st.session_state.get(f'_apex_cache_{ticker}', {})
+    apex_sigs = _apex_cache.get('signals', []) if _apex_cache else []
+    if apex_sigs:
+        active_apex = [s for s in apex_sigs if s.is_active]
+        if active_apex:
+            a = active_apex[-1]
+            trail_status = '🟢 ATR Trail ON' if a.atr_trail_active else '⏳ Pre-trail'
+            st.info(
+                f"📡 **APEX Signal Active** — {a.signal_tier.replace('_', ' ')} | "
+                f"{a.monthly_regime.replace('Monthly_', '')} regime | "
+                f"Stop: {a.stop_level}% | {trail_status} | "
+                f"Highest: ${a.highest_price:.2f}"
+            )
+        elif apex_sigs:  # signals exist but none active
+            last = apex_sigs[-1]
+            st.warning(
+                f"📡 **Last APEX signal closed** — {last.exit_reason} on "
+                f"{last.exit_date.strftime('%Y-%m-%d') if last.exit_date else '?'} "
+                f"({last.return_pct:+.1f}%)"
+            )
+
+    # ── Trail Stop Suggestions ────────────────────────────────────
+    if pnl_pct >= 15 and current > 0:
+        st.divider()
+        st.markdown("**💡 Trail Stop Suggestions:**")
+
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            # Breakeven + buffer
+            be_stop = entry * 1.02
+            if be_stop > stop:
+                locked = ((be_stop - entry) / entry * 100)
+                st.metric("🔒 Breakeven +2%", f"${be_stop:.2f}",
+                          f"Locks {locked:.1f}% profit")
+        with tc2:
+            # 50% profit lock
+            half_profit_stop = entry + (current - entry) * 0.5
+            if half_profit_stop > stop:
+                locked = ((half_profit_stop - entry) / entry * 100)
+                st.metric("🔐 Lock 50% Profit", f"${half_profit_stop:.2f}",
+                          f"Locks {locked:.1f}% profit")
+        with tc3:
+            # ATR trail (approximate)
+            atr_trail = current * 0.92  # ~8% from current
+            if atr_trail > stop:
+                locked = ((atr_trail - entry) / entry * 100)
+                st.metric("📊 ATR Trail (~8%)", f"${atr_trail:.2f}",
+                          f"Locks {locked:.1f}% profit")
+
+    # ── Position Scaling ──────────────────────────────────────────
+    if pnl_pct >= 10 and current > 0:
+        with st.expander("📈 Add to Winner?"):
+            account_size = st.session_state.get('account_size', 100000.0)
+            max_pos = account_size * 0.125  # 12.5%
+            room = max_pos - current_value
+
+            if room > current:
+                add_shares = int(room / current)
+                st.info(
+                    f"Room to add **{add_shares} shares** (${add_shares * current:,.0f}) "
+                    f"before hitting 12.5% max position. "
+                    f"Current position: ${current_value:,.0f} / ${max_pos:,.0f}"
+                )
+            else:
+                st.caption("Position near or above max size — no room to add")
+
+    # ── Actions ───────────────────────────────────────────────────
+    st.divider()
+    act1, act2 = st.columns(2)
+
+    with act1:
+        st.markdown("**📈 Trail Stop**")
+        new_stop = st.number_input("New Stop", value=float(stop),
+                                    step=0.50, format="%.2f",
+                                    key=f"trail_{ticker}")
+        if st.button("📈 Update Stop", key=f"trail_btn_{ticker}"):
+            if new_stop > stop:
+                result = jm.update_stop(ticker, new_stop)
+                st.info(result)
+                st.rerun()
+            else:
+                st.warning(f"New stop must be higher than current ${stop:.2f}")
+
+    with act2:
+        st.markdown("**🔴 Close Position**")
+        exit_price = st.number_input("Exit Price",
+                                      value=float(current) if current > 0 else 0.0,
+                                      step=0.01, format="%.2f",
+                                      key=f"exit_{ticker}")
+        exit_reason = st.selectbox("Exit Reason",
+                                    ['manual', 'stop_loss', 'target_hit',
+                                     'weekly_cross', 'time_exit'],
+                                    key=f"exit_reason_{ticker}")
+
+        if st.button("🔴 Close Position", key=f"close_{ticker}"):
+            if exit_price > 0:
+                result = jm.close_trade(ticker, exit_price, exit_reason)
+                st.success(result)
+                st.rerun()
+            else:
+                st.warning("Enter exit price")
+
+
+# =============================================================================
+# PERFORMANCE VIEW
+# =============================================================================
+
+@st.fragment
+def render_performance():
+    """Trade history and performance stats."""
+    jm = get_journal()
+    stats = jm.get_performance_stats()
+
+    def _compute_spy_alpha(details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compute per-trade SPY benchmark returns and alpha in UI layer."""
+        if not details:
+            return {'details': [], 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+        try:
+            from data_fetcher import fetch_historical_data
+        except Exception:
+            return {'details': details, 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+
+        min_entry = None
+        max_exit = None
+        for t in details:
+            e = str(t.get('entry_date', '') or '')
+            x = str(t.get('exit_date', '') or '')
+            if not e or not x:
+                continue
+            if min_entry is None or e < min_entry:
+                min_entry = e
+            if max_exit is None or x > max_exit:
+                max_exit = x
+        if not min_entry or not max_exit:
+            return {'details': details, 'avg_alpha_pct': 0.0, 'total_alpha_pct': 0.0, 'beat_rate': 0.0}
+
+        spy_map = {}
+        try:
+            spy_df = fetch_historical_data("SPY", min_entry, max_exit, interval='1d')
+            if isinstance(spy_df, pd.DataFrame) and not spy_df.empty and 'Close' in spy_df.columns:
+                for idx, row in spy_df.iterrows():
+                    try:
+                        spy_map[idx.strftime('%Y-%m-%d')] = float(row['Close'])
+                    except Exception:
+                        pass
+        except Exception:
+            spy_map = {}
+
+        def _nearest(date_str: str, forward: bool = True):
+            if date_str in spy_map:
+                return spy_map.get(date_str)
+            if not spy_map:
+                return None
+            keys = sorted(spy_map.keys())
+            if forward:
+                for k in keys:
+                    if k >= date_str:
+                        return spy_map.get(k)
+            else:
+                for k in reversed(keys):
+                    if k <= date_str:
+                        return spy_map.get(k)
+            return None
+
+        out = []
+        alphas = []
+        beats = 0
+        for t in details:
+            tr = float(t.get('realized_pnl_pct', 0) or 0)
+            e = str(t.get('entry_date', '') or '')
+            x = str(t.get('exit_date', '') or '')
+            se = _nearest(e, forward=True) if e else None
+            sx = _nearest(x, forward=False) if x else None
+            spy_ret = 0.0
+            if se and sx and se > 0:
+                spy_ret = round((sx - se) / se * 100.0, 2)
+            alpha = round(tr - spy_ret, 2)
+            if alpha > 0:
+                beats += 1
+            alphas.append(alpha)
+            row = dict(t)
+            row['spy_return_pct'] = spy_ret
+            row['alpha_pct'] = alpha
+            out.append(row)
+        return {
+            'details': out,
+            'avg_alpha_pct': round(sum(alphas) / len(alphas), 2) if alphas else 0.0,
+            'total_alpha_pct': round(sum(alphas), 2) if alphas else 0.0,
+            'beat_rate': round(beats / len(out) * 100, 1) if out else 0.0,
+        }
+
+    if stats['total_trades'] == 0:
+        st.info("No closed trades yet.")
+        return
+
+    st.subheader("Performance")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Trades", stats['total_trades'])
+    col2.metric("Win Rate", f"{stats['win_rate']:.0f}%")
+    col3.metric("Total P&L", f"${stats['total_pnl']:+,.2f}")
+    col4.metric("Avg P&L", f"{stats['avg_pnl_pct']:+.1f}%")
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Best Trade", f"{stats['best_trade']:+.1f}%")
+    col6.metric("Worst Trade", f"{stats['worst_trade']:+.1f}%")
+    col7.metric("Profit Factor", f"{stats['profit_factor']:.2f}")
+    col8.metric("Avg Hold", f"{stats['avg_days_held']:.0f}d")
+
+    enriched = _compute_spy_alpha(stats.get('trade_details', []) or [])
+    stats['avg_alpha_pct'] = enriched.get('avg_alpha_pct', 0.0)
+    stats['total_alpha_pct'] = enriched.get('total_alpha_pct', 0.0)
+    stats['beat_benchmark_rate'] = enriched.get('beat_rate', 0.0)
+    details = enriched.get('details', []) or stats.get('trade_details', []) or []
+
+    col9, col10, col11, col12 = st.columns(4)
+    col9.metric("Expectancy", f"{stats.get('expectancy_pct', 0):+.2f}%")
+    col10.metric("Payoff Ratio", f"{stats.get('payoff_ratio', 0):.2f}")
+    col11.metric("Avg Win / Loss", f"{stats.get('avg_win_pct', 0):+.1f}% / {stats.get('avg_loss_pct', 0):+.1f}%")
+    col12.metric("Avg Alpha vs SPY", f"{stats.get('avg_alpha_pct', 0):+.2f}%", f"Beat rate {stats.get('beat_benchmark_rate', 0):.1f}%")
+
+    # By signal type
+    if stats['by_signal_type']:
+        st.divider()
+        st.subheader("By Signal Type")
+        for st_name, st_data in stats['by_signal_type'].items():
+            st.text(f"  {st_name}: {st_data['count']} trades, "
+                    f"Win rate: {st_data['win_rate']:.0f}%, "
+                    f"Avg: {st_data['avg_pnl_pct']:+.1f}%")
+
+    # By ticker
+    by_ticker = stats.get('by_ticker', {}) or {}
+    if by_ticker:
+        st.divider()
+        st.subheader("By Ticker")
+        rows_tk = []
+        for tk, d in by_ticker.items():
+            rows_tk.append({
+                'Ticker': tk,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_tk = sorted(rows_tk, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_tk), hide_index=True, width='stretch')
+
+    by_regime = stats.get('by_regime', {}) or {}
+    if by_regime:
+        st.divider()
+        st.subheader("By Regime At Entry")
+        rows_rg = []
+        for rg, d in by_regime.items():
+            rows_rg.append({
+                'Regime': rg,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_rg = sorted(rows_rg, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_rg), hide_index=True, width='stretch')
+
+    by_src = stats.get('by_entry_source', {}) or {}
+    if by_src:
+        st.divider()
+        st.subheader("By Entry Source")
+        rows_src = []
+        for src, d in by_src.items():
+            rows_src.append({
+                'Source': src,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_src = sorted(rows_src, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_src), hide_index=True, width='stretch')
+
+    by_tf_run = stats.get('by_trade_finder_run', {}) or {}
+    if by_tf_run:
+        st.divider()
+        st.subheader("Trade Finder Attribution (By Run)")
+        rows_run = []
+        for run_id, d in by_tf_run.items():
+            rows_run.append({
+                'Run ID': run_id,
+                'Trades': d.get('count', 0),
+                'Win Rate %': d.get('win_rate', 0),
+                'Avg P&L %': d.get('avg_pnl_pct', 0),
+            })
+        rows_run = sorted(rows_run, key=lambda r: (r['Avg P&L %'], r['Win Rate %']), reverse=True)
+        st.dataframe(pd.DataFrame(rows_run), hide_index=True, width='stretch')
+
+    # Underperforming buckets
+    under = stats.get('underperforming_buckets', []) or []
+    if under:
+        st.divider()
+        st.subheader("What To Stop Doing")
+        st.warning("Buckets below have negative expectancy over meaningful sample size (>=5). Reduce size or pause them.")
+        under_rows = []
+        for u in under:
+            under_rows.append({
+                'Bucket': u.get('bucket', ''),
+                'Trades': u.get('count', 0),
+                'Avg P&L %': u.get('avg_pnl_pct', 0),
+                'Win Rate %': u.get('win_rate', '—') if u.get('win_rate', None) is not None else '—',
+            })
+        st.dataframe(pd.DataFrame(under_rows), hide_index=True, width='stretch')
+
+    # Trade history table
+    history = details[:20] if details else jm.get_trade_history(last_n=20)
+    if history:
+        st.divider()
+        st.subheader("Recent Trades")
+        rows = []
+        for t in history:
+            pnl = t.get('realized_pnl_pct', 0)
+            rows.append({
+                'Ticker': t['ticker'],
+                'Entry': f"${t.get('entry_price', 0):.2f}",
+                'Exit': f"${t.get('exit_price', 0):.2f}",
+                'P&L': f"{pnl:+.1f}%",
+                'SPY': f"{float(t.get('spy_return_pct', 0) or 0):+.1f}%" if 'spy_return_pct' in t else "—",
+                'Alpha': f"{float(t.get('alpha_pct', 0) or 0):+.1f}%" if 'alpha_pct' in t else "—",
+                'Days': t.get('days_held', 0),
+                'Reason': t.get('exit_reason', '?'),
+                'Signal': t.get('signal_type', '?'),
+                'Source': t.get('entry_source', t.get('source', '?')),
+                'TF Run': t.get('trade_finder_run_id', ''),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
+
+
+# =============================================================================
+# POSITION MANAGER — Exit Advisor Tab
+# =============================================================================
+
+@st.fragment
+def render_position_manager():
+    """Position Manager: AI-driven exit analysis for all open positions."""
+    jm = get_journal()
+    open_trades = jm.get_open_trades()
+
+    st.subheader(f"🏦 Position Manager ({len(open_trades)} open)")
+
+    if not open_trades:
+        st.info("No open positions. Enter trades from the Trade tab to use the Position Manager.")
+        return
+
+    # ── Portfolio Summary ─────────────────────────────────────────────
+    from data_fetcher import fetch_current_price
+
+    total_deployed = 0
+    total_unrealized = 0
+    position_rows = []
+
+    for trade in open_trades:
+        ticker = trade['ticker']
+        entry = float(trade.get('entry_price', 0))
+        shares = float(trade.get('shares', 0))
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)))
+        current = fetch_current_price(ticker) or entry
+
+        pos_size = shares * entry
+        total_deployed += pos_size
+        pnl = (current - entry) * shares
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        total_unrealized += pnl
+
+        # Days held
+        days_held = 0
+        entry_date = trade.get('entry_date', '')
+        if entry_date:
+            try:
+                days_held = (datetime.now() - datetime.strptime(entry_date, '%Y-%m-%d')).days
+            except Exception:
+                pass
+
+        # Get last AI advice if available
+        last_advice = st.session_state.get(f'exit_advice_{ticker}', {})
+
+        position_rows.append({
+            'ticker': ticker,
+            'entry': entry,
+            'current': current,
+            'shares': shares,
+            'stop': stop,
+            'pnl': pnl,
+            'pnl_pct': pnl_pct,
+            'days_held': days_held,
+            'pos_size': pos_size,
+            'advice': last_advice,
+        })
+
+    # Summary metrics
+    account_size = st.session_state.get('account_size', 100000.0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Deployed", f"${total_deployed:,.0f}",
+              f"{total_deployed / account_size * 100:.0f}% of account")
+    c2.metric("Unrealized P&L", f"${total_unrealized:+,.0f}",
+              f"{total_unrealized / total_deployed * 100:+.1f}%" if total_deployed > 0 else "")
+    c3.metric("Positions", f"{len(open_trades)}")
+
+    # Portfolio heat
+    risk_summary = jm.get_portfolio_risk_summary()
+    heat_pct = (risk_summary['total_risk_dollars'] / account_size * 100) if account_size > 0 else 0
+    heat_color = "normal" if heat_pct < 6 else ("off" if heat_pct < 8 else "inverse")
+    c4.metric("Portfolio Heat", f"{heat_pct:.1f}%",
+              f"${risk_summary['total_risk_dollars']:,.0f} at risk",
+              delta_color=heat_color)
+
+    # Macro posture for managing EXISTING positions
+    try:
+        snap = _build_dashboard_snapshot()
+        gate = _evaluate_trade_gate(snap)
+        posture = _position_posture_summary(snap, gate)
+        if posture['severity'] == "danger":
+            st.error(f"{posture['headline']} — {posture['summary']}")
+        elif posture['severity'] == "warning":
+            st.warning(f"{posture['headline']} — {posture['summary']}")
+        else:
+            st.success(f"{posture['headline']} — {posture['summary']}")
+        st.caption(f"Derived from Unified Regime {snap.regime} ({snap.regime_confidence}%) and Trade Gate {gate.status}.")
+    except Exception:
+        pass
+    _last_exit_summary = st.session_state.get('_last_exit_analysis_summary', {}) or {}
+    if _last_exit_summary:
+        _cts = _last_exit_summary.get('action_counts', {}) or {}
+        _order = ['HOLD', 'TIGHTEN_STOP', 'TAKE_PARTIAL', 'CLOSE']
+        _parts = [f"{k}:{int(_cts.get(k, 0))}" for k in _order if int(_cts.get(k, 0)) > 0]
+        _parts_txt = " | ".join(_parts) if _parts else "No actions"
+        st.caption(
+            f"Last exit analysis {_last_exit_summary.get('ts', '')}: "
+            f"analyzed {int(_last_exit_summary.get('analyzed', 0))}/{int(_last_exit_summary.get('requested', 0))} "
+            f"| {_parts_txt} | system fallback {int(_last_exit_summary.get('fallback_count', 0))}"
+        )
+        _skipped = list(_last_exit_summary.get('skipped_tickers', []) or [])
+        if _skipped:
+            st.caption(f"Skipped (no live price): {', '.join(_skipped[:8])}")
+
+    st.divider()
+
+    # ── Position Table with AI Advice ─────────────────────────────────
+    for pos in position_rows:
+        ticker = pos['ticker']
+        pnl_icon = "🟢" if pos['pnl'] >= 0 else "🔴"
+        advice = pos.get('advice', {})
+        action = advice.get('action', '')
+
+        action_icons = {
+            'HOLD': '🟢 HOLD', 'TAKE_PARTIAL': '🟡 TAKE PARTIAL',
+            'CLOSE': '🔴 CLOSE', 'TIGHTEN_STOP': '🔵 TIGHTEN STOP',
+        }
+        action_display = action_icons.get(action, '⚪ Not analyzed')
+
+        pc1, pc2, pc3, pc4, pc5, pc6 = st.columns([1.2, 1, 1, 1, 1.5, 1.5])
+        pc1.markdown(f"**{pnl_icon} {ticker}**")
+        pc2.caption(f"${pos['current']:.2f} ({pos['pnl_pct']:+.1f}%)")
+        pc3.caption(f"${pos['pnl']:+,.0f}")
+        pc4.caption(f"{pos['days_held']}d | Stop: ${pos['stop']:.2f}")
+        pc5.markdown(f"**{action_display}**")
+
+        with pc6:
+            if st.button("📈 Chart", key=f"pm_chart_{ticker}"):
+                if _open_chart_anywhere(ticker, warn=True):
+                    st.rerun()
+
+        # Show advice details if available
+        if advice.get('reasoning'):
+            with st.expander(f"💡 {ticker} — {advice.get('reasoning', '')[:80]}"):
+                st.caption(f"**Reasoning:** {advice.get('reasoning', '')}")
+                st.caption(f"**Confidence:** {advice.get('confidence', 0)}/10 | Provider: {advice.get('provider', '')}")
+                if advice.get('risk_note'):
+                    st.caption(f"**Risk:** {advice.get('risk_note', '')}")
+                if action == 'TIGHTEN_STOP' and advice.get('suggested_stop', 0) > 0:
+                    st.caption(f"**Suggested Stop:** ${advice['suggested_stop']:.2f}")
+                if action == 'TAKE_PARTIAL' and advice.get('partial_pct', 0) > 0:
+                    st.caption(f"**Sell:** {advice['partial_pct']}% of position")
+
+    # ── Analyze All Button ────────────────────────────────────────────
+    st.divider()
+    an_col1, an_col2, an_col3 = st.columns([1, 1, 2])
+
+    with an_col1:
+        if st.button("🤖 Analyze All Positions", type="primary", width="stretch"):
+            _run_exit_analysis(open_trades)
+
+    with an_col2:
+        if st.button("📧 Analyze + Email Report", width="stretch"):
+            _run_exit_analysis(open_trades, send_email=True)
+
+    with an_col3:
+        st.caption("AI will analyze each position and recommend: HOLD, TAKE PARTIAL, CLOSE, or TIGHTEN STOP")
+
+    # ── Audit Log ─────────────────────────────────────────────────────
+    with st.expander("📋 Audit Log (last 20 analyses)"):
+        try:
+            from exit_advisor import get_audit_history
+            history = get_audit_history(last_n=20)
+            if history:
+                for h in history:
+                    action_icon = {'HOLD': '🟢', 'TAKE_PARTIAL': '🟡',
+                                   'CLOSE': '🔴', 'TIGHTEN_STOP': '🔵'}.get(h.get('action', ''), '⚪')
+                    st.caption(
+                        f"{h.get('analyzed_at', '')[:16]} | {action_icon} {h.get('ticker', '')} "
+                        f"→ {h.get('action', '')} ({h.get('confidence', 0)}/10) "
+                        f"| P&L: {h.get('unrealized_pnl_pct', 0):+.1f}% | {h.get('provider', '')}"
+                    )
+            else:
+                st.caption("No audit history yet.")
+        except Exception:
+            st.caption("Audit log unavailable.")
+
+
+def _run_exit_analysis(open_trades: List, send_email: bool = False):
+    """Execute exit analysis for all open positions."""
+    with st.spinner(f"Analyzing {len(open_trades)} positions..."):
+        try:
+            from exit_advisor import analyze_all_positions, save_audit_batch, send_email_report
+            from data_fetcher import fetch_current_price, fetch_signal_for_exit
+
+            ai_clients = _get_ai_clients()
+            gemini_model = ai_clients.get('gemini')
+            openai_client = ai_clients.get('openai_client')
+            ai_cfg = ai_clients.get('ai_config', {}) or {}
+            ai_model = ai_cfg.get('model', 'llama-3.3-70b-versatile')
+            fallback_model = ai_cfg.get('fallback_model', '')
+
+            if not openai_client and not gemini_model:
+                primary_err = ai_clients.get('primary_error') or "primary unavailable"
+                gemini_err = ai_clients.get('gemini_error') or "gemini unavailable"
+                st.warning(
+                    "AI providers unavailable for exit analysis. "
+                    f"Primary: {primary_err}. Fallback: {gemini_err}. "
+                    "System HOLD fallback will be used."
+                )
+
+            advices = analyze_all_positions(
+                open_trades,
+                fetch_price_fn=fetch_current_price,
+                fetch_signal_fn=fetch_signal_for_exit,
+                gemini_model=gemini_model,
+                openai_client=openai_client,
+                ai_model=ai_model,
+                fallback_model=fallback_model,
+            )
+            analyzed_tickers = {str(a.ticker or '').upper().strip() for a in advices}
+            requested_tickers = [str(t.get('ticker', '')).upper().strip() for t in open_trades if str(t.get('ticker', '')).strip()]
+            skipped_tickers = [t for t in requested_tickers if t and t not in analyzed_tickers]
+
+            # Store results in session state for display
+            for advice in advices:
+                st.session_state[f'exit_advice_{advice.ticker}'] = advice.to_dict()
+
+            # Store quick summary for Position Manager visibility.
+            action_counts: Dict[str, int] = {}
+            fallback_count = 0
+            for advice in advices:
+                a = str(getattr(advice, 'action', '') or 'UNKNOWN')
+                action_counts[a] = int(action_counts.get(a, 0) + 1)
+                if str(getattr(advice, 'provider', '') or '').lower() == 'system':
+                    fallback_count += 1
+            st.session_state['_last_exit_analysis_summary'] = {
+                'requested': len(requested_tickers),
+                'analyzed': len(advices),
+                'skipped_tickers': skipped_tickers,
+                'action_counts': action_counts,
+                'fallback_count': fallback_count,
+                'ts': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            }
+
+            # Save to audit log
+            save_audit_batch(advices)
+
+            # Send email if requested
+            if send_email:
+                import os
+                smtp_email = os.environ.get('SMTP_EMAIL', '')
+                smtp_password = os.environ.get('SMTP_PASSWORD', '')
+                recipient = os.environ.get('ALERT_EMAIL', smtp_email)
+
+                if smtp_email and smtp_password:
+                    sent = send_email_report(advices, smtp_email, smtp_password, recipient)
+                    if sent:
+                        st.success(f"✅ Analyzed {len(advices)} positions + email sent to {recipient}")
+                    else:
+                        st.warning(f"✅ Analyzed {len(advices)} positions but email failed")
+                else:
+                    st.warning("Email not configured. Set SMTP_EMAIL, SMTP_PASSWORD, ALERT_EMAIL in Streamlit secrets.")
+            else:
+                st.success(f"✅ Analyzed {len(advices)} positions")
+            if skipped_tickers:
+                st.warning(
+                    f"Skipped {len(skipped_tickers)} position(s) due to missing live price data: "
+                    f"{', '.join(skipped_tickers[:8])}"
+                )
+
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Exit analysis error: {e}")
+
+
+# =============================================================================
+# EXECUTIVE DASHBOARD
+# =============================================================================
+
+# RiskBudgetPolicy, DashboardSnapshot, TradeGateDecision — imported from exec_logic.py
+
+
+def _is_exec_dashboard_enabled() -> bool:
+    """
+    Feature flag for phased rollout.
+    Priority: session override > secrets > enabled.
+    """
+    if 'exec_dashboard_beta_enabled' in st.session_state:
+        return bool(st.session_state['exec_dashboard_beta_enabled'])
+    try:
+        raw = str(st.secrets.get('EXEC_DASHBOARD_BETA', 'true')).strip().lower()
+        return raw in {'1', 'true', 'yes', 'on'}
+    except Exception:
+        return True
+
+
+# _infer_exec_regime — extracted to exec_logic.py (imported at top)
+# _risk_budget_for_regime — extracted to exec_logic.py (imported at top)
+def _build_dashboard_snapshot() -> DashboardSnapshot:
+    """Create single dashboard source-of-truth snapshot."""
+    jm = get_journal()
+    bridge = get_bridge()
+    now = time.time()
+    scan_summary = st.session_state.get('scan_results_summary', []) or []
+    market_filter = st.session_state.get('market_filter_data', {}) or {}
+    sector_rotation = st.session_state.get('sector_rotation', {}) or {}
+    earnings_flags = st.session_state.get('earnings_flags', {}) or {}
+
+    regime, confidence = _infer_exec_regime(market_filter, sector_rotation)
+    policy = _risk_budget_for_regime(regime)
+
+    _scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
+    _find_new_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
+    _tf_ts = 0.0
+    try:
+        _tf_iso = str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '') or '').strip()
+        if _tf_iso:
+            _tf_ts = datetime.strptime(_tf_iso, '%Y-%m-%d %H:%M:%S').timestamp()
+    except Exception:
+        _tf_ts = 0.0
+    _effective_scan_ts = max(_scan_ts, _find_new_ts, _tf_ts)
+
+    return DashboardSnapshot(
+        generated_at=now,
+        generated_at_iso=datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+        watchlist_tickers=bridge.get_watchlist_tickers(),
+        scan_summary=scan_summary,
+        open_trades=jm.get_open_trades(),
+        pending_alerts=jm.get_pending_conditionals(),
+        triggered_alerts=st.session_state.get('triggered_alerts', []) or [],
+        market_filter=market_filter,
+        sector_rotation=sector_rotation,
+        earnings_flags=earnings_flags,
+        scan_ts=_effective_scan_ts,
+        market_ts=float(st.session_state.get('_market_filter_ts', 0.0) or 0.0),
+        sector_ts=float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0),
+        pos_ts=float(st.session_state.get('_position_prices_ts', 0.0) or 0.0),
+        alert_ts=float(st.session_state.get('_alert_check_ts', 0.0) or 0.0),
+        workflow_ts=float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0),
+        workflow_sec=float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0),
+        regime=regime,
+        regime_confidence=confidence,
+        risk_policy=policy,
+    )
+
+
+# _normalize_brief_regime — extracted to exec_logic.py (imported at top)
+def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
+    """
+    Single execution authority for whether new trades should be taken now.
+    """
+    vix = float(snap.market_filter.get('vix_close', 0) or 0)
+    spy_ok = bool(snap.market_filter.get('spy_above_200', True))
+
+    stale = _stale_stream_status(snap)
+    stale_count = int(stale["count"])
+    stale_core = bool(stale.get("market", False)) or (bool(stale.get("scan", False)) and bool(stale.get("sector", False)))
+
+    deep_score = 0
+    deep = st.session_state.get('deep_market_analysis') or {}
+    deep_date = str(st.session_state.get('deep_analysis_date', '') or '')
+    brief = st.session_state.get('morning_narrative') or {}
+    brief_date = str(st.session_state.get('morning_narrative_date', '') or '')
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    has_deep = isinstance(deep, dict) and bool(deep) and deep_date == today and ('score' in deep)
+    has_brief = isinstance(brief, dict) and bool(brief) and brief_date == today and bool(str(brief.get('regime', '')).strip())
+
+    if has_deep:
+        deep_score = int(deep.get('score', 0) or 0)
+    brief_regime = _normalize_brief_regime(brief.get('regime', '')) if has_brief else "UNKNOWN"
+
+    aligned = 0
+    compared = 0
+    if has_brief and brief_regime != "UNKNOWN":
+        compared += 1
+        if brief_regime == snap.regime:
+            aligned += 1
+    if has_deep:
+        compared += 1
+        if (deep_score >= 1 and snap.regime == "RISK_ON") or (deep_score <= -1 and snap.regime == "RISK_OFF"):
+            aligned += 1
+        elif deep_score == 0 and snap.regime in {"TRANSITION", "DEFENSIVE"}:
+            aligned += 1
+
+    if compared == 0:
+        model_alignment = "UNAVAILABLE"
+    elif aligned == compared:
+        model_alignment = "ALIGNED"
+    elif aligned == 0:
+        model_alignment = "DIVERGENT"
+    else:
+        model_alignment = "PARTIAL"
+
+    # Base decision from unified regime + volatility
+    if stale_core:
+        status = "NO_TRADE"
+        reason = "Core data is stale (market/scan context). Refresh before opening new trades."
+    elif snap.regime == "RISK_OFF" or vix >= 25:
+        status = "NO_TRADE"
+        reason = f"Risk-off environment (VIX {vix:.1f}). Preserve capital."
+    elif snap.regime in {"DEFENSIVE", "TRANSITION"} or vix >= 20 or not spy_ok:
+        status = "TRADE_LIGHT"
+        reason = f"Mixed/cautious regime with elevated risk (VIX {vix:.1f})."
+    else:
+        status = "FAVOR_TRADING"
+        reason = f"Benign risk backdrop and supportive trend (VIX {vix:.1f})."
+
+    # Downgrade one notch when models diverge materially.
+    if model_alignment == "DIVERGENT":
+        if status == "FAVOR_TRADING":
+            status = "TRADE_LIGHT"
+            reason += " Downgraded due to model divergence."
+        elif status == "TRADE_LIGHT":
+            status = "NO_TRADE"
+            reason += " Downgraded due to model divergence."
+
+    if status == "NO_TRADE":
+        stale_gate = reason.startswith("Core data is stale")
+        return TradeGateDecision(
+            status=status,
+            label=("🟠 DATA STALE — REFRESH REQUIRED" if stale_gate else "🛑 TOO RISKY TO TRADE"),
+            allow_new_trades=False,
+            severity=("warning" if stale_gate else "danger"),
+            reason=reason,
+            model_alignment=model_alignment,
+        )
+    if status == "TRADE_LIGHT":
+        return TradeGateDecision(
+            status=status,
+            label="🟡 TRADE LIGHT (SELECTIVE)",
+            allow_new_trades=True,
+            severity="warning",
+            reason=reason,
+            model_alignment=model_alignment,
+        )
+    return TradeGateDecision(
+        status=status,
+        label="🟢 MARKET FAVORS TRADING",
+        allow_new_trades=True,
+        severity="success",
+        reason=reason,
+        model_alignment=model_alignment,
+    )
+
+
+# _normalize_gate_status — extracted to exec_logic.py (imported at top)
+# _classify_trade_candidate_color — extracted to exec_logic.py (imported at top)
+
+def _position_posture_summary(snap: DashboardSnapshot, gate: TradeGateDecision) -> Dict[str, Any]:
+    """
+    Clear macro guidance for EXISTING positions, separate from new-entry gate status.
+    """
+    stop_breaches = 0
+    drawdown_count = 0
+    for trade in (snap.open_trades or []):
+        ticker = str(trade.get('ticker', '')).upper().strip()
+        entry = float(trade.get('entry_price', 0) or 0)
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+        current = float(st.session_state.get('_position_prices', {}).get(ticker) or entry)
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        if stop > 0 and current <= stop:
+            stop_breaches += 1
+        elif pnl_pct <= -3:
+            drawdown_count += 1
+
+    vix = float(snap.market_filter.get('vix_close', 0) or 0)
+    severe_macro = snap.regime == "RISK_OFF" or vix >= 30
+
+    if gate.status == "NO_TRADE":
+        if severe_macro:
+            headline = "🛑 Macro Posture: Defensive hold/reduce risk"
+            summary = "No new trades. Keep winners with disciplined stops; reduce weakest positions into strength."
+            severity = "danger"
+        else:
+            headline = "🛡️ Macro Posture: Hold existing positions only"
+            summary = "No new trades. Manage open positions with stops; do not exit everything just because entry gate is closed."
+            severity = "warning"
+    elif gate.status == "TRADE_LIGHT":
+        headline = "🟡 Macro Posture: Hold and be selective"
+        summary = "Maintain current positions; add risk only on top-quality setups and smaller size."
+        severity = "warning"
+    else:
+        headline = "🟢 Macro Posture: Market supports holding and selective adds"
+        summary = "Trend backdrop is supportive. Hold existing positions and allow new entries that meet rules."
+        severity = "success"
+
+    if stop_breaches > 0:
+        summary += f" Immediate action: {stop_breaches} position(s) at/below stop."
+    elif drawdown_count > 0:
+        summary += f" Watchlist: {drawdown_count} position(s) in >3% drawdown."
+
+    return {
+        "headline": headline,
+        "summary": summary,
+        "severity": severity,
+        "stop_breaches": stop_breaches,
+        "drawdowns": drawdown_count,
+    }
+
+
+def _render_decision_contract(
+    snap: DashboardSnapshot,
+    gate: TradeGateDecision,
+    actionable: List[Dict[str, Any]],
+    ready_pending_alerts: List[Dict[str, Any]],
+    jm: JournalManager,
+    stale: Dict[str, Any],
+) -> None:
+    """Render a single, action-first checklist answering the core trading questions."""
+    stale_count = int(stale.get("count", 0) or 0)
+    stale_tags = list(stale.get("tags", []) or [])
+    pos_prices = st.session_state.get('_position_prices', {}) or {}
+    pos_summary = jm.get_position_summary(pos_prices)
+    perf = jm.get_performance_stats()
+
+    close_now: List[str] = []
+    for p in (pos_summary.get('positions', []) or []):
+        ticker = str(p.get('ticker', '') or '').upper().strip()
+        if not ticker:
+            continue
+        stop = float(p.get('stop', 0) or 0)
+        current = float(p.get('current_price', 0) or 0)
+        pnl_pct = float(p.get('unrealized_pnl_pct', 0) or 0)
+        if stop > 0 and current > 0 and current <= stop:
+            close_now.append(f"{ticker} (at/below stop)")
+        elif pnl_pct <= -3:
+            close_now.append(f"{ticker} ({pnl_pct:+.1f}%)")
+
+    top_trade_txt = "No qualified setup yet."
+    if actionable:
+        _top = actionable[0]
+        _row = _top.get('row', {}) or {}
+        _ticker = str(_row.get('ticker', '') or '').upper().strip()
+        _rec = str(_row.get('recommendation', '') or '').upper()
+        _conv = int(_row.get('conviction', 0) or 0)
+        _score = float(_top.get('score', 0) or 0)
+        if _ticker:
+            top_trade_txt = f"{_ticker} ({_rec}, conv {_conv}/10, score {_score:.1f})"
+    elif ready_pending_alerts:
+        _rt = str(ready_pending_alerts[0].get('ticker', '') or '').upper().strip()
+        if _rt:
+            top_trade_txt = f"{_rt} (alert-ready breakout)"
+
+    if gate.status == "NO_TRADE":
+        trade_now = "NO"
+        trade_now_detail = gate.reason
+    elif gate.status == "TRADE_LIGHT":
+        trade_now = "YES, LIGHT SIZE"
+        trade_now_detail = gate.reason
+    else:
+        trade_now = "YES"
+        trade_now_detail = gate.reason
+
+    when_trade = "After Fast Refresh + Check Alerts + fresh data."
+    if stale_count == 0:
+        if gate.status == "NO_TRADE":
+            when_trade = "Wait for gate to reopen (regime/volatility/alignment improves)."
+        elif gate.status == "TRADE_LIGHT":
+            when_trade = "Trade only A/B quality setups with reduced size."
+        else:
+            when_trade = "Now, if setup is qualified and risk is defined."
+
+    live_unreal = float(pos_summary.get('unrealized_pnl_pct', 0) or 0)
+    live_count = int(pos_summary.get('count', 0) or 0)
+    live_state = f"{live_count} open | unrealized {live_unreal:+.1f}%"
+    if live_count == 0:
+        live_state = "No open positions."
+
+    perf_trades = int(perf.get('total_trades', 0) or 0)
+    perf_win = float(perf.get('win_rate', 0) or 0)
+    perf_avg = float(perf.get('avg_pnl_pct', 0) or 0)
+    perf_total = float(perf.get('total_pnl', 0) or 0)
+    if perf_trades > 0:
+        perf_state = f"{perf_trades} closed | win rate {perf_win:.0f}% | avg {perf_avg:+.1f}% | total ${perf_total:+,.0f}"
+    else:
+        perf_state = "No closed-trade history yet."
+
+    st.markdown("**Decision Contract (Single Source Of Truth)**")
+    with st.container(border=True):
+        st.caption("This block always answers: should trade, what to trade, what to close, when to trade, and performance status.")
+
+        c1, c2 = st.columns([3, 2])
+        with c1:
+            st.markdown(f"**1) Should we trade now?** `{trade_now}`")
+            st.caption(trade_now_detail)
+            if stale_count > 0:
+                st.caption(f"Blocking stale streams: {', '.join(stale_tags)}")
+
+            st.markdown(f"**2) What should we trade next?** {top_trade_txt}")
+            if not actionable and not ready_pending_alerts:
+                st.caption("No immediate trade candidate. Run Find New Trades after refresh.")
+
+            close_preview = ", ".join(close_now[:5]) if close_now else "None"
+            st.markdown(f"**3) What should we close/reduce now?** {close_preview}")
+
+        with c2:
+            st.markdown(f"**4) When should we trade?** {when_trade}")
+            st.markdown(f"**5) Live + Performance status** {live_state}")
+            st.caption(perf_state)
+
+            if stale_count > 0:
+                if st.button("⚡ Refresh Core Data", key="decision_contract_fast_refresh", width="stretch"):
+                    _fast_refresh_dashboard()
+                    st.rerun()
+            elif not actionable and gate.allow_new_trades:
+                if st.button("🧭 Find New Trades Now", key="decision_contract_find_new", width="stretch"):
+                    _job_id = _start_trade_finder_background_run(rerank_only=False)
+                    if _job_id:
+                        st.info("Background Trade Finder run started.")
+                    st.rerun()
+            elif close_now:
+                if st.button("🛑 Auto-Manage Positions", key="decision_contract_auto_manage", width="stretch"):
+                    prices = {}
+                    for t in jm.get_open_trades():
+                        tk = str(t.get('ticker', '') or '').upper().strip()
+                        if tk:
+                            prices[tk] = fetch_current_price(tk) or float(t.get('entry_price', 0) or 0)
+                    _run_auto_exit_engine(jm, prices, source="decision_contract")
+                    st.rerun()
+
+
+# _fmt_last_update — extracted to exec_logic.py (imported at top)
+# _is_stale — extracted to exec_logic.py (imported at top)
+# _stale_stream_status — extracted to exec_logic.py (imported at top)
+def _scan_health_snapshot() -> Dict[str, float]:
+    """Compute scan telemetry from audit events + session metrics."""
+    events = _get_audit_events()
+    scan_done = [e for e in events if e.get('action') == 'SCAN_DONE']
+    scan_start = [e for e in events if e.get('action') == 'SCAN_START']
+
+    last_mode = ""
+    last_count = 0
+    if scan_done:
+        details = str(scan_done[0].get('details', ''))
+        m_mode = re.search(r'mode=([a-z_]+)', details)
+        m_count = re.search(r'scanned=(\d+)', details)
+        if m_mode:
+            last_mode = m_mode.group(1)
+        if m_count:
+            last_count = int(m_count.group(1))
+
+    dur_hist = st.session_state.get('_scan_duration_hist', [])
+    last_dur = float(dur_hist[-1]) if dur_hist else 0.0
+    avg_dur = (sum(dur_hist) / len(dur_hist)) if dur_hist else 0.0
+
+    return {
+        'total_scans_logged': float(len(scan_done)),
+        'scan_starts_logged': float(len(scan_start)),
+        'last_scan_count': float(last_count),
+        'last_scan_duration': last_dur,
+        'avg_scan_duration': avg_dur,
+        'last_scan_mode': last_mode,
+    }
+
+
+# _recommendation_score — extracted to exec_logic.py (imported at top)
+# _score_candidate_with_policy — extracted to exec_logic.py (imported at top)
+def _run_alert_check_now(jm: JournalManager) -> int:
+    """Evaluate pending conditionals immediately using current prices.
+    Delegates to alert_manager.check_alerts_now().
+    """
+    result = _alert_check_alerts_now(jm, fetch_current_price)
+    if result.triggered:
+        st.session_state['triggered_alerts'] = result.triggered
+    st.session_state['_alert_check_ts'] = time.time()
+    _append_audit_event(
+        "ALERT_CHECK",
+        f"pending={result.pending_count} triggered={result.triggered_count}",
+        source="exec_dashboard",
+    )
+    return result.triggered_count
+
+
+def _build_pending_alert_rows(conditionals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Build pending alert rows with live readiness state.
+    Delegates to alert_manager.build_alert_status_rows().
+    Wraps AlertStatusRow objects back to dicts for backward compat with existing UI code.
+    """
+    if not conditionals:
+        return []
+    jm = get_journal()
+    status_rows = build_alert_status_rows(jm, fetch_current_price)
+    # Convert AlertStatusRow objects to dicts matching the old format
+    return [
+        {
+            'ticker': r.ticker,
+            'trigger': r.trigger,
+            'condition_type': r.condition_type,
+            'current': r.current_price,
+            'delta_pct': r.delta_pct,
+            'is_ready': r.is_ready,
+            'state_label': r.state_label,
+            'created_at': r.created_at,
+            'raw': r.raw,
+        }
+        for r in status_rows
+    ]
+
+
+def _run_auto_exit_engine(jm: JournalManager, current_prices: Dict[str, float], source: str = "manual") -> Dict[str, Any]:
+    """
+    Evaluate open positions against stop/target and auto-close breaches.
+    Returns summary for UI + telemetry.
+    """
+    if not current_prices:
+        return {'checked': 0, 'triggered': 0, 'closed': 0, 'events': []}
+
+    open_trades = jm.get_open_trades()
+    checked = len(open_trades)
+    events = jm.check_stops(current_prices, auto_execute=True)
+    closed = len(events)
+    stop_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'stop_loss')
+    target_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'target_hit')
+
+    st.session_state['_auto_exit_last_ts'] = time.time()
+    st.session_state['_auto_exit_last_count'] = closed
+
+    if closed > 0:
+        tickers = ",".join(sorted({str(e.get('ticker', '')).upper() for e in events if e.get('ticker')}))
+        _append_audit_event(
+            "AUTO_EXIT",
+            f"source={source} checked={checked} closed={closed} stops={stop_hits} targets={target_hits} tickers={tickers}",
+            source="auto_exit",
+        )
+    else:
+        _append_audit_event(
+            "AUTO_EXIT",
+            f"source={source} checked={checked} closed=0",
+            source="auto_exit",
+        )
+
+    _append_perf_metric({
+        "kind": "auto_exit",
+        "source": source,
+        "checked": checked,
+        "closed": closed,
+        "stop_hits": stop_hits,
+        "target_hits": target_hits,
+    })
+    return {'checked': checked, 'triggered': closed, 'closed': closed, 'events': events}
+
+
+def _fast_refresh_dashboard() -> None:
+    """Fast refresh for dashboard metrics without running a full scan."""
+    _t0 = time.time()
+    from data_fetcher import fetch_sector_rotation
+
+    _refresh_shared_market_data(force=True)
+
+    st.session_state['sector_rotation'] = fetch_sector_rotation()
+    st.session_state['_sector_rotation_ts'] = time.time()
+
+    jm = get_journal()
+    open_trades = jm.get_open_trades()
+    prices = {}
+    for trade in open_trades:
+        t = trade.get('ticker', '').upper().strip()
+        if t:
+            prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+    st.session_state['_position_prices'] = prices
+    st.session_state['_position_prices_ts'] = time.time()
+
+    auto_exit_enabled = bool(st.session_state.get('exec_auto_exit_enabled', False))
+    auto_exit = {'closed': 0}
+    if auto_exit_enabled:
+        auto_exit = _run_auto_exit_engine(jm, prices, source="fast_refresh")
+        # refresh prices map after closes to keep panel consistent
+        refreshed_open = jm.get_open_trades()
+        refreshed_prices = {}
+        for trade in refreshed_open:
+            t = trade.get('ticker', '').upper().strip()
+            if t:
+                refreshed_prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+        st.session_state['_position_prices'] = refreshed_prices
+        st.session_state['_position_prices_ts'] = time.time()
+
+    trig_count = _run_alert_check_now(jm)
+    st.session_state['_dashboard_last_refresh'] = time.time()
+    _append_audit_event(
+        "FAST_REFRESH",
+        f"positions={len(open_trades)} alerts_triggered={trig_count} auto_closed={int(auto_exit.get('closed', 0) or 0)}",
+        source="exec_dashboard",
+    )
+    _append_perf_metric({
+        "kind": "fast_refresh",
+        "sec": round(time.time() - _t0, 3),
+        "positions": len(open_trades),
+        "alerts_triggered": trig_count,
+        "auto_closed": int(auto_exit.get('closed', 0) or 0),
+    })
+    st.success(
+        f"Fast refresh complete. Triggered alerts: {trig_count}. "
+        f"Auto-closed: {int(auto_exit.get('closed', 0) or 0)}."
+    )
+
+
+def _run_daily_workflow() -> Dict[str, float]:
+    """
+    Execute practical daily cycle:
+    1) Fast refresh macro/sector/positions/alerts
+    2) Scan only new tickers for speed
+    """
+    t0 = time.time()
+    st.session_state['_daily_workflow_start_ts'] = t0
+    st.session_state['_daily_workflow_in_progress'] = True
+    _append_audit_event("DAILY_WORKFLOW_START", "fast_refresh + scan_new_only", source="exec_dashboard")
+    _fast_refresh_dashboard()
+    _run_scan(mode='new_only')
+    # Note: _run_scan triggers rerun; completion metrics are finalized in _run_scan.
+    return {'elapsed': 0.0}
+
+
+def render_executive_dashboard():
+    """Daily command center for actionable overview and refresh controls."""
+    _render_started = time.time()
+    jm = get_journal()
+    snap = _build_dashboard_snapshot()
+    gate = _evaluate_trade_gate(snap)
+    dash_ts = float(st.session_state.get('_dashboard_last_refresh', 0.0) or 0.0)
+    pending_alert_rows = _build_pending_alert_rows(snap.pending_alerts)
+    ready_pending_alerts = [r for r in pending_alert_rows if bool(r.get('is_ready'))]
+
+    st.subheader("Executive Dashboard")
+    st.caption(f"Now: {snap.generated_at_iso}")
+    ensure_exec_dashboard_defaults(st.session_state)
+    st.checkbox(
+        "Enable Auto Exit on Fast Refresh / Daily Workflow",
+        key="exec_auto_exit_enabled",
+        help="When enabled, stop-loss and target-hit rules auto-close positions during refresh runs.",
+    )
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1:
+        if st.button("⚡ Fast Refresh", key="exec_fast_refresh", type="primary", width="stretch"):
+            _fast_refresh_dashboard()
+            st.rerun()
+    with c2:
+        if st.button("🔍 Full Refresh (Scan All)", key="exec_full_refresh", width="stretch"):
+            _run_scan(mode='all')
+    with c3:
+        if st.button("🎯 Check Alerts Now", key="exec_alert_refresh", width="stretch"):
+            trig_count = _run_alert_check_now(jm)
+            st.session_state['_alert_check_ts'] = time.time()
+            st.success(f"Alert check complete. Triggered alerts: {trig_count}")
+            st.rerun()
+    with c4:
+        if st.button("✅ Run Daily Workflow", key="exec_daily_workflow", width="stretch"):
+            _run_daily_workflow()
+    with c5:
+        if st.button("🛑 Auto-Manage Now", key="exec_auto_manage_now", width="stretch"):
+            open_trades = jm.get_open_trades()
+            prices = {}
+            for trade in open_trades:
+                t = trade.get('ticker', '').upper().strip()
+                if t:
+                    prices[t] = fetch_current_price(t) or float(trade.get('entry_price', 0) or 0)
+            res = _run_auto_exit_engine(jm, prices, source="manual_button")
+            st.success(f"Auto-manage complete. Checked {res.get('checked', 0)} positions; auto-closed {res.get('closed', 0)}.")
+            st.rerun()
+    with c6:
+        if st.button("🧭 Find New Trades", key="exec_find_new_trades", width="stretch"):
+            _job_id = _start_trade_finder_background_run(rerank_only=False)
+            if _job_id:
+                st.success("Background Trade Finder run started.")
+            else:
+                st.warning("Unable to start background Trade Finder run.")
+            st.rerun()
+
+    last_auto_ts = float(st.session_state.get('_auto_exit_last_ts', 0.0) or 0.0)
+    last_auto_count = int(st.session_state.get('_auto_exit_last_count', 0) or 0)
+    st.caption(
+        f"Auto Exit: {'ON' if st.session_state.get('exec_auto_exit_enabled') else 'OFF'} | "
+        f"Last run: {_fmt_last_update(last_auto_ts)} | Last closed: {last_auto_count}"
+    )
+    tf_last = st.session_state.get('trade_finder_results', {}) or {}
+    st.caption(
+        f"Trade Finder: {len(tf_last.get('rows', []) or [])} ranked candidate(s) | "
+        f"Updated: {tf_last.get('generated_at_iso', 'never') or 'never'}"
+    )
+
+    st.markdown("### 🧠 Weekly Market Intelligence")
+    with st.container(border=True):
+        _exec_pplx_key = _get_perplexity_api_key()
+        _weekly_key = "exec_weekly_market_read_result"
+        _weekly_result = st.session_state.get(_weekly_key, {}) or {}
+
+        w1, w2, w3 = st.columns([2.4, 1.3, 1.0])
+        with w1:
+            st.caption(
+                "One-click Perplexity weekly macro read for growth trading: market bias, sector and growth ETF "
+                "leaderboards, top opportunity themes, and a weekly execution posture."
+            )
+            if not _exec_pplx_key:
+                st.info("Perplexity key not configured. Add `PERPLEXITY_API_KEY` in Streamlit secrets.")
+        with w2:
+            if st.button(
+                "🧠 Perplexity Weekly Market Read",
+                key="exec_run_weekly_market_read",
+                width="stretch",
+                disabled=(not bool(_exec_pplx_key)),
+            ):
+                with st.spinner("Running weekly market read via Perplexity..."):
+                    _weekly_result = _run_perplexity_weekly_market_read(max_tokens=1400)
+                st.session_state[_weekly_key] = _weekly_result
+                if bool(_weekly_result.get("ok")):
+                    st.toast("✅ Weekly market read updated.")
+                else:
+                    st.warning(f"Perplexity request failed: {str(_weekly_result.get('error', 'unknown error'))[:220]}")
+                st.rerun()
+        with w3:
+            if st.button("🧹 Clear Read", key="exec_clear_weekly_market_read", width="stretch"):
+                st.session_state.pop(_weekly_key, None)
+                st.rerun()
+
+        if _weekly_result:
+            if bool(_weekly_result.get("ok")):
+                _weekly_text = str(_weekly_result.get("text", "") or "").strip()
+                _weekly_ts = str(_weekly_result.get("timestamp_utc", "") or "").strip()
+                _weekly_model = str(_weekly_result.get("model", "") or "").strip()
+                _weekly_meta = " | ".join([x for x in [_weekly_ts, _weekly_model] if x])
+                if _weekly_meta:
+                    st.caption(f"Updated: {_weekly_meta}")
+                _preview = _summary_snippet(_weekly_text, max_chars=320)
+                if _preview:
+                    st.success(_preview)
+                with st.expander("📘 Weekly Market Read (full)", expanded=False):
+                    st.markdown(clean_ai_formatting(_weekly_text))
+            else:
+                st.warning(f"Last request failed: {str(_weekly_result.get('error', 'unknown error'))[:220]}")
+        else:
+            st.caption("No weekly market read cached yet for this session.")
+
+    st.caption(
+        f"Last fast refresh: {_fmt_last_update(dash_ts)} | "
+        f"Scan: {_fmt_last_update(snap.scan_ts)} | "
+        f"Market: {_fmt_last_update(snap.market_ts)} | "
+        f"Sectors: {_fmt_last_update(snap.sector_ts)} | "
+        f"Position prices: {_fmt_last_update(snap.pos_ts)} | "
+        f"Alerts check: {_fmt_last_update(snap.alert_ts)} | "
+        f"Workflow: {_fmt_last_update(snap.workflow_ts)}"
+    )
+    if snap.workflow_sec > 0:
+        st.caption(f"Last workflow runtime: {snap.workflow_sec:.1f}s")
+
+    with st.expander("🔥 Market Heat Maps", expanded=False):
+        st.markdown("**Universe Heatmap (native)**")
+        st.caption("Built from your latest universe data: Trade Finder > Find New > Scanner (fallback order).")
+
+        def _open_from_heatmap(_ticker: str, _target: str = "chart"):
+            _tk = str(_ticker or "").upper().strip()
+            if not _tk:
+                st.warning("Select a ticker first.")
+                return
+            _ok = _navigate_to_scanner_ticker(_tk, target=("chart" if _target == "chart" else "trade"))
+            if not _ok:
+                st.warning(f"Unable to load {_tk} right now.")
+                return
+            st.rerun()
+
+        def _safe_float(v: Any, default: float = 0.0) -> float:
+            try:
+                f = float(v)
+                if pd.isna(f):
+                    return default
+                return f
+            except Exception:
+                return default
+
+        def _safe_int(v: Any, default: int = 0) -> int:
+            try:
+                if v is None:
+                    return default
+                if isinstance(v, str) and not v.strip():
+                    return default
+                i = int(float(v))
+                return i
+            except Exception:
+                return default
+
+        def _safe_bool(v: Any) -> bool:
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return False
+            s = str(v).strip().lower()
+            return s in {"1", "true", "yes", "y", "t"}
+
+        tf_rows = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        fn_rows = (st.session_state.get('find_new_trades_report', {}) or {}).get('candidates', []) or []
+        scan_rows = snap.scan_summary or []
+
+        _active_watchlist = [str(t).upper().strip() for t in (snap.watchlist_tickers or []) if str(t).strip()]
+        _active_watchlist_set = set(_active_watchlist)
+        _bridge = get_bridge()
+        _all_watchlists = (_bridge.manager.get_all_watchlists() if _bridge else []) or []
+        _all_watchlist_tickers: List[str] = []
+        _seen_all: set[str] = set()
+        _watchlist_sector_hints: Dict[str, str] = {}
+        for _wl in _all_watchlists:
+            _wl_sector_hint = _canonicalize_sector_name(
+                str(_wl.get('name', '') or '').strip(),
+                st.session_state.get('sector_rotation', {}) or {},
+            )
+            for _tk in (_wl.get('tickers', []) or []):
+                _tku = str(_tk or '').upper().strip()
+                if _tku and _tku not in _seen_all:
+                    _all_watchlist_tickers.append(_tku)
+                    _seen_all.add(_tku)
+                if _tku and _wl_sector_hint and _tku not in _watchlist_sector_hints:
+                    _watchlist_sector_hints[_tku] = _wl_sector_hint
+
+        _scope_opts = ["Active Watchlist", "All Watchlists (Universe)"]
+        _scope_default = 1 if _all_watchlist_tickers and len(_all_watchlist_tickers) > len(_active_watchlist) else 0
+        _scope = st.radio(
+            "Universe Scope",
+            _scope_opts,
+            index=int(st.session_state.get('exec_heatmap_scope_idx', _scope_default)),
+            horizontal=True,
+            key="exec_heatmap_scope",
+            help="Choose whether heatmap covers only active watchlist or every ticker across all watchlists.",
+        )
+        st.session_state['exec_heatmap_scope_idx'] = 0 if _scope == _scope_opts[0] else 1
+        _universe_tickers = _all_watchlist_tickers if _scope == _scope_opts[1] else _active_watchlist
+        _universe_set = set(_universe_tickers)
+        _ticker_sector_map = st.session_state.get('ticker_sectors', {}) or {}
+        _rotation_map = st.session_state.get('sector_rotation', {}) or {}
+        _scan_cache_rows: List[Dict[str, Any]] = []
+        try:
+            _scan_cache_blob = _load_scan_cache_file()
+            if isinstance(_scan_cache_blob, dict):
+                for _wl in _all_watchlists:
+                    _wl_id = str(_wl.get('id', '') or '').strip()
+                    if not _wl_id:
+                        continue
+                    _entry = _scan_cache_blob.get(_wl_id, {}) or {}
+                    _rows = (_entry.get('results', []) or []) if isinstance(_entry, dict) else []
+                    for _r in _rows:
+                        if isinstance(_r, dict):
+                            _scan_cache_rows.append(dict(_r))
+        except Exception:
+            _scan_cache_rows = []
+        _heatmap_sector_fetch_budget = int(st.session_state.get('exec_heatmap_sector_fetch_budget', 120) or 120)
+        st.session_state['exec_heatmap_sector_fetch_budget'] = _heatmap_sector_fetch_budget
+
+        def _row_richness(_row: Dict[str, Any]) -> int:
+            _score = 0
+            for _k in (
+                'sector', 'sector_phase', 'price', 'volume_ratio',
+                'recommendation', 'ai_buy_recommendation', 'conviction',
+                'weekly_bullish', 'monthly_bullish', 'monthly_macd_bullish',
+                'ao_positive', 'daily_ao_positive',
+            ):
+                _v = _row.get(_k)
+                if _v is None:
+                    continue
+                if isinstance(_v, str):
+                    if _v.strip():
+                        _score += 1
+                else:
+                    _score += 1
+            _ai = str(_row.get('ai_buy_recommendation', _row.get('recommendation', '')) or '').upper()
+            if "STRONG BUY" in _ai:
+                _score += 2
+            elif "BUY" in _ai:
+                _score += 1
+            return _score
+
+        # Build best-available row per ticker from all sources, then project full universe.
+        _best_by_ticker: Dict[str, Dict[str, Any]] = {}
+        for _src_rows in (tf_rows, fn_rows, scan_rows, _scan_cache_rows):
+            for _r in _src_rows:
+                _t = str(_r.get('ticker', '') or '').upper().strip()
+                if not _t:
+                    continue
+                if _universe_set and _t not in _universe_set:
+                    continue
+                _prev = _best_by_ticker.get(_t)
+                if _prev is None or _row_richness(_r) > _row_richness(_prev):
+                    _best_by_ticker[_t] = dict(_r)
+
+        if _universe_tickers:
+            source_rows = []
+            _sector_fetch_used = 0
+            _sector_resolved = 0
+            for _t in _universe_tickers:
+                _row = dict(_best_by_ticker.get(_t, {}))
+                if not _row:
+                    _row = {'ticker': _t, '_heatmap_placeholder': True}
+                _row.setdefault('ticker', _t)
+                _sector = str(_row.get('sector', '') or '').strip()
+                if not _sector:
+                    _sector = str(_ticker_sector_map.get(_t, '') or '').strip()
+                    if _sector:
+                        _row['sector'] = _sector
+                if not _sector:
+                    _sector = str(_watchlist_sector_hints.get(_t, '') or '').strip()
+                    if _sector:
+                        _row['sector'] = _sector
+                _allow_fetch = bool(_sector_fetch_used < _heatmap_sector_fetch_budget)
+                if not _sector:
+                    _resolved = _resolve_trade_finder_sector_fields(
+                        _row,
+                        rotation_ctx=_rotation_map,
+                        ticker_sector_ctx=_ticker_sector_map,
+                        scan_sector_map={},
+                        allow_fetch=_allow_fetch,
+                    )
+                    _sector = str(_resolved.get('sector', '') or '').strip()
+                    _phase_r = str(_resolved.get('sector_phase', '') or '').strip().upper()
+                    if _sector:
+                        _row['sector'] = _sector
+                        _sector_resolved += 1
+                    if _phase_r:
+                        _row['sector_phase'] = _phase_r
+                    if _allow_fetch:
+                        _sector_fetch_used += 1
+                _phase = str(_row.get('sector_phase', '') or '').strip().upper()
+                if not _phase and _sector:
+                    _phase = str((_rotation_map.get(_sector, {}) or {}).get('phase', '') or '').strip().upper()
+                    if _phase:
+                        _row['sector_phase'] = _phase
+                source_rows.append(_row)
+            st.session_state['ticker_sectors'] = _ticker_sector_map
+            _covered = sum(1 for _r in source_rows if not bool(_r.get('_heatmap_placeholder')))
+            _sector_mapped = sum(1 for _r in source_rows if str(_r.get('sector', '') or '').strip())
+            source_name = (
+                f"All Watchlists ({len(_universe_tickers)} tickers)"
+                if _scope == _scope_opts[1]
+                else f"Active Watchlist ({len(_universe_tickers)} tickers)"
+            )
+            st.caption(
+                f"Data source: {source_name} | coverage: {_covered}/{len(source_rows)} with scan/model data | "
+                f"sector mapped: {_sector_mapped}/{len(source_rows)}"
+            )
+            if _scan_cache_rows:
+                st.caption(f"Included cached scan rows from watchlists: {len(_scan_cache_rows)}")
+        else:
+            source_rows = tf_rows if len(tf_rows) >= 10 else (fn_rows if len(fn_rows) >= 10 else (scan_rows if len(scan_rows) >= 10 else _scan_cache_rows))
+            source_name = (
+                "Trade Finder" if source_rows is tf_rows else
+                ("Find New" if source_rows is fn_rows else ("Scanner" if source_rows is scan_rows else "Cached Watchlist Scans"))
+            )
+            st.caption(f"Data source: {source_name} ({len(source_rows)} rows)")
+
+        if not source_rows:
+            st.info("No data available yet. Run Find New Trades or Scan All first.")
+        else:
+            import plotly.express as px
+
+            def _extract_session_change_pct(_r: Dict[str, Any]) -> Optional[float]:
+                for _k in (
+                    'day_change_pct',
+                    'daily_change_pct',
+                    'session_change_pct',
+                    'change_pct',
+                    'pct_change',
+                ):
+                    _v = _r.get(_k, None)
+                    if _v is None:
+                        continue
+                    try:
+                        _f = float(_v)
+                        if pd.isna(_f):
+                            continue
+                        if abs(_f) <= 1000:
+                            return round(_f, 2)
+                    except Exception:
+                        continue
+                return None
+
+            _change_cache = st.session_state.get('exec_heatmap_day_change_map', {}) or {}
+            _cache_warm_updates = 0
+            for _sr in source_rows:
+                _tk = str(_sr.get('ticker', '') or '').upper().strip()
+                if not _tk:
+                    continue
+                _pct = _extract_session_change_pct(_sr)
+                if _pct is None:
+                    continue
+                _asof = str(_sr.get('price_asof', '') or _sr.get('asof', '') or '').strip()
+                _existing = _change_cache.get(_tk, {}) if isinstance(_change_cache, dict) else {}
+                if (not _existing) or (_existing.get('pct') != _pct) or (_asof and _existing.get('asof') != _asof):
+                    _change_cache[_tk] = {
+                        'pct': float(_pct),
+                        'asof': _asof,
+                    }
+                    _cache_warm_updates += 1
+            if _cache_warm_updates > 0:
+                st.session_state['exec_heatmap_day_change_map'] = _change_cache
+                if float(st.session_state.get('exec_heatmap_day_change_ts', 0.0) or 0.0) <= 0:
+                    st.session_state['exec_heatmap_day_change_ts'] = time.time()
+
+            _c1, _c2, _c3 = st.columns([1.4, 1.2, 2.4])
+            with _c1:
+                _color_mode = st.selectbox(
+                    "Color Mode",
+                    ["Session Change % (TradingView-style)", "Composite Signal Score"],
+                    key="exec_heatmap_color_mode",
+                )
+            with _c2:
+                _refresh_cap = int(
+                    st.number_input(
+                        "Refresh cap",
+                        min_value=25,
+                        max_value=1200,
+                        value=int(st.session_state.get('exec_heatmap_refresh_cap', 250) or 250),
+                        step=25,
+                        key="exec_heatmap_refresh_cap_input",
+                        help="Max tickers to live-refresh for session change. Keeps refresh deterministic.",
+                    )
+                )
+                st.session_state['exec_heatmap_refresh_cap'] = _refresh_cap
+            with _c3:
+                if st.button("🔄 Refresh Heatmap Prices", key="exec_heatmap_refresh_prices", width="stretch"):
+                    _updated = 0
+                    _attempted = 0
+                    _tickers_for_refresh = [str(_r.get('ticker', '') or '').upper().strip() for _r in source_rows]
+                    _tickers_for_refresh = [t for t in dict.fromkeys(_tickers_for_refresh) if t]
+                    _tickers_for_refresh = _tickers_for_refresh[:max(1, _refresh_cap)]
+                    with st.spinner(f"Refreshing session change for {len(_tickers_for_refresh)} ticker(s)..."):
+                        _attempted = len(_tickers_for_refresh)
+                        _batch = {}
+                        try:
+                            # User explicitly requested refresh: reset provider cooldown pressure first.
+                            clear_cache(clear_rate_limits=True)
+                        except Exception:
+                            pass
+                        try:
+                            _batch = fetch_batch_session_change(
+                                _tickers_for_refresh,
+                                period='5d',
+                                interval='1d',
+                                chunk_size=80,
+                                ignore_cooldown=True,
+                            ) or {}
+                        except Exception:
+                            _batch = {}
+
+                        for _tk, _payload in _batch.items():
+                            try:
+                                _pct = float(_payload.get('pct'))
+                            except Exception:
+                                continue
+                            _change_cache[_tk] = {
+                                'pct': round(_pct, 2),
+                                'asof': str(_payload.get('asof', '') or ''),
+                                'last_close': _payload.get('last_close'),
+                                'prev_close': _payload.get('prev_close'),
+                            }
+                            _updated += 1
+
+                        # Fallback: if batch coverage is still poor, try a small single-ticker pass.
+                        # This salvages partial data when batch endpoint is degraded.
+                        _missing = [t for t in _tickers_for_refresh if t not in _batch]
+                        _fallback_limit = min(40, len(_missing))
+                        if _updated < max(5, int(_attempted * 0.20)) and _fallback_limit > 0:
+                            for _tk in _missing[:_fallback_limit]:
+                                try:
+                                    _df5 = fetch_daily(_tk, period='5d')
+                                except Exception:
+                                    _df5 = None
+                                if _df5 is None or len(_df5) < 2:
+                                    continue
+                                try:
+                                    _last = float(_df5['Close'].iloc[-1])
+                                    _prev = float(_df5['Close'].iloc[-2])
+                                    if _prev <= 0:
+                                        continue
+                                    _pct = round(((_last - _prev) / _prev) * 100.0, 2)
+                                    _asof = str(pd.Timestamp(_df5.index[-1]).strftime('%Y-%m-%d'))
+                                    _change_cache[_tk] = {'pct': _pct, 'asof': _asof, 'last_close': _last, 'prev_close': _prev}
+                                    _updated += 1
+                                except Exception:
+                                    continue
+                    st.session_state['exec_heatmap_day_change_map'] = _change_cache
+                    st.session_state['exec_heatmap_day_change_ts'] = time.time()
+                    st.session_state['exec_heatmap_day_change_cov'] = {
+                        'updated': int(_updated),
+                        'attempted': int(_attempted),
+                    }
+                    st.success(f"Heatmap refresh complete: {_updated}/{_attempted} tickers updated.")
+                    st.rerun()
+
+            _hm_ts = float(st.session_state.get('exec_heatmap_day_change_ts', 0.0) or 0.0)
+            _hm_cov = st.session_state.get('exec_heatmap_day_change_cov', {}) or {}
+            st.caption(
+                f"Heatmap prices refreshed: {_fmt_last_update(_hm_ts)}"
+                + (
+                    f" | Last refresh coverage: {int(_hm_cov.get('updated', 0) or 0)}/{int(_hm_cov.get('attempted', 0) or 0)}"
+                    if _hm_cov else ""
+                )
+            )
+            _health = _compute_system_health()
+            _market_open_now = str(_health.get('market_session', 'CLOSED') or 'CLOSED').upper() == 'OPEN'
+            _stale_limit = 15 * 60 if _market_open_now else 12 * 60 * 60
+            if _hm_ts <= 0:
+                st.warning("Heatmap price-change data has not been manually refreshed yet in this session.")
+            elif (time.time() - _hm_ts) > _stale_limit:
+                st.warning("Heatmap price-change data is stale. Click Refresh Heatmap Prices.")
+            st.caption(
+                "Color can differ from a single red candle: session heatmap uses last price vs prior close."
+            )
+
+            heat_rows: List[Dict[str, Any]] = []
+            dedup: Dict[str, Dict[str, Any]] = {}
+            for r in source_rows:
+                ticker = str(r.get('ticker', '') or '').upper().strip()
+                if not ticker:
+                    continue
+
+                sector = str(r.get('sector', '') or '').strip() or "Unknown"
+                phase = str(r.get('sector_phase', '') or '').strip().upper() or "UNCLASSIFIED"
+                rec_u = str(r.get('ai_buy_recommendation', r.get('recommendation', '')) or '').upper()
+                conv = _safe_int(r.get('conviction', r.get('ai_confidence', 0)), 0)
+                price = _safe_float(r.get('price', 0), 0.0)
+                vol_ratio = _safe_float(r.get('volume_ratio', 0), 0.0)
+                _chg_rec = _extract_session_change_pct(r)
+                if _chg_rec is None:
+                    _chg_blob = (_change_cache.get(ticker, {}) if isinstance(_change_cache, dict) else {}) or {}
+                    _chg_rec = _safe_float(_chg_blob.get('pct', None), None) if _chg_blob else None
+                _chg_known = _chg_rec is not None
+                _chg_value = float(_chg_rec) if _chg_known else 0.0
+                _chg_asof = str(
+                    r.get('price_asof', '')
+                    or ((_change_cache.get(ticker, {}) if isinstance(_change_cache, dict) else {}) or {}).get('asof', '')
+                    or ''
+                ).strip()
+
+                score = 0.0
+                if "STRONG BUY" in rec_u:
+                    score += 2.0
+                elif "BUY" in rec_u:
+                    score += 1.0
+                elif "RE-ENTRY" in rec_u:
+                    score += 0.5
+                elif "LATE ENTRY" in rec_u:
+                    score += 0.2
+                elif "WAIT" in rec_u or "WATCH" in rec_u:
+                    score -= 0.4
+                elif "SKIP" in rec_u:
+                    score -= 1.2
+
+                if phase == "LEADING":
+                    score += 0.6
+                elif phase == "EMERGING":
+                    score += 0.3
+                elif phase == "FADING":
+                    score -= 0.4
+                elif phase == "LAGGING":
+                    score -= 0.8
+
+                monthly_ok = _safe_bool(r.get('monthly_bullish', r.get('monthly_macd_bullish', False)))
+                weekly_ok = _safe_bool(r.get('weekly_bullish', False))
+                ao_ok = _safe_bool(r.get('ao_positive', r.get('daily_ao_positive', False)))
+                score += 0.3 if monthly_ok else -0.2
+                if weekly_ok:
+                    score += 0.2
+                if ao_ok:
+                    score += 0.2
+
+                size_metric = max(1.0, float(conv if conv > 0 else 1))
+                if vol_ratio > 0:
+                    size_metric *= max(0.6, min(3.0, vol_ratio))
+
+                row = {
+                    'sector_bucket': f"{sector} ({phase})",
+                    'ticker': ticker,
+                    'size_metric': float(size_metric),
+                    'heat_score': round(float(score), 2),
+                    'recommendation': str(r.get('ai_buy_recommendation', r.get('recommendation', '')) or ''),
+                    'conviction': conv,
+                    'price': price,
+                    'volume_ratio': round(vol_ratio, 2),
+                    'earn_days': _safe_int(r.get('earn_days', 999), 999),
+                    'session_change_pct': round(_chg_value, 2),
+                    'session_change_known': bool(_chg_known),
+                    'price_asof': _chg_asof,
+                }
+                prev = dedup.get(ticker)
+                if prev is None or float(row['size_metric']) > float(prev.get('size_metric', 0) or 0):
+                    dedup[ticker] = row
+
+            heat_rows = list(dedup.values())
+            if not heat_rows:
+                st.info("No valid rows to render.")
+            else:
+                hdf = pd.DataFrame(heat_rows)
+                hdf['heat_score'] = pd.to_numeric(hdf['heat_score'], errors='coerce').fillna(0.0)
+                hdf['size_metric'] = pd.to_numeric(hdf['size_metric'], errors='coerce').fillna(1.0).clip(lower=1.0)
+                hdf['price'] = pd.to_numeric(hdf['price'], errors='coerce').fillna(0.0)
+                hdf['volume_ratio'] = pd.to_numeric(hdf['volume_ratio'], errors='coerce').fillna(0.0)
+                hdf['conviction'] = pd.to_numeric(hdf['conviction'], errors='coerce').fillna(0).astype(int)
+                hdf['earn_days'] = pd.to_numeric(hdf['earn_days'], errors='coerce').fillna(999).astype(int)
+                hdf['session_change_pct'] = pd.to_numeric(hdf['session_change_pct'], errors='coerce').fillna(0.0)
+                hdf['session_change_known'] = hdf['session_change_known'].astype(bool)
+                _known_cnt = int(hdf['session_change_known'].sum())
+                st.caption(f"Session change coverage: {_known_cnt}/{len(hdf)} tickers.")
+
+                _color_col = 'session_change_pct' if _color_mode.startswith("Session Change") else 'heat_score'
+                _color_title = "Session % Chg" if _color_col == 'session_change_pct' else "Score"
+                if _color_col == 'session_change_pct':
+                    _health = _compute_system_health()
+                    _rate_limited_now = bool((_health or {}).get('rate_limited', False))
+                    if _known_cnt == 0:
+                        st.warning(
+                            "No session-change data is currently available for this universe. "
+                            "Falling back to composite score coloring."
+                            + (" (Data provider is rate-limited.)" if _rate_limited_now else "")
+                        )
+                        _color_col = 'heat_score'
+                        _color_title = "Score (fallback)"
+                    elif _known_cnt < max(10, int(len(hdf) * 0.15)):
+                        # Mixed mode: use session change where available, fall back to score for unknowns.
+                        hdf['heat_color_mixed'] = hdf.apply(
+                            lambda _x: float(_x['session_change_pct'])
+                            if bool(_x.get('session_change_known', False))
+                            else float(_x['heat_score']),
+                            axis=1,
+                        )
+                        _color_col = 'heat_color_mixed'
+                        _color_title = "Session % Chg (mixed fallback)"
+                        st.info(
+                            "Session coverage is low; unknown tickers are colored by composite score."
+                        )
+                fig = px.treemap(
+                    hdf,
+                    path=['sector_bucket', 'ticker'],
+                    values='size_metric',
+                    color=_color_col,
+                    color_continuous_scale='RdYlGn',
+                    color_continuous_midpoint=0,
+                    hover_data={
+                        'recommendation': True,
+                        'conviction': True,
+                        'price': ':.2f',
+                        'session_change_pct': ':+.2f',
+                        'session_change_known': True,
+                        'price_asof': True,
+                        'volume_ratio': True,
+                        'earn_days': True,
+                        'size_metric': False,
+                        'heat_score': ':.2f',
+                    },
+                    custom_data=['ticker'],
+                )
+                # Avoid NaN text artifacts; keep labels clean.
+                fig.update_traces(
+                    texttemplate="%{label}",
+                    marker=dict(line=dict(width=0.7, color="rgba(255,255,255,0.15)")),
+                )
+                fig.update_layout(
+                    height=720,
+                    margin=dict(l=8, r=8, t=24, b=8),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    clickmode='event+select',
+                    coloraxis_colorbar=dict(title=_color_title),
+                )
+                _evt = st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    theme=None,
+                    key="exec_native_universe_heatmap",
+                    on_select="rerun",
+                    selection_mode=("points",),
+                )
+                _clicked_ticker = ""
+                try:
+                    _pts = []
+                    if isinstance(_evt, dict):
+                        _sel = _evt.get("selection", {}) or {}
+                        _pts = _sel.get("points", []) or _evt.get("points", []) or []
+                    elif _evt is not None:
+                        _sel = getattr(_evt, "selection", None)
+                        if _sel is not None:
+                            _pts = getattr(_sel, "points", []) or []
+                    for _pt in _pts:
+                        _cd = _pt.get("customdata") if isinstance(_pt, dict) else None
+                        if isinstance(_cd, (list, tuple)) and _cd:
+                            _cand = str(_cd[0] or '').upper().strip()
+                            if _cand:
+                                _clicked_ticker = _cand
+                                break
+                        if isinstance(_pt, dict):
+                            _lbl = str(_pt.get("label", '') or _pt.get("id", '') or '').upper().strip()
+                            if _lbl and re.match(r'^[A-Z0-9\.\-]{1,8}$', _lbl):
+                                _clicked_ticker = _lbl
+                                break
+                except Exception:
+                    _clicked_ticker = ""
+                if _clicked_ticker:
+                    st.session_state['exec_heatmap_selected_ticker'] = _clicked_ticker
+
+                _ticker_list = [str(x).upper().strip() for x in hdf['ticker'].dropna().tolist() if str(x).strip()]
+                _ticker_list = list(dict.fromkeys(_ticker_list))
+                _default_ticker = str(st.session_state.get('exec_heatmap_selected_ticker', '') or '').upper().strip()
+                if _default_ticker not in _ticker_list and _ticker_list:
+                    _default_ticker = _ticker_list[0]
+                _idx = _ticker_list.index(_default_ticker) if _default_ticker in _ticker_list else 0
+                _a1, _a2, _a3 = st.columns([2.5, 1, 1])
+                with _a1:
+                    _pick = st.selectbox(
+                        "Open ticker from heatmap universe",
+                        _ticker_list,
+                        index=int(_idx),
+                        key="exec_heatmap_picker",
+                    ) if _ticker_list else ""
+                with _a2:
+                    if st.button("📈 Open Chart", key="exec_heatmap_open_chart", width="stretch"):
+                        _open_from_heatmap(_pick, "chart")
+                with _a3:
+                    if st.button("✅ Open Trade", key="exec_heatmap_open_trade", width="stretch"):
+                        _open_from_heatmap(_pick, "trade")
+                if _pick:
+                    st.link_button(
+                        "🌐 Open TradingView Chart",
+                        f"https://www.tradingview.com/chart/?symbol={_pick}",
+                        width="stretch",
+                    )
+                if _color_col == 'session_change_pct':
+                    st.caption(
+                        "Color = session % change (last price vs previous close). "
+                        "Tile size = conviction adjusted by relative volume."
+                    )
+                else:
+                    st.caption(
+                        "Color = composite score (signal strength + sector phase + timeframe alignment). "
+                        "Tile size = conviction adjusted by relative volume."
+                    )
+
+        st.divider()
+        st.markdown("**TradingView Heatmap**")
+        stockanalysis_url = "https://stockanalysis.com/markets/heatmap/"
+        tv_url = "https://www.tradingview.com/heatmap/stock/"
+        st.markdown(f"[Open TradingView heatmap in new tab]({tv_url})")
+        st.markdown(f"[Open StockAnalysis heatmap in new tab]({stockanalysis_url})")
+        try:
+            import streamlit.components.v1 as components
+            components.html(
+                """
+                <div class="tradingview-widget-container" style="height:620px;width:100%;">
+                  <div class="tradingview-widget-container__widget"></div>
+                  <script type="text/javascript"
+                    src="https://s3.tradingview.com/external-embedding/embed-widget-stock-heatmap.js" async>
+                  {
+                    "exchanges": [],
+                    "dataSource": "SPX500",
+                    "grouping": "sector",
+                    "blockSize": "market_cap_basic",
+                    "blockColor": "change",
+                    "locale": "en",
+                    "symbolUrl": "",
+                    "colorTheme": "dark",
+                    "hasTopBar": true,
+                    "isDataSetEnabled": true,
+                    "isZoomEnabled": true,
+                    "hasSymbolTooltip": true,
+                    "isMonoSize": false,
+                    "width": "100%",
+                    "height": "620"
+                  }
+                  </script>
+                </div>
+                """,
+                height=640,
+                scrolling=False,
+            )
+        except Exception as e:
+            st.warning(
+                "TradingView widget unavailable in this browser/session. "
+                f"Use the links above. ({str(e)[:120]})"
+            )
+
+        st.divider()
+        _render_green_on_red_sector_finder(source_rows, key_prefix="exec", include_ai_button=True)
+
+    candidate_rows = []
+    if gate.allow_new_trades:
+        find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        find_new_cands = find_new.get('candidates', []) or []
+        if find_new_cands:
+            for c in find_new_cands:
+                row_for_policy = {
+                    'ticker': c.get('ticker', ''),
+                    'recommendation': c.get('recommendation', ''),
+                    'conviction': c.get('conviction', 0),
+                    'quality_grade': c.get('quality_grade', '?'),
+                    'price': c.get('price', 0),
+                    'summary': c.get('summary', ''),
+                    'sector_phase': c.get('sector_phase', ''),
+                    'earn_days': int(c.get('earn_days', 999) or 999),
+                    'earn_date': str(c.get('earn_date', '') or ''),
+                    'earn_source': str(c.get('earn_source', '') or ''),
+                    'earn_confidence': str(c.get('earn_confidence', '') or ''),
+                }
+                scored = _score_candidate_with_policy(row_for_policy, snap)
+                if scored.get('blocked'):
+                    continue
+                entry = float(c.get('price', 0) or 0)
+                stop = float(c.get('price', 0) or 0) * 0.94 if entry > 0 else 0.0
+                target = float(c.get('price', 0) or 0) * 1.10 if entry > 0 else 0.0
+                card = build_trade_decision_card(
+                    ticker=str(c.get('ticker', '') or ''),
+                    source="find_new",
+                    recommendation=str(c.get('recommendation', '') or ''),
+                    ai_buy_recommendation=str(c.get('recommendation', '') or ''),
+                    conviction=int(c.get('conviction', 0) or 0),
+                    quality_grade=str(c.get('quality_grade', '?') or '?'),
+                    entry=entry,
+                    stop=stop,
+                    target=target,
+                    rank_score=float(c.get('score', 0) or 0),
+                    regime=snap.regime,
+                    gate_status=gate.status,
+                    reason=str(c.get('summary', '') or ''),
+                    ai_rationale="",
+                    sector_phase=str(c.get('sector_phase', '') or ''),
+                    earn_days=int(c.get('earn_days', 999) or 999),
+                    explainability_bits=[
+                        "source=find_new",
+                        f"conv={int(c.get('conviction', 0) or 0)}",
+                        f"phase={str(c.get('sector_phase', '') or '')}",
+                    ],
+                ).to_dict()
+                candidate_rows.append({
+                    'row': row_for_policy,
+                    'score': float(max(float(c.get('score', 0) or 0), float(scored.get('score', 0) or 0))),
+                    'reasons': list(scored.get('reasons', []) or [])[:4],
+                    'card': card,
+                })
+        else:
+            for row in snap.scan_summary:
+                rec = str(row.get('recommendation', '')).upper()
+                if ('BUY' in rec or 'ENTRY' in rec) and 'SKIP' not in rec and 'AVOID' not in rec:
+                    scored = _score_candidate_with_policy(row, snap)
+                    if not scored['blocked']:
+                        entry = float(row.get('price', 0) or 0)
+                        stop = entry * 0.94 if entry > 0 else 0.0
+                        target = entry * 1.10 if entry > 0 else 0.0
+                        card = build_trade_decision_card(
+                            ticker=str(row.get('ticker', '') or ''),
+                            source="scanner",
+                            recommendation=str(row.get('recommendation', '') or ''),
+                            ai_buy_recommendation=str(row.get('recommendation', '') or ''),
+                            conviction=int(row.get('conviction', 0) or 0),
+                            quality_grade=str(row.get('quality_grade', '?') or '?'),
+                            entry=entry,
+                            stop=stop,
+                            target=target,
+                            rank_score=float(scored['score'] or 0),
+                            regime=snap.regime,
+                            gate_status=gate.status,
+                            reason=str(row.get('summary', '') or ''),
+                            ai_rationale="",
+                            sector_phase=str(row.get('sector_phase', '') or ''),
+                            earn_days=int(row.get('earn_days', 999) or 999),
+                            explainability_bits=list(scored['reasons'][:3]),
+                        ).to_dict()
+                        candidate_rows.append({
+                            'row': row,
+                            'score': scored['score'],
+                            'reasons': scored['reasons'],
+                            'card': card,
+                        })
+    candidate_rows = sorted(candidate_rows, key=lambda x: x['score'], reverse=True)
+    actionable = candidate_rows[: max(0, snap.risk_policy.max_new_trades)]
+
+    # SLO freshness checks
+    stale = _stale_stream_status(snap)
+    stale_count = int(stale["count"])
+    stale_tags = list(stale["tags"])
+
+    _render_decision_contract(
+        snap=snap,
+        gate=gate,
+        actionable=actionable,
+        ready_pending_alerts=ready_pending_alerts,
+        jm=jm,
+        stale=stale,
+    )
+
+    if stale_count > 0:
+        st.warning(f"Stale data detected: {', '.join(stale_tags)}")
+    else:
+        st.success("All core data streams are fresh.")
+
+    health = _scan_health_snapshot()
+    last_timing = st.session_state.get('_timing_last_scan', {}) or {}
+
+    regime_col1, regime_col2 = st.columns(2)
+    regime_col1.metric("Regime", f"{snap.regime}", f"{snap.regime_confidence}% confidence")
+    regime_col2.caption(
+        f"Risk Budget: max new {snap.risk_policy.max_new_trades}, "
+        f"size x{snap.risk_policy.position_size_multiplier:.2f}, "
+        f"max sector {snap.risk_policy.max_sector_exposure} | {snap.risk_policy.note}"
+    )
+    if gate.severity == "danger":
+        st.error(f"{gate.label} — {gate.reason}")
+    elif gate.severity == "warning":
+        st.warning(f"{gate.label} — {gate.reason}")
+    else:
+        st.success(f"{gate.label} — {gate.reason}")
+    st.caption(f"Execution Authority: Unified Trade Gate | Model alignment: {gate.model_alignment}")
+    posture = _position_posture_summary(snap, gate)
+    st.caption(f"Open-position posture: {posture['summary']}")
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Watchlist", len(snap.watchlist_tickers))
+    m2.metric("Scanned", len(snap.scan_summary))
+    m3.metric("Actionable", len(actionable))
+    m4.metric("Open Positions", len(snap.open_trades))
+    m5.metric("Alerts", len(snap.pending_alerts), delta=f"{len(ready_pending_alerts)} ready | {len(snap.triggered_alerts)} triggered")
+    m6.metric("Stale Streams", stale_count, delta=f"Last scan {health['last_scan_mode'] or 'n/a'}")
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Last Scan Count", int(health['last_scan_count']))
+    t2.metric("Last Scan Runtime", f"{health['last_scan_duration']:.1f}s")
+    t3.metric("Avg Scan Runtime", f"{health['avg_scan_duration']:.1f}s")
+    if last_timing:
+        st.caption(
+            f"Scan timings (sec): data={last_timing.get('fetch_scan_data_sec', 0.0):.1f}, "
+            f"analyze={last_timing.get('scan_watchlist_sec', 0.0):.1f}, "
+            f"sectors={last_timing.get('sector_refresh_sec', 0.0):.1f}, "
+            f"earnings={last_timing.get('earnings_refresh_sec', 0.0):.1f}, "
+            f"summary={last_timing.get('summary_build_sec', 0.0):.1f}, "
+            f"alerts={last_timing.get('alerts_check_sec', 0.0):.1f}"
+        )
+
+    st.divider()
+    q1, q2, q3 = st.columns(3)
+
+    must_act = []
+    action_queue = []
+    planned_trades = jm.get_planned_trades()
+    for p in planned_trades:
+        plan_id = str(p.get('plan_id', '')).strip()
+        pstatus = str(p.get('status', '')).upper()
+        pticker = str(p.get('ticker', '')).upper().strip()
+        if not pticker:
+            continue
+        if pstatus == "TRIGGERED":
+            must_act.append((92, f"🗂️ Planned triggered: {pticker}", pticker))
+            action_queue.append({
+                'priority': 92, 'category': 'planned', 'ticker': pticker, 'plan_id': plan_id,
+                'message': f"Planned triggered: {pticker}", 'action': 'planned_triggered'
+            })
+        elif pstatus == "PLANNED":
+            must_act.append((55, f"🗂️ Planned queued: {pticker}", pticker))
+            action_queue.append({
+                'priority': 55, 'category': 'planned', 'ticker': pticker, 'plan_id': plan_id,
+                'message': f"Planned queued: {pticker}", 'action': 'planned_queued'
+            })
+    for r in ready_pending_alerts:
+        ticker = str(r.get('ticker', '')).upper().strip()
+        if not ticker:
+            continue
+        must_act.append((97, f"🟢 Alert ready: {ticker} (can take trade)", ticker))
+        action_queue.append({
+            'priority': 97, 'category': 'alert', 'ticker': ticker,
+            'message': f"Alert ready: {ticker}", 'action': 'open_trade'
+        })
+    for t in snap.triggered_alerts:
+        ticker = t.get('ticker', '')
+        must_act.append((100, f"🎯 Alert triggered: {ticker}", ticker))
+        action_queue.append({'priority': 100, 'category': 'alert', 'ticker': ticker, 'message': f"Alert triggered: {ticker}", 'action': 'open_trade'})
+    for trade in snap.open_trades:
+        ticker = trade.get('ticker', '').upper().strip()
+        entry = float(trade.get('entry_price', 0) or 0)
+        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+        current = float(st.session_state.get('_position_prices', {}).get(ticker) or entry)
+        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+        if stop > 0 and current <= stop:
+            must_act.append((95, f"🔴 Stop breached: {ticker}", ticker))
+            action_queue.append({
+                'priority': 95, 'category': 'risk', 'ticker': ticker, 'message': f"Stop breached: {ticker}",
+                'action': 'risk_manage', 'current': current, 'stop': stop
+            })
+        elif pnl_pct <= -3:
+            must_act.append((75, f"🟠 Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)", ticker))
+            action_queue.append({
+                'priority': 75, 'category': 'risk', 'ticker': ticker, 'message': f"Drawdown >3%: {ticker} ({pnl_pct:+.1f}%)",
+                'action': 'risk_manage', 'current': current, 'stop': stop
+            })
+    for row in snap.scan_summary:
+        earn_days = int(row.get('earn_days', 999) or 999)
+        if 0 <= earn_days <= 3:
+            ticker = row.get('ticker', '')
+            must_act.append((70 - earn_days, f"🗓️ Earnings soon ({earn_days}d): {ticker}", ticker))
+            action_queue.append({'priority': 70 - earn_days, 'category': 'earnings', 'ticker': ticker, 'message': f"Earnings soon ({earn_days}d): {ticker}", 'action': 'open_trade'})
+    if stale_count >= 3:
+        action_queue.append({'priority': 98, 'category': 'system', 'ticker': '', 'message': "Critical stale data streams — refresh required", 'action': 'refresh'})
+    must_act.sort(key=lambda x: x[0], reverse=True)
+    action_queue = sorted(action_queue, key=lambda x: x['priority'], reverse=True)
+
+    with q1:
+        st.markdown("**Must Act Now**")
+        if not must_act:
+            st.caption("No urgent actions right now.")
+        for i, (_, msg, ticker) in enumerate(must_act[:12]):
+            if st.button(msg, key=f"exec_urgent_{i}_{ticker}", width="stretch"):
+                if ticker:
+                    _load_ticker_for_view(ticker)
+
+    with q2:
+        st.markdown("**Top Trade Candidates**")
+        settings = _trade_quality_settings()
+        tf_ranked_all = (st.session_state.get('trade_finder_results', {}) or {}).get('rows', []) or []
+        tf_ranked = [r for r in tf_ranked_all if _trade_candidate_is_qualified(r, settings)]
+        _find_new = st.session_state.get('find_new_trades_report', {}) or {}
+        if _find_new.get('candidates'):
+            st.caption(
+                f"Source: Find New Trades ({int(_find_new.get('scan_universe', 0) or 0)} tickers, "
+                f"{int(_find_new.get('watchlists_count', 0) or 0)} watchlists)"
+            )
+        if tf_ranked_all:
+            st.caption(
+                f"Source: Trade Finder ranked list (qualified {len(tf_ranked)}/{len(tf_ranked_all)} "
+                f"| min R:R {settings['min_rr']:.1f} | earnings>{settings['earn_block_days']}d)"
+            )
+        if not gate.allow_new_trades:
+            st.caption("New trade entries are blocked by current market gate.")
+        elif not actionable and not tf_ranked:
+            st.caption("No actionable entries in current scan.")
+        if tf_ranked:
+            for idx, tr in enumerate(tf_ranked[:12]):
+                ticker = str(tr.get('ticker', '?') or '?')
+                ai_rec = str(tr.get('ai_buy_recommendation', 'Watch Only') or 'Watch Only')
+                score = float(tr.get('rank_score', 0) or 0)
+                rr = float(tr.get('risk_reward', 0) or 0)
+                if st.button(
+                    f"{ticker} | {ai_rec} | R:R {rr:.2f}:1 | Score {score:.1f}",
+                    key=f"exec_pick_tf_{idx}_{ticker}",
+                    width="stretch",
+                ):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'ticker': ticker,
+                        'entry': float(tr.get('suggested_entry', tr.get('price', 0)) or tr.get('price', 0) or 0),
+                        'stop': float(tr.get('suggested_stop_loss', 0) or 0),
+                        'target': float(tr.get('suggested_target', 0) or 0),
+                        'ai_buy_recommendation': ai_rec,
+                        'risk_reward': rr,
+                        'earn_days': int(tr.get('earn_days', 999) or 999),
+                        'reason': str(tr.get('reason', '') or ''),
+                        'ai_rationale': str(tr.get('ai_rationale', '') or ''),
+                        'provider': str(tr.get('provider', 'system') or 'system'),
+                        'generated_at_iso': str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '')),
+                        'trade_finder_run_id': str(tr.get('trade_finder_run_id', '') or (st.session_state.get('trade_finder_results', {}) or {}).get('run_id', '') or ''),
+                        'support_price': float(tr.get('support_price', 0) or 0),
+                        'support_distance_pct': float(tr.get('support_distance_pct', 0) or 0),
+                        'support_stop_price': float(tr.get('support_stop_price', 0) or 0),
+                        'stop_basis': str(tr.get('stop_basis', '') or ''),
+                        'prefill_token': f"{ticker}:{int(time.time() * 1000)}",
+                    }
+                    if _navigate_to_scanner_ticker(ticker, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
+                st.caption(f"Why: {str(tr.get('ai_rationale', '') or str(tr.get('scanner_summary', '') or ''))[:180]}")
+        else:
+            for cand in actionable[:12]:
+                row = cand['row']
+                card = cand.get('card', {}) or {}
+                ticker = row.get('ticker', '?')
+                rec = row.get('recommendation', '?')
+                conv = row.get('conviction', 0)
+                score = cand['score']
+                why = card.get('explainability', '') or "; ".join(cand['reasons'][:3])
+                readiness = card.get('execution_readiness', '')
+                if st.button(f"{ticker} | {rec} | Conviction {conv} | Score {score:.1f}",
+                             key=f"exec_pick_{ticker}", width="stretch"):
+                    _load_ticker_for_view(ticker)
+                st.caption(f"Why: {why}")
+                if readiness:
+                    st.caption(f"Decision: {readiness} | Regime fit: {card.get('regime_fit_score', 0)}")
+
+    with q3:
+        st.markdown("**Open Positions Needing Attention**")
+        if not snap.open_trades:
+            st.caption("No open positions.")
+        else:
+            pos_cache = st.session_state.get('_position_prices', {})
+            for trade in snap.open_trades:
+                ticker = trade.get('ticker', '').upper().strip()
+                entry = float(trade.get('entry_price', 0) or 0)
+                stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
+                current = float(pos_cache.get(ticker) or fetch_current_price(ticker) or entry)
+                pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+                at_stop = stop > 0 and current <= stop
+                if pnl_pct <= -2 or at_stop:
+                    icon = "🔴" if at_stop else "🟠"
+                    text = f"{icon} {ticker}  ${current:.2f} ({pnl_pct:+.1f}%)"
+                    if st.button(text, key=f"exec_risk_{ticker}", width="stretch"):
+                        _load_ticker_for_view(ticker)
+
+    ensure_exec_queue_defaults(st.session_state)
+
+    undo_window_s = 12
+    confirm_ttl_s = 20
+
+    now_ts = time.time()
+    # Expire stale confirmation prompts so accidental stale confirms are not executed.
+    for ckey, ts in list(st.session_state['_queue_action_confirm'].items()):
+        if (now_ts - float(ts or 0)) > confirm_ttl_s:
+            st.session_state['_queue_action_confirm'].pop(ckey, None)
+
+    def _record_queue_recent(status: str, detail: str):
+        recent = st.session_state.get('_queue_recent_actions', [])
+        recent.insert(0, {
+            'ts': datetime.now().isoformat(timespec='seconds'),
+            'status': status,
+            'detail': (detail or '')[:220],
+        })
+        st.session_state['_queue_recent_actions'] = recent[:30]
+
+    def _open_trade_for_ticker(tkr: str) -> Optional[dict]:
+        for tr in jm.open_trades:
+            if str(tr.get('ticker', '')).upper().strip() == tkr and str(tr.get('status', '')).upper() == 'OPEN':
+                return tr
+        return None
+
+    def _planned_trade_for_id(pid: str) -> Optional[dict]:
+        for tr in jm.get_planned_trades():
+            if str(tr.get('plan_id', '')).strip() == pid:
+                return tr
+        return None
+
+    def _queue_log(op: str, status: str, details: str):
+        msg = f"op={op} status={status} {details}".strip()
+        _append_audit_event("QUEUE_ACTION", msg, source="exec_queue")
+        _record_queue_recent(status, msg)
+
+    def _confirm_remaining(confirm_key: str) -> int:
+        ts = float(st.session_state.get('_queue_action_confirm', {}).get(confirm_key, 0) or 0)
+        if ts <= 0:
+            return 0
+        left = max(0, int(confirm_ttl_s - (time.time() - ts)))
+        if left <= 0:
+            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+            return 0
+        return left
+
+    def _queue_schedule(action_key: str, payload: Dict[str, Any]) -> str:
+        pending = st.session_state.get('_queue_pending_actions', {})
+        executed = st.session_state.get('_queue_action_executed', {})
+        if action_key in executed:
+            return "Action already executed"
+        if action_key in pending:
+            return f"Action already pending ({max(0, int(pending[action_key].get('execute_at', 0) - time.time()))}s)"
+        now_ts = time.time()
+        payload['created_at'] = now_ts
+        payload['execute_at'] = now_ts + undo_window_s
+        pending[action_key] = payload
+        st.session_state['_queue_pending_actions'] = pending
+        _queue_log(payload.get('kind', 'unknown'), "QUEUED", f"action_key={action_key}")
+        return f"Queued. Undo available for {undo_window_s}s"
+
+    def _process_pending_queue_actions() -> bool:
+        pending = st.session_state.get('_queue_pending_actions', {})
+        executed = st.session_state.get('_queue_action_executed', {})
+        now_ts = time.time()
+        did_any = False
+        for action_key, payload in list(pending.items()):
+            if now_ts < float(payload.get('execute_at', 0) or 0):
+                continue
+
+            kind = str(payload.get('kind', '')).strip()
+            ticker = str(payload.get('ticker', '')).upper().strip()
+            plan_id = str(payload.get('plan_id', '')).strip()
+            status = "SKIPPED"
+            detail = f"action_key={action_key} ticker={ticker} plan_id={plan_id}"
+
+            if action_key in executed:
+                detail += " reason=already_executed"
+            elif kind == 'trigger_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status == 'PLANNED':
+                    jm.update_planned_trade_status(plan_id, "TRIGGERED", notes="triggered from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'entered_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status == 'TRIGGERED':
+                    jm.update_planned_trade_status(plan_id, "ENTERED", notes="entered from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'cancel_plan':
+                p = _planned_trade_for_id(plan_id)
+                p_status = str((p or {}).get('status', '')).upper()
+                if p and p_status in {'PLANNED', 'TRIGGERED'}:
+                    jm.update_planned_trade_status(plan_id, "CANCELLED", notes="cancelled from action queue")
+                    status = "EXECUTED"
+                else:
+                    detail += f" reason=invalid_status({p_status or 'missing'})"
+            elif kind == 'tighten_stop':
+                tr = _open_trade_for_ticker(ticker)
+                new_stop = float(payload.get('new_stop', 0) or 0)
+                old_stop = float(payload.get('old_stop', 0) or 0)
+                if tr and new_stop > float(tr.get('current_stop', tr.get('initial_stop', 0)) or 0):
+                    jm.update_stop(ticker, new_stop)
+                    status = "EXECUTED"
+                    detail += f" old_stop={old_stop:.2f} new_stop={new_stop:.2f}"
+                else:
+                    detail += " reason=not_tightening_or_missing"
+            elif kind == 'close_now':
+                tr = _open_trade_for_ticker(ticker)
+                close_px = float(payload.get('close_price', 0) or 0)
+                if tr and close_px > 0:
+                    jm.close_trade(ticker, close_px, exit_reason='manual', notes='Closed from action queue')
+                    status = "EXECUTED"
+                    detail += f" price={close_px:.2f}"
+                else:
+                    detail += " reason=no_open_position"
+            else:
+                detail += " reason=unknown_kind"
+
+            executed[action_key] = now_ts
+            pending.pop(action_key, None)
+            _queue_log(kind or 'unknown', status, detail)
+            st.session_state['_queue_last_result_toasts'].append({
+                'status': status,
+                'detail': f"{kind} {ticker}".strip(),
+            })
+            did_any = True
+
+        st.session_state['_queue_pending_actions'] = pending
+        st.session_state['_queue_action_executed'] = executed
+        return did_any
+
+    if _process_pending_queue_actions():
+        st.rerun()
+
+    with st.expander(f"⚡ Unified Action Queue ({len(action_queue)})", expanded=False):
+        if not action_queue:
+            st.caption("No queued actions.")
+        toast_rows = st.session_state.get('_queue_last_result_toasts', [])
+        for row in toast_rows[:5]:
+            st.toast(f"{row.get('status', 'INFO')}: {row.get('detail', '')}")
+        if toast_rows:
+            st.session_state['_queue_last_result_toasts'] = []
+        pending_actions = st.session_state.get('_queue_pending_actions', {})
+        if pending_actions:
+            st.markdown("**Pending Queue Actions (undo window)**")
+            for pkey, payload in sorted(pending_actions.items(), key=lambda x: x[1].get('execute_at', 0)):
+                secs_left = max(0, int(float(payload.get('execute_at', 0) or 0) - time.time()))
+                p_kind = str(payload.get('kind', 'action'))
+                p_ticker = str(payload.get('ticker', '')).upper().strip()
+                pc1, pc2 = st.columns([4, 1])
+                with pc1:
+                    st.caption(f"⏳ {p_kind} {p_ticker} executing in {secs_left}s")
+                with pc2:
+                    if st.button("Undo", key=f"aq_undo_{pkey}", width="stretch"):
+                        st.session_state['_queue_pending_actions'].pop(pkey, None)
+                        _queue_log(p_kind, "UNDONE", f"action_key={pkey} ticker={p_ticker}")
+                        st.rerun()
+            st.divider()
+        for i, item in enumerate(action_queue[:30]):
+            pri = int(item.get('priority', 0))
+            msg = str(item.get('message', ''))
+            ticker = str(item.get('ticker', '') or '').upper().strip()
+            plan_id = str(item.get('plan_id', '') or '').strip()
+            action = str(item.get('action', 'open_trade'))
+            current = float(item.get('current', 0) or 0)
+            stop = float(item.get('stop', 0) or 0)
+            cmsg, c1, c2, c3 = st.columns([4, 1, 1, 1])
+            row_badges = []
+            if action == 'planned_queued' and plan_id:
+                _k = f"trigger_plan:{plan_id}"
+                if _k in pending_actions:
+                    _left = max(0, int(float(pending_actions[_k].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {_left}s")
+                if _k in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
+            if action == 'planned_triggered' and plan_id:
+                _ek = f"entered_plan:{plan_id}"
+                _ck = f"cancel_plan:{plan_id}"
+                if _ek in pending_actions or _ck in pending_actions:
+                    _lefts = []
+                    if _ek in pending_actions:
+                        _lefts.append(int(float(pending_actions[_ek].get('execute_at', 0) or 0) - time.time()))
+                    if _ck in pending_actions:
+                        _lefts.append(int(float(pending_actions[_ck].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {max(0, min(_lefts))}s")
+                if _ek in st.session_state.get('_queue_action_executed', {}) or _ck in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
+            if action == 'risk_manage' and ticker:
+                _ck = f"close_now:{ticker}"
+                if _ck in pending_actions:
+                    _left = max(0, int(float(pending_actions[_ck].get('execute_at', 0) or 0) - time.time()))
+                    row_badges.append(f"⏳ pending {_left}s")
+                if _ck in st.session_state.get('_queue_action_executed', {}):
+                    row_badges.append("✅ executed")
+            with cmsg:
+                badge_txt = (" | " + " | ".join(row_badges)) if row_badges else ""
+                st.caption(f"P{pri} | {msg}{badge_txt}")
+            with c1:
+                if action == 'refresh':
+                    if st.button("Refresh", key=f"aq_refresh_{i}", width="stretch"):
+                        _fast_refresh_dashboard()
+                        st.rerun()
+                else:
+                    if st.button("Open", key=f"aq_open_{i}_{ticker}", width="stretch"):
+                        if ticker:
+                            if _navigate_to_scanner_ticker(ticker, target="trade"):
+                                st.rerun()
+                            else:
+                                st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {ticker}.")))
+            with c2:
+                if action == 'planned_queued' and plan_id:
+                    if st.button("Trigger", key=f"aq_trigger_{i}_{plan_id}", width="stretch"):
+                        action_key = f"trigger_plan:{plan_id}"
+                        status_msg = _queue_schedule(action_key, {
+                            'kind': 'trigger_plan',
+                            'plan_id': plan_id,
+                            'ticker': ticker,
+                        })
+                        st.info(status_msg)
+                        st.rerun()
+                elif action == 'planned_triggered' and plan_id:
+                    confirm_key = f"entered_{plan_id}"
+                    if st.button("Entered", key=f"aq_entered_{i}_{plan_id}", width="stretch"):
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
+                        if st.button("Confirm Entered", key=f"aq_entered_confirm_{i}_{plan_id}", width="stretch"):
+                            action_key = f"entered_plan:{plan_id}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'entered_plan',
+                                'plan_id': plan_id,
+                                'ticker': ticker,
+                            })
+                            st.info(status_msg)
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
+                elif action == 'risk_manage' and ticker and current > 0:
+                    if st.button("Tighten +1%", key=f"aq_tighten_{i}_{ticker}", width="stretch"):
+                        # quick risk action: move stop to 1% below current if this tightens risk
+                        new_stop = round(max(stop, current * 0.99), 2) if stop > 0 else round(current * 0.99, 2)
+                        action_key = f"tighten_stop:{ticker}:{new_stop:.2f}"
+                        status_msg = _queue_schedule(action_key, {
+                            'kind': 'tighten_stop',
+                            'ticker': ticker,
+                            'old_stop': stop,
+                            'new_stop': new_stop,
+                        })
+                        st.info(status_msg)
+                        st.rerun()
+            with c3:
+                if action in {'planned_queued', 'planned_triggered'} and plan_id:
+                    confirm_key = f"cancel_{plan_id}"
+                    if st.button("Cancel", key=f"aq_cancel_{i}_{plan_id}", width="stretch"):
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
+                        if st.button("Confirm Cancel", key=f"aq_cancel_confirm_{i}_{plan_id}", width="stretch"):
+                            action_key = f"cancel_plan:{plan_id}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'cancel_plan',
+                                'plan_id': plan_id,
+                                'ticker': ticker,
+                            })
+                            st.info(status_msg)
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
+                elif action == 'risk_manage' and ticker and current > 0:
+                    confirm_key = f"close_{ticker}_{i}"
+                    if st.button("Close Now", key=f"aq_close_{i}_{ticker}", width="stretch"):
+                        st.session_state['_queue_action_confirm'][confirm_key] = time.time()
+                    left_s = _confirm_remaining(confirm_key)
+                    if left_s > 0:
+                        st.caption(f"confirm {left_s}s")
+                        if st.button("Confirm Close", key=f"aq_close_confirm_{i}_{ticker}", width="stretch"):
+                            action_key = f"close_now:{ticker}"
+                            status_msg = _queue_schedule(action_key, {
+                                'kind': 'close_now',
+                                'ticker': ticker,
+                                'close_price': current,
+                            })
+                            st.info(status_msg)
+                            st.session_state['_queue_action_confirm'].pop(confirm_key, None)
+                            st.rerun()
+
+        with st.expander("🧾 Recent Queue Actions", expanded=False):
+            recent_queue_audit = []
+            for evt in _get_audit_events():
+                if evt.get('action') == 'QUEUE_ACTION' and evt.get('source') == 'exec_queue':
+                    recent_queue_audit.append(evt)
+                if len(recent_queue_audit) >= 12:
+                    break
+            if not recent_queue_audit:
+                st.caption("No queue actions yet.")
+            else:
+                for evt in recent_queue_audit:
+                    ts = str(evt.get('ts', ''))
+                    det = str(evt.get('details', ''))
+                    st.caption(f"{ts} | {det}")
+
+    st.divider()
+    with st.expander("🗂️ Planned Trades Board", expanded=False):
+        all_plans = jm.get_planned_trades()
+        status_filter = st.selectbox(
+            "Status Filter",
+            ["ALL", "PLANNED", "TRIGGERED", "CANCELLED", "ENTERED"],
+            key="exec_plan_status_filter",
+        )
+        only_today = st.checkbox("Today only", value=False, key="exec_plan_today_only")
+        stale_days = st.number_input(
+            "Stale threshold (days)",
+            min_value=1,
+            max_value=30,
+            value=3,
+            step=1,
+            key="exec_plan_stale_days",
+        )
+
+        def _parse_dt(s: str):
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+            except Exception:
+                return None
+
+        filtered = []
+        now_dt = datetime.now()
+        for p in all_plans:
+            p_status = str(p.get('status', '')).upper()
+            if status_filter != "ALL" and p_status != status_filter:
+                continue
+            created = _parse_dt(str(p.get('created_at', '') or ''))
+            if only_today and created is not None and created.date() != now_dt.date():
+                continue
+            filtered.append(p)
+
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            if st.button("✖ Cancel All Planned", key="exec_cancel_all_planned", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="PLANNED"):
+                    pid = str(p.get('plan_id', ''))
+                    if pid:
+                        jm.update_planned_trade_status(pid, "CANCELLED", notes="bulk-cancelled from executive board")
+                        cnt += 1
+                st.success(f"Cancelled {cnt} planned trade(s).")
+                st.rerun()
+        with bc2:
+            if st.button("🧹 Cancel Stale Planned", key="exec_cancel_stale_planned", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="PLANNED"):
+                    pid = str(p.get('plan_id', ''))
+                    created = _parse_dt(str(p.get('created_at', '') or ''))
+                    if pid and created is not None and (now_dt - created.replace(tzinfo=None) if created.tzinfo else now_dt - created).days >= int(stale_days):
+                        jm.update_planned_trade_status(pid, "CANCELLED", notes=f"stale >={int(stale_days)}d")
+                        cnt += 1
+                st.success(f"Cancelled {cnt} stale planned trade(s).")
+                st.rerun()
+        with bc3:
+            if st.button("✅ Mark Triggered Entered", key="exec_mark_triggered_entered", width="stretch"):
+                cnt = 0
+                for p in jm.get_planned_trades(status="TRIGGERED"):
+                    pid = str(p.get('plan_id', ''))
+                    if pid:
+                        jm.update_planned_trade_status(pid, "ENTERED", notes="manual-entered from executive board")
+                        cnt += 1
+                st.success(f"Marked {cnt} triggered trade(s) as entered.")
+                st.rerun()
+
+        st.caption(f"Showing {len(filtered)} / {len(all_plans)} planned trades")
+        if not filtered:
+            st.caption("No planned trades match filters.")
+        for p in filtered[:50]:
+            pid = str(p.get('plan_id', ''))
+            pticker = str(p.get('ticker', '')).upper().strip()
+            pstatus = str(p.get('status', 'PLANNED')).upper()
+            pentry = float(p.get('entry', 0) or 0)
+            pstop = float(p.get('stop', 0) or 0)
+            ptarget = float(p.get('target', 0) or 0)
+            prr = float(p.get('risk_reward', 0) or 0)
+            pscore = float(p.get('rank_score', 0) or 0)
+            st.caption(
+                f"{pticker} | {pstatus} | Entry ${pentry:.2f} Stop ${pstop:.2f} Target ${ptarget:.2f} "
+                f"| R:R {prr:.2f}:1 | Score {pscore:.2f} | Run {str(p.get('trade_finder_run_id', '') or 'n/a')}"
+            )
+            r1, r2, r3, r4 = st.columns(4)
+            with r1:
+                if st.button("▶ Open", key=f"exec_plan_open_{pid}", width="stretch"):
+                    st.session_state['trade_finder_selected_trade'] = {
+                        'plan_id': pid,
+                        'ticker': pticker,
+                        'entry': pentry,
+                        'stop': pstop,
+                        'target': ptarget,
+                        'risk_reward': prr,
+                        'trade_finder_run_id': str(p.get('trade_finder_run_id', '') or ''),
+                        'reason': str(p.get('reason', '') or ''),
+                        'ai_rationale': str(p.get('notes', '') or ''),
+                        'provider': str(p.get('source', 'planned') or 'planned'),
+                        'prefill_token': f"{pticker}:{int(time.time() * 1000)}",
+                    }
+                    if _navigate_to_scanner_ticker(pticker, target="trade"):
+                        st.rerun()
+                    else:
+                        st.warning(str(st.session_state.get('_scanner_nav_error', f"Unable to load {pticker}.")))
+            with r2:
+                if st.button("⚡ Trigger", key=f"exec_plan_trigger_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "TRIGGERED"))
+                    st.rerun()
+            with r3:
+                if st.button("✖ Cancel", key=f"exec_plan_cancel_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "CANCELLED"))
+                    st.rerun()
+            with r4:
+                if st.button("✅ Entered", key=f"exec_plan_entered_{pid}", width="stretch"):
+                    st.info(jm.update_planned_trade_status(pid, "ENTERED", notes="manual-entered from executive row"))
+                    st.rerun()
+
+    # Render telemetry (throttled)
+    now_ts = time.time()
+    if (now_ts - float(st.session_state.get('_last_exec_render_log_ts', 0.0))) > 60:
+        st.session_state['_last_exec_render_log_ts'] = now_ts
+        _append_perf_metric({
+            "kind": "dashboard_render",
+            "sec": round(now_ts - _render_started, 3),
+            "stale_streams": stale_count,
+            "regime": snap.regime,
+            "actionable": len(actionable),
+            "open_positions": len(snap.open_trades),
+            "alerts": len(snap.pending_alerts),
+        })
+
+
+# =============================================================================
+# APP MAIN
+# =============================================================================
+
+def main():
+    render_sidebar()
+
+    jm = get_journal()
+
+    # Main content area
+    conditionals = jm.get_pending_conditionals()
+    alerts_label = f"🎯 Alerts ({len(conditionals)})" if conditionals else "🎯 Alerts"
+    if _is_exec_dashboard_enabled():
+        tab_exec, tab_finder, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "📌 Executive Dashboard", "🧭 Trade Finder", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        ])
+
+        with tab_exec:
+            render_executive_dashboard()
+
+        with tab_finder:
+            render_trade_finder_tab()
+
+        with tab_scanner:
+            render_scanner_table()
+            if st.session_state.get('selected_analysis'):
+                st.divider()
+                render_detail_view()
+
+        with tab_alerts:
+            _render_alerts_panel()
+
+        with tab_positions:
+            render_position_manager()
+
+        with tab_perf:
+            render_performance()
+    else:
+        tab_finder, tab_scanner, tab_alerts, tab_positions, tab_perf = st.tabs([
+            "🧭 Trade Finder", "🔍 Scanner", alerts_label, "🏦 Position Manager", "📊 Performance"
+        ])
+        with tab_finder:
+            render_trade_finder_tab()
+        with tab_scanner:
+            render_scanner_table()
+            if st.session_state.get('selected_analysis'):
+                st.divider()
+                render_detail_view()
+        with tab_alerts:
+            _render_alerts_panel()
+        with tab_positions:
+            render_position_manager()
+        with tab_perf:
+            render_performance()
+
+    if st.session_state.pop(KEY_SWITCH_TO_SCANNER_TAB, False):
+        st.session_state.pop(KEY_SWITCH_TO_SCANNER_TARGET_TAB, None)
+        _focus_detail = bool(st.session_state.pop(KEY_SWITCH_TO_SCANNER_FOCUS_DETAIL, False))
+        import streamlit.components.v1 as components
+        _switch_js = f"""
+            <script>
+            (function() {{
+              const doc = window.parent.document;
+              const tabSelector = 'button[role="tab"], [role="tab"], [data-baseweb="tab"] button, [data-baseweb="tab"]';
+              const maxScannerAttempts = 80;
+              const maxFocusAttempts = 220;
+              const pollMs = 55;
+              const shouldFocusDetail = {str(_focus_detail).lower()};
+
+              function clickTabByLabel(label) {{
+                if (!label) return false;
+                const tabs = Array.from(doc.querySelectorAll(tabSelector));
+                const found = tabs.find(el => ((el.innerText || el.textContent || '') + '').includes(label));
+                if (!found) return false;
+                found.click();
+                found.dispatchEvent(new MouseEvent('click', {{ bubbles: true }}));
+                return true;
+              }}
+
+              function focusDetailAnchor() {{
+                if (!shouldFocusDetail) return;
+                const anchor = doc.getElementById('detail-anchor');
+                if (!anchor) return;
+                anchor.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+              }}
+
+              function focusDetailPanel() {{
+                let focusAttempts = 0;
+                const focusTimer = setInterval(function() {{
+                  focusAttempts += 1;
+                  focusDetailAnchor();
+                  const haveAnchor = !!doc.getElementById('detail-anchor');
+                  if (focusAttempts >= maxFocusAttempts || !shouldFocusDetail || haveAnchor) {{
+                    clearInterval(focusTimer);
+                  }}
+                }}, pollMs);
+              }}
+
+              if (clickTabByLabel('Scanner')) {{
+                focusDetailPanel();
+                return;
+              }}
+              let scannerAttempts = 0;
+              const scannerTimer = setInterval(function() {{
+                scannerAttempts += 1;
+                if (clickTabByLabel('Scanner')) {{
+                  clearInterval(scannerTimer);
+                  focusDetailPanel();
+                }} else if (scannerAttempts >= maxScannerAttempts) {{
+                  clearInterval(scannerTimer);
+                }}
+              }}, pollMs);
+            }})();
+            </script>
+        """
+        components.html(_switch_js, height=0)
+
+
+@st.fragment
+def _render_alerts_panel():
+    """Dedicated alerts panel — delegates to alert_dashboard_ui module."""
+    jm = get_journal()
+    render_alerts_dashboard(
+        jm,
+        fetch_current_price,
+        open_chart_fn=lambda t: _open_chart_anywhere(t, warn=False),
+        open_trade_fn=lambda t: _open_trade_anywhere(t, warn=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
+    # Flush any queued GitHub backups (debounced — won't push on every rerun)
+    try:
+        import github_backup
+        github_backup.flush()
+    except Exception:
+        pass
