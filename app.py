@@ -2603,17 +2603,17 @@ def _run_scan(mode='all'):
         except Exception as e:
             print(f"Earnings flags error: {e}")
 
-        # Fetch sectors for scanned tickers (independent)
+        # Fetch sectors for scanned tickers (bulk prefetch — uses persistent cache)
         try:
             _t = time.time()
             _set_scan_progress(86, "Resolving ticker sectors...")
-            from data_fetcher import get_ticker_sector
+            from data_fetcher import bulk_prefetch_sectors
             ticker_sectors = st.session_state.get('ticker_sectors', {})
-            for r in new_results:
-                if r.ticker not in ticker_sectors:
-                    sector = get_ticker_sector(r.ticker)
-                    if sector:
-                        ticker_sectors[r.ticker] = sector
+            # Only fetch tickers we don't already have in session state
+            _need_sectors = [r.ticker for r in new_results if r.ticker not in ticker_sectors]
+            if _need_sectors:
+                _bulk_result = bulk_prefetch_sectors(_need_sectors)
+                ticker_sectors.update(_bulk_result)
             st.session_state['ticker_sectors'] = ticker_sectors
             _timing['sector_assign_sec'] = time.time() - _t
         except Exception as e:
