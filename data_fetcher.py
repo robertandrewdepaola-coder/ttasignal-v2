@@ -1700,7 +1700,12 @@ _SECTOR_FALLBACK = {
     # Utilities
     'NEE': 'Utilities', 'DUK': 'Utilities', 'SO': 'Utilities', 'D': 'Utilities',
     'AEP': 'Utilities', 'SRE': 'Utilities', 'EXC': 'Utilities', 'XEL': 'Utilities',
-    'CEG': 'Utilities', 'VST': 'Utilities',
+    'CEG': 'Utilities', 'VST': 'Utilities', 'AWK': 'Utilities', 'CNP': 'Utilities',
+    'EIX': 'Utilities', 'ATO': 'Utilities', 'ED': 'Utilities', 'NRG': 'Utilities',
+    'PNW': 'Utilities', 'AES': 'Utilities', 'WEC': 'Utilities', 'ES': 'Utilities',
+    'ETR': 'Utilities', 'FE': 'Utilities', 'PPL': 'Utilities', 'CMS': 'Utilities',
+    'DTE': 'Utilities', 'EVRG': 'Utilities', 'NI': 'Utilities', 'LNT': 'Utilities',
+    'AEE': 'Utilities', 'OGE': 'Utilities', 'PNM': 'Utilities', 'IDA': 'Utilities',
     # Real Estate
     'AMT': 'Real Estate', 'PLD': 'Real Estate', 'CCI': 'Real Estate',
     'EQIX': 'Real Estate', 'SPG': 'Real Estate', 'O': 'Real Estate',
