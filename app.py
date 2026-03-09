@@ -2204,7 +2204,16 @@ def _ensure_ticker_chart_cache(
     if not _ticker:
         return False
 
+    # Fast path: if all needed data is already cached, skip dict copies and API calls
     cache = st.session_state.get('ticker_data_cache', {}) or {}
+    _existing = cache.get(_ticker)
+    if _existing is not None:
+        _has_daily = _existing.get('daily') is not None
+        _has_weekly = (not include_weekly) or _existing.get('weekly') is not None
+        _has_monthly = (not include_monthly) or _existing.get('monthly') is not None
+        if _has_daily and _has_weekly and _has_monthly:
+            return True
+
     data = dict((cache.get(_ticker, {}) if isinstance(cache, dict) else {}) or {})
 
     # Prefer already-fetched Trade Finder scan payload to avoid duplicate API calls.
@@ -2276,13 +2285,16 @@ def _load_ticker_for_view(
                 st.session_state['scroll_to_detail'] = True
             analysis_cache[ticker] = r
             st.session_state['_ticker_analysis_cache'] = analysis_cache
-            _need_mtf = not bool(prefer_chart_fast)
-            if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
-                # Keep navigation deterministic even when live chart fetch is rate-limited.
-                # Detail view still opens and will show explicit "No chart data available".
-                msg = f"No chart data for {ticker} (data provider limit or unavailable)."
-                st.session_state['_ticker_load_error'] = msg
-                st.sidebar.error(msg)
+            # Only call _ensure_ticker_chart_cache if daily data isn't already cached
+            # (scan already populated ticker_data_cache for all scanned tickers)
+            _data_cache = st.session_state.get('ticker_data_cache', {}) or {}
+            _has_daily = (_data_cache.get(ticker, {}) or {}).get('daily') is not None
+            if not _has_daily:
+                _need_mtf = not bool(prefer_chart_fast)
+                if not _ensure_ticker_chart_cache(ticker, include_weekly=_need_mtf, include_monthly=_need_mtf):
+                    msg = f"No chart data for {ticker} (data provider limit or unavailable)."
+                    st.session_state['_ticker_load_error'] = msg
+                    st.sidebar.error(msg)
             return True  # No rerun — current pass will render detail view
 
     cached_analysis = analysis_cache.get(ticker)
@@ -8169,13 +8181,14 @@ def render_scanner_table():
                     st.session_state['_scanner_nav_error'] = str(
                         st.session_state.get('_ticker_load_error', f"Unable to load {row['Ticker']}.")
                     )
-                st.rerun()
+                # No explicit st.rerun() — button click already triggers rerun;
+                # avoiding double-rerun eliminates redundant 279-row table repaint.
 
         # Chart button — opens directly to chart tab
         with cols[1]:
             if st.button("📈", key=f"chart_row_{row['Ticker']}_{global_idx}"):
-                if _open_chart_anywhere(row['Ticker'], warn=True, switch_to_scanner_tab=False):
-                    st.rerun()
+                _open_chart_anywhere(row['Ticker'], warn=True, switch_to_scanner_tab=False)
+                # No explicit st.rerun() — button click already triggers rerun.
 
         # One-click alert button @ major overhead resistance
         with cols[2]:
