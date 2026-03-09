@@ -131,6 +131,13 @@ from exec_logic import (
     is_stale as _is_stale,
     stale_stream_status as _stale_stream_status,
 )
+from exec_dashboard_logic import (
+    build_dashboard_snapshot as _build_dashboard_snapshot_core,
+    evaluate_trade_gate as _evaluate_trade_gate_core,
+    position_posture_summary as _position_posture_summary_core,
+    run_auto_exit_engine as _run_auto_exit_engine_core,
+    scan_health_snapshot as _scan_health_snapshot_core,
+)
 
 # Startup-safe defaults for navigation helpers.
 # If navigation_state cannot import for any reason (missing module, stale hot-reload,
@@ -13079,150 +13086,43 @@ def _is_exec_dashboard_enabled() -> bool:
 # _infer_exec_regime — extracted to exec_logic.py (imported at top)
 # _risk_budget_for_regime — extracted to exec_logic.py (imported at top)
 def _build_dashboard_snapshot() -> DashboardSnapshot:
-    """Create single dashboard source-of-truth snapshot."""
+    """Create single dashboard source-of-truth snapshot.
+    Delegates to exec_dashboard_logic.build_dashboard_snapshot().
+    """
     jm = get_journal()
     bridge = get_bridge()
-    now = time.time()
-    scan_summary = st.session_state.get('scan_results_summary', []) or []
-    market_filter = st.session_state.get('market_filter_data', {}) or {}
-    sector_rotation = st.session_state.get('sector_rotation', {}) or {}
-    earnings_flags = st.session_state.get('earnings_flags', {}) or {}
-
-    regime, confidence = _infer_exec_regime(market_filter, sector_rotation)
-    policy = _risk_budget_for_regime(regime)
-
-    _scan_ts = float(st.session_state.get('_scan_run_ts', 0.0) or 0.0)
-    _find_new_ts = float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0)
-    _tf_ts = 0.0
-    try:
-        _tf_iso = str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '') or '').strip()
-        if _tf_iso:
-            _tf_ts = datetime.strptime(_tf_iso, '%Y-%m-%d %H:%M:%S').timestamp()
-    except Exception:
-        _tf_ts = 0.0
-    _effective_scan_ts = max(_scan_ts, _find_new_ts, _tf_ts)
-
-    return DashboardSnapshot(
-        generated_at=now,
-        generated_at_iso=datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S'),
+    _tf_iso = str((st.session_state.get('trade_finder_results', {}) or {}).get('generated_at_iso', '') or '').strip()
+    return _build_dashboard_snapshot_core(
+        jm=jm,
         watchlist_tickers=bridge.get_watchlist_tickers(),
-        scan_summary=scan_summary,
-        open_trades=jm.get_open_trades(),
-        pending_alerts=jm.get_pending_conditionals(),
+        scan_summary=st.session_state.get('scan_results_summary', []) or [],
+        market_filter=st.session_state.get('market_filter_data', {}) or {},
+        sector_rotation=st.session_state.get('sector_rotation', {}) or {},
+        earnings_flags=st.session_state.get('earnings_flags', {}) or {},
         triggered_alerts=st.session_state.get('triggered_alerts', []) or [],
-        market_filter=market_filter,
-        sector_rotation=sector_rotation,
-        earnings_flags=earnings_flags,
-        scan_ts=_effective_scan_ts,
-        market_ts=float(st.session_state.get('_market_filter_ts', 0.0) or 0.0),
-        sector_ts=float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0),
-        pos_ts=float(st.session_state.get('_position_prices_ts', 0.0) or 0.0),
-        alert_ts=float(st.session_state.get('_alert_check_ts', 0.0) or 0.0),
-        workflow_ts=float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0),
-        workflow_sec=float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0),
-        regime=regime,
-        regime_confidence=confidence,
-        risk_policy=policy,
+        scan_run_ts=float(st.session_state.get('_scan_run_ts', 0.0) or 0.0),
+        find_new_ts=float(st.session_state.get('_find_new_trades_ts', 0.0) or 0.0),
+        trade_finder_iso=_tf_iso,
+        market_filter_ts=float(st.session_state.get('_market_filter_ts', 0.0) or 0.0),
+        sector_rotation_ts=float(st.session_state.get('_sector_rotation_ts', 0.0) or 0.0),
+        position_prices_ts=float(st.session_state.get('_position_prices_ts', 0.0) or 0.0),
+        alert_check_ts=float(st.session_state.get('_alert_check_ts', 0.0) or 0.0),
+        daily_workflow_ts=float(st.session_state.get('_daily_workflow_ts', 0.0) or 0.0),
+        daily_workflow_sec=float(st.session_state.get('_daily_workflow_sec', 0.0) or 0.0),
     )
 
 
 # _normalize_brief_regime — extracted to exec_logic.py (imported at top)
 def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
+    """Single execution authority for whether new trades should be taken now.
+    Delegates to exec_dashboard_logic.evaluate_trade_gate().
     """
-    Single execution authority for whether new trades should be taken now.
-    """
-    vix = float(snap.market_filter.get('vix_close', 0) or 0)
-    spy_ok = bool(snap.market_filter.get('spy_above_200', True))
-
-    stale = _stale_stream_status(snap)
-    stale_count = int(stale["count"])
-    stale_core = bool(stale.get("market", False)) or (bool(stale.get("scan", False)) and bool(stale.get("sector", False)))
-
-    deep_score = 0
-    deep = st.session_state.get('deep_market_analysis') or {}
-    deep_date = str(st.session_state.get('deep_analysis_date', '') or '')
-    brief = st.session_state.get('morning_narrative') or {}
-    brief_date = str(st.session_state.get('morning_narrative_date', '') or '')
-    today = datetime.now().strftime('%Y-%m-%d')
-
-    has_deep = isinstance(deep, dict) and bool(deep) and deep_date == today and ('score' in deep)
-    has_brief = isinstance(brief, dict) and bool(brief) and brief_date == today and bool(str(brief.get('regime', '')).strip())
-
-    if has_deep:
-        deep_score = int(deep.get('score', 0) or 0)
-    brief_regime = _normalize_brief_regime(brief.get('regime', '')) if has_brief else "UNKNOWN"
-
-    aligned = 0
-    compared = 0
-    if has_brief and brief_regime != "UNKNOWN":
-        compared += 1
-        if brief_regime == snap.regime:
-            aligned += 1
-    if has_deep:
-        compared += 1
-        if (deep_score >= 1 and snap.regime == "RISK_ON") or (deep_score <= -1 and snap.regime == "RISK_OFF"):
-            aligned += 1
-        elif deep_score == 0 and snap.regime in {"TRANSITION", "DEFENSIVE"}:
-            aligned += 1
-
-    if compared == 0:
-        model_alignment = "UNAVAILABLE"
-    elif aligned == compared:
-        model_alignment = "ALIGNED"
-    elif aligned == 0:
-        model_alignment = "DIVERGENT"
-    else:
-        model_alignment = "PARTIAL"
-
-    # Base decision from unified regime + volatility
-    if stale_core:
-        status = "NO_TRADE"
-        reason = "Core data is stale (market/scan context). Refresh before opening new trades."
-    elif snap.regime == "RISK_OFF" or vix >= 25:
-        status = "NO_TRADE"
-        reason = f"Risk-off environment (VIX {vix:.1f}). Preserve capital."
-    elif snap.regime in {"DEFENSIVE", "TRANSITION"} or vix >= 20 or not spy_ok:
-        status = "TRADE_LIGHT"
-        reason = f"Mixed/cautious regime with elevated risk (VIX {vix:.1f})."
-    else:
-        status = "FAVOR_TRADING"
-        reason = f"Benign risk backdrop and supportive trend (VIX {vix:.1f})."
-
-    # Downgrade one notch when models diverge materially.
-    if model_alignment == "DIVERGENT":
-        if status == "FAVOR_TRADING":
-            status = "TRADE_LIGHT"
-            reason += " Downgraded due to model divergence."
-        elif status == "TRADE_LIGHT":
-            status = "NO_TRADE"
-            reason += " Downgraded due to model divergence."
-
-    if status == "NO_TRADE":
-        stale_gate = reason.startswith("Core data is stale")
-        return TradeGateDecision(
-            status=status,
-            label=("🟠 DATA STALE — REFRESH REQUIRED" if stale_gate else "🛑 TOO RISKY TO TRADE"),
-            allow_new_trades=False,
-            severity=("warning" if stale_gate else "danger"),
-            reason=reason,
-            model_alignment=model_alignment,
-        )
-    if status == "TRADE_LIGHT":
-        return TradeGateDecision(
-            status=status,
-            label="🟡 TRADE LIGHT (SELECTIVE)",
-            allow_new_trades=True,
-            severity="warning",
-            reason=reason,
-            model_alignment=model_alignment,
-        )
-    return TradeGateDecision(
-        status=status,
-        label="🟢 MARKET FAVORS TRADING",
-        allow_new_trades=True,
-        severity="success",
-        reason=reason,
-        model_alignment=model_alignment,
+    return _evaluate_trade_gate_core(
+        snap,
+        deep_analysis=st.session_state.get('deep_market_analysis') or {},
+        deep_analysis_date=str(st.session_state.get('deep_analysis_date', '') or ''),
+        morning_narrative=st.session_state.get('morning_narrative') or {},
+        morning_narrative_date=str(st.session_state.get('morning_narrative_date', '') or ''),
     )
 
 
@@ -13230,55 +13130,11 @@ def _evaluate_trade_gate(snap: DashboardSnapshot) -> TradeGateDecision:
 # _classify_trade_candidate_color — extracted to exec_logic.py (imported at top)
 
 def _position_posture_summary(snap: DashboardSnapshot, gate: TradeGateDecision) -> Dict[str, Any]:
+    """Clear macro guidance for EXISTING positions.
+    Delegates to exec_dashboard_logic.position_posture_summary().
     """
-    Clear macro guidance for EXISTING positions, separate from new-entry gate status.
-    """
-    stop_breaches = 0
-    drawdown_count = 0
-    for trade in (snap.open_trades or []):
-        ticker = str(trade.get('ticker', '')).upper().strip()
-        entry = float(trade.get('entry_price', 0) or 0)
-        stop = float(trade.get('current_stop', trade.get('initial_stop', 0)) or 0)
-        current = float(st.session_state.get('_position_prices', {}).get(ticker) or entry)
-        pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
-        if stop > 0 and current <= stop:
-            stop_breaches += 1
-        elif pnl_pct <= -3:
-            drawdown_count += 1
-
-    vix = float(snap.market_filter.get('vix_close', 0) or 0)
-    severe_macro = snap.regime == "RISK_OFF" or vix >= 30
-
-    if gate.status == "NO_TRADE":
-        if severe_macro:
-            headline = "🛑 Macro Posture: Defensive hold/reduce risk"
-            summary = "No new trades. Keep winners with disciplined stops; reduce weakest positions into strength."
-            severity = "danger"
-        else:
-            headline = "🛡️ Macro Posture: Hold existing positions only"
-            summary = "No new trades. Manage open positions with stops; do not exit everything just because entry gate is closed."
-            severity = "warning"
-    elif gate.status == "TRADE_LIGHT":
-        headline = "🟡 Macro Posture: Hold and be selective"
-        summary = "Maintain current positions; add risk only on top-quality setups and smaller size."
-        severity = "warning"
-    else:
-        headline = "🟢 Macro Posture: Market supports holding and selective adds"
-        summary = "Trend backdrop is supportive. Hold existing positions and allow new entries that meet rules."
-        severity = "success"
-
-    if stop_breaches > 0:
-        summary += f" Immediate action: {stop_breaches} position(s) at/below stop."
-    elif drawdown_count > 0:
-        summary += f" Watchlist: {drawdown_count} position(s) in >3% drawdown."
-
-    return {
-        "headline": headline,
-        "summary": summary,
-        "severity": severity,
-        "stop_breaches": stop_breaches,
-        "drawdowns": drawdown_count,
-    }
+    pos_prices = st.session_state.get('_position_prices', {}) or {}
+    return _position_posture_summary_core(snap, gate, pos_prices)
 
 
 def _render_decision_contract(
@@ -13406,34 +13262,13 @@ def _render_decision_contract(
 # _is_stale — extracted to exec_logic.py (imported at top)
 # _stale_stream_status — extracted to exec_logic.py (imported at top)
 def _scan_health_snapshot() -> Dict[str, float]:
-    """Compute scan telemetry from audit events + session metrics."""
-    events = _get_audit_events()
-    scan_done = [e for e in events if e.get('action') == 'SCAN_DONE']
-    scan_start = [e for e in events if e.get('action') == 'SCAN_START']
-
-    last_mode = ""
-    last_count = 0
-    if scan_done:
-        details = str(scan_done[0].get('details', ''))
-        m_mode = re.search(r'mode=([a-z_]+)', details)
-        m_count = re.search(r'scanned=(\d+)', details)
-        if m_mode:
-            last_mode = m_mode.group(1)
-        if m_count:
-            last_count = int(m_count.group(1))
-
-    dur_hist = st.session_state.get('_scan_duration_hist', [])
-    last_dur = float(dur_hist[-1]) if dur_hist else 0.0
-    avg_dur = (sum(dur_hist) / len(dur_hist)) if dur_hist else 0.0
-
-    return {
-        'total_scans_logged': float(len(scan_done)),
-        'scan_starts_logged': float(len(scan_start)),
-        'last_scan_count': float(last_count),
-        'last_scan_duration': last_dur,
-        'avg_scan_duration': avg_dur,
-        'last_scan_mode': last_mode,
-    }
+    """Compute scan telemetry from audit events + session metrics.
+    Delegates to exec_dashboard_logic.scan_health_snapshot().
+    """
+    return _scan_health_snapshot_core(
+        audit_events=_get_audit_events(),
+        scan_duration_hist=st.session_state.get('_scan_duration_hist', []) or [],
+    )
 
 
 # _recommendation_score — extracted to exec_logic.py (imported at top)
@@ -13481,19 +13316,16 @@ def _build_pending_alert_rows(conditionals: List[Dict[str, Any]]) -> List[Dict[s
 
 
 def _run_auto_exit_engine(jm: JournalManager, current_prices: Dict[str, float], source: str = "manual") -> Dict[str, Any]:
+    """Evaluate open positions against stop/target and auto-close breaches.
+    Delegates core logic to exec_dashboard_logic.run_auto_exit_engine();
+    handles session-state, audit, and perf-metric side-effects here.
     """
-    Evaluate open positions against stop/target and auto-close breaches.
-    Returns summary for UI + telemetry.
-    """
-    if not current_prices:
-        return {'checked': 0, 'triggered': 0, 'closed': 0, 'events': []}
-
-    open_trades = jm.get_open_trades()
-    checked = len(open_trades)
-    events = jm.check_stops(current_prices, auto_execute=True)
-    closed = len(events)
-    stop_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'stop_loss')
-    target_hits = sum(1 for e in events if str(e.get('trigger', '')) == 'target_hit')
+    result = _run_auto_exit_engine_core(jm, current_prices)
+    checked = result["checked"]
+    closed = result["closed"]
+    stop_hits = result["stop_hits"]
+    target_hits = result["target_hits"]
+    events = result["events"]
 
     st.session_state['_auto_exit_last_ts'] = time.time()
     st.session_state['_auto_exit_last_count'] = closed
