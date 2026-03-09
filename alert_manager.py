@@ -1,4 +1,4 @@
-Alert manager · PY
+
 """
 TTA v2 Alert Manager — Centralized Alert & Conditional Entry Logic
 ===================================================================
