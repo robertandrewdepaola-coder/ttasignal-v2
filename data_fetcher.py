@@ -25,6 +25,7 @@ import requests as _requests_lib
 import logging
 import hashlib
 import os
+import json
 import threading
 from collections import deque
 from earnings_utils import select_earnings_dates
@@ -1621,20 +1622,118 @@ def fetch_batch_earnings_flags(tickers: list, days_ahead: int = 14) -> Dict[str,
     return flags
 
 
+# =============================================================================
+# PERSISTENT SECTOR CACHE — survives across scans / app restarts
+# =============================================================================
+# Lookup chain: file cache → yfinance API → static fallback
+# Once a sector is fetched from yfinance, it's saved to disk permanently.
+
+_SECTOR_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sector_cache.json')
+_sector_file_cache: Dict[str, str] = {}  # in-memory mirror of the JSON file
+_sector_file_lock = threading.Lock()
+_sector_file_loaded = False
+
+
+def _load_sector_cache() -> None:
+    """Load sector_cache.json into memory (once per process)."""
+    global _sector_file_cache, _sector_file_loaded
+    if _sector_file_loaded:
+        return
+    with _sector_file_lock:
+        if _sector_file_loaded:
+            return
+        try:
+            if os.path.exists(_SECTOR_CACHE_FILE):
+                with open(_SECTOR_CACHE_FILE, 'r') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    _sector_file_cache = {k.upper(): v for k, v in data.items()}
+        except Exception:
+            _sector_file_cache = {}
+        _sector_file_loaded = True
+
+
+def _save_sector_to_cache(ticker: str, sector: str) -> None:
+    """Persist a newly-discovered sector to the JSON file."""
+    ticker = ticker.upper()
+    with _sector_file_lock:
+        _sector_file_cache[ticker] = sector
+        try:
+            with open(_SECTOR_CACHE_FILE, 'w') as f:
+                json.dump(_sector_file_cache, f, indent=1, sort_keys=True)
+        except Exception:
+            pass  # non-critical — will retry next time
+
+
 def get_ticker_sector(ticker: str) -> Optional[str]:
-    """Get sector for a ticker — with static fallback when yfinance is rate-limited."""
-    # Try yfinance first
+    """
+    Get sector for a ticker using a 3-tier lookup:
+      1. Persistent file cache (sector_cache.json) — instant, no API call
+      2. yfinance API — saves result to file cache on success
+      3. Static fallback map — last resort for common tickers
+    """
+    ticker_upper = ticker.upper()
+    _load_sector_cache()
+
+    # 1. File cache (fastest — no API needed)
+    cached = _sector_file_cache.get(ticker_upper)
+    if cached:
+        return cached
+
+    # 2. yfinance API
     info = fetch_ticker_info(ticker)
     sector = info.get('sector')
     if sector:
+        _save_sector_to_cache(ticker_upper, sector)
         return sector
 
-    # Fallback: static sector map for common tickers
-    return _SECTOR_FALLBACK.get(ticker.upper())
+    # 3. Static fallback
+    fallback = _SECTOR_FALLBACK.get(ticker_upper)
+    if fallback:
+        # Also persist the fallback so next scan is instant
+        _save_sector_to_cache(ticker_upper, fallback)
+        return fallback
+
+    return None
+
+
+def bulk_prefetch_sectors(tickers: List[str]) -> Dict[str, str]:
+    """
+    Batch-resolve sectors for a list of tickers.
+    Skips any ticker already in the persistent cache.
+    Returns dict of {ticker: sector} for all resolved tickers.
+    """
+    _load_sector_cache()
+    resolved: Dict[str, str] = {}
+    to_fetch: List[str] = []
+
+    for t in tickers:
+        t_upper = t.upper()
+        cached = _sector_file_cache.get(t_upper) or _SECTOR_FALLBACK.get(t_upper)
+        if cached:
+            resolved[t_upper] = cached
+            if t_upper not in _sector_file_cache:
+                _save_sector_to_cache(t_upper, cached)
+        else:
+            to_fetch.append(t)
+
+    # Fetch remaining from yfinance — one at a time but only the uncached ones
+    for t in to_fetch:
+        t_upper = t.upper()
+        try:
+            info = fetch_ticker_info(t)
+            sector = info.get('sector')
+            if sector:
+                _save_sector_to_cache(t_upper, sector)
+                resolved[t_upper] = sector
+        except Exception:
+            pass
+
+    return resolved
 
 
 # Static sector map — covers top ~150 most traded US tickers
-# Used when yfinance is rate-limited or returns no data
+# Used as LAST RESORT when yfinance is rate-limited and file cache is empty
 _SECTOR_FALLBACK = {
     # Technology
     'AAPL': 'Technology', 'MSFT': 'Technology', 'NVDA': 'Technology', 'GOOGL': 'Technology',
@@ -1697,6 +1796,20 @@ _SECTOR_FALLBACK = {
     'LIN': 'Basic Materials', 'APD': 'Basic Materials', 'SHW': 'Basic Materials',
     'FCX': 'Basic Materials', 'NEM': 'Basic Materials', 'NUE': 'Basic Materials',
     'GOLD': 'Basic Materials', 'X': 'Basic Materials', 'CLF': 'Basic Materials',
+    'AU': 'Basic Materials', 'AEM': 'Basic Materials', 'KGC': 'Basic Materials',
+    'B': 'Basic Materials', 'WPM': 'Basic Materials', 'FNV': 'Basic Materials',
+    'RGLD': 'Basic Materials', 'AGI': 'Basic Materials', 'HMY': 'Basic Materials',
+    'PAAS': 'Basic Materials', 'AG': 'Basic Materials', 'CDE': 'Basic Materials',
+    'HL': 'Basic Materials', 'MAG': 'Basic Materials', 'SSRM': 'Basic Materials',
+    'BTG': 'Basic Materials', 'EGO': 'Basic Materials', 'IAG': 'Basic Materials',
+    'NGD': 'Basic Materials', 'SA': 'Basic Materials', 'OR': 'Basic Materials',
+    'SCCO': 'Basic Materials', 'TECK': 'Basic Materials', 'RIO': 'Basic Materials',
+    'BHP': 'Basic Materials', 'VALE': 'Basic Materials', 'AA': 'Basic Materials',
+    'STLD': 'Basic Materials', 'RS': 'Basic Materials', 'VMC': 'Basic Materials',
+    'MLM': 'Basic Materials', 'ECL': 'Basic Materials', 'DD': 'Basic Materials',
+    'DOW': 'Basic Materials', 'CE': 'Basic Materials', 'EMN': 'Basic Materials',
+    'PPG': 'Basic Materials', 'ALB': 'Basic Materials', 'CF': 'Basic Materials',
+    'MOS': 'Basic Materials', 'IPI': 'Basic Materials', 'CENX': 'Basic Materials',
     # Utilities
     'NEE': 'Utilities', 'DUK': 'Utilities', 'SO': 'Utilities', 'D': 'Utilities',
     'AEP': 'Utilities', 'SRE': 'Utilities', 'EXC': 'Utilities', 'XEL': 'Utilities',
