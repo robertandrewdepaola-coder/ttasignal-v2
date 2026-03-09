@@ -107,12 +107,12 @@
     "quality_grade": "?",
     "created_date": "2026-02-25",
     "created_at": "2026-02-25T04:10:09.003952+00:00",
-    "updated_at": "2026-02-25T04:10:09.003952+00:00",
+    "updated_at": "2026-03-09T21:16:37.804452+00:00",
     "expires_date": "2026-03-27",
-    "status": "PENDING",
-    "triggered_date": "",
-    "triggered_at": "",
-    "triggered_price": 0,
-    "triggered_volume_ratio": 0
+    "status": "TRIGGERED",
+    "triggered_date": "2026-03-09",
+    "triggered_at": "2026-03-09T21:16:37.804444+00:00",
+    "triggered_price": 264.3500061035156,
+    "triggered_volume_ratio": 3.2425223555206277
   }
 ]
