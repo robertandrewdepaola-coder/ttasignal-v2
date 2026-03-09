@@ -642,7 +642,7 @@ def generate_recommendation(signal: EntrySignal,
     """
     Generate final recommendation based on all signal types and context.
 
-    Priority: PRIMARY > AO_CONFIRMATION > RE_ENTRY > LATE_ENTRY > WATCH > SKIP
+    Priority: PRIMARY > AO_CONFIRMATION > RE_ENTRY > LATE_ENTRY > MTF_PULLBACK > WATCH > SKIP
 
     Returns dict with: signal_type, recommendation, summary, conviction (1-10)
 
@@ -966,6 +966,57 @@ def generate_recommendation(signal: EntrySignal,
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
             result['conviction'] = _q_refine(2, 3, q_score)
+        return _apply_signal_guards(result)
+
+    # --- MTF PULLBACK ENTRY ---
+    # Daily MACD just crossed bullish from oversold (below zero line) while
+    # weekly + monthly MACD are both positive.  This is a high-quality pullback
+    # buy in an established multi-timeframe uptrend.  AO confirmation is NOT
+    # required — the higher-timeframe trend alignment substitutes for it.
+    _daily_cross = bool(signal.macd.get('cross_recent', False))
+    _daily_macd_val = float(signal.macd.get('macd', 0) or 0)
+    _daily_hist = float(signal.macd.get('histogram', 0) or 0)
+    _cross_bars = int(signal.macd.get('cross_bars_ago', 0) or 0)
+    # "From oversold" = MACD line is still near zero (just crossed up from negative)
+    # or histogram is small-positive (early days of the cross).
+    _from_oversold = _daily_cross and (_daily_macd_val <= 0.5 or _daily_hist < 1.0)
+    # Also accept when MACD crossed recently and is still below its own signal line
+    # by a tiny amount — histogram barely positive.
+    if not _from_oversold and _daily_cross and _cross_bars <= 3:
+        _from_oversold = True  # Any fresh cross within 3 bars qualifies
+
+    if _from_oversold and weekly_bullish and monthly_bullish:
+        result['signal_type'] = 'MTF_PULLBACK'
+        _mtf_note = f"Daily MACD cross from oversold ({_cross_bars}d ago, MACD={_daily_macd_val:.2f})"
+
+        if grade in ['A', 'B']:
+            result['recommendation'] = 'BUY (PULLBACK)'
+            result['summary'] = (
+                f"🔄 {_mtf_note}, Weekly + Monthly bullish, Quality {grade}"
+            )
+            result['conviction'] = _q_refine(6, 8, q_score)
+        elif grade in ['C']:
+            result['recommendation'] = 'WATCH (PULLBACK)'
+            result['summary'] = (
+                f"🔄 {_mtf_note}, Weekly + Monthly bullish, Quality {grade}"
+            )
+            result['conviction'] = _q_refine(4, 6, q_score)
+        else:
+            result['recommendation'] = 'WATCH'
+            result['summary'] = f"🔄 {_mtf_note}, Quality {grade}"
+            result['conviction'] = _q_refine(2, 4, q_score)
+        return _apply_signal_guards(result)
+
+    # Also catch: daily MACD just crossed from oversold + weekly bullish (no monthly)
+    # — still worth a WATCH, not a SKIP.
+    if _from_oversold and weekly_bullish and not monthly_bullish:
+        result['signal_type'] = 'MTF_PULLBACK'
+        result['recommendation'] = 'WATCH (PULLBACK)'
+        result['summary'] = (
+            f"🔄 Daily MACD cross from oversold, Weekly bullish but Monthly not confirmed, "
+            f"Quality {grade}{monthly_warning}"
+        )
+        result['conviction'] = _q_refine(3, 5, q_score) if grade in ['A', 'B'] else _q_refine(2, 3, q_score)
         return _apply_signal_guards(result)
 
     # --- NO SIGNAL ---
