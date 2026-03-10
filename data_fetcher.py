@@ -2951,30 +2951,57 @@ def _batch_download_timeframe(
                 threads=True,  # yfinance internal threading for this batch
             )
             if dl is None or dl.empty:
+                print(f"[data_fetcher] Batch {cache_suffix} download returned empty for chunk of {len(chunk)} tickers")
                 continue
-            dl = normalize_columns(dl)
+
+            # IMPORTANT: Do NOT call normalize_columns on the batch result.
+            # For multi-ticker downloads, yf.download returns a MultiIndex
+            # with (ticker, field) columns.  normalize_columns collapses
+            # MultiIndex via get_level_values(0), which destroys the ticker
+            # grouping and makes every ticker unextractable.
+            # Instead, normalize each individual ticker DataFrame AFTER extraction.
 
             for tk in chunk:
                 try:
+                    df = None
                     # Single ticker returns flat columns; multi returns MultiIndex
                     if len(chunk) == 1:
-                        if 'Close' in dl.columns:
-                            df = dl.copy()
-                        else:
+                        df = normalize_columns(dl.copy())
+                        if df is None or 'Close' not in df.columns:
                             continue
                     elif isinstance(dl.columns, pd.MultiIndex):
-                        # Try (ticker, field) grouping first
+                        # yf.download with group_by="ticker" returns (Ticker, Field)
                         lvl0 = set(str(x) for x in dl.columns.get_level_values(0))
+                        lvl1 = set(str(x) for x in dl.columns.get_level_values(1)) if dl.columns.nlevels > 1 else set()
+
                         if tk in lvl0:
-                            df = dl[tk].copy()
-                        elif any((tk, c) in dl.columns for c in ['Close', 'close']):
-                            cols = [c for c in ['Open', 'High', 'Low', 'Close', 'Volume']
-                                    if (tk, c) in dl.columns]
-                            df = dl[[( tk, c) for c in cols]].droplevel(0, axis=1)
+                            # Level 0 is ticker → (Ticker, Field) layout
+                            df = normalize_columns(dl[tk].copy())
+                        elif tk in lvl1:
+                            # Level 0 is field, level 1 is ticker → (Field, Ticker) layout
+                            # (yfinance sometimes swaps levels)
+                            cols = [(f, tk) for f in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close',
+                                                       'open', 'high', 'low', 'close', 'volume', 'adj close']
+                                    if (f, tk) in dl.columns]
+                            if cols:
+                                df = dl[cols].copy()
+                                df.columns = df.columns.get_level_values(0)
+                                df = normalize_columns(df)
                         else:
+                            # Try case-insensitive match
+                            lvl0_upper = {x.upper(): x for x in lvl0}
+                            if tk.upper() in lvl0_upper:
+                                df = normalize_columns(dl[lvl0_upper[tk.upper()]].copy())
+                            else:
+                                continue
+
+                        if df is None or df.empty or 'Close' not in df.columns:
                             continue
                     else:
-                        continue
+                        # Flat columns, single ticker case missed above
+                        df = normalize_columns(dl.copy())
+                        if df is None or 'Close' not in df.columns:
+                            continue
 
                     if df is not None and not df.empty and 'Close' in df.columns:
                         df = df.dropna(subset=['Close'])
@@ -2983,8 +3010,8 @@ def _batch_download_timeframe(
                             ttl = {'daily': 15 * 60, 'weekly': 2 * 60 * 60, 'monthly': 6 * 60 * 60}.get(cache_suffix, 300)
                             _cache.set(cache_key, df, ttl_sec=ttl)
                             out[tk] = df
-                except Exception:
-                    pass  # Individual ticker extraction failed; will fallback below
+                except Exception as _ex:
+                    print(f"[data_fetcher] Batch {cache_suffix} extract failed for {tk}: {_ex}")
 
             _mark_fetch_success(scope)
         except Exception as e:
