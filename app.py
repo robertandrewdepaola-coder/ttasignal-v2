@@ -8017,16 +8017,44 @@ def render_scanner_table():
         'RE-ENTRY': 6, 'RE-ENTRY (CAUTIOUS)': 5,
         'WATCH (AO)': 4, 'WATCH (AO CONFIRM)': 4,
         'WATCH (PULLBACK)': 4,
-        'WATCH': 3, 'WATCH (RE-ENTRY)': 3, 'WATCH (LATE)': 3,
-        'WAIT': 2, 'WAIT (D)': 2,
+        'WATCH (RE-ENTRY)': 3,
+        'WATCH': 3, 'WATCH (LATE)': 3,
+        'WAIT': 2, 'WAIT (D)': 2, 'WAIT (M-AO)': 2,
+        'WAIT (ZONE)': 2, 'WATCH (STAGE 4)': 1,
         'SKIP': 0,
     }
+
+    def _rank_rec(rec_str: str) -> int:
+        """Resolve recommendation string to sort rank, handling dynamic names."""
+        r = _rec_rank.get(rec_str)
+        if r is not None:
+            return r
+        # Handle dynamic names like 'LATE ENTRY (+3d)', 'WATCH (LATE +3d)'
+        base = rec_str.split(' (+')[0]  # strip (+Nd) suffix
+        r = _rec_rank.get(base)
+        if r is not None:
+            return r
+        # Keyword-based fallback
+        ru = rec_str.upper()
+        if 'STRONG BUY' in ru:
+            return 10
+        if 'BUY' in ru and 'WATCH' not in ru and 'WAIT' not in ru:
+            return 7
+        if 'LATE ENTRY' in ru:
+            return 5
+        if 'RE-ENTRY' in ru and 'WATCH' not in ru:
+            return 6
+        if 'WATCH' in ru:
+            return 3
+        if 'WAIT' in ru:
+            return 2
+        return 0
 
     # Apply sort
     if sort_by == "Signal Strength ↓":
         filtered.sort(key=lambda r: (
             0 if r['Ticker'] in fav_tickers else 1,
-            -_rec_rank.get(r['Rec'].split(' (+')[0], 5 if 'LATE ENTRY' in r['Rec'] else 0),
+            -_rank_rec(r['Rec']),
             -(int(r['Conv'].split('/')[0]) if '/' in r['Conv'] else 0),
         ))
     elif sort_by == "Conviction ↓":
