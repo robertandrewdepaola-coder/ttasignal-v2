@@ -2935,7 +2935,11 @@ def _batch_download_timeframe(
         chunk = remaining[i:i + chunk_size]
         scope = f"batch:{cache_suffix}:{i // chunk_size}"
         try:
-            if not _governed_request_acquire(scope):
+            # ignore_cooldown=True: batch scan MUST wait for the governor
+            # rather than silently skipping.  Skipping an entire timeframe
+            # (weekly/monthly) leaves every ticker without higher-TF data,
+            # which cascades into missing MACD columns and broken signals.
+            if not _governed_request_acquire(scope, ignore_cooldown=True):
                 continue
             dl = yf.download(
                 tickers=" ".join(chunk),
@@ -2986,18 +2990,25 @@ def _batch_download_timeframe(
         except Exception as e:
             if _is_rate_limit_error(e):
                 _register_rate_limit(scope, e)
-                break
+                # Wait and retry rather than abandoning all remaining chunks.
+                # Losing weekly/monthly data for all tickers is worse than a delay.
+                time.sleep(5)
+                continue
             print(f"[data_fetcher] Batch {cache_suffix} download error ({len(chunk)} tickers): {e}")
 
-    # Fallback: individually fetch any tickers that the batch missed
+    # Fallback: individually fetch any tickers that the batch missed.
+    # Use ignore_cooldown=True to wait patiently rather than skip.
     fetch_fn = {'daily': fetch_daily, 'weekly': fetch_weekly, 'monthly': fetch_monthly}.get(cache_suffix)
     if fetch_fn:
-        for tk in remaining:
-            if out[tk] is None:
-                try:
-                    out[tk] = fetch_fn(tk)
-                except Exception:
-                    pass
+        _missed = [tk for tk in remaining if out[tk] is None]
+        if _missed:
+            print(f"[data_fetcher] Fallback: {len(_missed)} tickers missed in {cache_suffix} batch, fetching individually")
+        for tk in _missed:
+            try:
+                _governed_request_acquire(f"fallback:{cache_suffix}:{tk}", ignore_cooldown=True)
+                out[tk] = fetch_fn(tk)
+            except Exception:
+                pass
 
     return out
 
