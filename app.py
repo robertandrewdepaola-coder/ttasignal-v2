@@ -15044,6 +15044,28 @@ def main():
             if st.session_state.get('selected_analysis'):
                 st.divider()
                 render_detail_view()
+            # Scroll to detail panel when chart/ticker button clicked within Scanner tab.
+            # The flag is set by _load_ticker_for_view; consume it once to inject scroll JS.
+            if st.session_state.pop('scroll_to_detail', False):
+                import streamlit.components.v1 as _scroll_comp
+                _scroll_comp.html("""
+                    <script>
+                    (function() {
+                        var doc = window.parent.document;
+                        var attempts = 0;
+                        var timer = setInterval(function() {
+                            attempts++;
+                            var anchor = doc.getElementById('detail-anchor');
+                            if (anchor) {
+                                anchor.scrollIntoView({behavior: 'smooth', block: 'start'});
+                                clearInterval(timer);
+                            } else if (attempts > 40) {
+                                clearInterval(timer);
+                            }
+                        }, 60);
+                    })();
+                    </script>
+                """, height=0)
         with tab_alerts:
             _render_alerts_panel()
         with tab_positions:
