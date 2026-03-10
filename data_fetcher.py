@@ -1667,10 +1667,14 @@ def _save_sector_to_cache(ticker: str, sector: str) -> None:
 
 def get_ticker_sector(ticker: str) -> Optional[str]:
     """
-    Get sector for a ticker using a 3-tier lookup:
+    Get sector for a ticker using a 4-tier lookup:
       1. Persistent file cache (sector_cache.json) — instant, no API call
-      2. yfinance API — saves result to file cache on success
-      3. Static fallback map — last resort for common tickers
+      2. Static fallback map — instant, no API call
+      3. yfinance API — saves result to file cache on success
+      4. None — truly unknown ticker
+
+    Static fallback is checked BEFORE the API so that known tickers
+    never waste a rate-limited API slot on sector lookups.
     """
     ticker_upper = ticker.upper()
     _load_sector_cache()
@@ -1680,19 +1684,18 @@ def get_ticker_sector(ticker: str) -> Optional[str]:
     if cached:
         return cached
 
-    # 2. yfinance API
+    # 2. Static fallback (also instant — check BEFORE burning an API call)
+    fallback = _SECTOR_FALLBACK.get(ticker_upper)
+    if fallback:
+        _save_sector_to_cache(ticker_upper, fallback)
+        return fallback
+
+    # 3. yfinance API (only for tickers not in cache or fallback)
     info = fetch_ticker_info(ticker)
     sector = info.get('sector')
     if sector:
         _save_sector_to_cache(ticker_upper, sector)
         return sector
-
-    # 3. Static fallback
-    fallback = _SECTOR_FALLBACK.get(ticker_upper)
-    if fallback:
-        # Also persist the fallback so next scan is instant
-        _save_sector_to_cache(ticker_upper, fallback)
-        return fallback
 
     return None
 
@@ -1700,7 +1703,8 @@ def get_ticker_sector(ticker: str) -> Optional[str]:
 def bulk_prefetch_sectors(tickers: List[str]) -> Dict[str, str]:
     """
     Batch-resolve sectors for a list of tickers.
-    Skips any ticker already in the persistent cache.
+    Skips any ticker already in the persistent cache or static fallback.
+    Uses yf.Tickers for efficient batch fetching of uncached tickers.
     Returns dict of {ticker: sector} for all resolved tickers.
     """
     _load_sector_cache()
@@ -1717,17 +1721,42 @@ def bulk_prefetch_sectors(tickers: List[str]) -> Dict[str, str]:
         else:
             to_fetch.append(t)
 
-    # Fetch remaining from yfinance — one at a time but only the uncached ones
-    for t in to_fetch:
-        t_upper = t.upper()
+    if not to_fetch:
+        return resolved
+
+    # Batch fetch using yf.Tickers — much more efficient than individual calls.
+    # Process in small chunks to avoid overwhelming yfinance.
+    _chunk_size = 10
+    for ci in range(0, len(to_fetch), _chunk_size):
+        chunk = to_fetch[ci:ci + _chunk_size]
         try:
-            info = fetch_ticker_info(t)
-            sector = info.get('sector')
-            if sector:
-                _save_sector_to_cache(t_upper, sector)
-                resolved[t_upper] = sector
-        except Exception:
-            pass
+            # Wait for governor but don't skip — sector data is critical
+            _governed_request_acquire(f"sector_batch:{ci}", ignore_cooldown=True)
+            tickers_obj = yf.Tickers(" ".join(chunk))
+            for t in chunk:
+                t_upper = t.upper()
+                try:
+                    tk_obj = tickers_obj.tickers.get(t_upper) or tickers_obj.tickers.get(t)
+                    if tk_obj is None:
+                        continue
+                    info = tk_obj.info
+                    if info:
+                        sector = info.get('sector')
+                        if sector:
+                            _save_sector_to_cache(t_upper, sector)
+                            resolved[t_upper] = sector
+                except Exception:
+                    pass
+            _mark_fetch_success(f"sector_batch:{ci}")
+            # Small pause between chunks to be polite to the API
+            if ci + _chunk_size < len(to_fetch):
+                time.sleep(0.5)
+        except Exception as e:
+            if _is_rate_limit_error(e):
+                _register_rate_limit(f"sector_batch:{ci}", e)
+                time.sleep(3)
+            else:
+                print(f"[data_fetcher] Sector batch error: {e}")
 
     return resolved
 
