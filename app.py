@@ -2695,7 +2695,9 @@ def _run_scan(mode='all'):
                 reentry_bars_ago = r.late_entry.get('days_since_cross', 0)
 
             # Sector phase for filtering persistence
-            sector_name = ticker_sectors.get(r.ticker, '')
+            sector_name = _canonicalize_sector_name(
+                str(ticker_sectors.get(r.ticker, '') or ''), sector_rotation
+            )
             sector_info = sector_rotation.get(sector_name, {})
             sector_phase = sector_info.get('phase', '')
 
@@ -8454,10 +8456,11 @@ def _build_rows_from_analysis(results, jm) -> list:
             status = "👀"
 
         # Sector rotation — use phase for color (LEADING/EMERGING/FADING/LAGGING)
-        sector = _resolve_sector(r.ticker)
+        sector_raw = _resolve_sector(r.ticker)
+        sector = _canonicalize_sector_name(sector_raw, sector_rotation)
         sector_info = sector_rotation.get(sector, {})
         sector_phase = sector_info.get('phase', '')
-        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        sector_short = sector_info.get('short_name', '') or (sector[:4] if sector else '')
         if sector_phase == 'LEADING':
             sector_dot = f"🟢 {sector_short}"
         elif sector_phase == 'EMERGING':
@@ -8624,14 +8627,15 @@ def _build_rows_from_summary(summary, jm) -> list:
             status = "👀"
 
         # Sector rotation — prefer persisted phase, fallback to runtime lookup
-        sector = _resolve_sector(ticker, s.get('sector', ''))
+        sector_raw = _resolve_sector(ticker, s.get('sector', ''))
+        sector = _canonicalize_sector_name(sector_raw, sector_rotation)
         sector_phase = s.get('sector_phase', '')  # Persisted from scan
         if not sector_phase:
             # Fallback to runtime sector_rotation (may be empty after page refresh)
             sector_info = sector_rotation.get(sector, {})
             sector_phase = sector_info.get('phase', '')
         sector_info = sector_rotation.get(sector, {})
-        sector_short = sector_info.get('short_name', sector[:4] if sector else '')
+        sector_short = sector_info.get('short_name', '') or (sector[:4] if sector else '')
         if sector_phase == 'LEADING':
             sector_dot = f"🟢 {sector_short}"
         elif sector_phase == 'EMERGING':
