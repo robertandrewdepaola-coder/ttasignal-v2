@@ -842,6 +842,36 @@ def generate_recommendation(signal: EntrySignal,
             delta -= 1
             modifiers.append(f"Near resistance ({dist:.1f}%) ⚠️")
 
+        # ── 6. MACD overbought / momentum fading guard ──────────────
+        # When daily MACD is elevated above zero AND the histogram is
+        # shrinking (momentum fading), this is NOT a fresh entry — it's
+        # an extended move losing steam.  Downgrade buy-type signals.
+        _d_macd = signal.macd or {}
+        _d_macd_val = float(_d_macd.get('macd', 0) or 0)
+        _d_hist = float(_d_macd.get('histogram', 0) or 0)
+        # 'weakening' is True when histogram is shrinking while MACD still bullish
+        _momentum_fading = bool(_d_macd.get('weakening', False))
+
+        # Overbought threshold: MACD well above zero + momentum fading
+        if _d_macd_val > 1.5 and _momentum_fading:
+            delta -= 2
+            modifiers.append(f"MACD overbought ({_d_macd_val:.1f}), momentum fading ⚠️")
+            rec_u = str(out.get('recommendation', '')).upper()
+            # Hard downgrade: BUY/ENTRY signals become WATCH when overbought
+            is_buy = (
+                ('BUY' in rec_u or 'ENTRY' in rec_u)
+                and 'WATCH' not in rec_u
+                and 'WAIT' not in rec_u
+                and 'SKIP' not in rec_u
+            )
+            if is_buy:
+                out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
+                out['overbought_downgrade'] = True
+        elif _d_macd_val > 2.0:
+            # MACD very elevated even if histogram not yet shrinking — caution
+            delta -= 1
+            modifiers.append(f"MACD extended ({_d_macd_val:.1f}) ⚠️")
+
         # ── Apply with bounds ────────────────────────────────────────
         if delta != 0 or modifiers:
             original = out['conviction']
@@ -943,9 +973,11 @@ def generate_recommendation(signal: EntrySignal,
             result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Weekly bullish, Quality {grade}{monthly_warning}"
             result['conviction'] = _q_refine(5, 7, q_score)
         elif grade in ['A', 'B']:
-            result['recommendation'] = 'RE-ENTRY'
-            result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(4, 6, q_score)
+            # No weekly confirmation — WATCH not green RE-ENTRY.
+            # Re-entering an established trend without weekly backing is risky.
+            result['recommendation'] = 'WATCH (RE-ENTRY)'
+            result['summary'] = f"🟡 Re-Entry ({bars_ago}d ago), Quality {grade}, no Weekly confirmation{monthly_warning}"
+            result['conviction'] = _q_refine(3, 5, q_score)
         else:
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🟡 Re-Entry but Quality {grade}"
@@ -958,10 +990,15 @@ def generate_recommendation(signal: EntrySignal,
         days = late_entry.get('days_since_cross', 0)
         premium = late_entry.get('entry_premium_pct', 0)
 
-        if grade in ['A', 'B'] and premium <= 3:
+        if grade in ['A', 'B'] and premium <= 3 and weekly_bullish:
             result['recommendation'] = f'LATE ENTRY (+{days}d)'
-            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Quality {grade}{monthly_warning}"
+            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Weekly bullish, Quality {grade}{monthly_warning}"
             result['conviction'] = _q_refine(4, 6, q_score)
+        elif grade in ['A', 'B'] and premium <= 3:
+            # No weekly — downgrade to WATCH
+            result['recommendation'] = f'WATCH (LATE +{days}d)'
+            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Quality {grade}, no Weekly confirmation{monthly_warning}"
+            result['conviction'] = _q_refine(3, 4, q_score)
         else:
             result['recommendation'] = 'WATCH'
             result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
@@ -1286,13 +1323,24 @@ def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = No
     )
 
     # --- AO Divergence Downgrade ---
-    # If bearish divergence is active, downgrade BUY-type signals
+    # If bearish divergence is active, downgrade any bullish entry signals.
+    # Divergence means price making new highs but AO making lower highs —
+    # momentum is failing even if other indicators look green.
     if result.ao_divergence_active:
         rec = result.recommendation
         original_rec = rec.get('recommendation', '')
-        if original_rec in ('STRONG BUY', 'BUY', 'BUY (AO)'):
+        rec_upper = original_rec.upper()
+        # Catch all buy-type signals: STRONG BUY, BUY, BUY (AO), RE-ENTRY,
+        # LATE ENTRY, BUY (PULLBACK)
+        _is_bullish = (
+            ('BUY' in rec_upper or 'ENTRY' in rec_upper)
+            and 'WATCH' not in rec_upper
+            and 'WAIT' not in rec_upper
+            and 'SKIP' not in rec_upper
+        )
+        if _is_bullish:
             rec['recommendation'] = 'WAIT (D)'
-            rec['summary'] = f"⚠️ {rec.get('summary', '')} — AO divergence active"
+            rec['summary'] = f"⚠️ {rec.get('summary', '')} — AO divergence active, momentum failing"
             rec['conviction'] = max(1, rec.get('conviction', 0) - 2)
             rec['ao_divergence_downgrade'] = True
             rec['original_recommendation'] = original_rec
