@@ -874,11 +874,9 @@ def generate_recommendation(signal: EntrySignal,
         # 'weakening' is True when histogram is shrinking while MACD still bullish
         _momentum_fading = bool(_d_macd.get('weakening', False))
 
-        # Overbought threshold tiers:
-        #   >4.0 = extremely extended, kill any remaining buy signals
-        #   >2.5 = heavily extended, hard downgrade to WATCH
-        #   >1.5 + fading = overbought with weakening momentum, downgrade
-        #   >2.0 (no fade) = elevated, caution penalty
+        # Overbought tiers: use BOTH absolute value AND percentile rank.
+        # Percentile catches stocks like KNSA where MACD=0.81 is 85th+ pctl.
+        _d_pctl = float(_d_macd.get('macd_percentile', 50) or 50)
         rec_u = str(out.get('recommendation', '')).upper()
         is_buy = (
             ('BUY' in rec_u or 'ENTRY' in rec_u)
@@ -887,33 +885,36 @@ def generate_recommendation(signal: EntrySignal,
             and 'SKIP' not in rec_u
         )
 
-        if _d_macd_val > 4.0:
+        _extreme = _d_macd_val > 4.0 or _d_pctl >= 95
+        _heavily_ext = _d_macd_val > 2.5 or _d_pctl >= 90
+        _ob_fading = (_d_macd_val > 1.5 or _d_pctl >= 80) and _momentum_fading
+        _elevated = _d_macd_val > 2.0 or (_d_pctl >= 85 and not _momentum_fading)
+
+        if _extreme:
             # Extreme — the move has already happened
             delta -= 3
-            modifiers.append(f"MACD extreme ({_d_macd_val:.1f}), entry window closed ⛔")
+            modifiers.append(f"MACD extreme ({_d_macd_val:.1f}, {_d_pctl:.0f}th pctl), entry window closed ⛔")
             if is_buy:
                 out['recommendation'] = 'SKIP'
                 out['overbought_downgrade'] = True
             elif 'WATCH' in rec_u and 'SKIP' not in rec_u:
-                # Even WATCH signals get crushed at this level
                 out['conviction'] = min(out.get('conviction', 2), 2)
                 out['overbought_downgrade'] = True
-        elif _d_macd_val > 2.5:
+        elif _heavily_ext:
             delta -= 2
-            modifiers.append(f"MACD heavily extended ({_d_macd_val:.1f}) ⚠️")
+            modifiers.append(f"MACD heavily extended ({_d_macd_val:.1f}, {_d_pctl:.0f}th pctl) ⚠️")
             if is_buy:
                 out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
                 out['overbought_downgrade'] = True
-        elif _d_macd_val > 1.5 and _momentum_fading:
+        elif _ob_fading:
             delta -= 2
-            modifiers.append(f"MACD overbought ({_d_macd_val:.1f}), momentum fading ⚠️")
+            modifiers.append(f"MACD overbought ({_d_macd_val:.1f}, {_d_pctl:.0f}th pctl), momentum fading ⚠️")
             if is_buy:
                 out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
                 out['overbought_downgrade'] = True
-        elif _d_macd_val > 2.0:
-            # MACD elevated even if histogram not yet shrinking — caution
+        elif _elevated:
             delta -= 1
-            modifiers.append(f"MACD extended ({_d_macd_val:.1f}) ⚠️")
+            modifiers.append(f"MACD extended ({_d_macd_val:.1f}, {_d_pctl:.0f}th pctl) ⚠️")
 
         # ── Apply with bounds ────────────────────────────────────────
         if delta != 0 or modifiers:
@@ -1016,23 +1017,36 @@ def generate_recommendation(signal: EntrySignal,
         result['signal_type'] = 'RE_ENTRY'
         bars_ago = reentry.get('macd_cross_bars_ago', 0)
 
-        # Overbought gate: if daily MACD has already run far above zero,
-        # the re-entry window has closed — you'd be chasing, not re-entering.
+        # Overbought gate: uses BOTH absolute thresholds AND percentile rank.
+        # A MACD of 0.81 on KNSA ($47 stock) may be 85th percentile — overbought
+        # for that stock — even though the absolute value is low.
         _re_macd = float(signal.macd.get('macd', 0) or 0)
-        if _re_macd > 4.0:
+        _re_pctl = float(signal.macd.get('macd_percentile', 50) or 50)
+        _wk_pctl = float(signal.weekly_macd.get('macd_percentile', 50) or 50)
+        # Overbought = absolute > 4.0 OR daily percentile > 90th
+        _abs_extreme = _re_macd > 4.0
+        _abs_elevated = _re_macd > 2.5
+        _pctl_extreme = _re_pctl >= 90
+        _pctl_elevated = _re_pctl >= 80
+        # Also flag when BOTH daily and weekly are in upper quartile
+        _dual_hot = _re_pctl >= 75 and _wk_pctl >= 75
+
+        if _abs_extreme or _pctl_extreme:
             # Extremely extended — kill the signal entirely
+            _reason = f"MACD={_re_macd:.2f} ({_re_pctl:.0f}th pctl)"
             result['recommendation'] = 'SKIP'
             result['summary'] = (
-                f"⛔ Re-Entry ({bars_ago}d ago) but daily MACD={_re_macd:.1f} — "
-                f"far too extended, entry window closed"
+                f"⛔ Re-Entry ({bars_ago}d ago) but daily {_reason} — "
+                f"overbought, entry window closed"
             )
             result['conviction'] = 1
             return _apply_signal_guards(result)
-        elif _re_macd > 2.5:
+        elif _abs_elevated or _pctl_elevated or _dual_hot:
             # Elevated — cap at low-conviction WATCH
+            _reason = f"MACD={_re_macd:.2f} ({_re_pctl:.0f}th pctl)"
             result['recommendation'] = 'WATCH (RE-ENTRY)'
             result['summary'] = (
-                f"🟡 Re-Entry ({bars_ago}d ago) but MACD already at {_re_macd:.1f}, "
+                f"🟡 Re-Entry ({bars_ago}d ago) but daily {_reason}, "
                 f"Quality {grade}{monthly_warning}"
             )
             result['conviction'] = _q_refine(2, 3, q_score)
@@ -1065,20 +1079,30 @@ def generate_recommendation(signal: EntrySignal,
         days = late_entry.get('days_since_cross', 0)
         premium = late_entry.get('entry_premium_pct', 0)
 
-        # Same overbought gate as RE-ENTRY — too extended = no entry
+        # Same overbought gate as RE-ENTRY — percentile + absolute
         _le_macd = float(signal.macd.get('macd', 0) or 0)
-        if _le_macd > 4.0:
+        _le_pctl = float(signal.macd.get('macd_percentile', 50) or 50)
+        _le_wk_pctl = float(signal.weekly_macd.get('macd_percentile', 50) or 50)
+        _le_abs_ext = _le_macd > 4.0
+        _le_pctl_ext = _le_pctl >= 90
+        _le_abs_elev = _le_macd > 2.5
+        _le_pctl_elev = _le_pctl >= 80
+        _le_dual_hot = _le_pctl >= 75 and _le_wk_pctl >= 75
+
+        if _le_abs_ext or _le_pctl_ext:
+            _reason = f"MACD={_le_macd:.2f} ({_le_pctl:.0f}th pctl)"
             result['recommendation'] = 'SKIP'
             result['summary'] = (
-                f"⛔ Late Entry (+{days}d) but daily MACD={_le_macd:.1f} — "
-                f"far too extended, entry window closed"
+                f"⛔ Late Entry (+{days}d) but daily {_reason} — "
+                f"overbought, entry window closed"
             )
             result['conviction'] = 1
             return _apply_signal_guards(result)
-        elif _le_macd > 2.5:
+        elif _le_abs_elev or _le_pctl_elev or _le_dual_hot:
+            _reason = f"MACD={_le_macd:.2f} ({_le_pctl:.0f}th pctl)"
             result['recommendation'] = f'WATCH (LATE +{days}d)'
             result['summary'] = (
-                f"🟡 Late Entry (+{days}d) but MACD already at {_le_macd:.1f}, "
+                f"🟡 Late Entry (+{days}d) but daily {_reason}, "
                 f"Quality {grade}{monthly_warning}"
             )
             result['conviction'] = _q_refine(2, 3, q_score)
