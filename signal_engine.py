@@ -375,6 +375,19 @@ def detect_macd_cross(df: pd.DataFrame, bar_index: int = -1) -> Dict[str, Any]:
             weakening = bullish and (hist < h1) and (h1 < h2)
             near_cross = abs(hist) < abs(macd) * 0.1 if macd != 0 else False
 
+    # ── MACD percentile — where current MACD sits in its own history ──
+    # 90th+ = overbought for THIS stock (regardless of absolute value).
+    # Uses up to 252 bars of history for daily, full available for weekly/monthly.
+    macd_percentile = 50.0  # default middle if insufficient data
+    try:
+        _lookback = min(252, i + 1)
+        _macd_series = df['MACD'].iloc[max(0, i + 1 - _lookback):i + 1].dropna()
+        if len(_macd_series) >= 30:
+            _rank = (_macd_series < macd).sum()
+            macd_percentile = round(float(_rank) / float(len(_macd_series)) * 100.0, 1)
+    except Exception:
+        macd_percentile = 50.0
+
     return {
         'cross_today': cross_today,
         'cross_recent': cross_recent,
@@ -386,6 +399,7 @@ def detect_macd_cross(df: pd.DataFrame, bar_index: int = -1) -> Dict[str, Any]:
         'histogram': round(hist, 4),
         'weakening': weakening,
         'near_cross': near_cross,
+        'macd_percentile': macd_percentile,
     }
 
 
@@ -402,6 +416,7 @@ def _empty_macd_result() -> Dict[str, Any]:
         'histogram': 0.0,
         'weakening': False,
         'near_cross': False,
+        'macd_percentile': 50.0,
     }
 
 
