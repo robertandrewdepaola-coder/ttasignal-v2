@@ -38,6 +38,24 @@ def render_detail_view_shell(
     signal = analysis.signal
     rec = analysis.recommendation or {}
 
+    # ── Reconcile with persisted scan summary for consistency ──────────
+    # The scanner table may show a sector-adjusted recommendation that
+    # differs from the raw analysis.recommendation.  Use the persisted
+    # summary value (which the table also reads) so header and table match.
+    _display_rec = rec.get('recommendation', 'SKIP')
+    _display_summary = rec.get('summary', '')
+    _display_conv = rec.get('conviction', 0)
+    try:
+        _summaries = st.session_state.get('scan_results_summary', []) or []
+        for _s in _summaries:
+            if str(_s.get('ticker', '')).upper() == str(ticker).upper():
+                _display_rec = _s.get('recommendation', _display_rec)
+                _display_conv = _s.get('conviction', _display_conv)
+                # Keep the detailed summary from rec (richer than persisted)
+                break
+    except Exception:
+        pass
+
     # Auto-scroll anchor — when a ticker is clicked, scroll here.
     st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
 
@@ -56,7 +74,7 @@ def render_detail_view_shell(
     # Header with scroll-to-top button.
     hdr_col1, hdr_col2 = st.columns([8, 1])
     with hdr_col1:
-        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+        st.header(f"{ticker} — {_display_rec}")
     with hdr_col2:
         if st.button("⬆️ Top", key="scroll_top", help="Scroll to top"):
             st.session_state["_do_scroll_top"] = True
