@@ -1,1381 +1,1919 @@
 """
-TTA v2 Scanner Engine — Analysis & Recommendations
-====================================================
+TTA v2 Signal Engine — Single Source of Truth
+==============================================
 
-Orchestrates signal_engine + data_fetcher to produce actionable results.
-Contains: quality scoring (mini-backtest), signal classification
-(primary/AO confirm/re-entry/late entry), and recommendation logic.
+ALL indicator calculations and signal detection logic lives here.
+No other module should calculate MACD, AO, ATR, or detect signals.
 
-NO yfinance calls. NO Streamlit code. Pure analysis logic.
+Supports staged MACD profiles:
+- Legacy: EMA(12,26) with SMA(9) signal line
+- HPotter Zone: EMA(8,16) with SMA(11) signal line
+- Shadow: legacy decision path + HPotter diagnostics
+- AO: (SMA(hl2,5) - SMA(hl2,34)) / 2
+- Signal line uses SMA, NOT EMA
 
-Version: 2.0.0 (2026-02-07)
+Version: 2.1.0 (2026-02-22)
 """
 
+import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+
+# Conditional Streamlit caching — works without Streamlit for testing/standalone use.
+try:
+    from streamlit import cache_data as _cache_data
+except ImportError:
+    def _cache_data(func=None, *, ttl=None, max_entries=None, show_spinner=False):
+        """No-op decorator when Streamlit is not available."""
+        if func is not None:
+            return func
+        return lambda f: f
+from typing import Dict, Tuple, Optional, Any, List
 from dataclasses import dataclass, field
 
-from signal_engine import (
-    ENTRY_WINDOW, MACD_CROSS_LOOKBACK,
-    AO_CONFIRM_MACD_LOOKBACK, AO_CONFIRM_MAX_PREMIUM,
-    LATE_ENTRY_MAX_DAYS, LATE_ENTRY_MAX_PREMIUM,
-    normalize_columns, calculate_macd, calculate_ao,
-    detect_macd_cross, detect_ao_state,
-    check_timeframe_macd, check_timeframe_ao, classify_macd_zone,
-    validate_entry, EntrySignal,
-    MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW,
-    get_active_macd_profile,
-)
+
+# =============================================================================
+# CONSTANTS — Define once, use everywhere
+# =============================================================================
+
+# MACD profiles
+MACD_PROFILE_LEGACY = "legacy"
+MACD_PROFILE_HPOTTER_ZONE = "hpotter_zone"
+MACD_PROFILE_SHADOW = "shadow"
+
+# Legacy MACD parameters (current production behavior)
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+# HPotter MACD parameters: EMA(8)-EMA(16), SMA(11) signal
+HPOTTER_MACD_FAST = 8
+HPOTTER_MACD_SLOW = 16
+HPOTTER_MACD_SIGNAL = 11
+
+_VALID_MACD_PROFILES = {
+    MACD_PROFILE_LEGACY,
+    MACD_PROFILE_HPOTTER_ZONE,
+    MACD_PROFILE_SHADOW,
+}
+_ACTIVE_MACD_PROFILE = str(os.getenv("TTA_MACD_PROFILE", MACD_PROFILE_LEGACY) or MACD_PROFILE_LEGACY).strip().lower()
+if _ACTIVE_MACD_PROFILE not in _VALID_MACD_PROFILES:
+    _ACTIVE_MACD_PROFILE = MACD_PROFILE_LEGACY
+
+# Awesome Oscillator parameters
+AO_FAST = 5
+AO_SLOW = 34
+
+# ATR
+ATR_PERIOD = 14
+
+# Entry window: how far back to look for AO zero-cross
+ENTRY_WINDOW = 20
+
+# MACD cross lookback: how many bars back a cross is still actionable
+MACD_CROSS_LOOKBACK = 10
+
+# Late entry
+LATE_ENTRY_MAX_DAYS = 5
+LATE_ENTRY_MAX_PREMIUM = 5.0  # % above crossover price
+
+# AO Confirmation signal
+AO_CONFIRM_MACD_LOOKBACK = 7
+AO_CONFIRM_MAX_PREMIUM = 8.0  # % above MACD cross price
+
+# Stop loss
+STOP_LOSS_PCT = 0.15  # 15% default
+PROFIT_TARGET_MULT = 2.0  # 2x risk
+
+# Market filter
+MARKET_FILTER_SPY_SMA = 200
+MARKET_FILTER_VIX_MAX = 30
+
+# Data periods (standardized)
+DAILY_PERIOD = '5y'      # Full history for chart viewing + indicator warmup
+WEEKLY_PERIOD = '5y'     # ~260 bars
+MONTHLY_PERIOD = '10y'   # ~120 bars
 
 
 # =============================================================================
-# CONSTANTS
+# DATA NORMALIZATION — Handle yfinance quirks in ONE place
 # =============================================================================
 
-RE_ENTRY_MACD_LOOKBACK = 10  # Bars to look back for re-entry MACD cross
+def get_active_macd_profile() -> str:
+    """Return active MACD profile."""
+    return _ACTIVE_MACD_PROFILE if _ACTIVE_MACD_PROFILE in _VALID_MACD_PROFILES else MACD_PROFILE_LEGACY
+
+
+def set_active_macd_profile(profile: str) -> str:
+    """Set active MACD profile at runtime. Returns resolved value."""
+    global _ACTIVE_MACD_PROFILE
+    p = str(profile or "").strip().lower()
+    if p not in _VALID_MACD_PROFILES:
+        p = MACD_PROFILE_LEGACY
+    _ACTIVE_MACD_PROFILE = p
+    return _ACTIVE_MACD_PROFILE
 
 
 def _resolve_macd_profile(profile: Optional[str]) -> str:
     p = str(profile or get_active_macd_profile() or MACD_PROFILE_LEGACY).strip().lower()
-    if p not in {MACD_PROFILE_LEGACY, MACD_PROFILE_HPOTTER_ZONE, MACD_PROFILE_SHADOW}:
-        return MACD_PROFILE_LEGACY
+    if p not in _VALID_MACD_PROFILES:
+        p = MACD_PROFILE_LEGACY
     return p
 
 
-# =============================================================================
-# QUALITY SCORING — Mini-Backtest
-# =============================================================================
+def _macd_params_for_profile(profile: str) -> Tuple[int, int, int]:
+    p = _resolve_macd_profile(profile)
+    if p == MACD_PROFILE_HPOTTER_ZONE:
+        return HPOTTER_MACD_FAST, HPOTTER_MACD_SLOW, HPOTTER_MACD_SIGNAL
+    # Shadow keeps legacy signal path; HPotter is computed in parallel for diagnostics.
+    return MACD_FAST, MACD_SLOW, MACD_SIGNAL
 
-def calculate_quality_score(daily_df: pd.DataFrame,
-                            weekly_df: pd.DataFrame = None,
-                            ticker: str = '',
-                            lookback_years: int = 3,
-                            macd_profile: Optional[str] = None) -> Dict[str, Any]:
+
+def get_macd_profile_params(profile: Optional[str] = None) -> Tuple[int, int, int]:
+    """Public accessor for MACD params under a given profile."""
+    return _macd_params_for_profile(_resolve_macd_profile(profile))
+
+
+def get_macd_indicator_label(profile: Optional[str] = None) -> str:
     """
-    Run mini-backtest on historical data to calculate quality score.
-
-    Simulates TTA strategy entry/exit on past signals:
-    - Entry: MACD cross up + AO > 0 + AO zero-cross in prior window
-    - Exit: 15% stop loss OR weekly MACD cross down OR 60-day hold
-
-    Returns quality grade (A/B/C/F), win rate, avg return, signal count.
+    Human-readable MACD label for UI panes/legends.
+    Uses active profile when `profile` is None.
     """
-    result = {
-        'ticker': ticker,
-        'quality_grade': 'N/A',
-        'quality_score': 0,
-        'signals_found': 0,
-        'win_rate': 0,
-        'avg_return': 0,
-        'best_return': 0,
-        'worst_return': 0,
-        'weekly_confirmed_pct': 0,
-        'error': None,
-        'details': []
+    p = _resolve_macd_profile(profile)
+    fast, slow, sig = get_macd_profile_params(p)
+    if p == MACD_PROFILE_SHADOW:
+        return f"MACD ({fast}/{slow}/{sig}, shadow 8/16/11)"
+    return f"MACD ({fast}/{slow}/{sig})"
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize DataFrame column names from yfinance.
+    Handles both MultiIndex and case variations.
+    Returns DataFrame with standard column names: Open, High, Low, Close, Volume
+    """
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+
+    # Handle MultiIndex columns (yfinance sometimes returns these)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    # Standardize column names to Title Case
+    col_map = {}
+    for col in df.columns:
+        lower = col.lower()
+        if lower == 'open':
+            col_map[col] = 'Open'
+        elif lower == 'high':
+            col_map[col] = 'High'
+        elif lower == 'low':
+            col_map[col] = 'Low'
+        elif lower == 'close':
+            col_map[col] = 'Close'
+        elif lower == 'volume':
+            col_map[col] = 'Volume'
+        elif lower == 'adj close':
+            col_map[col] = 'Adj Close'
+
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    return df
+
+
+# =============================================================================
+# INDICATOR CALCULATIONS
+# =============================================================================
+
+def calculate_macd(df: pd.DataFrame,
+                   fast: Optional[int] = None,
+                   slow: Optional[int] = None,
+                   signal: Optional[int] = None,
+                   profile: Optional[str] = None) -> pd.DataFrame:
+    """
+    Calculate MACD indicator.
+
+    Matches TradingView AO+MACD overlay Pine Script:
+        fastMA = ema(src, fastLength)
+        slowMA = ema(src, slowLength)
+        macd = fastMA - slowMA
+        signal = sma(macd, signalLength)   <-- SMA, not EMA!
+
+    Adds columns: MACD, MACD_Signal, MACD_Hist
+    """
+    df = normalize_columns(df.copy())
+    if fast is None or slow is None or signal is None:
+        _fast, _slow, _sig = _macd_params_for_profile(_resolve_macd_profile(profile))
+        fast = _fast if fast is None else fast
+        slow = _slow if slow is None else slow
+        signal = _sig if signal is None else signal
+
+    ema_fast = df['Close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = df['Close'].ewm(span=slow, adjust=False).mean()
+    df['MACD'] = ema_fast - ema_slow
+    df['MACD_Signal'] = df['MACD'].rolling(window=signal).mean()  # SMA
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    return df
+
+
+def calculate_macd_hpotter(close: pd.Series,
+                           fast: int = HPOTTER_MACD_FAST,
+                           slow: int = HPOTTER_MACD_SLOW,
+                           signal: int = HPOTTER_MACD_SIGNAL) -> pd.DataFrame:
+    """
+    HPotter MACD: EMA(8)-EMA(16), signal=SMA(11) of MACD.
+    Accepts close series and returns MACD dataframe.
+    """
+    src = pd.to_numeric(close, errors='coerce')
+    fast_ma = src.ewm(span=fast, adjust=False).mean()
+    slow_ma = src.ewm(span=slow, adjust=False).mean()
+    macd = fast_ma - slow_ma
+    sig_line = macd.rolling(window=signal).mean()
+    hist = macd - sig_line
+    return pd.DataFrame({
+        'macd': macd,
+        'signal': sig_line,
+        'hist': hist,
+    }, index=src.index)
+
+
+def calculate_ao(df: pd.DataFrame,
+                 fast: int = AO_FAST,
+                 slow: int = AO_SLOW) -> pd.DataFrame:
+    """
+    Calculate Awesome Oscillator.
+
+    Matches TradingView AO+MACD overlay Pine Script:
+        ao = (sma(hl2, 5) - sma(hl2, 34)) / 2
+
+    Adds column: AO
+    """
+    df = df.copy()
+    median_price = (df['High'] + df['Low']) / 2
+    df['AO'] = (median_price.rolling(window=fast).mean()
+                - median_price.rolling(window=slow).mean()) / 2
+    return df
+
+
+def calculate_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.DataFrame:
+    """
+    Calculate Average True Range.
+
+    Adds column: ATR
+    """
+    df = df.copy()
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift(1)).abs()
+    low_close = (df['Low'] - df['Close'].shift(1)).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR'] = true_range.rolling(period).mean()
+    return df
+
+
+def calculate_sma(series: pd.Series, period: int) -> pd.Series:
+    """Simple Moving Average."""
+    return series.rolling(window=period).mean()
+
+
+def calculate_ema(series: pd.Series, period: int) -> pd.Series:
+    """Exponential Moving Average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+@_cache_data(ttl=600, show_spinner=False)
+def add_all_indicators(df: pd.DataFrame, macd_profile: Optional[str] = None) -> pd.DataFrame:
+    """
+    Add all standard indicators to a DataFrame in one call.
+    Adds: MACD, MACD_Signal, MACD_Hist, AO, ATR, SMA_50, SMA_200, SMA_150
+    """
+    df = normalize_columns(df)
+    df = calculate_macd(df, profile=macd_profile)
+    df = calculate_ao(df)
+    df = calculate_atr(df)
+    df['SMA_50'] = calculate_sma(df['Close'], 50)
+    df['SMA_200'] = calculate_sma(df['Close'], 200)
+    df['SMA_150'] = calculate_sma(df['Close'], 150)  # ~30 week SMA for Weinstein
+    return df
+
+
+# =============================================================================
+# MACD SIGNAL DETECTION
+# =============================================================================
+
+def detect_macd_cross(df: pd.DataFrame, bar_index: int = -1) -> Dict[str, Any]:
+    """
+    Detect MACD crossover state at a given bar.
+
+    Returns dict with:
+        - cross_today: bool — exact crossover on this bar
+        - cross_recent: bool — crossover within MACD_CROSS_LOOKBACK bars AND still bullish
+        - cross_bars_ago: int — how many bars since the cross (0 = today)
+        - bullish: bool — MACD > Signal right now
+        - bearish_cross: bool — MACD just crossed below signal
+        - histogram: float — current histogram value
+        - weakening: bool — histogram shrinking while still bullish
+        - near_cross: bool — histogram tiny relative to MACD
+    """
+    if 'MACD' not in df.columns or 'MACD_Signal' not in df.columns:
+        df = calculate_macd(df)
+
+    i = len(df) + bar_index if bar_index < 0 else bar_index
+
+    if i < 2:
+        return _empty_macd_result()
+
+    macd = float(df['MACD'].iloc[i])
+    signal = float(df['MACD_Signal'].iloc[i])
+    prev_macd = float(df['MACD'].iloc[i - 1])
+    prev_signal = float(df['MACD_Signal'].iloc[i - 1])
+    hist = macd - signal
+
+    # Skip if NaN (insufficient data for SMA warmup)
+    if pd.isna(macd) or pd.isna(signal) or pd.isna(prev_macd) or pd.isna(prev_signal):
+        return _empty_macd_result()
+
+    # Cross today
+    cross_today = (macd > signal) and (prev_macd <= prev_signal)
+    bearish_cross = (macd < signal) and (prev_macd >= prev_signal)
+
+    # Recent cross (within lookback, must still be bullish now)
+    cross_recent = False
+    cross_bars_ago = 0
+
+    for lookback in range(min(MACD_CROSS_LOOKBACK, i)):
+        ci = i - lookback
+        if ci < 1:
+            break
+        cm = float(df['MACD'].iloc[ci])
+        cs = float(df['MACD_Signal'].iloc[ci])
+        pm = float(df['MACD'].iloc[ci - 1])
+        ps = float(df['MACD_Signal'].iloc[ci - 1])
+
+        if pd.isna(cm) or pd.isna(cs) or pd.isna(pm) or pd.isna(ps):
+            continue
+
+        if (cm > cs) and (pm <= ps):
+            cross_recent = True
+            cross_bars_ago = lookback
+            break
+
+    # Must still be bullish for recent cross to count
+    bullish = macd > signal
+    cross_recent = cross_recent and bullish
+
+    # Histogram trend (weakening detection)
+    weakening = False
+    near_cross = False
+
+    if i >= 3:
+        h1 = float(df['MACD'].iloc[i - 1]) - float(df['MACD_Signal'].iloc[i - 1])
+        h2 = float(df['MACD'].iloc[i - 2]) - float(df['MACD_Signal'].iloc[i - 2])
+
+        if not (pd.isna(h1) or pd.isna(h2)):
+            weakening = bullish and (hist < h1) and (h1 < h2)
+            near_cross = abs(hist) < abs(macd) * 0.1 if macd != 0 else False
+
+    return {
+        'cross_today': cross_today,
+        'cross_recent': cross_recent,
+        'cross_bars_ago': cross_bars_ago,
+        'bullish': bullish,
+        'bearish_cross': bearish_cross,
+        'macd': round(macd, 4),
+        'signal': round(signal, 4),
+        'histogram': round(hist, 4),
+        'weakening': weakening,
+        'near_cross': near_cross,
     }
 
-    if daily_df is None or len(daily_df) < 100:
-        result['error'] = "Insufficient daily data"
-        return result
 
-    profile = _resolve_macd_profile(macd_profile)
-    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
+def _empty_macd_result() -> Dict[str, Any]:
+    """Default empty MACD result when data insufficient."""
+    return {
+        'cross_today': False,
+        'cross_recent': False,
+        'cross_bars_ago': 0,
+        'bullish': False,
+        'bearish_cross': False,
+        'macd': 0.0,
+        'signal': 0.0,
+        'histogram': 0.0,
+        'weakening': False,
+        'near_cross': False,
+    }
 
-    daily = normalize_columns(daily_df).copy()
-    daily = calculate_macd(daily, profile=profile_for_primary)
-    daily = calculate_ao(daily)
 
-    # Weekly data for exit signals
-    weekly = None
-    if weekly_df is not None and len(weekly_df) >= 30:
-        weekly = normalize_columns(weekly_df).copy()
-        weekly = calculate_macd(weekly, profile=profile_for_primary)
+# =============================================================================
+# AO SIGNAL DETECTION
+# =============================================================================
 
-    PROTECTIVE_STOP_PCT = -15.0
-    signals = []
+def detect_ao_state(df: pd.DataFrame, bar_index: int = -1,
+                    entry_window: int = ENTRY_WINDOW) -> Dict[str, Any]:
+    """
+    Detect AO state at a given bar.
 
-    for i in range(ENTRY_WINDOW + 30, len(daily)):
-        # --- Check MACD crossover ---
-        macd_now = daily['MACD'].iloc[i]
-        sig_now = daily['MACD_Signal'].iloc[i]
-        macd_prev = daily['MACD'].iloc[i - 1]
-        sig_prev = daily['MACD_Signal'].iloc[i - 1]
+    Returns dict with:
+        - positive: bool — AO > 0
+        - value: float — current AO value
+        - zero_cross_found: bool — AO crossed from ≤0 to >0 in prior entry_window bars
+        - zero_cross_date: str — date of that cross
+        - zero_cross_days_ago: int — bars since that cross
+        - cross_today: bool — AO crossed zero today
+        - trend: str — 'rising', 'falling', 'flat'
+    """
+    if 'AO' not in df.columns:
+        df = calculate_ao(df)
 
-        if pd.isna(macd_now) or pd.isna(sig_now) or pd.isna(macd_prev) or pd.isna(sig_prev):
+    i = len(df) + bar_index if bar_index < 0 else bar_index
+
+    if i < 2:
+        return _empty_ao_result()
+
+    ao = float(df['AO'].iloc[i])
+    ao_prev = float(df['AO'].iloc[i - 1])
+
+    if pd.isna(ao):
+        return _empty_ao_result()
+
+    positive = ao > 0
+    cross_today = (ao > 0) and (ao_prev <= 0)
+
+    # Look backwards for zero-cross in entry window
+    zero_cross_found = False
+    zero_cross_date = None
+    zero_cross_days_ago = None
+
+    for j in range(1, min(entry_window + 1, i)):
+        past_idx = i - j
+        if past_idx < 1:
+            break
+        ao_before = float(df['AO'].iloc[past_idx - 1])
+        ao_after = float(df['AO'].iloc[past_idx])
+
+        if pd.isna(ao_before) or pd.isna(ao_after):
             continue
 
-        macd_cross = (macd_now > sig_now) and (macd_prev <= sig_prev)
-        if not macd_cross:
-            continue
+        if ao_before <= 0 and ao_after > 0:
+            zero_cross_found = True
+            idx_val = df.index[past_idx]
+            zero_cross_date = (idx_val.strftime('%Y-%m-%d')
+                               if hasattr(idx_val, 'strftime') else str(idx_val))
+            zero_cross_days_ago = j
+            break
 
-        # --- Check AO positive ---
-        ao_val = daily['AO'].iloc[i]
-        if pd.isna(ao_val) or ao_val <= 0:
-            continue
-
-        # --- Check AO zero-cross in lookback ---
-        ao_cross_found = False
-        for j in range(1, ENTRY_WINDOW + 1):
-            pi = i - j
-            if pi < 1:
-                break
-            ao_before = daily['AO'].iloc[pi - 1]
-            ao_after = daily['AO'].iloc[pi]
-            if not (pd.isna(ao_before) or pd.isna(ao_after)):
-                if ao_before <= 0 and ao_after > 0:
-                    ao_cross_found = True
-                    break
-
-        if not ao_cross_found:
-            continue
-
-        # --- Entry signal found — simulate trade ---
-        entry_price = float(daily['Close'].iloc[i])
-        entry_date = daily.index[i]
-
-        # Weekly confirmation at entry
-        weekly_confirmed = False
-        weekly_idx = None
-        if weekly is not None:
-            weekly_dates = weekly.index[weekly.index <= entry_date]
-            if len(weekly_dates) > 0:
-                weekly_idx = len(weekly_dates) - 1
-                if weekly_idx >= 26:
-                    w_m = weekly['MACD'].iloc[weekly_idx]
-                    w_s = weekly['MACD_Signal'].iloc[weekly_idx]
-                    if not (pd.isna(w_m) or pd.isna(w_s)):
-                        weekly_confirmed = w_m > w_s
-
-        # Simulate exit
-        exit_price = entry_price
-        exit_reason = "End_Data"
-
-        for fd in range(i + 1, min(i + 60, len(daily))):
-            future_price = float(daily['Close'].iloc[fd])
-            current_return = ((future_price - entry_price) / entry_price) * 100
-
-            # Stop loss
-            if current_return <= PROTECTIVE_STOP_PCT:
-                exit_price = future_price
-                exit_reason = "Stop_Loss"
-                break
-
-            # Weekly MACD cross down
-            if weekly is not None and weekly_idx is not None:
-                future_date = daily.index[fd]
-                fw_dates = weekly.index[weekly.index <= future_date]
-                if len(fw_dates) > 0:
-                    fw_idx = len(fw_dates) - 1
-                    if fw_idx > weekly_idx and fw_idx >= 26:
-                        cw_m = weekly['MACD'].iloc[fw_idx]
-                        cw_s = weekly['MACD_Signal'].iloc[fw_idx]
-                        pw_m = weekly['MACD'].iloc[fw_idx - 1]
-                        pw_s = weekly['MACD_Signal'].iloc[fw_idx - 1]
-
-                        if not any(pd.isna(x) for x in [cw_m, cw_s, pw_m, pw_s]):
-                            if cw_m < cw_s and pw_m >= pw_s:
-                                exit_price = future_price
-                                exit_reason = "Weekly_Cross_Down"
-                                break
+    # Trend
+    if i >= 3:
+        ao_prev2 = float(df['AO'].iloc[i - 2])
+        if not pd.isna(ao_prev2):
+            if ao > ao_prev > ao_prev2:
+                trend = 'rising'
+            elif ao < ao_prev < ao_prev2:
+                trend = 'falling'
+            else:
+                trend = 'flat'
         else:
-            exit_price = float(daily['Close'].iloc[min(i + 59, len(daily) - 1)])
+            trend = 'flat'
+    else:
+        trend = 'flat'
 
-        return_pct = ((exit_price - entry_price) / entry_price) * 100
+    return {
+        'positive': positive,
+        'value': round(ao, 4),
+        'zero_cross_found': zero_cross_found,
+        'zero_cross_date': zero_cross_date,
+        'zero_cross_days_ago': zero_cross_days_ago,
+        'cross_today': cross_today,
+        'trend': trend,
+    }
 
-        signals.append({
-            'entry_date': entry_date.strftime('%Y-%m-%d') if hasattr(entry_date, 'strftime') else str(entry_date),
-            'entry_price': round(entry_price, 2),
-            'exit_price': round(exit_price, 2),
-            'return_pct': round(return_pct, 1),
-            'win': return_pct > 0,
-            'weekly_confirmed': weekly_confirmed,
-            'exit_reason': exit_reason,
+
+def _empty_ao_result() -> Dict[str, Any]:
+    """Default empty AO result."""
+    return {
+        'positive': False,
+        'value': 0.0,
+        'zero_cross_found': False,
+        'zero_cross_date': None,
+        'zero_cross_days_ago': None,
+        'cross_today': False,
+        'trend': 'flat',
+    }
+
+
+# =============================================================================
+# DIVERGENCE DETECTION
+# =============================================================================
+
+@_cache_data(ttl=600, show_spinner=False)
+def detect_bearish_divergence(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
+    """
+    Detect bearish divergence using AO wave structure.
+
+    The pattern:
+    1. AO is positive (Wave 3 momentum building)
+    2. AO crosses below zero (Wave 3 correction / Wave 4)
+    3. AO returns positive again (Wave 5 begins)
+    4. This new positive AO peak is SMALLER than the previous positive peak
+       while price is HIGHER → bearish divergence
+    5. Mark divergence at the highest price during the smaller AO block
+    6. Divergence confirmed once AO drops below zero again (correction starts)
+
+    Adds columns: bearish_div_detected, bearish_div_active
+    Also stores divergence line data in df.attrs['divergence_lines'] for chart drawing.
+    """
+    if df is None or len(df) < 50:
+        df = df.copy() if df is not None else pd.DataFrame()
+        df['bearish_div_detected'] = False
+        df['bearish_div_active'] = False
+        df.attrs['divergence_lines'] = []
+        return df
+
+    df = df.copy()
+
+    if 'AO' not in df.columns:
+        df = calculate_ao(df)
+
+    df['bearish_div_detected'] = False
+    df['bearish_div_active'] = False
+
+    ao = df['AO'].values
+    highs = df['High'].values
+
+    # Step 1: Identify AO positive blocks (continuous runs above zero)
+    # Each block = (start_idx, end_idx, peak_ao, peak_ao_idx, highest_price, highest_price_idx)
+    positive_blocks = []
+    in_block = False
+    block_start = 0
+    block_peak_ao = 0.0
+    block_peak_ao_idx = 0
+    block_high_price = 0.0
+    block_high_idx = 0
+
+    for i in range(len(df)):
+        if pd.isna(ao[i]):
+            if in_block:
+                if block_peak_ao > 0:
+                    positive_blocks.append((block_start, i - 1, block_peak_ao,
+                                            block_peak_ao_idx, block_high_price, block_high_idx))
+                in_block = False
+            continue
+
+        if ao[i] > 0:
+            if not in_block:
+                in_block = True
+                block_start = i
+                block_peak_ao = ao[i]
+                block_peak_ao_idx = i
+                block_high_price = highs[i]
+                block_high_idx = i
+            else:
+                if ao[i] > block_peak_ao:
+                    block_peak_ao = ao[i]
+                    block_peak_ao_idx = i
+                if highs[i] > block_high_price:
+                    block_high_price = highs[i]
+                    block_high_idx = i
+        else:
+            if in_block:
+                if block_peak_ao > 0:
+                    positive_blocks.append((block_start, i - 1, block_peak_ao,
+                                            block_peak_ao_idx, block_high_price, block_high_idx))
+                in_block = False
+
+    # Capture final block if still in one
+    if in_block and block_peak_ao > 0:
+        positive_blocks.append((block_start, len(df) - 1, block_peak_ao,
+                                block_peak_ao_idx, block_high_price, block_high_idx))
+
+    # Step 2: Compare consecutive positive blocks separated by negative zone
+    divergence_lines = []
+
+    for b_idx in range(1, len(positive_blocks)):
+        prev_start, prev_end, prev_peak_ao, prev_ao_idx, prev_high_price, prev_high_idx = positive_blocks[b_idx - 1]
+        curr_start, curr_end, curr_peak_ao, curr_ao_idx, curr_high_price, curr_high_idx = positive_blocks[b_idx]
+
+        # Verify there's a negative zone between them (Wave 4)
+        gap_has_negative = False
+        for j in range(prev_end + 1, curr_start):
+            if not pd.isna(ao[j]) and ao[j] < 0:
+                gap_has_negative = True
+                break
+
+        if not gap_has_negative:
+            continue
+
+        # Bearish divergence: price higher high BUT AO smaller peak
+        if curr_high_price > prev_high_price and curr_peak_ao < prev_peak_ao:
+            # Mark at the highest price bar in the smaller AO block
+            df.iloc[curr_high_idx, df.columns.get_loc('bearish_div_detected')] = True
+
+            # Store line coordinates for chart drawing
+            # Line 1: Price panel — connects W3 high to W5 high (rising)
+            # Line 2: AO panel — connects W3 AO peak to W5 AO peak (falling)
+            divergence_lines.append({
+                "price_line": {
+                    "x0": df.index[prev_high_idx].strftime('%Y-%m-%d'),
+                    "y0": round(float(prev_high_price), 2),
+                    "x1": df.index[curr_high_idx].strftime('%Y-%m-%d'),
+                    "y1": round(float(curr_high_price), 2),
+                },
+                "ao_line": {
+                    "x0": df.index[prev_ao_idx].strftime('%Y-%m-%d'),
+                    "y0": round(float(prev_peak_ao), 4),
+                    "x1": df.index[curr_ao_idx].strftime('%Y-%m-%d'),
+                    "y1": round(float(curr_peak_ao), 4),
+                },
+                "w3_label": {
+                    "date": df.index[prev_high_idx].strftime('%Y-%m-%d'),
+                    "price": round(float(prev_high_price), 2),
+                },
+                "w5_label": {
+                    "date": df.index[curr_high_idx].strftime('%Y-%m-%d'),
+                    "price": round(float(curr_high_price), 2),
+                },
+            })
+
+    df.attrs['divergence_lines'] = divergence_lines
+
+    # Step 3: Set active flag — active from detection until AO goes negative again
+    div_active = False
+    for i in range(len(df)):
+        if df.iloc[i]['bearish_div_detected']:
+            div_active = True
+
+        if div_active and not pd.isna(ao[i]) and ao[i] < 0:
+            div_active = False
+
+        df.iloc[i, df.columns.get_loc('bearish_div_active')] = div_active
+
+    return df
+
+
+# =============================================================================
+# VOLATILITY CONTRACTION PATTERN (VCP)
+# =============================================================================
+
+@_cache_data(ttl=600, show_spinner=False)
+def detect_vcp(
+    df: pd.DataFrame,
+    lookback: int = 120,
+    n_segments: int = 4,
+    min_contractions: int = 2,
+    volume_contraction_threshold: float = 0.80,
+) -> Dict[str, Any]:
+    """
+    Detect Minervini-style Volatility Contraction Pattern (VCP).
+
+    Pattern requirements:
+    1) Left-to-right base range contraction (successively tighter swings)
+    2) Volume contraction in the right-side tight zone vs the rest of the base
+    3) Uptrend context (price > MA50 > MA150 using FULL history, not truncated)
+    """
+    out = {
+        'vcp_detected': False,
+        'vcp_score': 0.0,
+        'price_contracting': False,
+        'volume_contracting': False,
+        'in_uptrend': False,
+        'segment_ranges': [],
+        'base_avg_volume': 0,
+        'tight_zone_volume': 0,
+        'contractions_found': 0,
+        'range_ratio': 1.0,
+        'volume_ratio': 1.0,
+        'pivot_price': None,
+    }
+    if df is None or len(df) < 60:
+        return out
+
+    full_df = normalize_columns(df).copy()
+    required_cols = {'High', 'Low', 'Close', 'Volume'}
+    if not required_cols.issubset(set(full_df.columns)):
+        return out
+
+    # ── Uptrend check using FULL history (Minervini Stage 2 criteria) ──
+    # A VCP forms during base-building after a strong advance. During the
+    # consolidation, MA50 can temporarily dip below MA150. The key is that
+    # the stock is still in a long-term uptrend and near its highs.
+    full_close = pd.to_numeric(full_df['Close'], errors='coerce')
+    current_price = float(full_close.iloc[-1]) if len(full_close) > 0 else 0.0
+    ma50 = float(full_close.rolling(50).mean().iloc[-1]) if len(full_close) >= 50 else float('nan')
+    ma150 = float(full_close.rolling(150).mean().iloc[-1]) if len(full_close) >= 150 else float('nan')
+    ma200 = float(full_close.rolling(200).mean().iloc[-1]) if len(full_close) >= 200 else float('nan')
+
+    # 52-week high proximity
+    high_52w_len = min(252, len(full_close))
+    high_52w = float(full_close.tail(high_52w_len).max())
+    pct_from_high = (current_price - high_52w) / high_52w * 100 if high_52w > 0 else -100
+
+    # MA200 trending up (rising over last 20 bars)
+    ma200_rising = False
+    if len(full_close) >= 220:
+        ma200_20ago = float(full_close.rolling(200).mean().iloc[-21])
+        if not pd.isna(ma200_20ago) and not pd.isna(ma200):
+            ma200_rising = ma200 > ma200_20ago
+
+    # Uptrend = Minervini Stage 2 or recent Stage 2:
+    #   Primary: price > MA200 AND MA200 trending up
+    #   OR: price > MA150 AND within 25% of 52-week high
+    #   Strict bonus: price > MA50 > MA150 (full alignment)
+    in_uptrend = False
+    if current_price > 0:
+        if not pd.isna(ma200) and current_price > ma200 and ma200_rising:
+            in_uptrend = True
+        elif not pd.isna(ma150) and current_price > ma150 and pct_from_high > -25:
+            in_uptrend = True
+        elif not pd.isna(ma50) and not pd.isna(ma150) and current_price > ma50 > ma150:
+            in_uptrend = True  # Classic stacking still works
+
+    # ── Base window for contraction analysis ─────────────────────────
+    base_len = min(max(lookback, n_segments * 15), len(full_df))
+    data = full_df.tail(base_len).copy()
+    data = data.reset_index(drop=True)
+
+    n_segments = max(3, int(n_segments or 4))
+    seg_len = len(data) // n_segments
+    if seg_len < 5:
+        return out
+
+    ranges: List[float] = []
+    for i in range(n_segments):
+        seg = data.iloc[i * seg_len: (i + 1) * seg_len]
+        if seg.empty:
+            continue
+        seg_range = float(seg['High'].max() - seg['Low'].min())
+        ranges.append(seg_range)
+    if len(ranges) < 2:
+        return out
+
+    contractions = sum(ranges[i] > ranges[i + 1] for i in range(len(ranges) - 1))
+    price_contracting = contractions >= int(min_contractions or 2)
+
+    # ── Volume: compare tight zone vs REST of base (exclude tight zone) ──
+    tight_zone = data.tail(seg_len)
+    base_excl_tight = data.head(len(data) - seg_len)
+    base_excl_volume = float(pd.to_numeric(base_excl_tight['Volume'], errors='coerce').dropna().mean() or 0.0)
+    tight_avg_volume = float(pd.to_numeric(tight_zone['Volume'], errors='coerce').dropna().mean() or 0.0)
+    volume_contracting = (
+        base_excl_volume > 0
+        and tight_avg_volume < (base_excl_volume * float(volume_contraction_threshold or 0.80))
+    )
+
+    range_ratio = (ranges[-1] / ranges[0]) if ranges[0] > 0 else 1.0
+    volume_ratio = (tight_avg_volume / base_excl_volume) if base_excl_volume > 0 else 1.0
+    raw_score = ((1 - range_ratio) * 50.0) + ((1 - volume_ratio) * 50.0)
+    vcp_score = max(0.0, min(100.0, round(float(raw_score), 1)))
+
+    pivot_price = float(tight_zone['High'].max()) if len(tight_zone) > 0 else None
+    detected = bool(price_contracting and volume_contracting and in_uptrend)
+
+    out.update({
+        'vcp_detected': detected,
+        'vcp_score': vcp_score,
+        'price_contracting': bool(price_contracting),
+        'volume_contracting': bool(volume_contracting),
+        'in_uptrend': bool(in_uptrend),
+        'segment_ranges': [round(float(r), 4) for r in ranges],
+        'base_avg_volume': int(round(base_excl_volume)) if base_excl_volume > 0 else 0,
+        'tight_zone_volume': int(round(tight_avg_volume)) if tight_avg_volume > 0 else 0,
+        'contractions_found': int(contractions),
+        'range_ratio': round(float(range_ratio), 4),
+        'volume_ratio': round(float(volume_ratio), 4),
+        'pivot_price': round(float(pivot_price), 2) if pivot_price and pivot_price > 0 else None,
+    })
+    return out
+
+
+# =============================================================================
+# MULTI-TIMEFRAME CONFIRMATION
+# =============================================================================
+
+def classify_macd_zone(df_macd: pd.DataFrame,
+                       lookback_cross: int = 5,
+                       hist_norm_window: int = 60) -> Dict[str, Any]:
+    """
+    Classify MACD state into zones:
+      just_cross, strong, extended, bearish, neutral.
+    """
+    out = {
+        'zone': 'neutral',
+        'hist_pct': 0.0,
+        'recent_cross': False,
+        'macd': 0.0,
+        'signal': 0.0,
+        'hist': 0.0,
+        'error': None,
+    }
+    if df_macd is None or len(df_macd) < 5:
+        out['error'] = 'Insufficient MACD data'
+        return out
+
+    macd = pd.to_numeric(df_macd.get('MACD', df_macd.get('macd')), errors='coerce')
+    sig = pd.to_numeric(df_macd.get('MACD_Signal', df_macd.get('signal')), errors='coerce')
+    hist = pd.to_numeric(df_macd.get('MACD_Hist', df_macd.get('hist')), errors='coerce')
+    if macd is None or sig is None or hist is None:
+        out['error'] = 'Missing MACD columns'
+        return out
+
+    m = float(macd.iloc[-1]) if len(macd) else float('nan')
+    s = float(sig.iloc[-1]) if len(sig) else float('nan')
+    h = float(hist.iloc[-1]) if len(hist) else float('nan')
+    if any(pd.isna(v) for v in [m, s, h]):
+        out['error'] = 'NaN MACD values'
+        return out
+
+    hist_slice = hist.tail(max(10, hist_norm_window))
+    h_max = float(hist_slice.max()) if len(hist_slice) else 0.0
+    h_min = float(hist_slice.min()) if len(hist_slice) else 0.0
+    h_range = (h_max - h_min) if (h_max - h_min) != 0 else 1e-9
+    h_pct = (h - h_min) / h_range
+    h_pct = max(0.0, min(1.0, float(h_pct)))
+
+    recent_cross = False
+    max_lb = max(1, int(lookback_cross))
+    for i in range(1, max_lb + 1):
+        if len(hist) > i:
+            cur = float(hist.iloc[-i])
+            prev = float(hist.iloc[-(i + 1)])
+            if (not pd.isna(cur)) and (not pd.isna(prev)) and cur > 0 and prev <= 0:
+                recent_cross = True
+                break
+
+    if m < s:
+        zone = 'bearish'
+    elif recent_cross and h_pct <= 0.20:
+        zone = 'just_cross'
+    elif h_pct > 0.80:
+        zone = 'extended'
+    elif h_pct >= 0.35:
+        zone = 'strong'
+    else:
+        zone = 'neutral'
+
+    out.update({
+        'zone': zone,
+        'hist_pct': round(h_pct, 3),
+        'recent_cross': bool(recent_cross),
+        'macd': round(m, 4),
+        'signal': round(s, 4),
+        'hist': round(h, 4),
+    })
+    return out
+
+
+def check_macd_mtf_zones(daily_df: pd.DataFrame,
+                         weekly_df: Optional[pd.DataFrame],
+                         monthly_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """
+    MTF MACD zone check using HPotter profile.
+    BUY timing rule:
+      - Daily must be in fresh-entry timing:
+          just_cross
+          OR recent strong/extended cross that is not yet extreme
+      - Weekly/Monthly can be just_cross, strong, or extended (momentum can be mature)
+      - Weekly/Monthly bearish still reject
+    """
+    out = {
+        'buy_approved': False,
+        'daily_zone': {'zone': 'neutral', 'error': 'missing'},
+        'weekly_zone': {'zone': 'neutral', 'error': 'missing'},
+        'monthly_zone': {'zone': 'neutral', 'error': 'missing'},
+        'reject_reason': 'missing_timeframes',
+    }
+    if daily_df is None or weekly_df is None or monthly_df is None:
+        return out
+    if len(daily_df) < 30 or len(weekly_df) < 20 or len(monthly_df) < 20:
+        out['reject_reason'] = 'insufficient_timeframe_data'
+        return out
+
+    d = calculate_macd(normalize_columns(daily_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+    w = calculate_macd(normalize_columns(weekly_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+    m = calculate_macd(normalize_columns(monthly_df), profile=MACD_PROFILE_HPOTTER_ZONE)
+
+    d_zone = classify_macd_zone(d, lookback_cross=5)
+    w_zone = classify_macd_zone(w, lookback_cross=3)
+    m_zone = classify_macd_zone(m, lookback_cross=2)
+    out['daily_zone'] = d_zone
+    out['weekly_zone'] = w_zone
+    out['monthly_zone'] = m_zone
+
+    d_key = str(d_zone.get('zone', 'neutral') or 'neutral')
+    w_key = str(w_zone.get('zone', 'neutral') or 'neutral')
+    m_key = str(m_zone.get('zone', 'neutral') or 'neutral')
+    d_recent = bool(d_zone.get('recent_cross', False))
+    d_hist_pct = float(d_zone.get('hist_pct', 1.0) or 1.0)
+    # Allow fresh crosses that have accelerated quickly, but cap extreme late-chase.
+    daily_ok = (d_key == 'just_cross') or (d_recent and d_key in ('strong', 'extended') and d_hist_pct <= 0.90)
+    weekly_ok = w_key in ('strong', 'just_cross', 'extended')
+    monthly_ok = m_key in ('strong', 'just_cross', 'extended')
+    daily_reject = (d_key == 'bearish') or (d_key == 'extended' and (not d_recent or d_hist_pct > 0.90))
+    weekly_reject = w_key in ('bearish',)
+    monthly_reject = m_key in ('bearish',)
+    failures: List[str] = []
+    if daily_reject:
+        failures.append(f"Daily extended/bearish ({d_key})")
+    if weekly_reject:
+        failures.append(f"Weekly bearish ({w_key})")
+    if monthly_reject:
+        failures.append(f"Monthly bearish ({m_key})")
+    if not daily_ok:
+        failures.append(f"Daily not in fresh entry zone ({d_key})")
+    if not weekly_ok:
+        failures.append(f"Weekly not strong ({w_key})")
+    if not monthly_ok:
+        failures.append(f"Monthly not strong ({m_key})")
+
+    approved = (len(failures) == 0)
+    out['buy_approved'] = bool(approved)
+    if approved:
+        out['reject_reason'] = None
+    else:
+        out['reject_reason'] = "; ".join(failures) if failures else 'mtf_zone_reject'
+    return out
+
+
+def check_timeframe_macd(df: pd.DataFrame, macd_profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Check MACD status on a given timeframe DataFrame (weekly or monthly).
+
+    Returns dict with:
+        - bullish: bool — MACD > Signal
+        - macd: float
+        - signal: float
+        - histogram: float
+        - cross_down: bool — just crossed bearish
+        - cross_up: bool — just crossed bullish
+    """
+    if df is None or df.empty or len(df) < 30:
+        return {
+            'bullish': False, 'macd': None, 'signal': None,
+            'histogram': None, 'cross_down': False, 'cross_up': False,
+            'error': 'Insufficient data'
+        }
+
+    df = normalize_columns(df)
+    df = calculate_macd(df, profile=macd_profile)
+
+    macd_val = float(df['MACD'].iloc[-1])
+    signal_val = float(df['MACD_Signal'].iloc[-1])
+
+    if pd.isna(macd_val) or pd.isna(signal_val):
+        return {
+            'bullish': False, 'macd': None, 'signal': None,
+            'histogram': None, 'cross_down': False, 'cross_up': False,
+            'error': 'NaN in MACD values'
+        }
+
+    bullish = macd_val > signal_val
+    hist = macd_val - signal_val
+
+    # Check for recent cross
+    cross_down = False
+    cross_up = False
+    if len(df) >= 2:
+        prev_m = float(df['MACD'].iloc[-2])
+        prev_s = float(df['MACD_Signal'].iloc[-2])
+        if not (pd.isna(prev_m) or pd.isna(prev_s)):
+            cross_down = (macd_val < signal_val) and (prev_m >= prev_s)
+            cross_up = (macd_val > signal_val) and (prev_m <= prev_s)
+
+    return {
+        'bullish': bullish,
+        'macd': round(macd_val, 4),
+        'signal': round(signal_val, 4),
+        'histogram': round(hist, 4),
+        'zone': classify_macd_zone(df, lookback_cross=3).get('zone', 'neutral'),
+        'cross_down': cross_down,
+        'cross_up': cross_up,
+        'error': None
+    }
+
+
+def check_timeframe_ao(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Check AO status on a given timeframe DataFrame (weekly or monthly).
+    """
+    if df is None or df.empty or len(df) < 35:
+        return {
+            'positive': False,
+            'value': None,
+            'cross_up': False,
+            'cross_down': False,
+            'trend': 'flat',
+            'error': 'Insufficient data',
+        }
+
+    df = normalize_columns(df)
+    df = calculate_ao(df)
+
+    ao_val = float(df['AO'].iloc[-1])
+    ao_prev = float(df['AO'].iloc[-2]) if len(df) >= 2 else 0.0
+    ao_prev2 = float(df['AO'].iloc[-3]) if len(df) >= 3 else ao_prev
+
+    if pd.isna(ao_val):
+        return {
+            'positive': False,
+            'value': None,
+            'cross_up': False,
+            'cross_down': False,
+            'trend': 'flat',
+            'error': 'NaN in AO',
+        }
+
+    cross_up = False
+    cross_down = False
+    if len(df) >= 2 and not pd.isna(ao_prev):
+        cross_up = (ao_val > 0) and (ao_prev <= 0)
+        cross_down = (ao_val < 0) and (ao_prev >= 0)
+
+    trend = 'flat'
+    if len(df) >= 3 and not pd.isna(ao_prev) and not pd.isna(ao_prev2):
+        if ao_val > ao_prev > ao_prev2:
+            trend = 'rising'
+        elif ao_val < ao_prev < ao_prev2:
+            trend = 'falling'
+
+    return {
+        'positive': ao_val > 0,
+        'value': round(ao_val, 4),
+        'cross_up': cross_up,
+        'cross_down': cross_down,
+        'trend': trend,
+        'error': None
+    }
+
+
+# =============================================================================
+# WEINSTEIN STAGE DETECTION
+# =============================================================================
+
+@_cache_data(ttl=600, show_spinner=False)
+def detect_weinstein_stage(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Classify stock into Weinstein Stage (1-4) using 150-day SMA (~30 weeks).
+
+    Stage 1 (Base): SMA flattening, price consolidating near SMA
+    Stage 2 (Advance): SMA rising, price above SMA
+    Stage 3 (Top): SMA flattening after rise, price rolling over
+    Stage 4 (Decline): SMA falling, price below SMA
+
+    Returns dict with stage number, label, SMA slope, and trend maturity.
+    """
+    if df is None or len(df) < 200:
+        return {
+            'stage': 0, 'label': 'Insufficient data',
+            'sma150_slope': 'unknown', 'price_vs_sma150': 'unknown',
+            'trend_maturity': 'unknown'
+        }
+
+    df = df.copy()
+    if 'SMA_150' not in df.columns:
+        df['SMA_150'] = calculate_sma(df['Close'], 150)
+
+    price = float(df['Close'].iloc[-1])
+    sma_now = float(df['SMA_150'].iloc[-1])
+    sma_20ago = float(df['SMA_150'].iloc[-20]) if len(df) >= 20 else sma_now
+    sma_50ago = float(df['SMA_150'].iloc[-50]) if len(df) >= 50 else sma_now
+
+    if pd.isna(sma_now) or pd.isna(sma_20ago):
+        return {
+            'stage': 0, 'label': 'Insufficient data',
+            'sma150_slope': 'unknown', 'price_vs_sma150': 'unknown',
+            'trend_maturity': 'unknown'
+        }
+
+    # SMA slope (20-bar rate of change)
+    sma_roc = (sma_now - sma_20ago) / sma_20ago * 100  # percentage change
+    above_sma = price > sma_now
+    pct_from_sma = (price - sma_now) / sma_now * 100
+
+    # Classify slope
+    if sma_roc > 1.0:
+        slope = 'rising'
+    elif sma_roc < -1.0:
+        slope = 'falling'
+    else:
+        slope = 'flat'
+
+    # 52-week position
+    high_52w = float(df['High'].tail(252).max())
+    low_52w = float(df['Low'].tail(252).min())
+    range_52w = high_52w - low_52w
+    pct_from_high = (price - high_52w) / high_52w * 100
+    pct_from_low = (price - low_52w) / low_52w * 100
+
+    # Stage classification
+    if slope == 'rising' and above_sma:
+        stage = 2
+        label = 'Stage 2 — Advance'
+        # Maturity: early if just broke above, late if extended
+        if pct_from_sma < 5:
+            maturity = 'early'
+        elif pct_from_sma < 15:
+            maturity = 'mid'
+        elif pct_from_sma < 30:
+            maturity = 'late'
+        else:
+            maturity = 'extended'
+    elif slope == 'falling' and not above_sma:
+        stage = 4
+        label = 'Stage 4 — Decline'
+        maturity = 'active'
+    elif slope == 'flat' and abs(pct_from_sma) < 5:
+        # Flat SMA, price near it — could be Stage 1 or 3
+        # Differentiate: was it rising before (Stage 3) or falling before (Stage 1)?
+        sma_longer_roc = (sma_now - sma_50ago) / sma_50ago * 100 if not pd.isna(sma_50ago) else 0
+        if sma_longer_roc > 5:
+            stage = 3
+            label = 'Stage 3 — Top/Distribution'
+            maturity = 'caution'
+        else:
+            stage = 1
+            label = 'Stage 1 — Base/Accumulation'
+            maturity = 'building'
+    elif slope == 'rising' and not above_sma:
+        # SMA still rising but price dipped below — pullback in Stage 2
+        stage = 2
+        label = 'Stage 2 — Pullback'
+        maturity = 'pullback'
+    elif slope == 'falling' and above_sma:
+        # SMA falling but price above — rally in Stage 4 (bear market rally)
+        stage = 4
+        label = 'Stage 4 — Bear Rally'
+        maturity = 'counter-trend'
+    elif slope == 'flat' and above_sma:
+        stage = 3
+        label = 'Stage 3 — Topping'
+        maturity = 'distribution'
+    elif slope == 'flat' and not above_sma:
+        stage = 1
+        label = 'Stage 1 — Basing'
+        maturity = 'accumulation'
+    else:
+        stage = 0
+        label = 'Indeterminate'
+        maturity = 'unknown'
+
+    return {
+        'stage': stage,
+        'label': label,
+        'sma150_slope': slope,
+        'sma150_roc_pct': round(sma_roc, 2),
+        'price_vs_sma150': 'above' if above_sma else 'below',
+        'pct_from_sma150': round(pct_from_sma, 1),
+        'pct_from_52w_high': round(pct_from_high, 1),
+        'pct_from_52w_low': round(pct_from_low, 1),
+        'trend_maturity': maturity,
+    }
+
+
+# =============================================================================
+# VOLUME ANALYSIS
+# =============================================================================
+
+def analyze_volume(df: pd.DataFrame, macd_cross_bar: int = None) -> Dict[str, Any]:
+    """
+    Analyze volume patterns.
+
+    Returns:
+        - avg_volume_50d: average daily volume over 50 days
+        - cross_volume_ratio: volume on cross day vs 50d average (if cross provided)
+        - accum_dist_trend: 'accumulating', 'distributing', or 'neutral'
+        - volume_trend_20d: 'increasing', 'decreasing', or 'flat'
+        - big_volume_days_20d: count of 2x+ average volume days in last 20
+    """
+    if df is None or len(df) < 50 or 'Volume' not in df.columns:
+        return {
+            'avg_volume_50d': 0, 'cross_volume_ratio': None,
+            'accum_dist_trend': 'unknown', 'volume_trend_20d': 'unknown',
+            'big_volume_days_20d': 0
+        }
+
+    vol = df['Volume']
+    avg_50 = float(vol.tail(50).mean())
+
+    # Cross volume ratio
+    cross_vol_ratio = None
+    if macd_cross_bar is not None and 0 <= macd_cross_bar < len(df):
+        cross_vol = float(vol.iloc[macd_cross_bar])
+        cross_vol_ratio = round(cross_vol / avg_50, 2) if avg_50 > 0 else None
+
+    # Accumulation/Distribution: compare up-day volume vs down-day volume (last 20 bars)
+    recent = df.tail(20)
+    up_days = recent[recent['Close'] >= recent['Close'].shift(1)]
+    down_days = recent[recent['Close'] < recent['Close'].shift(1)]
+    up_vol = float(up_days['Volume'].sum()) if len(up_days) > 0 else 0
+    down_vol = float(down_days['Volume'].sum()) if len(down_days) > 0 else 0
+
+    if up_vol > down_vol * 1.3:
+        ad_trend = 'accumulating'
+    elif down_vol > up_vol * 1.3:
+        ad_trend = 'distributing'
+    else:
+        ad_trend = 'neutral'
+
+    # Volume trend (is volume increasing or drying up?)
+    vol_first_10 = float(vol.tail(20).head(10).mean())
+    vol_last_10 = float(vol.tail(10).mean())
+
+    if vol_last_10 > vol_first_10 * 1.2:
+        vol_trend = 'increasing'
+    elif vol_last_10 < vol_first_10 * 0.8:
+        vol_trend = 'decreasing'
+    else:
+        vol_trend = 'flat'
+
+    # Big volume days
+    big_days = int((vol.tail(20) > avg_50 * 2).sum())
+
+    return {
+        'avg_volume_50d': int(avg_50),
+        'cross_volume_ratio': cross_vol_ratio,
+        'accum_dist_trend': ad_trend,
+        'volume_trend_20d': vol_trend,
+        'big_volume_days_20d': big_days,
+    }
+
+
+# =============================================================================
+# KEY LEVELS ANALYSIS
+# =============================================================================
+
+def analyze_key_levels(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Analyze price relative to key technical levels.
+
+    Returns price vs 50/200 SMA, golden/death cross status,
+    and simple pivot-based support/resistance.
+    """
+    if df is None or len(df) < 200:
+        return {
+            'price': None, 'sma50': None, 'sma200': None,
+            'price_vs_sma50': 'unknown', 'price_vs_sma200': 'unknown',
+            'golden_cross': None, 'nearest_support': None,
+            'nearest_resistance': None, 'at_key_level': False
+        }
+
+    if 'SMA_50' not in df.columns:
+        df = df.copy()
+        df['SMA_50'] = calculate_sma(df['Close'], 50)
+        df['SMA_200'] = calculate_sma(df['Close'], 200)
+
+    price = float(df['Close'].iloc[-1])
+    sma50 = float(df['SMA_50'].iloc[-1])
+    sma200 = float(df['SMA_200'].iloc[-1])
+
+    if pd.isna(sma50) or pd.isna(sma200):
+        return {
+            'price': price, 'sma50': None, 'sma200': None,
+            'price_vs_sma50': 'unknown', 'price_vs_sma200': 'unknown',
+            'golden_cross': None, 'nearest_support': None,
+            'nearest_resistance': None, 'at_key_level': False
+        }
+
+    golden_cross = sma50 > sma200
+
+    # Simple support/resistance from recent 60-day lows/highs
+    recent = df.tail(60)
+    swing_lows = recent['Low'].rolling(5, center=True).min()
+    swing_highs = recent['High'].rolling(5, center=True).max()
+
+    # Support: highest swing low below current price
+    supports = swing_lows[swing_lows < price].dropna()
+    nearest_support = float(supports.iloc[-1]) if len(supports) > 0 else None
+
+    # Resistance: lowest swing high above current price
+    resistances = swing_highs[swing_highs > price].dropna()
+    nearest_resistance = float(resistances.iloc[-1]) if len(resistances) > 0 else None
+
+    # Near a key level? (within 1% of SMA50, SMA200, support, or resistance)
+    at_key = False
+    for level in [sma50, sma200, nearest_support, nearest_resistance]:
+        if level and abs(price - level) / price < 0.01:
+            at_key = True
+            break
+
+    return {
+        'price': round(price, 2),
+        'sma50': round(sma50, 2),
+        'sma200': round(sma200, 2),
+        'price_vs_sma50': 'above' if price > sma50 else 'below',
+        'price_vs_sma200': 'above' if price > sma200 else 'below',
+        'pct_from_sma50': round((price - sma50) / sma50 * 100, 1),
+        'pct_from_sma200': round((price - sma200) / sma200 * 100, 1),
+        'golden_cross': golden_cross,
+        'nearest_support': round(nearest_support, 2) if nearest_support else None,
+        'nearest_resistance': round(nearest_resistance, 2) if nearest_resistance else None,
+        'at_key_level': at_key,
+    }
+
+
+# =============================================================================
+# OVERHEAD RESISTANCE ANALYSIS
+# =============================================================================
+
+@_cache_data(ttl=600, show_spinner=False)
+def find_overhead_resistance(df: pd.DataFrame, num_levels: int = 5) -> Dict[str, Any]:
+    """
+    Identify major overhead resistance levels the stock must break through
+    for a sustained uptrend.
+
+    Combines four methods:
+    1. Volume Profile — price zones where heaviest trading occurred above current price
+       (overhead supply = trapped buyers who want to sell at breakeven)
+    2. Prior Swing Highs — significant peaks where rallies previously failed
+    3. Declining SMAs — moving averages sitting above price act as dynamic resistance
+    4. Psychological levels — 52-week high, round numbers
+
+    Returns dict with:
+        - levels: list of resistance levels, each with price, type, strength, description
+        - critical_level: the single most important level to break
+        - breakout_volume_needed: estimated volume multiple needed for breakout
+        - distance_to_critical: % from current price to critical level
+        - assessment: plain text summary for AI context
+    """
+    if df is None or len(df) < 100:
+        return {
+            'levels': [],
+            'critical_level': None,
+            'breakout_volume_needed': None,
+            'distance_to_critical': None,
+            'assessment': 'Insufficient data for resistance analysis',
+        }
+
+    df = df.copy()
+    price = float(df['Close'].iloc[-1])
+    levels = []
+
+    # ── 1. VOLUME PROFILE — find price zones with heavy volume above current price ──
+    # Bucket the last 200 bars into price bins, sum volume in each bin
+    lookback = min(200, len(df))
+    recent = df.tail(lookback)
+
+    price_range = float(recent['High'].max() - recent['Low'].min())
+    if price_range > 0:
+        num_bins = 30  # 30 price zones
+        bin_size = price_range / num_bins
+        bin_low = float(recent['Low'].min())
+
+        vol_profile = {}
+        for _, row in recent.iterrows():
+            bar_mid = (float(row['High']) + float(row['Low'])) / 2
+            bin_idx = int((bar_mid - bin_low) / bin_size)
+            bin_idx = min(bin_idx, num_bins - 1)
+            bin_price = bin_low + (bin_idx + 0.5) * bin_size
+            vol_profile[round(bin_price, 2)] = (
+                vol_profile.get(round(bin_price, 2), 0) + float(row['Volume'])
+            )
+
+        # Find volume nodes ABOVE current price
+        avg_bin_vol = np.mean(list(vol_profile.values())) if vol_profile else 0
+        for vp_price, vol in sorted(vol_profile.items()):
+            if vp_price > price * 1.005:  # At least 0.5% above
+                strength = vol / avg_bin_vol if avg_bin_vol > 0 else 0
+                if strength > 1.3:  # Must be above average to be significant
+                    strength_label = 'strong' if strength > 2.0 else 'moderate'
+                    total_vol_m = vol / 1_000_000
+                    levels.append({
+                        'price': vp_price,
+                        'type': 'volume_node',
+                        'strength': round(strength, 1),
+                        'strength_label': strength_label,
+                        'description': f"${vp_price:.0f} — Volume node ({total_vol_m:.0f}M shares, {strength:.1f}x avg)",
+                    })
+
+    # ── 2. PRIOR SWING HIGHS — peaks where price reversed ──
+    # Use a 10-bar window to find local maxima in the last 120 bars
+    swing_lookback = min(120, len(df))
+    swing_data = df.tail(swing_lookback)
+
+    if len(swing_data) >= 10:
+        highs = swing_data['High']
+        for i in range(5, len(highs) - 5):
+            window = highs.iloc[i - 5:i + 6]
+            peak = float(highs.iloc[i])
+            if peak == float(window.max()) and peak > price * 1.005:
+                # Count how many times price tested this level (within 1%)
+                tests = 0
+                for j in range(len(swing_data)):
+                    if abs(float(swing_data['High'].iloc[j]) - peak) / peak < 0.01:
+                        tests += 1
+
+                if tests >= 2:  # Tested at least twice = real resistance
+                    strength = min(tests, 5)
+                    # Check if this level is near an existing level (merge within 1.5%)
+                    merged = False
+                    for existing in levels:
+                        if abs(existing['price'] - peak) / peak < 0.015:
+                            # Merge — take the stronger one
+                            if strength > existing.get('strength', 0):
+                                existing['price'] = peak
+                                existing['strength'] = strength
+                                existing['description'] = f"${peak:.2f} — Swing high (tested {tests}x)"
+                            existing['type'] = 'confluence'  # Volume + swing = confluence
+                            merged = True
+                            break
+                    if not merged:
+                        levels.append({
+                            'price': round(peak, 2),
+                            'type': 'swing_high',
+                            'strength': strength,
+                            'strength_label': 'strong' if tests >= 3 else 'moderate',
+                            'description': f"${peak:.2f} — Swing high (tested {tests}x)",
+                        })
+
+    # ── 3. DECLINING SMAs OVERHEAD — dynamic resistance ──
+    if 'SMA_50' not in df.columns:
+        df['SMA_50'] = calculate_sma(df['Close'], 50)
+        df['SMA_200'] = calculate_sma(df['Close'], 200)
+    if 'SMA_150' not in df.columns:
+        df['SMA_150'] = calculate_sma(df['Close'], 150)
+
+    for sma_name, col in [('50-day SMA', 'SMA_50'), ('150-day SMA', 'SMA_150'),
+                           ('200-day SMA', 'SMA_200')]:
+        sma_val = float(df[col].iloc[-1])
+        if pd.isna(sma_val):
+            continue
+        if sma_val > price * 1.005:
+            # Check if SMA is declining (acting as resistance, not support)
+            sma_prev = float(df[col].iloc[-20]) if len(df) >= 20 else sma_val
+            declining = sma_val < sma_prev if not pd.isna(sma_prev) else False
+            flat_or_declining = sma_val <= sma_prev * 1.005 if not pd.isna(sma_prev) else False
+
+            if flat_or_declining:
+                pct_above = (sma_val - price) / price * 100
+                strength = 3.0 if declining else 2.0  # Declining SMA = stronger resistance
+                levels.append({
+                    'price': round(sma_val, 2),
+                    'type': 'declining_sma',
+                    'strength': strength,
+                    'strength_label': 'strong' if declining else 'moderate',
+                    'description': f"${sma_val:.2f} — {sma_name} {'declining ↘' if declining else 'flat →'} ({pct_above:.1f}% above)",
+                })
+
+    # ── 4. PSYCHOLOGICAL LEVELS — 52-week high, round numbers ──
+    high_52w = float(df['High'].tail(252).max()) if len(df) >= 252 else float(df['High'].max())
+
+    if high_52w > price * 1.005:
+        pct_below = (high_52w - price) / price * 100
+        levels.append({
+            'price': round(high_52w, 2),
+            'type': '52w_high',
+            'strength': 4.0,  # Always significant
+            'strength_label': 'strong',
+            'description': f"${high_52w:.2f} — 52-week high ({pct_below:.1f}% above)",
         })
 
-    # --- Calculate metrics ---
-    if len(signals) == 0:
-        result['error'] = "No signals found in backtest"
-        return result
+    # Round numbers (nearest $10, $25, $50, $100 above price)
+    for increment in [10, 25, 50, 100]:
+        round_level = float(np.ceil(price / increment) * increment)
+        if round_level > price * 1.005 and round_level < price * 1.30:
+            # Only add if not too close to existing level
+            too_close = any(abs(l['price'] - round_level) / round_level < 0.01 for l in levels)
+            if not too_close:
+                levels.append({
+                    'price': round_level,
+                    'type': 'round_number',
+                    'strength': 1.5,
+                    'strength_label': 'moderate',
+                    'description': f"${round_level:.0f} — Round number psychological level",
+                })
 
-    df = pd.DataFrame(signals)
-
-    result['signals_found'] = len(signals)
-    result['win_rate'] = round((df['win'].sum() / len(df)) * 100, 1)
-    result['avg_return'] = round(df['return_pct'].mean(), 1)
-    result['best_return'] = round(df['return_pct'].max(), 1)
-    result['worst_return'] = round(df['return_pct'].min(), 1)
-    result['weekly_confirmed_pct'] = round((df['weekly_confirmed'].sum() / len(df)) * 100, 1)
-    result['details'] = signals[-5:]
-
-    # Compute expectancy: (win_rate × avg_win) - (loss_rate × avg_loss)
-    wins = df[df['win']]
-    losses = df[~df['win']]
-    avg_win = float(wins['return_pct'].mean()) if len(wins) > 0 else 0.0
-    avg_loss = abs(float(losses['return_pct'].mean())) if len(losses) > 0 else 0.0
-    wr_frac = result['win_rate'] / 100.0
-    expectancy = (wr_frac * avg_win) - ((1 - wr_frac) * avg_loss)
-    result['avg_win'] = round(avg_win, 1)
-    result['avg_loss'] = round(avg_loss, 1)
-    result['expectancy'] = round(expectancy, 2)
-
-    # Quality score (0-100) — expectancy-weighted
-    # Expectancy is the single best predictor of whether a strategy makes money.
-    # A 40% WR with +20% avg win / -5% avg loss = +5% expectancy (profitable)
-    # An 80% WR with +1.5% avg win / -8% avg loss = -0.4% expectancy (unprofitable)
-    expect_score = min(max(expectancy, 0), 10) / 10 * 30    # 30 pts max, caps at 10% expectancy
-    wr_score = min(result['win_rate'], 80) / 80 * 25         # 25 pts max
-    ret_score = min(max(result['avg_return'], 0), 15) / 15 * 20  # 20 pts max, caps at 15% avg
-    sig_score = min(result['signals_found'], 20) / 20 * 15   # 15 pts max
-    loss_score = max(0, 10 + result['worst_return'] / 3)     # 10 pts max
-
-    result['quality_score'] = int(expect_score + wr_score + ret_score + sig_score + loss_score)
-
-    if result['quality_score'] >= 60 and result['win_rate'] >= 55 and expectancy >= 2.0:
-        result['quality_grade'] = 'A'
-    elif result['quality_score'] >= 42 and result['win_rate'] >= 45 and expectancy >= 0.5:
-        result['quality_grade'] = 'B'
-    elif result['quality_score'] >= 25 and result['win_rate'] >= 35:
-        result['quality_grade'] = 'C'
-    else:
-        result['quality_grade'] = 'F'
-
-    return result
-
-
-# =============================================================================
-# SECONDARY SIGNAL TYPES
-# =============================================================================
-
-def check_ao_confirmation(daily_df: pd.DataFrame,
-                          market_filter: Dict = None,
-                          macd_lookback: int = AO_CONFIRM_MACD_LOOKBACK,
-                          macd_profile: Optional[str] = None) -> Dict[str, Any]:
-    """
-    AO Confirmation signal: MACD crossed up first, AO confirms by crossing zero later.
-
-    Conditions:
-    1. MACD crossed up within last macd_lookback days
-    2. AO just crossed from ≤0 to >0 (today or last 1-2 days)
-    3. MACD still bullish
-    4. Market filter passes
-    """
-    result = {
-        'is_valid': False,
-        'signal_type': 'AO_CONFIRMATION',
-        'macd_cross_date': None,
-        'macd_cross_price': 0,
-        'macd_cross_days_ago': 0,
-        'ao_at_macd_cross': 0,
-        'ao_cross_date': None,
-        'ao_cross_days_ago': 0,
-        'current_price': 0,
-        'entry_premium_pct': 0,
-        'quality': '❌ No Signal',
-        'quality_score': 0,
-        'reason': '',
-    }
-
-    if daily_df is None or len(daily_df) < 50:
-        result['reason'] = 'Insufficient data'
-        return result
-
-    profile = _resolve_macd_profile(macd_profile)
-    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
-
-    df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df, profile=profile_for_primary)
-    df = calculate_ao(df)
-
-    i = len(df) - 1
-    current_price = float(df['Close'].iloc[i])
-    result['current_price'] = round(current_price, 2)
-
-    macd_now = float(df['MACD'].iloc[i])
-    sig_now = float(df['MACD_Signal'].iloc[i])
-    ao_now = float(df['AO'].iloc[i])
-
-    if pd.isna(macd_now) or pd.isna(sig_now) or pd.isna(ao_now):
-        result['reason'] = 'NaN in indicators'
-        return result
-
-    # Must be bullish and AO positive
-    if macd_now <= sig_now:
-        result['reason'] = 'MACD not bullish'
-        return result
-
-    if ao_now <= 0:
-        result['reason'] = 'AO not positive'
-        return result
-
-    # Find AO zero-cross in last 3 days
-    ao_cross_found = False
-    for j in range(0, 3):
-        ci = i - j
-        if ci < 1:
-            break
-        ao_before = float(df['AO'].iloc[ci - 1])
-        ao_after = float(df['AO'].iloc[ci])
-        if not (pd.isna(ao_before) or pd.isna(ao_after)):
-            if ao_before <= 0 and ao_after > 0:
-                ao_cross_found = True
-                result['ao_cross_days_ago'] = j
-                idx = df.index[ci]
-                result['ao_cross_date'] = idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
+    # ── SORT & RANK — closest first, with strength weighting ──
+    # Remove duplicates within 1% of each other, keeping strongest
+    filtered = []
+    for level in sorted(levels, key=lambda x: x['price']):
+        merged = False
+        for existing in filtered:
+            if abs(existing['price'] - level['price']) / level['price'] < 0.01:
+                if level['strength'] > existing['strength']:
+                    existing.update(level)
+                    existing['type'] = 'confluence'
+                    existing['strength'] = max(existing['strength'], level['strength'])
+                merged = True
                 break
+        if not merged:
+            filtered.append(level)
 
-    if not ao_cross_found:
-        result['reason'] = 'No recent AO zero-cross (last 3 days)'
-        return result
+    # Sort by proximity to current price
+    filtered.sort(key=lambda x: x['price'])
 
-    # Find MACD cross in lookback period
-    macd_cross_found = False
-    for j in range(0, macd_lookback):
-        ci = i - j
-        if ci < 1:
-            break
-        cm = float(df['MACD'].iloc[ci])
-        cs = float(df['MACD_Signal'].iloc[ci])
-        pm = float(df['MACD'].iloc[ci - 1])
-        ps = float(df['MACD_Signal'].iloc[ci - 1])
+    # Take top N levels
+    top_levels = filtered[:num_levels]
 
-        if pd.isna(cm) or pd.isna(cs) or pd.isna(pm) or pd.isna(ps):
-            continue
+    # ── CRITICAL LEVEL — the most important one to break ──
+    # Prioritize: closest + highest strength
+    critical = None
+    if top_levels:
+        # Score: strength * proximity_bonus (closer = more important)
+        for lev in top_levels:
+            dist = (lev['price'] - price) / price * 100
+            # Closer levels weighted more heavily, but very close ones (< 1%) less so
+            proximity_score = max(0, 10 - dist) if dist < 10 else 1
+            lev['_score'] = lev['strength'] * proximity_score
 
-        if cm > cs and pm <= ps:
-            macd_cross_found = True
-            result['macd_cross_days_ago'] = j
-            result['macd_cross_price'] = round(float(df['Close'].iloc[ci]), 2)
-            result['ao_at_macd_cross'] = round(float(df['AO'].iloc[ci]), 4)
-            idx = df.index[ci]
-            result['macd_cross_date'] = idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
-            break
+        critical = max(top_levels, key=lambda x: x.get('_score', 0))
 
-    if not macd_cross_found:
-        result['reason'] = f'No MACD cross in last {macd_lookback} days'
-        return result
+        # Clean up internal score
+        for lev in top_levels:
+            lev.pop('_score', None)
 
-    # Entry premium check
-    if result['macd_cross_price'] > 0:
-        premium = (current_price - result['macd_cross_price']) / result['macd_cross_price'] * 100
-        result['entry_premium_pct'] = round(premium, 1)
-        if premium > AO_CONFIRM_MAX_PREMIUM:
-            result['reason'] = f'Entry premium too high ({premium:.1f}% > {AO_CONFIRM_MAX_PREMIUM}%)'
-            return result
+    # ── BREAKOUT VOLUME ESTIMATE ──
+    # If critical level is a volume node, need proportionally more volume to absorb supply
+    breakout_vol = None
+    if critical:
+        if critical['type'] in ['volume_node', 'confluence']:
+            breakout_vol = round(max(1.5, critical['strength'] * 0.8), 1)
+        elif critical['type'] == 'declining_sma':
+            breakout_vol = 1.5
+        else:
+            breakout_vol = 1.3  # Default: need at least 1.3x avg volume
 
-    # Market filter — conservative: reject if missing or bearish
-    _mf = market_filter or {}
-    if not _mf.get('spy_above_200', False):
-        result['reason'] = 'Market filter: SPY below 200 SMA (or data missing)'
-        return result
-    if not _mf.get('vix_below_30', False):
-        result['reason'] = 'Market filter: VIX above 30 (or data missing)'
-        return result
+    # ── DISTANCE TO CRITICAL ──
+    dist_pct = None
+    if critical:
+        dist_pct = round((critical['price'] - price) / price * 100, 1)
 
-    # VALID
-    result['is_valid'] = True
-
-    # Quality rating
-    days_ago = result['macd_cross_days_ago']
-    premium = result['entry_premium_pct']
-
-    if days_ago <= 3 and premium <= 2:
-        result['quality'] = '🟢 Fresh AO Confirm'
-        result['quality_score'] = 85
-    elif days_ago <= 5 and premium <= 4:
-        result['quality'] = '🟡 Recent AO Confirm'
-        result['quality_score'] = 70
+    # ── ASSESSMENT TEXT ──
+    if not top_levels:
+        assessment = "No significant overhead resistance detected — clear path higher."
+    elif critical and dist_pct is not None:
+        num_above = len(top_levels)
+        if dist_pct < 3:
+            assessment = (f"Critical resistance at ${critical['price']:.2f} ({dist_pct:.1f}% above) — "
+                         f"{critical['description']}. "
+                         f"{num_above} resistance level{'s' if num_above > 1 else ''} overhead. "
+                         f"Breakout needs {breakout_vol:.1f}x average volume to stick.")
+        elif dist_pct < 8:
+            assessment = (f"Room to run before hitting resistance at ${critical['price']:.2f} "
+                         f"({dist_pct:.1f}% above). {num_above} level{'s' if num_above > 1 else ''} overhead.")
+        else:
+            assessment = (f"Significant resistance at ${critical['price']:.2f} ({dist_pct:.1f}% above) "
+                         f"but has room to move. {num_above} level{'s' if num_above > 1 else ''} total overhead.")
     else:
-        result['quality'] = '🟠 Late AO Confirm'
-        result['quality_score'] = 55
+        assessment = f"{len(top_levels)} resistance level{'s' if len(top_levels) > 1 else ''} identified overhead."
 
-    return result
-
-
-def check_reentry_signal(daily_df: pd.DataFrame,
-                         market_filter: Dict = None,
-                         macd_profile: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Re-entry signal: MACD crosses up while AO is already positive (established trend).
-
-    This fills the gap where:
-    - Primary fails (no fresh AO zero-cross)
-    - AO Confirmation fails (AO was already positive at MACD cross)
-
-    Conditions:
-    1. MACD crossed up within last RE_ENTRY_MACD_LOOKBACK bars
-    2. MACD still bullish
-    3. AO positive
-    4. AO has been positive for a while (no recent zero-cross = established momentum)
-    5. Market filter passes
-    """
-    result = {
-        'is_valid': False,
-        'signal_type': 'RE_ENTRY',
-        'macd_cross_date': None,
-        'macd_cross_price': 0,
-        'macd_cross_bars_ago': 0,
-        'ao_value': 0,
-        'current_price': 0,
-        'reason': '',
-        'quality': '',
-        'quality_score': 0,
+    return {
+        'levels': top_levels,
+        'critical_level': {
+            'price': critical['price'],
+            'type': critical['type'],
+            'description': critical['description'],
+        } if critical else None,
+        'breakout_volume_needed': breakout_vol,
+        'distance_to_critical_pct': dist_pct,
+        'assessment': assessment,
     }
-
-    if daily_df is None or len(daily_df) < 50:
-        result['reason'] = 'Insufficient data'
-        return result
-
-    profile = _resolve_macd_profile(macd_profile)
-    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
-
-    df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df, profile=profile_for_primary)
-    df = calculate_ao(df)
-
-    i = len(df) - 1
-    current_price = float(df['Close'].iloc[i])
-    result['current_price'] = round(current_price, 2)
-
-    macd_now = float(df['MACD'].iloc[i])
-    sig_now = float(df['MACD_Signal'].iloc[i])
-    ao_now = float(df['AO'].iloc[i])
-
-    if pd.isna(macd_now) or pd.isna(sig_now) or pd.isna(ao_now):
-        result['reason'] = 'NaN in indicators'
-        return result
-
-    result['ao_value'] = round(ao_now, 2)
-
-    # MACD must be bullish
-    if macd_now <= sig_now:
-        result['reason'] = 'MACD not bullish'
-        return result
-
-    # AO must be positive
-    if ao_now <= 0:
-        result['reason'] = 'AO not positive'
-        return result
-
-    # Find MACD cross in lookback
-    macd_cross_found = False
-    for j in range(RE_ENTRY_MACD_LOOKBACK):
-        ci = i - j
-        if ci < 1:
-            break
-        cm = float(df['MACD'].iloc[ci])
-        cs = float(df['MACD_Signal'].iloc[ci])
-        pm = float(df['MACD'].iloc[ci - 1])
-        ps = float(df['MACD_Signal'].iloc[ci - 1])
-
-        if pd.isna(cm) or pd.isna(cs) or pd.isna(pm) or pd.isna(ps):
-            continue
-
-        if cm > cs and pm <= ps:
-            macd_cross_found = True
-            result['macd_cross_bars_ago'] = j
-            result['macd_cross_price'] = round(float(df['Close'].iloc[ci]), 2)
-            idx = df.index[ci]
-            result['macd_cross_date'] = idx.strftime('%Y-%m-%d') if hasattr(idx, 'strftime') else str(idx)
-            break
-
-    if not macd_cross_found:
-        result['reason'] = f'No MACD cross in last {RE_ENTRY_MACD_LOOKBACK} bars'
-        return result
-
-    # AO must NOT have a recent zero-cross (that would be primary signal territory)
-    for j in range(1, ENTRY_WINDOW + 1):
-        pi = i - j
-        if pi < 1:
-            break
-        ao_before = float(df['AO'].iloc[pi - 1])
-        ao_after = float(df['AO'].iloc[pi])
-        if not (pd.isna(ao_before) or pd.isna(ao_after)):
-            if ao_before <= 0 and ao_after > 0:
-                result['reason'] = 'AO had recent zero-cross — primary signal applies'
-                return result
-
-    # Market filter — conservative: reject if missing or bearish
-    _mf = market_filter or {}
-    if not _mf.get('spy_above_200', False):
-        result['reason'] = 'Market filter: SPY below 200 SMA (or data missing)'
-        return result
-    if not _mf.get('vix_below_30', False):
-        result['reason'] = 'Market filter: VIX above 30 (or data missing)'
-        return result
-
-    # VALID
-    result['is_valid'] = True
-
-    bars_ago = result['macd_cross_bars_ago']
-    if bars_ago <= 2:
-        result['quality'] = '🟢 Fresh Re-Entry'
-        result['quality_score'] = 75
-    elif bars_ago <= 5:
-        result['quality'] = '🟡 Recent Re-Entry'
-        result['quality_score'] = 65
-    else:
-        result['quality'] = '🟠 Late Re-Entry'
-        result['quality_score'] = 55
-
-    result['reason'] = f"MACD crossed up {bars_ago}d ago, AO already positive ({ao_now:.1f})"
-    return result
-
-
-def check_late_entry(daily_df: pd.DataFrame,
-                     market_filter: Dict = None,
-                     macd_profile: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Late entry: valid signal occurred 1-5 days ago, still actionable if not too extended.
-
-    Finds the most recent primary signal in the last LATE_ENTRY_MAX_DAYS
-    and checks if the price hasn't run too far.
-    """
-    result = {
-        'is_valid': False,
-        'signal_type': 'LATE_ENTRY',
-        'cross_date': None,
-        'cross_price': 0,
-        'days_since_cross': 0,
-        'entry_premium_pct': 0,
-        'current_price': 0,
-        'reason': '',
-    }
-
-    if daily_df is None or len(daily_df) < 50:
-        result['reason'] = 'Insufficient data'
-        return result
-
-    profile = _resolve_macd_profile(macd_profile)
-    profile_for_primary = MACD_PROFILE_LEGACY if profile == MACD_PROFILE_SHADOW else profile
-
-    df = normalize_columns(daily_df).copy()
-    df = calculate_macd(df, profile=profile_for_primary)
-    df = calculate_ao(df)
-
-    i = len(df) - 1
-    current_price = float(df['Close'].iloc[i])
-    result['current_price'] = round(current_price, 2)
-
-    # Look back for a valid primary signal in last LATE_ENTRY_MAX_DAYS
-    for lookback in range(1, LATE_ENTRY_MAX_DAYS + 1):
-        ci = i - lookback
-        if ci < ENTRY_WINDOW + 1:
-            break
-
-        # Check MACD cross at that bar
-        cm = float(df['MACD'].iloc[ci])
-        cs = float(df['MACD_Signal'].iloc[ci])
-        pm = float(df['MACD'].iloc[ci - 1])
-        ps = float(df['MACD_Signal'].iloc[ci - 1])
-
-        if pd.isna(cm) or pd.isna(cs) or pd.isna(pm) or pd.isna(ps):
-            continue
-
-        if not (cm > cs and pm <= ps):
-            continue
-
-        # AO positive at that bar
-        ao_val = float(df['AO'].iloc[ci])
-        if pd.isna(ao_val) or ao_val <= 0:
-            continue
-
-        # AO zero-cross in prior window
-        ao_cross = False
-        for j in range(1, ENTRY_WINDOW + 1):
-            pi = ci - j
-            if pi < 1:
-                break
-            ab = float(df['AO'].iloc[pi - 1])
-            aa = float(df['AO'].iloc[pi])
-            if not (pd.isna(ab) or pd.isna(aa)):
-                if ab <= 0 and aa > 0:
-                    ao_cross = True
-                    break
-
-        if not ao_cross:
-            continue
-
-        # Found a valid signal — check if still actionable
-        cross_price = float(df['Close'].iloc[ci])
-        premium = (current_price - cross_price) / cross_price * 100
-
-        result['cross_date'] = (df.index[ci].strftime('%Y-%m-%d')
-                                if hasattr(df.index[ci], 'strftime') else str(df.index[ci]))
-        result['cross_price'] = round(cross_price, 2)
-        result['days_since_cross'] = lookback
-        result['entry_premium_pct'] = round(premium, 1)
-
-        if premium > LATE_ENTRY_MAX_PREMIUM:
-            result['reason'] = f'Price extended {premium:.1f}% above signal (max {LATE_ENTRY_MAX_PREMIUM}%)'
-            return result
-
-        # MACD must still be bullish
-        if float(df['MACD'].iloc[i]) <= float(df['MACD_Signal'].iloc[i]):
-            result['reason'] = 'MACD no longer bullish'
-            return result
-
-        # Market filter — conservative: reject if missing or bearish
-        _mf = market_filter or {}
-        if not _mf.get('spy_above_200', False) or not _mf.get('vix_below_30', False):
-            result['reason'] = 'Market filter failed (or data missing)'
-            return result
-
-        result['is_valid'] = True
-        result['reason'] = f'Signal {lookback}d ago at ${cross_price:.2f}, premium {premium:.1f}%'
-        return result
-
-    result['reason'] = f'No valid signal in last {LATE_ENTRY_MAX_DAYS} days'
-    return result
 
 
 # =============================================================================
-# RECOMMENDATION ENGINE
+# RELATIVE STRENGTH
 # =============================================================================
 
-def generate_recommendation(signal: EntrySignal,
-                            quality: Dict,
-                            ao_confirm: Dict = None,
-                            reentry: Dict = None,
-                            late_entry: Dict = None) -> Dict[str, Any]:
+@_cache_data(ttl=600, show_spinner=False)
+def analyze_relative_strength(df: pd.DataFrame, spy_df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Generate final recommendation based on all signal types and context.
+    Calculate relative strength vs SPY over multiple periods.
 
-    Priority: PRIMARY > AO_CONFIRMATION > RE_ENTRY > LATE_ENTRY > MTF_PULLBACK > WATCH > SKIP
-
-    Returns dict with: signal_type, recommendation, summary, conviction (1-10)
-
-    Conviction scoring uses quality_score (0-100) for granularity within grades:
-      STRONG BUY: base 7-10 (A=8-10, B=7-8), refined by quality_score
-      BUY:        base 5-7
-      RE-ENTRY:   base 4-6
-      WATCH:      base 2-4
-      SKIP:       0-1
+    Both DataFrames should be daily with 'Close' column.
     """
-    grade = quality.get('quality_grade', 'N/A')
-    q_score = quality.get('quality_score', 0)  # 0-100 for fine-tuning
-    weekly_bullish = signal.weekly_macd.get('bullish', False)
-    # Weekly "healthy" = bullish AND histogram not deeply negative/declining.
-    # A ticker where MACD line is barely above signal but histogram is negative
-    # (e.g. META: MACD=0.64, signal=-7.70, hist=-8.33) is technically bullish
-    # but the weekly trend is rolling over — NOT a healthy pullback base.
-    _wk_hist = float(signal.weekly_macd.get('histogram', 0) or 0)
-    _wk_weakening = bool(signal.weekly_macd.get('weakening', False))
-    _wk_bearish_cross = bool(signal.weekly_macd.get('bearish_cross', False))
-    weekly_healthy = weekly_bullish and not _wk_bearish_cross and _wk_hist >= 0
-    # Even if hist >= 0, if it's weakening rapidly, flag it
-    if weekly_healthy and _wk_weakening and _wk_hist < 1.0:
-        weekly_healthy = False
-    # Conservative: missing monthly data = unconfirmed, not assumed bullish.
-    _has_monthly = bool(signal.monthly_macd) and signal.monthly_macd.get('error') is None
-    monthly_macd_bullish = signal.monthly_macd.get('bullish', False) if _has_monthly else False
-    monthly_ao_positive = signal.monthly_ao.get('positive', False) if bool(signal.monthly_ao) else False
-    monthly_bullish = bool(monthly_macd_bullish and monthly_ao_positive)
-    monthly_warning = ""
-    if not monthly_macd_bullish:
-        monthly_warning += " ⚠️ Monthly MACD bearish headwind!"
-    if not monthly_ao_positive:
-        monthly_warning += " ⚠️ Monthly AO negative headwind!"
+    if df is None or spy_df is None or len(df) < 252 or len(spy_df) < 252:
+        return {
+            'rs_1mo': None, 'rs_3mo': None, 'rs_6mo': None, 'rs_12mo': None,
+            'rs_trend': 'unknown'
+        }
 
-    result = {
-        'signal_type': None,
-        'recommendation': 'SKIP',
-        'summary': '',
-        'conviction': 0,
+    price = df['Close']
+    spy = spy_df['Close']
+
+    # Align on dates
+    common = price.index.intersection(spy.index)
+    if len(common) < 252:
+        return {
+            'rs_1mo': None, 'rs_3mo': None, 'rs_6mo': None, 'rs_12mo': None,
+            'rs_trend': 'unknown'
+        }
+
+    price = price.reindex(common)
+    spy = spy.reindex(common)
+
+    def period_rs(n_bars):
+        if len(price) < n_bars:
+            return None
+        stock_ret = (float(price.iloc[-1]) / float(price.iloc[-n_bars]) - 1) * 100
+        spy_ret = (float(spy.iloc[-1]) / float(spy.iloc[-n_bars]) - 1) * 100
+        return round(stock_ret - spy_ret, 1)
+
+    rs_1mo = period_rs(21)
+    rs_3mo = period_rs(63)
+    rs_6mo = period_rs(126)
+    rs_12mo = period_rs(252)
+
+    # RS trend: is short-term RS improving or deteriorating vs longer-term?
+    if rs_1mo is not None and rs_3mo is not None:
+        if rs_1mo > rs_3mo:
+            trend = 'improving'
+        elif rs_1mo < rs_3mo - 5:
+            trend = 'deteriorating'
+        else:
+            trend = 'stable'
+    else:
+        trend = 'unknown'
+
+    return {
+        'rs_1mo': rs_1mo,
+        'rs_3mo': rs_3mo,
+        'rs_6mo': rs_6mo,
+        'rs_12mo': rs_12mo,
+        'rs_trend': trend,
     }
 
-    # Helper: scale quality_score into a range
-    # e.g. _q_refine(7, 10, q_score) → 7.0 to 10.0 based on quality_score 0-100
-    def _q_refine(low, high, qs):
-        return int(round(low + (high - low) * min(qs, 100) / 100))
 
-    def _apply_monthly_ao_guard(out: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Hard guardrail: if monthly AO is negative, do not allow bullish entry recommendations.
-        This enforces consistency with multi-timeframe momentum rules.
-        """
-        if bool(monthly_ao_positive):
-            return out
-        rec_u = str(out.get('recommendation', '') or '').upper()
-        is_bullish_entry = (
-            ('BUY' in rec_u or 'ENTRY' in rec_u)
-            and 'WATCH' not in rec_u
-            and 'WAIT' not in rec_u
-            and 'SKIP' not in rec_u
-            and 'AVOID' not in rec_u
-        )
-        if is_bullish_entry:
-            base = str(out.get('summary', '') or '').strip()
-            out['recommendation'] = 'WAIT (M-AO)'
-            out['summary'] = (
-                (base + " " if base else "")
-                + "⚠️ Monthly AO negative headwind — no new bullish entries."
-            )
-            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 1), 4)
-            out['monthly_ao_downgrade'] = True
-            out['monthly_ao_value'] = signal.monthly_ao.get('value')
-        elif 'WATCH' in rec_u and 'SKIP' not in rec_u and not monthly_macd_bullish:
-            # Monthly AO negative AND monthly MACD bearish — full monthly headwind.
-            # WATCH signals are misleading when the entire monthly trend is hostile.
-            base = str(out.get('summary', '') or '').strip()
-            out['recommendation'] = 'SKIP'
-            out['summary'] = (
-                (base + " " if base else "")
-                + "⚠️ Monthly MACD + AO both bearish — full monthly headwind."
-            )
-            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 0), 1)
-            out['monthly_ao_downgrade'] = True
-        return out
+# =============================================================================
+# STOP LOSS & POSITION SIZING
+# =============================================================================
 
-    def _apply_mtf_zone_guard(out: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Hard guardrail: prevent bullish entry recommendations when MTF MACD zone check rejects.
-        Only applies to HPotter Zone profile where zone approval is the primary timing mechanism.
-        Legacy profile uses MACD cross + context modifiers instead.
-        """
-        # Legacy profile: zone check is informational, not a gate.
-        # Context modifiers already penalize extended/declining conditions.
-        _profile = str(signal.macd_profile or '').lower()
-        if _profile not in (MACD_PROFILE_HPOTTER_ZONE,):
-            return out
+def calculate_stops(entry_price: float, atr: float = None) -> Dict[str, Any]:
+    """
+    Calculate stop loss and profit target.
 
-        zone = signal.mtf_zone_check or {}
-        buy_approved = bool(zone.get('buy_approved', False))
-        if buy_approved:
-            return out
+    Uses 15% stop loss or 2x ATR, whichever is tighter.
+    Profit target = 2x risk (reward:risk = 2:1).
+    """
+    # Percentage stop
+    pct_stop = entry_price * (1 - STOP_LOSS_PCT)
 
-        rec_u = str(out.get('recommendation', '') or '').upper()
-        is_bullish_entry = (
-            ('BUY' in rec_u or 'ENTRY' in rec_u)
-            and 'WATCH' not in rec_u
-            and 'WAIT' not in rec_u
-            and 'SKIP' not in rec_u
-            and 'AVOID' not in rec_u
-        )
-        if not is_bullish_entry:
-            return out
+    # ATR stop (2x ATR below entry)
+    atr_stop = entry_price - (2 * atr) if atr else None
 
-        reject_reason = str(zone.get('reject_reason', '') or '').strip()
-        d_zone = str((signal.daily_macd_zone or {}).get('zone', '') or '')
-        w_zone = str((signal.weekly_macd_zone or {}).get('zone', '') or '')
-        m_zone = str((signal.monthly_macd_zone or {}).get('zone', '') or '')
-        reason_txt = reject_reason or f"D:{d_zone} W:{w_zone} M:{m_zone}"
-        rr = reason_txt.lower()
-
-        if ('extended' in rr) or ('bearish' in rr):
-            out['recommendation'] = 'SKIP'
-            out['summary'] = f"⚠️ MACD zone reject ({reason_txt}) — setup extended/bearish, skip new entry."
-            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 0), 1)
-        else:
-            out['recommendation'] = 'WAIT (ZONE)'
-            out['summary'] = f"⚠️ MACD zone timing not approved ({reason_txt}) — wait for valid just-cross entry."
-            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 1), 4)
-
-        out['mtf_zone_downgrade'] = True
-        out['mtf_zone_reject_reason'] = reason_txt
-        return out
-
-    def _apply_context_modifiers(out: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Adjust conviction using contextual data the signal already carries.
-        Wires volume, relative strength, VCP, Weinstein stage, and overhead
-        resistance into the decision path instead of display-only.
-        """
-        if out.get('conviction', 0) <= 0:
-            return out  # Don't modify SKIP/no-signal
-
-        modifiers = []
-        delta = 0
-
-        # ── 1. Weinstein Stage guard ─────────────────────────────────
-        w = signal.weinstein or {}
-        stage = w.get('stage', 0)
-        maturity = w.get('trend_maturity', '')
-
-        if stage == 4:
-            delta -= 3
-            modifiers.append("Stage 4 decline ⚠️")
-            rec_u = str(out.get('recommendation', '')).upper()
-            if 'BUY' in rec_u or 'ENTRY' in rec_u:
-                if 'WATCH' not in rec_u and 'WAIT' not in rec_u and 'SKIP' not in rec_u:
-                    out['recommendation'] = 'WATCH (STAGE 4)'
-                    out['stage4_downgrade'] = True
-        elif stage == 3:
-            delta -= 1
-            modifiers.append("Stage 3 topping")
-        elif stage == 2:
-            if maturity == 'early':
-                delta += 1
-                modifiers.append("Early Stage 2 advance ✅")
-            elif maturity == 'extended':
-                delta -= 1
-                modifiers.append("Stage 2 extended")
-
-        # ── 2. Volume confirmation ───────────────────────────────────
-        vol = signal.volume or {}
-        cross_vol = vol.get('cross_volume_ratio')
-        ad_trend = vol.get('accum_dist_trend', 'unknown')
-
-        if cross_vol is not None:
-            if cross_vol >= 2.0:
-                delta += 1
-                modifiers.append(f"Strong breakout volume ({cross_vol:.1f}x) ✅")
-            elif cross_vol < 0.7:
-                delta -= 1
-                modifiers.append(f"Weak volume on cross ({cross_vol:.1f}x) ⚠️")
-
-        if ad_trend == 'distributing':
-            delta -= 1
-            modifiers.append("Distribution pattern ⚠️")
-        elif ad_trend == 'accumulating':
-            delta += 1
-            modifiers.append("Accumulation ✅")
-
-        # ── 3. Relative strength vs SPY ──────────────────────────────
-        rs = signal.relative_strength or {}
-        rs_1mo = rs.get('rs_1mo')
-        rs_3mo = rs.get('rs_3mo')
-        rs_trend = rs.get('rs_trend', 'unknown')
-
-        if rs_1mo is not None and rs_3mo is not None:
-            if rs_1mo > 5 and rs_3mo > 5:
-                delta += 1
-                modifiers.append(f"Strong RS vs SPY ✅")
-            elif rs_1mo < -5 and rs_3mo < -5:
-                delta -= 1
-                modifiers.append(f"Weak RS vs SPY ⚠️")
-
-        if rs_trend == 'deteriorating':
-            delta -= 1
-            modifiers.append("RS deteriorating ⚠️")
-
-        # ── 4. VCP detection bonus ───────────────────────────────────
-        vcp = signal.vcp or {}
-        if vcp.get('vcp_detected'):
-            delta += 1
-            vcp_score = vcp.get('vcp_score', 0)
-            modifiers.append(f"VCP pattern ({vcp_score:.0f}) ✅")
-
-        # ── 5. Overhead resistance proximity ─────────────────────────
-        ores = signal.overhead_resistance or {}
-        dist = ores.get('distance_to_critical_pct')
-        if dist is not None and 0 < dist < 2.0:
-            delta -= 1
-            modifiers.append(f"Near resistance ({dist:.1f}%) ⚠️")
-
-        # ── 6. MACD overbought / momentum fading guard ──────────────
-        # When daily MACD is elevated above zero AND the histogram is
-        # shrinking (momentum fading), this is NOT a fresh entry — it's
-        # an extended move losing steam.  Downgrade buy-type signals.
-        _d_macd = signal.macd or {}
-        _d_macd_val = float(_d_macd.get('macd', 0) or 0)
-        _d_hist = float(_d_macd.get('histogram', 0) or 0)
-        # 'weakening' is True when histogram is shrinking while MACD still bullish
-        _momentum_fading = bool(_d_macd.get('weakening', False))
-
-        # Overbought threshold tiers:
-        #   >4.0 = extremely extended, kill any remaining buy signals
-        #   >2.5 = heavily extended, hard downgrade to WATCH
-        #   >1.5 + fading = overbought with weakening momentum, downgrade
-        #   >2.0 (no fade) = elevated, caution penalty
-        rec_u = str(out.get('recommendation', '')).upper()
-        is_buy = (
-            ('BUY' in rec_u or 'ENTRY' in rec_u)
-            and 'WATCH' not in rec_u
-            and 'WAIT' not in rec_u
-            and 'SKIP' not in rec_u
-        )
-
-        if _d_macd_val > 4.0:
-            # Extreme — the move has already happened
-            delta -= 3
-            modifiers.append(f"MACD extreme ({_d_macd_val:.1f}), entry window closed ⛔")
-            if is_buy:
-                out['recommendation'] = 'SKIP'
-                out['overbought_downgrade'] = True
-            elif 'WATCH' in rec_u and 'SKIP' not in rec_u:
-                # Even WATCH signals get crushed at this level
-                out['conviction'] = min(out.get('conviction', 2), 2)
-                out['overbought_downgrade'] = True
-        elif _d_macd_val > 2.5:
-            delta -= 2
-            modifiers.append(f"MACD heavily extended ({_d_macd_val:.1f}) ⚠️")
-            if is_buy:
-                out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
-                out['overbought_downgrade'] = True
-        elif _d_macd_val > 1.5 and _momentum_fading:
-            delta -= 2
-            modifiers.append(f"MACD overbought ({_d_macd_val:.1f}), momentum fading ⚠️")
-            if is_buy:
-                out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
-                out['overbought_downgrade'] = True
-        elif _d_macd_val > 2.0:
-            # MACD elevated even if histogram not yet shrinking — caution
-            delta -= 1
-            modifiers.append(f"MACD extended ({_d_macd_val:.1f}) ⚠️")
-
-        # ── Apply with bounds ────────────────────────────────────────
-        if delta != 0 or modifiers:
-            original = out['conviction']
-            out['conviction'] = max(0, min(10, out['conviction'] + delta))
-            out['context_modifiers'] = modifiers
-            out['conviction_delta'] = delta
-            # Append key modifiers to summary
-            flags = [m for m in modifiers if '✅' in m or '⚠️' in m][:3]
-            if flags:
-                out['summary'] += ' | ' + ', '.join(flags)
-
-        return out
-
-    def _apply_signal_guards(out: Dict[str, Any]) -> Dict[str, Any]:
-        out = _apply_monthly_ao_guard(out)
-        out = _apply_mtf_zone_guard(out)
-        out = _apply_context_modifiers(out)
-        return out
-
-    # --- PRIMARY SIGNAL ---
-    if signal.is_valid:
-        result['signal_type'] = 'PRIMARY'
-
-        # Volume context for gating STRONG BUY
-        _vol = signal.volume or {}
-        _cross_vol = _vol.get('cross_volume_ratio')  # None if no cross bar
-        _ad_trend = _vol.get('accum_dist_trend', 'unknown')
-        _vol_ok = (
-            _ad_trend != 'distributing'
-            and (_cross_vol is None or _cross_vol >= 0.8)
-        )
-        _vol_strong = _cross_vol is not None and _cross_vol >= 1.5
-        _vol_tag = ""
-        if not _vol_ok:
-            _vol_tag = " ⚠️ Volume concern"
-        elif _vol_strong:
-            _vol_tag = " 📊 Strong volume"
-
-        if grade in ['A', 'B'] and weekly_healthy and monthly_bullish and _vol_ok:
-            result['recommendation'] = 'STRONG BUY'
-            result['summary'] = f"✅ Entry signal valid, Weekly + Monthly bullish, Quality {grade}{_vol_tag}"
-            if grade == 'A':
-                result['conviction'] = _q_refine(8, 10, q_score)
-            else:
-                result['conviction'] = _q_refine(7, 9, q_score)
-            # Bonus for strong breakout volume
-            if _vol_strong:
-                result['conviction'] = min(10, result['conviction'] + 1)
-        elif grade in ['A', 'B'] and weekly_bullish and not weekly_healthy and monthly_bullish and _vol_ok:
-            # Weekly technically bullish but histogram deteriorating — cap at BUY
-            result['recommendation'] = 'BUY'
-            result['summary'] = f"✅ Entry valid, Weekly bullish but momentum fading, Monthly bullish, Quality {grade}{_vol_tag}"
-            result['conviction'] = _q_refine(6, 8, q_score)
-        elif grade in ['A', 'B'] and weekly_bullish and monthly_bullish and not _vol_ok:
-            # All timeframes aligned but volume is distributing or weak — downgrade to BUY
-            result['recommendation'] = 'BUY'
-            result['summary'] = f"✅ Entry valid, all TFs bullish but volume weak, Quality {grade}{_vol_tag}"
-            result['conviction'] = _q_refine(6, 8, q_score)
-        elif grade in ['A', 'B'] and weekly_bullish:
-            result['recommendation'] = 'BUY'
-            result['summary'] = f"✅ Entry valid, Weekly bullish, Quality {grade}{monthly_warning}{_vol_tag}"
-            result['conviction'] = _q_refine(6, 8, q_score)
-        elif grade in ['A', 'B']:
-            # No weekly confirmation — WATCH not BUY
-            result['recommendation'] = 'WATCH'
-            result['summary'] = f"🟡 Entry valid, Quality {grade}, awaiting Weekly confirmation{monthly_warning}{_vol_tag}"
-            result['conviction'] = _q_refine(4, 6, q_score)
-        elif grade == 'C':
-            result['recommendation'] = 'WAIT'
-            result['summary'] = f"⚠️ Entry valid but Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(3, 5, q_score)
-        else:
-            result['recommendation'] = 'SKIP'
-            result['summary'] = f"❌ Entry valid but Quality {grade}"
-            result['conviction'] = 1
-        return _apply_signal_guards(result)
-
-    # --- AO CONFIRMATION ---
-    if ao_confirm and ao_confirm.get('is_valid'):
-        result['signal_type'] = 'AO_CONFIRMATION'
-        ao_q = ao_confirm.get('quality_score', 0)
-
-        if grade in ['A', 'B'] and ao_q >= 80 and weekly_bullish:
-            result['recommendation'] = 'BUY (AO)'
-            result['summary'] = f"🔄 AO Confirmation, Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(6, 8, q_score)
-        elif grade in ['A', 'B'] and ao_q >= 65:
-            result['recommendation'] = 'WATCH (AO)'
-            result['summary'] = f"🟡 AO Confirmation, Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(4, 6, q_score)
-        else:
-            result['recommendation'] = 'SKIP'
-            result['summary'] = f"⚠️ AO Confirmation but weak"
-            result['conviction'] = 2
-        return _apply_signal_guards(result)
-
-    # --- RE-ENTRY ---
-    if reentry and reentry.get('is_valid'):
-        result['signal_type'] = 'RE_ENTRY'
-        bars_ago = reentry.get('macd_cross_bars_ago', 0)
-
-        # Overbought gate: if daily MACD has already run far above zero,
-        # the re-entry window has closed — you'd be chasing, not re-entering.
-        _re_macd = float(signal.macd.get('macd', 0) or 0)
-        if _re_macd > 4.0:
-            # Extremely extended — kill the signal entirely
-            result['recommendation'] = 'SKIP'
-            result['summary'] = (
-                f"⛔ Re-Entry ({bars_ago}d ago) but daily MACD={_re_macd:.1f} — "
-                f"far too extended, entry window closed"
-            )
-            result['conviction'] = 1
-            return _apply_signal_guards(result)
-        elif _re_macd > 2.5:
-            # Elevated — cap at low-conviction WATCH
-            result['recommendation'] = 'WATCH (RE-ENTRY)'
-            result['summary'] = (
-                f"🟡 Re-Entry ({bars_ago}d ago) but MACD already at {_re_macd:.1f}, "
-                f"Quality {grade}{monthly_warning}"
-            )
-            result['conviction'] = _q_refine(2, 3, q_score)
-            return _apply_signal_guards(result)
-
-        if grade in ['A', 'B'] and weekly_healthy:
-            result['recommendation'] = 'RE-ENTRY'
-            result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(5, 7, q_score)
-        elif grade in ['A', 'B'] and weekly_bullish:
-            # Weekly technically bullish but histogram deteriorating — lower confidence
-            result['recommendation'] = 'WATCH (RE-ENTRY)'
-            result['summary'] = f"🟡 Re-Entry ({bars_ago}d ago), Weekly bullish but fading, Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(3, 4, q_score)
-        elif grade in ['A', 'B']:
-            # No weekly confirmation — WATCH not green RE-ENTRY.
-            # Re-entering an established trend without weekly backing is risky.
-            result['recommendation'] = 'WATCH (RE-ENTRY)'
-            result['summary'] = f"🟡 Re-Entry ({bars_ago}d ago), Quality {grade}, no Weekly confirmation{monthly_warning}"
-            result['conviction'] = _q_refine(3, 5, q_score)
-        else:
-            result['recommendation'] = 'WATCH'
-            result['summary'] = f"🟡 Re-Entry but Quality {grade}"
-            result['conviction'] = _q_refine(2, 4, q_score)
-        return _apply_signal_guards(result)
-
-    # --- LATE ENTRY ---
-    if late_entry and late_entry.get('is_valid'):
-        result['signal_type'] = 'LATE_ENTRY'
-        days = late_entry.get('days_since_cross', 0)
-        premium = late_entry.get('entry_premium_pct', 0)
-
-        # Same overbought gate as RE-ENTRY — too extended = no entry
-        _le_macd = float(signal.macd.get('macd', 0) or 0)
-        if _le_macd > 4.0:
-            result['recommendation'] = 'SKIP'
-            result['summary'] = (
-                f"⛔ Late Entry (+{days}d) but daily MACD={_le_macd:.1f} — "
-                f"far too extended, entry window closed"
-            )
-            result['conviction'] = 1
-            return _apply_signal_guards(result)
-        elif _le_macd > 2.5:
-            result['recommendation'] = f'WATCH (LATE +{days}d)'
-            result['summary'] = (
-                f"🟡 Late Entry (+{days}d) but MACD already at {_le_macd:.1f}, "
-                f"Quality {grade}{monthly_warning}"
-            )
-            result['conviction'] = _q_refine(2, 3, q_score)
-            return _apply_signal_guards(result)
-
-        if grade in ['A', 'B'] and premium <= 3 and weekly_bullish:
-            result['recommendation'] = f'LATE ENTRY (+{days}d)'
-            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Weekly bullish, Quality {grade}{monthly_warning}"
-            result['conviction'] = _q_refine(4, 6, q_score)
-        elif grade in ['A', 'B'] and premium <= 3:
-            # No weekly — downgrade to WATCH
-            result['recommendation'] = f'WATCH (LATE +{days}d)'
-            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium, Quality {grade}, no Weekly confirmation{monthly_warning}"
-            result['conviction'] = _q_refine(3, 4, q_score)
-        else:
-            result['recommendation'] = 'WATCH'
-            result['summary'] = f"🕐 Signal {days}d ago, +{premium:.1f}% premium"
-            result['conviction'] = _q_refine(2, 3, q_score)
-        return _apply_signal_guards(result)
-
-    # --- MTF PULLBACK ENTRY ---
-    # Daily MACD just crossed bullish from oversold (below zero line) while
-    # weekly + monthly MACD are both positive.  This is a high-quality pullback
-    # buy in an established multi-timeframe uptrend.  AO confirmation is NOT
-    # required — the higher-timeframe trend alignment substitutes for it.
-    _daily_cross = bool(signal.macd.get('cross_recent', False))
-    _daily_macd_val = float(signal.macd.get('macd', 0) or 0)
-    _daily_hist = float(signal.macd.get('histogram', 0) or 0)
-    _cross_bars = int(signal.macd.get('cross_bars_ago', 0) or 0)
-    # "From oversold" = MACD line is still near zero (just crossed up from negative)
-    # or histogram is small-positive (early days of the cross).
-    _from_oversold = _daily_cross and (_daily_macd_val <= 0.5 or _daily_hist < 1.0)
-    # Also accept when MACD crossed recently and is still below its own signal line
-    # by a tiny amount — histogram barely positive.
-    if not _from_oversold and _daily_cross and _cross_bars <= 3:
-        _from_oversold = True  # Any fresh cross within 3 bars qualifies
-
-    if _from_oversold and weekly_healthy and monthly_bullish:
-        # Best case: weekly trend is healthy (positive histogram, not weakening)
-        # AND monthly is bullish — this is a genuine pullback in a strong uptrend
-        result['signal_type'] = 'MTF_PULLBACK'
-        _mtf_note = f"Daily MACD cross from oversold ({_cross_bars}d ago, MACD={_daily_macd_val:.2f})"
-
-        if grade in ['A', 'B']:
-            result['recommendation'] = 'BUY (PULLBACK)'
-            result['summary'] = (
-                f"🔄 {_mtf_note}, Weekly + Monthly bullish, Quality {grade}"
-            )
-            result['conviction'] = _q_refine(6, 8, q_score)
-        elif grade in ['C']:
-            result['recommendation'] = 'WATCH (PULLBACK)'
-            result['summary'] = (
-                f"🔄 {_mtf_note}, Weekly + Monthly bullish, Quality {grade}"
-            )
-            result['conviction'] = _q_refine(4, 6, q_score)
-        else:
-            result['recommendation'] = 'WATCH'
-            result['summary'] = f"🔄 {_mtf_note}, Quality {grade}"
-            result['conviction'] = _q_refine(2, 4, q_score)
-        return _apply_signal_guards(result)
-
-    if _from_oversold and weekly_bullish and not weekly_healthy and monthly_bullish:
-        # Weekly is technically bullish (MACD > signal) but histogram is negative
-        # or weakening — the weekly uptrend is rolling over.  This is NOT a
-        # high-quality pullback; it's a bounce inside a deteriorating trend.
-        # Downgrade to WATCH regardless of quality grade.
-        result['signal_type'] = 'MTF_PULLBACK'
-        _wk_warn = []
-        if _wk_hist < 0:
-            _wk_warn.append(f"wkly hist={_wk_hist:.1f}")
-        if _wk_weakening:
-            _wk_warn.append("wkly momentum fading")
-        if _wk_bearish_cross:
-            _wk_warn.append("wkly bearish cross")
-        _wk_tag = ", ".join(_wk_warn) if _wk_warn else "wkly trend deteriorating"
-        result['recommendation'] = 'WATCH (PULLBACK)'
-        result['summary'] = (
-            f"🔄 Daily MACD cross from oversold ({_cross_bars}d ago), "
-            f"Weekly technically bullish but {_wk_tag}, Monthly bullish, Quality {grade}"
-        )
-        result['conviction'] = _q_refine(3, 4, q_score) if grade in ['A', 'B'] else _q_refine(2, 3, q_score)
-        return _apply_signal_guards(result)
-
-    # Also catch: daily MACD just crossed from oversold + weekly bullish (no monthly)
-    # — still worth a WATCH, not a SKIP.
-    if _from_oversold and weekly_bullish and not monthly_bullish:
-        result['signal_type'] = 'MTF_PULLBACK'
-        _wk_health_tag = "" if weekly_healthy else " (wkly trend weakening)"
-        result['recommendation'] = 'WATCH (PULLBACK)'
-        result['summary'] = (
-            f"🔄 Daily MACD cross from oversold, Weekly bullish{_wk_health_tag} but Monthly not confirmed, "
-            f"Quality {grade}{monthly_warning}"
-        )
-        result['conviction'] = _q_refine(3, 5, q_score) if grade in ['A', 'B'] and weekly_healthy else _q_refine(2, 3, q_score)
-        return _apply_signal_guards(result)
-
-    # --- NO SIGNAL ---
-    if signal.is_valid_relaxed:
-        # Before assigning WATCH, check if higher timeframes are hostile.
-        # If weekly AND monthly are both bearish, a daily-only bullish MACD
-        # is swimming against the tide — SKIP, not WATCH.
-        _wk_bear = not weekly_bullish
-        _mo_bear = not monthly_macd_bullish
-        _mo_ao_neg = not monthly_ao_positive
-        _wk_ao_neg = not bool(signal.weekly_ao.get('positive', False)) if signal.weekly_ao else True
-        # Also check if daily histogram is paper-thin (nearly crossed back)
-        _d_hist_thin = abs(float(signal.macd.get('histogram', 0) or 0)) < 0.15
-
-        if (_mo_bear and _mo_ao_neg) or (_wk_bear and _mo_bear):
-            # Both monthly MACD & AO bearish, OR weekly + monthly MACD both bearish
-            # — no reason to watch this; the daily is a counter-trend blip.
-            result['recommendation'] = 'SKIP'
-            _htf_reasons = []
-            if _mo_bear:
-                _htf_reasons.append("Monthly MACD bearish")
-            if _mo_ao_neg:
-                _htf_reasons.append("Monthly AO negative")
-            if _wk_bear:
-                _htf_reasons.append("Weekly MACD bearish")
-            if _wk_ao_neg:
-                _htf_reasons.append("Weekly AO negative")
-            result['summary'] = f"❌ Daily MACD bullish but higher timeframes hostile: {', '.join(_htf_reasons)}"
-            result['conviction'] = 1
-        elif _d_hist_thin and (_wk_ao_neg or _mo_ao_neg):
-            # Daily histogram nearly zero + at least one higher-TF AO negative
-            # — the daily cross is about to fail, don't watch
-            result['recommendation'] = 'SKIP'
-            result['summary'] = f"❌ Daily MACD barely bullish (hist≈0), higher TF momentum negative"
-            result['conviction'] = 1
-        else:
-            result['recommendation'] = 'WATCH'
-            result['summary'] = f"🟡 MACD bullish but no fresh cross, Quality {grade}"
-            result['conviction'] = 2
+    # Use the tighter (higher) stop
+    if atr_stop and atr_stop > pct_stop:
+        stop = round(atr_stop, 2)
+        stop_method = f"ATR-based ({2}x ATR)"
     else:
-        result['recommendation'] = 'SKIP'
-        failed = []
-        if not signal.macd.get('bullish', False):
-            failed.append("MACD bearish")
-        if not signal.ao.get('positive', False):
-            failed.append("AO negative")
-        if not signal.ao.get('zero_cross_found', False):
-            failed.append("No AO zero-cross")
-        result['summary'] = f"❌ {', '.join(failed)}" if failed else "❌ No signal"
-        result['conviction'] = 0
+        stop = round(pct_stop, 2)
+        stop_method = f"Percentage ({STOP_LOSS_PCT:.0%})"
 
-    return _apply_signal_guards(result)
+    risk = entry_price - stop
+    target = round(entry_price + (risk * PROFIT_TARGET_MULT), 2)
+    risk_pct = round(risk / entry_price * 100, 1)
+    rr_ratio = round(PROFIT_TARGET_MULT, 1)
+
+    return {
+        'entry': round(entry_price, 2),
+        'stop': stop,
+        'stop_method': stop_method,
+        'target': target,
+        'risk_per_share': round(risk, 2),
+        'risk_pct': risk_pct,
+        'reward_risk': f"1:{rr_ratio}",
+    }
+
+
+def calculate_position_size(entry_price: float, stop_price: float,
+                            account_size: float = 100000,
+                            risk_pct: float = 1.0) -> Dict[str, Any]:
+    """
+    Calculate position size based on account risk.
+
+    Default: risk 1% of $100k account = $1,000 max loss.
+    """
+    risk_per_share = entry_price - stop_price
+    if risk_per_share <= 0:
+        return {'shares': 0, 'position_value': 0, 'dollar_risk': 0}
+
+    dollar_risk = account_size * (risk_pct / 100)
+    shares = int(dollar_risk / risk_per_share)
+    position_value = shares * entry_price
+
+    return {
+        'shares': shares,
+        'position_value': round(position_value, 2),
+        'dollar_risk': round(dollar_risk, 2),
+        'pct_of_portfolio': round(position_value / account_size * 100, 1),
+    }
 
 
 # =============================================================================
-# FULL TICKER ANALYSIS — Orchestrator
+# FULL ENTRY VALIDATION — Combines all checks
 # =============================================================================
 
 @dataclass
-class TickerAnalysis:
-    """Complete analysis result for a single ticker."""
+class EntrySignal:
+    """Complete entry signal assessment."""
     ticker: str
-    timestamp: str = ''
+    is_valid: bool = False
+    is_valid_relaxed: bool = False
 
-    # Core signal
-    signal: EntrySignal = None
+    # MACD state
+    macd: Dict = field(default_factory=dict)
 
-    # Secondary signals
-    ao_confirmation: Dict = field(default_factory=dict)
-    reentry: Dict = field(default_factory=dict)
-    late_entry: Dict = field(default_factory=dict)
+    # AO state
+    ao: Dict = field(default_factory=dict)
 
-    # Quality
-    quality: Dict = field(default_factory=dict)
+    # Market filter
+    market_filter: Dict = field(default_factory=dict)
 
-    # Recommendation
-    recommendation: Dict = field(default_factory=dict)
+    # Multi-timeframe
+    weekly_macd: Dict = field(default_factory=dict)
+    monthly_macd: Dict = field(default_factory=dict)
+    monthly_ao: Dict = field(default_factory=dict)
+    macd_profile: str = MACD_PROFILE_LEGACY
+    daily_macd_zone: Dict = field(default_factory=dict)
+    weekly_macd_zone: Dict = field(default_factory=dict)
+    monthly_macd_zone: Dict = field(default_factory=dict)
+    mtf_zone_check: Dict = field(default_factory=dict)
+    vcp: Dict = field(default_factory=dict)
 
-    # Current price
-    current_price: float = None
+    # Context (for AI analysis)
+    weinstein: Dict = field(default_factory=dict)
+    volume: Dict = field(default_factory=dict)
+    key_levels: Dict = field(default_factory=dict)
+    overhead_resistance: Dict = field(default_factory=dict)
+    relative_strength: Dict = field(default_factory=dict)
 
-    # AO divergence (bearish warning)
-    ao_divergence_active: bool = False
+    # Stops
+    stops: Dict = field(default_factory=dict)
 
-    # Volume data
-    volume: float = 0
-    avg_volume_50d: float = 0
-    volume_ratio: float = 0  # today_vol / avg_50d
-
-    # Apex signal
-    apex_buy: bool = False
-    apex_signal_days_ago: int = 999
-    apex_signal_tier: str = ''
-    apex_signal_regime: str = ''
-
-    # Error
+    # Debug
+    data_bars: int = 0
+    last_bar_date: str = ''
     error: str = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for backward compatibility."""
         return {
             'ticker': self.ticker,
-            'timestamp': self.timestamp,
-            'current_price': self.current_price,
-            'signal': self.signal.to_dict() if self.signal else {},
-            'ao_confirmation': self.ao_confirmation,
-            'reentry': self.reentry,
-            'late_entry': self.late_entry,
-            'quality': self.quality,
-            'recommendation': self.recommendation,
-            'ao_divergence_active': self.ao_divergence_active,
+            'is_valid': self.is_valid,
+            'is_valid_relaxed': self.is_valid_relaxed,
+            'macd': self.macd,
+            'ao': self.ao,
+            'market_filter': self.market_filter,
+            'weekly_macd': self.weekly_macd,
+            'monthly_macd': self.monthly_macd,
+            'monthly_ao': self.monthly_ao,
+            'macd_profile': self.macd_profile,
+            'daily_macd_zone': self.daily_macd_zone,
+            'weekly_macd_zone': self.weekly_macd_zone,
+            'monthly_macd_zone': self.monthly_macd_zone,
+            'mtf_zone_check': self.mtf_zone_check,
+            'vcp': self.vcp,
+            'weinstein': self.weinstein,
             'volume': self.volume,
-            'avg_volume_50d': self.avg_volume_50d,
-            'volume_ratio': self.volume_ratio,
-            'apex_buy': self.apex_buy,
-            'apex_signal_days_ago': self.apex_signal_days_ago,
-            'apex_signal_tier': self.apex_signal_tier,
-            'apex_signal_regime': self.apex_signal_regime,
+            'key_levels': self.key_levels,
+            'overhead_resistance': self.overhead_resistance,
+            'relative_strength': self.relative_strength,
+            'stops': self.stops,
+            'data_bars': self.data_bars,
+            'last_bar_date': self.last_bar_date,
             'error': self.error,
         }
 
 
-def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = None) -> TickerAnalysis:
+def validate_entry(daily_df: pd.DataFrame,
+                   weekly_df: pd.DataFrame = None,
+                   monthly_df: pd.DataFrame = None,
+                   spy_df: pd.DataFrame = None,
+                   ticker: str = '',
+                   macd_profile: Optional[str] = None) -> EntrySignal:
     """
-    Full analysis of a single ticker using pre-fetched data.
+    Complete entry validation against TTA strategy rules.
 
-    ticker_data should come from data_fetcher.fetch_all_ticker_data()
-    with keys: ticker, daily, weekly, monthly, spy_daily, market_filter
+    Takes pre-fetched DataFrames (data fetching is NOT this module's job).
 
-    Returns TickerAnalysis with signal, quality, recommendation.
+    Checks:
+    1. MACD cross (recent, within lookback)
+    2. AO positive
+    3. AO zero-cross in prior entry window
+    4. Market filter (SPY > 200 SMA, VIX < 30) — requires spy_df
+    5. Weekly MACD confirmation
+    6. Monthly MACD top-down context
     """
-    ticker = ticker_data.get('ticker', '???')
-    result = TickerAnalysis(
-        ticker=ticker,
-        timestamp=datetime.now().isoformat(),
-        current_price=ticker_data.get('current_price'),
-    )
-
-    daily = ticker_data.get('daily')
-    weekly = ticker_data.get('weekly')
-    monthly = ticker_data.get('monthly')
-    spy = ticker_data.get('spy_daily')
-    mkt = ticker_data.get('market_filter', {})
-
-    if daily is None or len(daily) < 50:
-        result.error = 'Insufficient daily data'
-        result.recommendation = {'signal_type': None, 'recommendation': 'SKIP',
-                                 'summary': '❌ Insufficient data', 'conviction': 0}
-        return result
-
     profile_req = _resolve_macd_profile(macd_profile)
+    signal = EntrySignal(ticker=ticker, macd_profile=profile_req)
+
+    if daily_df is None or len(daily_df) < 50:
+        signal.error = 'Insufficient daily data'
+        return signal
+
+    # Normalize and add indicators
     profile_for_primary = MACD_PROFILE_LEGACY if profile_req == MACD_PROFILE_SHADOW else profile_req
+    daily_df = add_all_indicators(daily_df, macd_profile=profile_for_primary)
+    signal.data_bars = len(daily_df)
 
-    # --- Primary entry signal ---
-    signal = validate_entry(
-        daily_df=daily,
-        weekly_df=weekly,
-        monthly_df=monthly,
-        spy_df=spy,
-        ticker=ticker,
-        macd_profile=profile_req,
-    )
+    last_idx = daily_df.index[-1]
+    signal.last_bar_date = (last_idx.strftime('%Y-%m-%d')
+                            if hasattr(last_idx, 'strftime') else str(last_idx))
 
-    # Inject market filter (VIX comes from data_fetcher)
-    signal.market_filter = mkt
-    
-    # Re-evaluate validity with full market filter
-    # Conservative: missing market data = unconfirmed
-    _has_mkt = bool(mkt) and mkt.get('spy_close') is not None
-    spy_ok = mkt.get('spy_above_200', False) if _has_mkt else False
-    vix_ok = mkt.get('vix_below_30', False) if _has_mkt else False
-    
+    # ── MACD ──────────────────────────────────────────────────────────
+    signal.macd = detect_macd_cross(daily_df)
+
+    # ── AO ────────────────────────────────────────────────────────────
+    signal.ao = detect_ao_state(daily_df)
+
+    # ── Volume ────────────────────────────────────────────────────────
+    cross_bar = None
+    if signal.macd['cross_recent']:
+        cross_bar = len(daily_df) - 1 - signal.macd['cross_bars_ago']
+    signal.volume = analyze_volume(daily_df, macd_cross_bar=cross_bar)
+
+    # ── Key Levels ────────────────────────────────────────────────────
+    signal.key_levels = analyze_key_levels(daily_df)
+
+    # ── Volatility Contraction Pattern (VCP) ──────────────────────────
+    signal.vcp = detect_vcp(daily_df)
+
+    # ── Overhead Resistance ───────────────────────────────────────────
+    signal.overhead_resistance = find_overhead_resistance(daily_df)
+
+    # ── Weinstein Stage ───────────────────────────────────────────────
+    signal.weinstein = detect_weinstein_stage(daily_df)
+
+    # ── Relative Strength ─────────────────────────────────────────────
+    if spy_df is not None:
+        spy_norm = normalize_columns(spy_df)
+        signal.relative_strength = analyze_relative_strength(daily_df, spy_norm)
+
+    # ── Stops ─────────────────────────────────────────────────────────
+    price = float(daily_df['Close'].iloc[-1])
+    atr = float(daily_df['ATR'].iloc[-1]) if not pd.isna(daily_df['ATR'].iloc[-1]) else None
+    signal.stops = calculate_stops(price, atr)
+
+    # ── Weekly MACD ───────────────────────────────────────────────────
+    if weekly_df is not None and len(weekly_df) >= 30:
+        signal.weekly_macd = check_timeframe_macd(weekly_df, macd_profile=profile_for_primary)
+
+    # ── Monthly MACD + AO ─────────────────────────────────────────────
+    if monthly_df is not None and len(monthly_df) >= 30:
+        signal.monthly_macd = check_timeframe_macd(monthly_df, macd_profile=profile_for_primary)
+        signal.monthly_ao = check_timeframe_ao(monthly_df)
+
+    # ── MTF MACD Zones (HPotter) ──────────────────────────────────────
+    zone_check = check_macd_mtf_zones(daily_df, weekly_df, monthly_df)
+    signal.mtf_zone_check = zone_check
+    signal.daily_macd_zone = dict(zone_check.get('daily_zone', {}) or {})
+    signal.weekly_macd_zone = dict(zone_check.get('weekly_zone', {}) or {})
+    signal.monthly_macd_zone = dict(zone_check.get('monthly_zone', {}) or {})
+
+    # ── Market Filter ─────────────────────────────────────────────────
+    if spy_df is not None:
+        spy_norm = normalize_columns(spy_df)
+        spy_close = float(spy_norm['Close'].iloc[-1])
+        spy_sma200 = float(calculate_sma(spy_norm['Close'], 200).iloc[-1])
+        spy_above = spy_close > spy_sma200 if not pd.isna(spy_sma200) else True
+
+        signal.market_filter = {
+            'spy_above_200': spy_above,
+            'spy_close': round(spy_close, 2),
+            'spy_sma200': round(spy_sma200, 2) if not pd.isna(spy_sma200) else None,
+            # VIX needs separate fetch — handled by data_fetcher
+            'vix_below_30': signal.market_filter.get('vix_below_30', False),
+            'vix_close': signal.market_filter.get('vix_close', None),
+        }
+
+    # ── FINAL DETERMINATION ───────────────────────────────────────────
+    # Conservative: missing market data = unconfirmed, not assumed safe.
+    _has_market = bool(signal.market_filter) and signal.market_filter.get('spy_close') is not None
+    spy_ok = signal.market_filter.get('spy_above_200', False) if _has_market else False
+    vix_ok = signal.market_filter.get('vix_below_30', False) if _has_market else False
+
     legacy_valid = all([
         signal.macd['cross_recent'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
-        spy_ok, vix_ok,
+        spy_ok,
+        vix_ok,
     ])
     legacy_relaxed = all([
         signal.macd['bullish'],
         signal.ao['positive'],
         signal.ao['zero_cross_found'],
-        spy_ok, vix_ok,
+        spy_ok,
+        vix_ok,
     ])
-    if profile_for_primary == MACD_PROFILE_HPOTTER_ZONE:
-        d_zone = str((signal.daily_macd_zone or {}).get('zone', 'neutral'))
-        w_zone = str((signal.weekly_macd_zone or {}).get('zone', 'neutral'))
-        m_zone = str((signal.monthly_macd_zone or {}).get('zone', 'neutral'))
-        d_recent = bool((signal.daily_macd_zone or {}).get('recent_cross', False))
-        d_hist_pct = float((signal.daily_macd_zone or {}).get('hist_pct', 1.0) or 1.0)
-        daily_relaxed_ok = (d_zone != 'bearish') and not (
-            d_zone == 'extended' and (not d_recent or d_hist_pct > 0.95)
-        )
+
+    if profile_req == MACD_PROFILE_HPOTTER_ZONE:
         signal.is_valid = all([
-            bool((signal.mtf_zone_check or {}).get('buy_approved', False)),
+            bool(signal.mtf_zone_check.get('buy_approved', False)),
             signal.ao['positive'],
             signal.ao['zero_cross_found'],
             spy_ok,
             vix_ok,
         ])
+        d_zone = str(signal.daily_macd_zone.get('zone', 'neutral') or 'neutral')
+        w_zone = str(signal.weekly_macd_zone.get('zone', 'neutral') or 'neutral')
+        m_zone = str(signal.monthly_macd_zone.get('zone', 'neutral') or 'neutral')
+        d_recent = bool(signal.daily_macd_zone.get('recent_cross', False))
+        d_hist_pct = float(signal.daily_macd_zone.get('hist_pct', 1.0) or 1.0)
+        daily_relaxed_ok = (d_zone != 'bearish') and not (
+            d_zone == 'extended' and (not d_recent or d_hist_pct > 0.95)
+        )
         signal.is_valid_relaxed = all([
             daily_relaxed_ok,
-            w_zone not in {'bearish'},
-            m_zone not in {'bearish'},
+            w_zone != 'bearish',
+            m_zone != 'bearish',
             signal.ao['positive'],
             spy_ok,
             vix_ok,
@@ -1383,150 +1921,10 @@ def analyze_ticker(ticker_data: Dict[str, Any], macd_profile: Optional[str] = No
     else:
         signal.is_valid = legacy_valid
         signal.is_valid_relaxed = legacy_relaxed
+
     if profile_req == MACD_PROFILE_SHADOW:
-        zone_ok = bool((signal.mtf_zone_check or {}).get('buy_approved', False))
-        signal.mtf_zone_check['shadow_diff'] = bool(legacy_valid != zone_ok)
+        signal.mtf_zone_check['shadow_diff'] = bool(signal.is_valid != bool(signal.mtf_zone_check.get('buy_approved', False)))
         signal.mtf_zone_check['legacy_is_valid'] = bool(legacy_valid)
-        signal.mtf_zone_check['zone_is_valid'] = bool(zone_ok)
+        signal.mtf_zone_check['zone_is_valid'] = bool(signal.mtf_zone_check.get('buy_approved', False))
 
-    result.signal = signal
-
-    # --- Secondary signals (only if primary fails) ---
-    if not signal.is_valid:
-        result.ao_confirmation = check_ao_confirmation(daily, market_filter=mkt, macd_profile=profile_for_primary)
-
-        if not result.ao_confirmation.get('is_valid'):
-            result.reentry = check_reentry_signal(daily, market_filter=mkt, macd_profile=profile_for_primary)
-
-            if not result.reentry.get('is_valid'):
-                result.late_entry = check_late_entry(daily, market_filter=mkt, macd_profile=profile_for_primary)
-
-    # --- Quality score ---
-    # Use longer history for backtest
-    backtest_daily = ticker_data.get('daily')  # Already 1y
-    backtest_weekly = ticker_data.get('weekly')  # Already 2y
-    result.quality = calculate_quality_score(
-        backtest_daily,
-        backtest_weekly,
-        ticker=ticker,
-        macd_profile=profile_for_primary,
-    )
-
-    # --- AO Bearish Divergence Detection ---
-    try:
-        from signal_engine import detect_bearish_divergence
-        div_df = detect_bearish_divergence(daily)
-        if div_df is not None and 'bearish_div_active' in div_df.columns:
-            # Check if divergence is currently active (last bar)
-            result.ao_divergence_active = bool(div_df['bearish_div_active'].iloc[-1])
-    except Exception:
-        pass
-
-    # --- Volume Data ---
-    try:
-        if daily is not None and len(daily) > 50 and 'Volume' in daily.columns:
-            result.volume = float(daily['Volume'].iloc[-1])
-            result.avg_volume_50d = float(daily['Volume'].tail(50).mean())
-            if result.avg_volume_50d > 0:
-                result.volume_ratio = round(result.volume / result.avg_volume_50d, 2)
-    except Exception:
-        pass
-
-    # --- Apex Buy Signal Detection ---
-    try:
-        from apex_signals import detect_apex_signals
-        if weekly is not None and monthly is not None:
-            spy = ticker_data.get('spy_daily')
-            apex_signals = detect_apex_signals(
-                ticker=ticker,
-                daily_data=daily,
-                weekly_data=weekly,
-                monthly_data=monthly,
-                spy_data=spy,
-                vix_data=ticker_data.get('vix_daily'),
-            )
-            if apex_signals:
-                last_date = daily.index[-1] if len(daily) > 0 else None
-                active = [s for s in apex_signals if bool(getattr(s, 'is_active', False))]
-                ref_sig = active[-1] if active else apex_signals[-1]
-                sig_date = getattr(ref_sig, 'entry_date', None)
-                sig_days = 999
-                if sig_date is not None and last_date is not None:
-                    try:
-                        sig_days = max(0, int((last_date - sig_date).days))
-                    except Exception:
-                        sig_days = 999
-                result.apex_signal_days_ago = sig_days
-                result.apex_signal_tier = str(getattr(ref_sig, 'signal_tier', '') or '')
-                result.apex_signal_regime = str(getattr(ref_sig, 'monthly_regime', '') or '')
-                # APEX buy if a signal is still active or fired very recently.
-                result.apex_buy = bool(active) or sig_days <= 7
-    except Exception:
-        pass
-
-    # --- Recommendation ---
-    result.recommendation = generate_recommendation(
-        signal=signal,
-        quality=result.quality,
-        ao_confirm=result.ao_confirmation,
-        reentry=result.reentry,
-        late_entry=result.late_entry,
-    )
-
-    # --- AO Divergence Downgrade ---
-    # If bearish divergence is active, downgrade any bullish entry signals.
-    # Divergence means price making new highs but AO making lower highs —
-    # momentum is failing even if other indicators look green.
-    if result.ao_divergence_active:
-        rec = result.recommendation
-        original_rec = rec.get('recommendation', '')
-        rec_upper = original_rec.upper()
-        # Catch all buy-type signals: STRONG BUY, BUY, BUY (AO), RE-ENTRY,
-        # LATE ENTRY, BUY (PULLBACK)
-        _is_bullish = (
-            ('BUY' in rec_upper or 'ENTRY' in rec_upper)
-            and 'WATCH' not in rec_upper
-            and 'WAIT' not in rec_upper
-            and 'SKIP' not in rec_upper
-        )
-        if _is_bullish:
-            rec['recommendation'] = 'WAIT (D)'
-            rec['summary'] = f"⚠️ {rec.get('summary', '')} — AO divergence active, momentum failing"
-            rec['conviction'] = max(1, rec.get('conviction', 0) - 2)
-            rec['ao_divergence_downgrade'] = True
-            rec['original_recommendation'] = original_rec
-
-    return result
-
-
-def scan_watchlist(all_ticker_data: Dict[str, Dict], macd_profile: Optional[str] = None) -> List[TickerAnalysis]:
-    """
-    Scan an entire watchlist.
-
-    all_ticker_data: dict of ticker -> data from data_fetcher.fetch_scan_data()
-
-    Returns list of TickerAnalysis sorted by conviction (highest first).
-    """
-    results = []
-    for ticker, data in all_ticker_data.items():
-        try:
-            analysis = analyze_ticker(data, macd_profile=macd_profile)
-            results.append(analysis)
-        except Exception as e:
-            err = TickerAnalysis(
-                ticker=ticker,
-                timestamp=datetime.now().isoformat(),
-                error=str(e),
-                recommendation={'signal_type': None, 'recommendation': 'ERROR',
-                                'summary': f'❌ {str(e)}', 'conviction': 0}
-            )
-            results.append(err)
-
-    # Sort by conviction descending, then by quality grade
-    grade_order = {'A': 0, 'B': 1, 'C': 2, 'F': 3, 'N/A': 4}
-    results.sort(key=lambda r: (
-        -r.recommendation.get('conviction', 0),
-        grade_order.get(r.quality.get('quality_grade', 'N/A'), 4),
-    ))
-
-    return results
+    return signal
