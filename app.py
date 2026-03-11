@@ -252,8 +252,18 @@ except (ImportError, AttributeError, KeyError):
         ticker = analysis.ticker
         signal = analysis.signal
         rec = analysis.recommendation or {}
+        # Use persisted summary recommendation for consistency with scanner table
+        _display_rec = rec.get('recommendation', 'SKIP')
+        try:
+            _summaries = st.session_state.get('scan_results_summary', []) or []
+            for _s in _summaries:
+                if str(_s.get('ticker', '')).upper() == str(ticker).upper():
+                    _display_rec = _s.get('recommendation', _display_rec)
+                    break
+        except Exception:
+            pass
         st.markdown('<div id="detail-anchor"></div>', unsafe_allow_html=True)
-        st.header(f"{ticker} — {rec.get('recommendation', 'SKIP')}")
+        st.header(f"{ticker} — {_display_rec}")
         st.caption(rec.get("summary", ""))
         tab_map = {
             "signal": lambda: render_signal_tab(ticker, signal, rec, analysis),
