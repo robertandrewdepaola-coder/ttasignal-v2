@@ -863,23 +863,44 @@ def generate_recommendation(signal: EntrySignal,
         # 'weakening' is True when histogram is shrinking while MACD still bullish
         _momentum_fading = bool(_d_macd.get('weakening', False))
 
-        # Overbought threshold: MACD well above zero + momentum fading
-        if _d_macd_val > 1.5 and _momentum_fading:
+        # Overbought threshold tiers:
+        #   >4.0 = extremely extended, kill any remaining buy signals
+        #   >2.5 = heavily extended, hard downgrade to WATCH
+        #   >1.5 + fading = overbought with weakening momentum, downgrade
+        #   >2.0 (no fade) = elevated, caution penalty
+        rec_u = str(out.get('recommendation', '')).upper()
+        is_buy = (
+            ('BUY' in rec_u or 'ENTRY' in rec_u)
+            and 'WATCH' not in rec_u
+            and 'WAIT' not in rec_u
+            and 'SKIP' not in rec_u
+        )
+
+        if _d_macd_val > 4.0:
+            # Extreme — the move has already happened
+            delta -= 3
+            modifiers.append(f"MACD extreme ({_d_macd_val:.1f}), entry window closed ⛔")
+            if is_buy:
+                out['recommendation'] = 'SKIP'
+                out['overbought_downgrade'] = True
+            elif 'WATCH' in rec_u and 'SKIP' not in rec_u:
+                # Even WATCH signals get crushed at this level
+                out['conviction'] = min(out.get('conviction', 2), 2)
+                out['overbought_downgrade'] = True
+        elif _d_macd_val > 2.5:
+            delta -= 2
+            modifiers.append(f"MACD heavily extended ({_d_macd_val:.1f}) ⚠️")
+            if is_buy:
+                out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
+                out['overbought_downgrade'] = True
+        elif _d_macd_val > 1.5 and _momentum_fading:
             delta -= 2
             modifiers.append(f"MACD overbought ({_d_macd_val:.1f}), momentum fading ⚠️")
-            rec_u = str(out.get('recommendation', '')).upper()
-            # Hard downgrade: BUY/ENTRY signals become WATCH when overbought
-            is_buy = (
-                ('BUY' in rec_u or 'ENTRY' in rec_u)
-                and 'WATCH' not in rec_u
-                and 'WAIT' not in rec_u
-                and 'SKIP' not in rec_u
-            )
             if is_buy:
                 out['recommendation'] = f"WATCH ({out.get('recommendation', 'SIGNAL')})"
                 out['overbought_downgrade'] = True
         elif _d_macd_val > 2.0:
-            # MACD very elevated even if histogram not yet shrinking — caution
+            # MACD elevated even if histogram not yet shrinking — caution
             delta -= 1
             modifiers.append(f"MACD extended ({_d_macd_val:.1f}) ⚠️")
 
@@ -984,10 +1005,37 @@ def generate_recommendation(signal: EntrySignal,
         result['signal_type'] = 'RE_ENTRY'
         bars_ago = reentry.get('macd_cross_bars_ago', 0)
 
-        if grade in ['A', 'B'] and weekly_bullish:
+        # Overbought gate: if daily MACD has already run far above zero,
+        # the re-entry window has closed — you'd be chasing, not re-entering.
+        _re_macd = float(signal.macd.get('macd', 0) or 0)
+        if _re_macd > 4.0:
+            # Extremely extended — kill the signal entirely
+            result['recommendation'] = 'SKIP'
+            result['summary'] = (
+                f"⛔ Re-Entry ({bars_ago}d ago) but daily MACD={_re_macd:.1f} — "
+                f"far too extended, entry window closed"
+            )
+            result['conviction'] = 1
+            return _apply_signal_guards(result)
+        elif _re_macd > 2.5:
+            # Elevated — cap at low-conviction WATCH
+            result['recommendation'] = 'WATCH (RE-ENTRY)'
+            result['summary'] = (
+                f"🟡 Re-Entry ({bars_ago}d ago) but MACD already at {_re_macd:.1f}, "
+                f"Quality {grade}{monthly_warning}"
+            )
+            result['conviction'] = _q_refine(2, 3, q_score)
+            return _apply_signal_guards(result)
+
+        if grade in ['A', 'B'] and weekly_healthy:
             result['recommendation'] = 'RE-ENTRY'
             result['summary'] = f"🔁 Re-Entry ({bars_ago}d ago), Weekly bullish, Quality {grade}{monthly_warning}"
             result['conviction'] = _q_refine(5, 7, q_score)
+        elif grade in ['A', 'B'] and weekly_bullish:
+            # Weekly technically bullish but histogram deteriorating — lower confidence
+            result['recommendation'] = 'WATCH (RE-ENTRY)'
+            result['summary'] = f"🟡 Re-Entry ({bars_ago}d ago), Weekly bullish but fading, Quality {grade}{monthly_warning}"
+            result['conviction'] = _q_refine(3, 4, q_score)
         elif grade in ['A', 'B']:
             # No weekly confirmation — WATCH not green RE-ENTRY.
             # Re-entering an established trend without weekly backing is risky.
@@ -1005,6 +1053,25 @@ def generate_recommendation(signal: EntrySignal,
         result['signal_type'] = 'LATE_ENTRY'
         days = late_entry.get('days_since_cross', 0)
         premium = late_entry.get('entry_premium_pct', 0)
+
+        # Same overbought gate as RE-ENTRY — too extended = no entry
+        _le_macd = float(signal.macd.get('macd', 0) or 0)
+        if _le_macd > 4.0:
+            result['recommendation'] = 'SKIP'
+            result['summary'] = (
+                f"⛔ Late Entry (+{days}d) but daily MACD={_le_macd:.1f} — "
+                f"far too extended, entry window closed"
+            )
+            result['conviction'] = 1
+            return _apply_signal_guards(result)
+        elif _le_macd > 2.5:
+            result['recommendation'] = f'WATCH (LATE +{days}d)'
+            result['summary'] = (
+                f"🟡 Late Entry (+{days}d) but MACD already at {_le_macd:.1f}, "
+                f"Quality {grade}{monthly_warning}"
+            )
+            result['conviction'] = _q_refine(2, 3, q_score)
+            return _apply_signal_guards(result)
 
         if grade in ['A', 'B'] and premium <= 3 and weekly_bullish:
             result['recommendation'] = f'LATE ENTRY (+{days}d)'
