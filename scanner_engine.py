@@ -656,6 +656,17 @@ def generate_recommendation(signal: EntrySignal,
     grade = quality.get('quality_grade', 'N/A')
     q_score = quality.get('quality_score', 0)  # 0-100 for fine-tuning
     weekly_bullish = signal.weekly_macd.get('bullish', False)
+    # Weekly "healthy" = bullish AND histogram not deeply negative/declining.
+    # A ticker where MACD line is barely above signal but histogram is negative
+    # (e.g. META: MACD=0.64, signal=-7.70, hist=-8.33) is technically bullish
+    # but the weekly trend is rolling over — NOT a healthy pullback base.
+    _wk_hist = float(signal.weekly_macd.get('histogram', 0) or 0)
+    _wk_weakening = bool(signal.weekly_macd.get('weakening', False))
+    _wk_bearish_cross = bool(signal.weekly_macd.get('bearish_cross', False))
+    weekly_healthy = weekly_bullish and not _wk_bearish_cross and _wk_hist >= 0
+    # Even if hist >= 0, if it's weakening rapidly, flag it
+    if weekly_healthy and _wk_weakening and _wk_hist < 1.0:
+        weekly_healthy = False
     # Conservative: missing monthly data = unconfirmed, not assumed bullish.
     _has_monthly = bool(signal.monthly_macd) and signal.monthly_macd.get('error') is None
     monthly_macd_bullish = signal.monthly_macd.get('bullish', False) if _has_monthly else False
@@ -910,7 +921,7 @@ def generate_recommendation(signal: EntrySignal,
         elif _vol_strong:
             _vol_tag = " 📊 Strong volume"
 
-        if grade in ['A', 'B'] and weekly_bullish and monthly_bullish and _vol_ok:
+        if grade in ['A', 'B'] and weekly_healthy and monthly_bullish and _vol_ok:
             result['recommendation'] = 'STRONG BUY'
             result['summary'] = f"✅ Entry signal valid, Weekly + Monthly bullish, Quality {grade}{_vol_tag}"
             if grade == 'A':
@@ -920,6 +931,11 @@ def generate_recommendation(signal: EntrySignal,
             # Bonus for strong breakout volume
             if _vol_strong:
                 result['conviction'] = min(10, result['conviction'] + 1)
+        elif grade in ['A', 'B'] and weekly_bullish and not weekly_healthy and monthly_bullish and _vol_ok:
+            # Weekly technically bullish but histogram deteriorating — cap at BUY
+            result['recommendation'] = 'BUY'
+            result['summary'] = f"✅ Entry valid, Weekly bullish but momentum fading, Monthly bullish, Quality {grade}{_vol_tag}"
+            result['conviction'] = _q_refine(6, 8, q_score)
         elif grade in ['A', 'B'] and weekly_bullish and monthly_bullish and not _vol_ok:
             # All timeframes aligned but volume is distributing or weak — downgrade to BUY
             result['recommendation'] = 'BUY'
@@ -1022,7 +1038,9 @@ def generate_recommendation(signal: EntrySignal,
     if not _from_oversold and _daily_cross and _cross_bars <= 3:
         _from_oversold = True  # Any fresh cross within 3 bars qualifies
 
-    if _from_oversold and weekly_bullish and monthly_bullish:
+    if _from_oversold and weekly_healthy and monthly_bullish:
+        # Best case: weekly trend is healthy (positive histogram, not weakening)
+        # AND monthly is bullish — this is a genuine pullback in a strong uptrend
         result['signal_type'] = 'MTF_PULLBACK'
         _mtf_note = f"Daily MACD cross from oversold ({_cross_bars}d ago, MACD={_daily_macd_val:.2f})"
 
@@ -1044,16 +1062,39 @@ def generate_recommendation(signal: EntrySignal,
             result['conviction'] = _q_refine(2, 4, q_score)
         return _apply_signal_guards(result)
 
+    if _from_oversold and weekly_bullish and not weekly_healthy and monthly_bullish:
+        # Weekly is technically bullish (MACD > signal) but histogram is negative
+        # or weakening — the weekly uptrend is rolling over.  This is NOT a
+        # high-quality pullback; it's a bounce inside a deteriorating trend.
+        # Downgrade to WATCH regardless of quality grade.
+        result['signal_type'] = 'MTF_PULLBACK'
+        _wk_warn = []
+        if _wk_hist < 0:
+            _wk_warn.append(f"wkly hist={_wk_hist:.1f}")
+        if _wk_weakening:
+            _wk_warn.append("wkly momentum fading")
+        if _wk_bearish_cross:
+            _wk_warn.append("wkly bearish cross")
+        _wk_tag = ", ".join(_wk_warn) if _wk_warn else "wkly trend deteriorating"
+        result['recommendation'] = 'WATCH (PULLBACK)'
+        result['summary'] = (
+            f"🔄 Daily MACD cross from oversold ({_cross_bars}d ago), "
+            f"Weekly technically bullish but {_wk_tag}, Monthly bullish, Quality {grade}"
+        )
+        result['conviction'] = _q_refine(3, 4, q_score) if grade in ['A', 'B'] else _q_refine(2, 3, q_score)
+        return _apply_signal_guards(result)
+
     # Also catch: daily MACD just crossed from oversold + weekly bullish (no monthly)
     # — still worth a WATCH, not a SKIP.
     if _from_oversold and weekly_bullish and not monthly_bullish:
         result['signal_type'] = 'MTF_PULLBACK'
+        _wk_health_tag = "" if weekly_healthy else " (wkly trend weakening)"
         result['recommendation'] = 'WATCH (PULLBACK)'
         result['summary'] = (
-            f"🔄 Daily MACD cross from oversold, Weekly bullish but Monthly not confirmed, "
+            f"🔄 Daily MACD cross from oversold, Weekly bullish{_wk_health_tag} but Monthly not confirmed, "
             f"Quality {grade}{monthly_warning}"
         )
-        result['conviction'] = _q_refine(3, 5, q_score) if grade in ['A', 'B'] else _q_refine(2, 3, q_score)
+        result['conviction'] = _q_refine(3, 5, q_score) if grade in ['A', 'B'] and weekly_healthy else _q_refine(2, 3, q_score)
         return _apply_signal_guards(result)
 
     # --- NO SIGNAL ---
