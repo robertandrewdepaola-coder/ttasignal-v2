@@ -715,6 +715,17 @@ def generate_recommendation(signal: EntrySignal,
             out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 1), 4)
             out['monthly_ao_downgrade'] = True
             out['monthly_ao_value'] = signal.monthly_ao.get('value')
+        elif 'WATCH' in rec_u and 'SKIP' not in rec_u and not monthly_macd_bullish:
+            # Monthly AO negative AND monthly MACD bearish — full monthly headwind.
+            # WATCH signals are misleading when the entire monthly trend is hostile.
+            base = str(out.get('summary', '') or '').strip()
+            out['recommendation'] = 'SKIP'
+            out['summary'] = (
+                (base + " " if base else "")
+                + "⚠️ Monthly MACD + AO both bearish — full monthly headwind."
+            )
+            out['conviction'] = min(max(int(out.get('conviction', 0) or 0), 0), 1)
+            out['monthly_ao_downgrade'] = True
         return out
 
     def _apply_mtf_zone_guard(out: Dict[str, Any]) -> Dict[str, Any]:
@@ -1166,9 +1177,41 @@ def generate_recommendation(signal: EntrySignal,
 
     # --- NO SIGNAL ---
     if signal.is_valid_relaxed:
-        result['recommendation'] = 'WATCH'
-        result['summary'] = f"🟡 MACD bullish but no fresh cross, Quality {grade}"
-        result['conviction'] = 2
+        # Before assigning WATCH, check if higher timeframes are hostile.
+        # If weekly AND monthly are both bearish, a daily-only bullish MACD
+        # is swimming against the tide — SKIP, not WATCH.
+        _wk_bear = not weekly_bullish
+        _mo_bear = not monthly_macd_bullish
+        _mo_ao_neg = not monthly_ao_positive
+        _wk_ao_neg = not bool(signal.weekly_ao.get('positive', False)) if signal.weekly_ao else True
+        # Also check if daily histogram is paper-thin (nearly crossed back)
+        _d_hist_thin = abs(float(signal.macd.get('histogram', 0) or 0)) < 0.15
+
+        if (_mo_bear and _mo_ao_neg) or (_wk_bear and _mo_bear):
+            # Both monthly MACD & AO bearish, OR weekly + monthly MACD both bearish
+            # — no reason to watch this; the daily is a counter-trend blip.
+            result['recommendation'] = 'SKIP'
+            _htf_reasons = []
+            if _mo_bear:
+                _htf_reasons.append("Monthly MACD bearish")
+            if _mo_ao_neg:
+                _htf_reasons.append("Monthly AO negative")
+            if _wk_bear:
+                _htf_reasons.append("Weekly MACD bearish")
+            if _wk_ao_neg:
+                _htf_reasons.append("Weekly AO negative")
+            result['summary'] = f"❌ Daily MACD bullish but higher timeframes hostile: {', '.join(_htf_reasons)}"
+            result['conviction'] = 1
+        elif _d_hist_thin and (_wk_ao_neg or _mo_ao_neg):
+            # Daily histogram nearly zero + at least one higher-TF AO negative
+            # — the daily cross is about to fail, don't watch
+            result['recommendation'] = 'SKIP'
+            result['summary'] = f"❌ Daily MACD barely bullish (hist≈0), higher TF momentum negative"
+            result['conviction'] = 1
+        else:
+            result['recommendation'] = 'WATCH'
+            result['summary'] = f"🟡 MACD bullish but no fresh cross, Quality {grade}"
+            result['conviction'] = 2
     else:
         result['recommendation'] = 'SKIP'
         failed = []
