@@ -1,7 +1,7 @@
 [
   {
     "ticker": "AAPL",
-    "added_date": "2026-02-18",
+    "added_date": "2026-04-18",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -673,7 +673,7 @@
   },
   {
     "ticker": "GOOGL",
-    "added_date": "2026-02-18",
+    "added_date": "2026-04-18",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -729,7 +729,7 @@
   },
   {
     "ticker": "AMZN",
-    "added_date": "2026-02-18",
+    "added_date": "2026-04-18",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -4089,7 +4089,7 @@
   },
   {
     "ticker": "AXP",
-    "added_date": "2026-02-18",
+    "added_date": "2026-04-18",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
@@ -4537,7 +4537,7 @@
   },
   {
     "ticker": "MSFT",
-    "added_date": "2026-02-18",
+    "added_date": "2026-04-18",
     "signal_type": "",
     "quality_grade": "",
     "recommendation": "",
